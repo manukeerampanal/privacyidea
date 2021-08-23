@@ -33,8 +33,7 @@ import binascii
 import base64
 import qrcode
 import sqlalchemy
-from six.moves.urllib.parse import urlunparse, urlparse, urlencode
-from six.moves import zip_longest
+from six.moves.urllib.parse import urlencode
 from io import BytesIO
 import string
 import re
@@ -46,7 +45,7 @@ from netaddr import IPAddress, IPNetwork, AddrFormatError
 import hashlib
 import traceback
 import threading
-import pkg_resources
+import importlib_metadata
 import time
 import html
 
@@ -1252,7 +1251,7 @@ def get_version_number():
     """
     version = "unknown"
     try:
-        version = pkg_resources.get_distribution("privacyidea").version
+        version = importlib_metadata.version("privacyidea")
     except:
         log.info("We are not able to determine the privacyidea version number.")
     return version
@@ -1292,6 +1291,19 @@ def prepare_result(obj, rid=1, details=None):
     if details is not None and len(details) > 0:
         details["threadid"] = threading.current_thread().ident
         res["detail"] = details
+
+    # Fix for sending an information about challenge response
+    # TODO: Make this default, when we move from the binary result->value to
+    #       more states in version 4.0
+    if rid > 1:
+        if obj:
+            r_authentication = "ACCEPT"
+        if not obj and details.get("multi_challenge"):
+            # We have a challenge authentication
+            r_authentication = "CHALLENGE"
+        else:
+            r_authentication = "REJECT"
+        res["result"]["authentication"] = r_authentication
 
     return res
 
@@ -1441,3 +1453,30 @@ def to_list(input):
     if isinstance(input, set):
         return list(input)
     return [input]
+
+
+def parse_string_to_dict(s, split_char=":"):
+    """
+    This function can parse a string that is formatted like:
+
+       :key1: valueA valueB valueC :key2: valueD valueE
+
+    and return a dict:
+
+       {"key1": ["valueA", "valueB", "valueC"],
+        "key2": ["valueD", "valueE"]
+
+    Note: a whitespace is in the string is separating the values.
+    Thus values can not contain a whitespace.
+
+    :param s: The string that should be parsed
+    :param split_char: The character used for splitting the string
+    :return: the dict
+    """
+    # create a list like ["key1", "valueA valueB valueC", "key2", "valueD valueE"]
+    packed_list = [x.strip() for x in s.strip().split(split_char) if x]
+    keys = packed_list[::2]
+    # create a list of the values: [['valueA', 'valueB', 'valueC'], ['valueD', 'valueE']]
+    values = [[x for x in y.split()] for y in packed_list[1::2]]
+    d = {a: b for a, b in zip(keys, values)}
+    return d

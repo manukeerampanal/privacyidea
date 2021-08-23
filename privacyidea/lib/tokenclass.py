@@ -95,7 +95,7 @@ from privacyidea.lib.crypto import (encryptPassword, decryptPassword,
                                     generate_otpkey)
 from .policydecorators import libpolicy, auth_otppin, challenge_response_allowed
 from .decorators import check_token_locked
-from dateutil.parser import parse as parse_date_string
+from dateutil.parser import parse as parse_date_string, ParserError
 from dateutil.tz import tzlocal, tzutc
 from privacyidea.lib.utils import (is_true, decode_base32check,
                                    to_unicode, create_img, parse_timedelta,
@@ -125,11 +125,27 @@ class TOKENKIND(object):
     VIRTUAL = "virtual"
 
 
-class TOKENMODE(object):
+class AUTHENTICATIONMODE(object):
     AUTHENTICATE = 'authenticate'
     CHALLENGE = 'challenge'
     # If the challenge is answered out of band
     OUTOFBAND = 'outofband'
+
+
+class CLIENTMODE(object):
+    """
+    This informs privacyIDEA clients how to
+    handle challenge-responses
+    """
+    INTERACTIVE = 'interactive'
+    POLL = 'poll'
+    U2F = 'u2f'
+    WEBAUTHN = 'webauthn'
+
+    
+class ROLLOUTSTATE(object):
+    CLIENTWAIT = 'clientwait'
+    PENDING = 'pending'
 
 
 class TokenClass(object):
@@ -137,7 +153,10 @@ class TokenClass(object):
     # Class properties
     using_pin = True
     hKeyRequired = False
-    mode = [TOKENMODE.AUTHENTICATE, TOKENMODE.CHALLENGE]
+    mode = [AUTHENTICATIONMODE.AUTHENTICATE, AUTHENTICATIONMODE.CHALLENGE]
+    client_mode = CLIENTMODE.INTERACTIVE
+    # Usually a token will be checked in the lib:check_token_list, even if it is disabled
+    check_if_disabled = True
 
     @log_with(log)
     def __init__(self, db_token):
@@ -173,7 +192,7 @@ class TokenClass(object):
 
     @classmethod
     def is_outofband(cls):
-        return TOKENMODE.OUTOFBAND in cls.mode
+        return AUTHENTICATIONMODE.OUTOFBAND in cls.mode
 
     @staticmethod
     def get_class_type():
@@ -200,9 +219,18 @@ class TokenClass(object):
         :return: None
         """
         (uid, resolvertype, resolvername) = user.get_user_identifiers()
-        r = TokenOwner(token_id=self.token.id,
-                       user_id=uid, resolver=resolvername,
-                       realmname=user.realm).save()
+        # prevent to init update a token changing the token owner
+        # FIXME: We need to remove this, if we one day want to assign several users to one token
+        if self.user and self.user != user:
+            log.info(u"The token with serial {0!s} is already assigned "
+                     u"to user {1!s}. Can not assign to {2!s}.".format(self.token.serial, self.user, user))
+            raise TokenAdminError("This token is already assigned to another user.")
+
+        if not self.user:
+            # If the tokenowner is not set yet, set it / avoid setting the same tokenowner multiple times
+            r = TokenOwner(token_id=self.token.id,
+                           user_id=uid, resolver=resolvername,
+                           realmname=user.realm).save()
         # set the tokenrealm
         self.set_realms([user.realm])
 
@@ -230,7 +258,9 @@ class TokenClass(object):
         
         An orphaned token means, that it has a user assigned, but the user 
         does not exist in the user store (anymore)
+
         :return: True / False
+        :rtype: bool
         """
         orphaned = False
         if self.token.first_owner:
@@ -298,6 +328,7 @@ class TokenClass(object):
     def set_tokeninfo(self, info):
         """
         Set the tokeninfo field in the DB. Old values will be deleted.
+
         :param info: dictionary with key and value
         :type info: dict
         :return:
@@ -317,6 +348,7 @@ class TokenClass(object):
     def add_tokeninfo(self, key, value, value_type=None):
         """
         Add a key and a value to the DB tokeninfo
+
         :param key:
         :param value:
         :return:
@@ -432,12 +464,13 @@ class TokenClass(object):
         :type options: dict
 
         :return: returns tuple of
-                 1. true or false for the pin match,
-                 2. the otpcounter (int) and the
-                 3. reply (dict) that will be added as
-                    additional information in the JSON response
-                    of ``/validate/check``.
-        :rtype: tuple
+
+            1. true or false for the pin match,
+            2. the otpcounter (int) and the
+            3. reply (dict) that will be added as additional information in
+                the JSON response of ``/validate/check``.
+
+        :rtype: tuple(bool, int, dict)
         """
         pin_match = False
         otp_counter = -1
@@ -452,7 +485,6 @@ class TokenClass(object):
                 #self.set_otp_count(otp_counter)
 
         return pin_match, otp_counter, reply
-
 
     @staticmethod
     def decode_otpkey(otpkey, otpkeyformat):
@@ -476,7 +508,6 @@ class TokenClass(object):
             return decode_base32check(otpkey)
         else:
             raise ParameterError("Unknown OTP key format: {!r}".format(otpkeyformat))
-
 
     def update(self, param, reset_failcount=True):
         """
@@ -512,7 +543,7 @@ class TokenClass(object):
             otpKey = self.decode_otpkey(otpKey, otpkeyformat)
 
         if twostep_init:
-            if self.token.rollout_state == "clientwait":
+            if self.token.rollout_state == ROLLOUTSTATE.CLIENTWAIT:
                 # We do not do 2stepinit in the second step
                 raise ParameterError("2stepinit is only to be used in the "
                                      "first initialization step.")
@@ -538,7 +569,7 @@ class TokenClass(object):
             otpKey = getParam(param, "otpkey", required)
 
         if otpKey is not None:
-            if self.token.rollout_state == "clientwait":
+            if self.token.rollout_state == ROLLOUTSTATE.CLIENTWAIT:
                 # If we have otpkey and the token is in the enrollment-state
                 # generate the new key
                 server_component = to_unicode(self.token.get_otpkey().getKey())
@@ -553,7 +584,7 @@ class TokenClass(object):
 
         if twostep_init:
             # After the key is generated, we set "waiting for the client".
-            self.token.rollout_state = "clientwait"
+            self.token.rollout_state = ROLLOUTSTATE.CLIENTWAIT
 
         pin = getParam(param, "pin", optional)
         if pin is not None:
@@ -675,6 +706,7 @@ class TokenClass(object):
     def set_realms(self, realms, add=False):
         """
         Set the list of the realms of a token.
+
         :param realms: realms the token should be assigned to
         :type realms: list
         :param add: if the realms should be added and not replaced
@@ -685,8 +717,9 @@ class TokenClass(object):
     def get_realms(self):
         """
         Return a list of realms the token is assigned to
+
         :return: realms
-        :rtype:l list
+        :rtype: list
         """
         return self.token.get_realms()
         
@@ -726,10 +759,11 @@ class TokenClass(object):
         """
         set the PIN of a token.
         Usually the pin is stored in a hashed way.
+
         :param pin: the pin to be set for the token
         :type pin: basestring
         :param encrypt: If set to True, the pin is stored encrypted and
-                        can be retrieved from the database again
+            can be retrieved from the database again
         :type encrypt: bool
         """
         storeHashed = not encrypt
@@ -822,6 +856,7 @@ class TokenClass(object):
     def get_hashlib(hLibStr):
         """
         Returns a hashlib function for a given string
+
         :param hLibStr: the hashlib
         :type hLibStr: string
         :return: the hashlib
@@ -880,6 +915,7 @@ class TokenClass(object):
         """
         Sets the counter for the maximum allowed successful logins
         as key "count_auth_success_max" in token info
+
         :param count: a number
         :type count: int
         """
@@ -890,6 +926,7 @@ class TokenClass(object):
         """
         Sets the counter for the occurred successful logins
         as key "count_auth_success" in token info
+
         :param count: a number
         :type count: int
         """
@@ -900,6 +937,7 @@ class TokenClass(object):
         """
         Sets the counter for the maximum allowed login attempts
         as key "count_auth_max" in token info
+
         :param count: a number
         :type count: int
         """
@@ -910,6 +948,7 @@ class TokenClass(object):
         """
         Sets the counter for the occurred login attepms
         as key "count_auth" in token info
+
         :param count: a number
         :type count: int
         """
@@ -947,8 +986,9 @@ class TokenClass(object):
         """
         returns the end of validity period (if set)
         if not set, "" is returned.
+
         :return: the end of the validity period
-        :rtype: string
+        :rtype: str
         """
         end = self.get_tokeninfo("validity_period_end", "")
         if end:
@@ -959,10 +999,11 @@ class TokenClass(object):
     def set_validity_period_end(self, end_date):
         """
         sets the end date of the validity period for a token
+
         :param end_date: the end date in the format YYYY-MM-DDTHH:MM+OOOO
                          if the format is wrong, the method will
                          throw an exception
-        :type end_date: string
+        :type end_date: str
         """
         if not end_date:
             self.del_tokeninfo("validity_period_end")
@@ -979,8 +1020,9 @@ class TokenClass(object):
         """
         returns the start of validity period (if set)
         if not set, "" is returned.
+
         :return: the start of the validity period
-        :rtype: string
+        :rtype: str
         """
         start = self.get_tokeninfo("validity_period_start", "")
         if start:
@@ -991,10 +1033,11 @@ class TokenClass(object):
     def set_validity_period_start(self, start_date):
         """
         sets the start date of the validity period for a token
+
         :param start_date: the start date in the format YYYY-MM-DDTHH:MM+OOOO
                            if the format is wrong, the method will
                            throw an exception
-        :type start_date: string
+        :type start_date: str
         """
         if not start_date:
             self.del_tokeninfo("validity_period_start")
@@ -1012,7 +1055,6 @@ class TokenClass(object):
         Sets the timestamp for the next_pin_change. Provide a
         difference like 90d (90 days).
 
-        Either provider the
         :param diff: The time delta.
         :type diff: basestring
         :param password: Do no set next_pin_change but next_password_change
@@ -1028,9 +1070,9 @@ class TokenClass(object):
     def is_pin_change(self, password=False):
         """
         Returns true if the pin of the token needs to be changed.
+
         :param password: Whether the password needs to be changed.
         :type password: bool
-
         :return: True or False
         """
         key = "next_pin_change"
@@ -1077,7 +1119,7 @@ class TokenClass(object):
         Checks if we should reset the failcounter due to the
         FAILCOUNTER_CLEAR_TIMEOUT
 
-        :return: True, if the failcounter was resetted
+        :return: True, if the failcounter was reset
         """
         timeout = 0
         try:
@@ -1100,7 +1142,9 @@ class TokenClass(object):
         """
         Checks if the failcounter is exceeded. It returns True, if the
         failcounter is less than maxfail
+
         :return: True or False
+        :rtype: bool
         """
         return self.token.failcount < self.token.maxfail
 
@@ -1297,7 +1341,7 @@ class TokenClass(object):
 
     def get_init_detail(self, params=None, user=None):
         """
-        to complete the token initialization, the response of the initialisation
+        to complete the token initialization, the response of the initialization
         should be build by this token specific method.
         This method is called from api/token after the token is enrolled
 
@@ -1343,9 +1387,9 @@ class TokenClass(object):
         Each token type can decide on its own under which condition a challenge
         is triggered by overwriting this method.
 
-        **please note**: in case of pin policy == 2 (no pin is required)
-        the ``check_pin`` would always return true! Thus each request
-        containing a ``data`` or ``challenge`` would trigger a challenge!
+        .. note:: in case of ``pin policy == 2`` (no pin is required)
+                  the ``check_pin`` would always return true! Thus each request
+                  containing a ``data`` or ``challenge`` would trigger a challenge!
 
         The Challenge workflow is like this.
 
@@ -1353,19 +1397,19 @@ class TokenClass(object):
         a request which will create a new challenge (is_challenge_request) or if
         this is a response to an existing challenge (is_challenge_response).
         In these two cases during request processing the following functions are
-        called.
+        called::
 
-        is_challenge_request or is_challenge_response  <-------+
-                 |                       |                     |
-                 V                       V                     |
-        create_challenge        check_challenge_response     create_challenge
-                 |                       |                     ^
-                 |                       |                     |
-                 |              has_further_challenge [yes] ---+
-                 |                      [no]
-                 |                       |
-                 V                       V
-        challenge_janitor       challenge_janitor
+            is_challenge_request or is_challenge_response  <-------+
+                     |                       |                     |
+                     V                       V                     |
+            create_challenge        check_challenge_response     create_challenge
+                     |                       |                     ^
+                     |                       |                     |
+                     |              has_further_challenge [yes] ---+
+                     |                      [no]
+                     |                       |
+                     V                       V
+            challenge_janitor       challenge_janitor
 
         :param passw: password, which might be pin or pin+otp
         :type passw: string
@@ -1373,7 +1417,6 @@ class TokenClass(object):
         :type user: User object
         :param options: dictionary of additional request parameters
         :type options: dict
-
         :return: true or false
         :rtype: bool
         """
@@ -1387,8 +1430,8 @@ class TokenClass(object):
 
     def is_challenge_response(self, passw, user=None, options=None):
         """
-        This method checks, if this is a request, that is the response to
-        a previously sent challenge.
+        This method checks, if this is a request that is supposed to be
+        the answer to a previous challenge.
 
         The default behaviour to check if this is the response to a
         previous challenge is simply by checking if the request contains
@@ -1397,6 +1440,7 @@ class TokenClass(object):
 
         This method does not try to verify the response itself!
         It only determines, if this is a response for a challenge or not.
+        If the challenge still exists, is checked in has_db_challenge_response.
         The response is verified in check_challenge_response.
 
         :param passw: password, which might be pin or pin+otp
@@ -1409,11 +1453,28 @@ class TokenClass(object):
         :rtype: bool
         """
         options = options or {}
+        transaction_id = options.get("transaction_id") or options.get("state")
+        return bool(transaction_id)
+
+    def has_db_challenge_response(self, passw, user=None, options=None):
+        """
+        This method checks, if the given transaction_id is actually the response to
+        a real challenge. To do so, it verifies, if there is a DB entry for the
+        given serial number and transaction_id.
+        This is to avoid side effects by passing non-existent transaction_ids.
+
+        This method checks, if the token still has a challenge
+
+        :param passw:
+        :param user:
+        :param options:
+        :return:
+        """
+        options = options or {}
         challenge_response = False
         transaction_id = options.get("transaction_id") or options.get("state")
         if transaction_id:
-            # Now we also need to check, if the transaction_id is an entry to the
-            # serial number of this token
+            # Now we also need to check, if there is a corresponding DB entry
             chals = get_challenges(serial=self.token.serial, transaction_id=transaction_id)
             challenge_response = bool(chals)
 
@@ -1506,20 +1567,20 @@ class TokenClass(object):
         :param transactionid: the id of this challenge
         :param options: the request context parameters / data
         :type options: dict
-        :return: tuple of (bool, message, transactionid, attributes)
+        :return: tuple of (bool, message, transactionid, reply_dict)
         :rtype: tuple
 
         The return tuple builds up like this:
         ``bool`` if submit was successful;
         ``message`` which is displayed in the JSON response;
-        additional ``attributes``, which are displayed in the JSON response.
+        additional challenge ``reply_dict``, which are displayed in the JSON challenges response.
         """
         options = options or {}
         message = get_action_values_from_options(SCOPE.AUTH,
                                                  ACTION.CHALLENGETEXT,
                                                  options) or _('please enter otp: ')
         data = None
-        attributes = None
+        reply_dict = {}
 
         validity = int(get_from_config('DefaultChallengeValidityTime', 120))
         tokentype = self.get_tokentype().lower()
@@ -1536,7 +1597,7 @@ class TokenClass(object):
                                  validitytime=validity)
         db_challenge.save()
         self.challenge_janitor()
-        return True, message, db_challenge.transaction_id, attributes
+        return True, message, db_challenge.transaction_id, reply_dict
 
     def get_as_dict(self):
         """
@@ -1610,6 +1671,7 @@ class TokenClass(object):
         policies.
 
         The returned dictionary is added to the parameters of the API call.
+
         :param g: context object, see documentation of ``Match``
         :param params: The call parameters
         :type params: dict
@@ -1623,7 +1685,10 @@ class TokenClass(object):
         than the specified time delta which is passed as 10h, 7d or 1y.
 
         It returns True, if the last authentication with this token is
-        **newer*** than the specified delta.
+        **newer** than the specified delta or by any chance exactly the same.
+
+        It returns False, if the last authentication is older or
+        if the data in the token can not be parsed.
 
         :param last_auth: 10h, 7d or 1y
         :type last_auth: basestring
@@ -1642,7 +1707,12 @@ class TokenClass(object):
                       "tdelta %s: %s" % (self.token.serial, tdelta,
                                          date_s))
             # parse the string from the database
-            last_success_auth = parse_date_string(date_s)
+            try:
+                last_success_auth = parse_date_string(date_s)
+            except ParserError:
+                log.info("Failed to parse the date in 'last_auth' of token {0!s}.".format(self.token.serial))
+                return False
+
             if not last_success_auth.tzinfo:
                 # the date string has no timezone, default timezone is UTC
                 # We need to set the timezone manually

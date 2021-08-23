@@ -7,7 +7,7 @@ The lib.policy.py only depends on the database model.
 import dateutil
 import mock
 
-from .base import MyTestCase, FakeFlaskG
+from .base import MyTestCase, FakeFlaskG, FakeAudit
 
 from privacyidea.lib.auth import ROLE
 from privacyidea.lib.policy import (set_policy, delete_policy,
@@ -16,7 +16,8 @@ from privacyidea.lib.policy import (set_policy, delete_policy,
                                     PolicyClass, SCOPE, enable_policy,
                                     PolicyError, ACTION, MAIN_MENU,
                                     delete_all_policies,
-                                    get_action_values_from_options, Match, MatchingError)
+                                    get_action_values_from_options, Match, MatchingError,
+                                    get_allowed_custom_attributes)
 from privacyidea.lib.realm import (set_realm, delete_realm, get_realms)
 from privacyidea.lib.resolver import (save_resolver, get_resolver_list,
                                       delete_resolver)
@@ -1198,7 +1199,7 @@ class PolicyTestCase(MyTestCase):
         user3.info = {"type": "notverysecure", "groups": ["b", "c"]}
 
         # no user => policy error
-        with self.assertRaisesRegexp(PolicyError, ".* a user_object is not available.*"):
+        with self.assertRaisesRegexp(PolicyError, ".* an according object is not available.*"):
             P.match_policies(user_object=None)
 
         # empty user => policy error
@@ -1344,6 +1345,149 @@ class PolicyTestCase(MyTestCase):
         delete_policy("import_node1")
         delete_policy("delete_node2")
         delete_policy("enable")
+
+    def test_31_filter_by_conditions_tokeninfo(self):
+        def _names(policies):
+            return set(p['name'] for p in policies)
+
+        from privacyidea.lib.tokenclass import TokenClass
+        from privacyidea.models import Token
+        serial = "filter_by_conditions_token"
+        db_token = Token(serial, tokentype="spass")
+        db_token.save()
+        token = TokenClass(db_token)
+        token.set_tokeninfo({"fixedpin": "true", "otherinfo": "true"})
+
+        P = PolicyClass()
+
+        class MockUser(object):
+            login = 'login'
+            realm = 'realm'
+            resolver = 'resolver'
+
+        user1 = MockUser()
+        user1.info = {"email": "foo@bar.com"}
+
+        # Policy with initially inactive condition, setpin is allowed for this token
+        set_policy("setpin_pol", scope=SCOPE.USER, action=ACTION.SETPIN,
+                   conditions=[("tokeninfo", "fixedpin", "equals", "false", False)])
+
+        # policy matches, because the condition on tokeninfo is inactive
+        self.assertEqual(_names(P.match_policies(user_object=user1, serial=serial)),
+                         {"setpin_pol"})
+
+        # activate the condition
+        set_policy("setpin_pol", conditions=[("tokeninfo", "fixedpin", "equals", "false", True)])
+
+        # policy does not match anymore, because the condition on tokeninfo is active
+        # setpin action not returned for our token with tokeninfo "fixedpin" = "true"
+        self.assertEqual(_names(P.match_policies(user_object=user1, serial=serial)),
+                         set())
+
+        # A request without any serial number will raise a Policy error, since condition
+        # on tokeninfo is there, but no dbtoken object is available.
+        self.assertRaises(PolicyError, P.match_policies, user_object=user1)
+
+        delete_policy("setpin_pol")
+        db_token.delete()
+
+    def test_32_filter_by_conditions_token(self):
+        def _names(policies):
+            return set(p['name'] for p in policies)
+
+        from privacyidea.lib.tokenclass import TokenClass
+        from privacyidea.models import Token
+        serial = "filter_by_conditions_token"
+        db_token = Token(serial, tokentype="spass")
+        db_token.save()
+
+        P = PolicyClass()
+
+        class MockUser(object):
+            login = 'login'
+            realm = 'realm'
+            resolver = 'resolver'
+
+        user1 = MockUser()
+        user1.info = {"email": "foo@bar.com"}
+
+        # Policy with initially inactive condition, setpin is allowed for this token
+        set_policy("setpin_pol", scope=SCOPE.USER, action=ACTION.SETPIN,
+                   conditions=[("token", "tokentype", "equals", "hotp", False)])
+
+        # policy matches, because the condition on tokeninfo is inactive
+        self.assertEqual(_names(P.match_policies(user_object=user1, serial=serial)),
+                         {"setpin_pol"})
+
+        # activate the condition
+        set_policy("setpin_pol", conditions=[("token", "tokentype", "equals", "hotp", True)])
+
+        # policy does not match anymore, because the condition on tokeninfo is active
+        # setpin action not returned for our token with tokentype == spass
+        self.assertEqual(_names(P.match_policies(user_object=user1, serial=serial)),
+                         set())
+
+        # Now set a policy condition with a non-case matching token type!
+        set_policy("setpin_pol", conditions=[("token", "tokentype", "equals", "Spass", True)])
+        self.assertEqual(_names(P.match_policies(user_object=user1, serial=serial)),
+                         set())
+
+        # Now check, if we can compare numbers.
+        set_policy("setpin_pol", conditions=[("token", "count", "<", "100", True)])
+        self.assertEqual(_names(P.match_policies(user_object=user1, serial=serial)),
+                         {"setpin_pol"})
+        # The the counter of the token is >=100, the policy will not match anymore
+        db_token.count = 102
+        db_token.save()
+        self.assertEqual(_names(P.match_policies(user_object=user1, serial=serial)),
+                         set())
+
+        # A request without any serial number will raise a Policy error, since condition
+        # on tokeninfo is there, but no dbtoken object is available.
+        self.assertRaises(PolicyError, P.match_policies, user_object=user1)
+
+        # Now check, if a wrong comparison raises an exception
+        set_policy("setpin_pol", conditions=[("token", "count", "<", "not a number", True)])
+        self.assertRaises(PolicyError, P.match_policies, user_object=user1, serial=serial)
+
+        delete_policy("setpin_pol")
+        db_token.delete()
+
+    def test_33_get_allowed_attributes(self):
+
+        class MockUser(object):
+            login = 'login'
+            realm = 'realm'
+            resolver = 'resolver'
+
+        user = MockUser()
+        g = FakeFlaskG()
+        g.policy_object = PolicyClass()
+        g.audit_object = FakeAudit()
+        g.logged_in_user = {"role": "admin", "username": "admin", "realm": ""}
+
+        d = get_allowed_custom_attributes(g, user)
+        self.assertEqual({"set": {}, "delete": []}, d)
+
+        set_policy("custom_attr", scope=SCOPE.ADMIN,
+                   action="{0!s}=:hello: one two".format(ACTION.SET_USER_ATTRIBUTES))
+        set_policy("custom_attr2", scope=SCOPE.ADMIN,
+                   action="{0!s}=:hello2: * :hello: three".format(ACTION.SET_USER_ATTRIBUTES))
+        set_policy("custom_attr3", scope=SCOPE.ADMIN,
+                   action="{0!s}=:*: on off".format(ACTION.SET_USER_ATTRIBUTES))
+        set_policy("custom_attr4", scope=SCOPE.ADMIN,
+                   action="{0!s}=*".format(ACTION.DELETE_USER_ATTRIBUTES))
+        # Also check, that a double entry "one" only appears once
+        set_policy("custom_attr5", scope=SCOPE.ADMIN,
+                   action="{0!s}=:hello: one".format(ACTION.SET_USER_ATTRIBUTES))
+        g.policy_object = PolicyClass()
+
+        d = get_allowed_custom_attributes(g, user)
+        self.assertEqual(["*"], d.get("delete"))
+        self.assertEqual(sorted(d.get("set").keys()), ["*", "hello", "hello2"])
+        self.assertEqual(sorted(d.get("set").get("*")), ["off", "on"])
+        self.assertEqual(sorted(d.get("set").get("hello")), ["one", "three", "two"])
+        self.assertEqual(sorted(d.get("set").get("hello2")), ["*"])
 
 
 class PolicyMatchTestCase(MyTestCase):

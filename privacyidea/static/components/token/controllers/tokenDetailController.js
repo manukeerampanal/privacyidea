@@ -65,6 +65,7 @@ myApp.controller("tokenDetailController", function ($scope,
     $scope.params = {page: 1};
     $scope.form = {options: {}};
     $scope.editTokenInfo = 0;
+    $scope.pin1 = $scope.pin2 = "";
     $scope.testTokenPlaceholder = gettextCatalog.getString('Enter PIN and OTP to check the' +
         ' token.');
     ConfigFactory.getSystemConfig(function(data) {
@@ -384,6 +385,16 @@ myApp.controller("tokenDetailController", function ($scope,
 
     // listen to the reload broadcast
     $scope.$on("piReload", $scope.get);
+
+    $scope.rolloverTokenAllowed = function(token) {
+        if ( typeof(token) != 'undefined' ) {
+            if ($scope.checkEnroll() && (token.tokentype in $scope.token_rollover) &&
+                token.info.tokenkind === 'software') {
+                return true;
+            }
+        }
+        return false;
+    };
 
 
 });

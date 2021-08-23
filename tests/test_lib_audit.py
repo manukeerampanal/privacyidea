@@ -159,6 +159,18 @@ class AuditTestCase(MyTestCase):
         res = search(self.app.config, {"timelimit": "-1d"})
         self.assertTrue(res.get("count") == 0, res)
 
+        # test that hidden columns are not returned by audit search
+        # write some test data
+        self.Audit.log({"action": "/validate/check",
+                        "success": False})
+        self.Audit.finalize_log()
+        hidden_columns = [u"number", u"action_detail"]
+        res = search(self.app.config, {"hidden_columns": hidden_columns})
+        self.assertTrue(res.get("count") == 1, res)
+        # hidden columns are not returned in the auditdata
+        for col in hidden_columns:
+            self.assertTrue(col not in res.get("auditdata")[0], res)
+
     def test_04_lib_download(self):
         # Prepare some audit entries:
         self.Audit.log({"serial": "serial1"})
@@ -305,6 +317,16 @@ class AuditTestCase(MyTestCase):
         # The tokentype was actually written as token_type
         self.assertEqual(audit_log.auditdata[0].get("token_type"), "spass")
 
+    def test_11_check_audit_columns(self):
+        self.Audit.log({"action": "test11"})
+        self.Audit.finalize_log()
+        audit_log = self.Audit.search({"action": "test11"})
+        self.assertEqual(audit_log.total, 1)
+        # The tokentype was actually written as token_type
+        self.assertEqual(set(audit_log.auditdata[0].keys()),
+                         set(self.Audit.available_audit_columns),
+                         audit_log.auditdata[0].keys())
+
 
 class AuditColumnLengthTestCase(OverrideConfigTestCase):
     class Config(TestingConfig):
@@ -354,28 +376,39 @@ class AuditFileTestCase(OverrideConfigTestCase):
     @log_capture()
     def test_30_logger_audit_qualname(self, capture):
         # Check that the default qualname is 'privacyidea.lib.auditmodules.loggeraudit'
+        # The audit log runs 2 seconds - mocked
         current_utc_time = datetime.datetime(2018, 3, 4, 5, 6, 8)
-        with mock.patch('privacyidea.lib.auditmodules.loggeraudit.datetime') as mock_dt:
-            mock_dt.utcnow.return_value = current_utc_time
-            a = LoggerAudit(config={})
-            a.log({"action": "No PI_AUDIT_LOGGER_QUALNAME given"})
-            a.finalize_log()
-            capture.check_present(
-                ('privacyidea.lib.auditmodules.loggeraudit', 'INFO',
-                 '{{"action": "No PI_AUDIT_LOGGER_QUALNAME given", "policies": "", '
-                 '"timestamp": "{timestamp}"}}'.format(timestamp=current_utc_time.isoformat())))
+        startdate_time = datetime.datetime(2018, 3, 4, 5, 6, 6)
+        with mock.patch('privacyidea.lib.auditmodules.loggeraudit.datetime') as mock_timestamp:
+            with mock.patch('privacyidea.lib.auditmodules.base.datetime.datetime') as mock_startdate:
+                mock_timestamp.utcnow.return_value = current_utc_time
+                mock_startdate.now.return_value = startdate_time
+                a = LoggerAudit(config={})
+                a.log({"action": "No PI_AUDIT_LOGGER_QUALNAME given"})
+                a.finalize_log()
+                capture.check_present(
+                    ('privacyidea.lib.auditmodules.loggeraudit', 'INFO',
+                     '{{"action": "No PI_AUDIT_LOGGER_QUALNAME given", "duration": "0:00:02", '
+                     '"policies": "", "startdate": "{startdate}", '
+                     '"timestamp": "{timestamp}"}}'.format(timestamp=current_utc_time.isoformat(),
+                                                           startdate=startdate_time.isoformat())))
 
         # Now change the qualname to 'pi-audit'
         current_utc_time = datetime.datetime(2020, 3, 4, 5, 6, 8)
+        startdate_time = datetime.datetime(2020, 3, 4, 5, 6, 0)
         with mock.patch('privacyidea.lib.auditmodules.loggeraudit.datetime') as mock_dt:
-            mock_dt.utcnow.return_value = current_utc_time
-            a = LoggerAudit(config={"PI_AUDIT_LOGGER_QUALNAME": "pi-audit"})
-            a.log({"action": "PI_AUDIT_LOGGER_QUALNAME given"})
-            a.finalize_log()
-            capture.check_present(
-                ('pi-audit', 'INFO',
-                 '{{"action": "PI_AUDIT_LOGGER_QUALNAME given", "policies": "", '
-                 '"timestamp": "{timestamp}"}}'.format(timestamp=current_utc_time.isoformat())))
+            with mock.patch('privacyidea.lib.auditmodules.base.datetime.datetime') as mock_startdate:
+                mock_dt.utcnow.return_value = current_utc_time
+                mock_startdate.now.return_value = startdate_time
+                a = LoggerAudit(config={"PI_AUDIT_LOGGER_QUALNAME": "pi-audit"})
+                a.log({"action": "PI_AUDIT_LOGGER_QUALNAME given"})
+                a.finalize_log()
+                capture.check_present(
+                    ('pi-audit', 'INFO',
+                     '{{"action": "PI_AUDIT_LOGGER_QUALNAME given", "duration": "0:00:08", '
+                     '"policies": "", "startdate": "{startdate}", '
+                     '"timestamp": "{timestamp}"}}'.format(timestamp=current_utc_time.isoformat(),
+                                                           startdate=startdate_time.isoformat())))
 
 
 class ContainerAuditTestCase(OverrideConfigTestCase):
@@ -390,7 +423,8 @@ class ContainerAuditTestCase(OverrideConfigTestCase):
                                                          "privacyidea.lib.auditmodules.sqlaudit"],
                             "PI_AUDIT_CONTAINER_READ": "privacyidea.lib.auditmodules.sqlaudit",
                             "PI_AUDIT_NO_SIGN": True,
-                            "PI_AUDIT_SQL_URI": 'sqlite:///' + os.path.join(basedir, 'data-test.sqlite')})
+                            "PI_AUDIT_SQL_URI": self.app.config['SQLALCHEMY_DATABASE_URI']},
+                           startdate=None)
         self.assertFalse(a.has_data)
         a.log({"action": "something_test_30"})
         self.assertTrue(a.has_data)
@@ -422,7 +456,7 @@ class ContainerAuditTestCase(OverrideConfigTestCase):
                                                          "privacyidea.lib.auditmodules.sqlaudit"],
                             "PI_AUDIT_CONTAINER_READ": "privacyidea.lib.auditmodules.sqlaudit",
                             "PI_AUDIT_NO_SIGN": True,
-                            "PI_AUDIT_SQL_URI": 'sqlite:///' + os.path.join(basedir, 'data-test.sqlite')})
+                            "PI_AUDIT_SQL_URI": self.app.config['SQLALCHEMY_DATABASE_URI']})
         a.log({"action": "something_test_35"})
         a.add_to_log({'action_detail': 'some detail'})
         a.add_policy('some policy')
@@ -457,5 +491,5 @@ class ContainerAuditTestCase(OverrideConfigTestCase):
                                          "privacyidea.lib.auditmodules.sqlaudit"],
             "PI_AUDIT_CONTAINER_READ": "privacyidea.lib.auditmodules.sqlaudit",
             "PI_AUDIT_NO_SIGN": True,
-            "PI_AUDIT_SQL_URI": 'sqlite:///' + os.path.join(basedir, 'data-test.sqlite')}
+            "PI_AUDIT_SQL_URI": self.app.config['SQLALCHEMY_DATABASE_URI']}
         self.assertRaises(ImportError, ContainerAudit, module_config)

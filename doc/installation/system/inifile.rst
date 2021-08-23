@@ -9,7 +9,7 @@ privacyIDEA reads its configuration from different locations:
 
    1. default configuration from the module ``privacyidea/config.py``
    2. then from the config file ``/etc/privacyidea/pi.cfg`` if it exists and then
-   3. from the file specified in the environment variable ``PRIVACYIDEA_CONFIGFILE``.
+   3. from the file specified in the environment variable ``PRIVACYIDEA_CONFIGFILE``::
 
          export PRIVACYIDEA_CONFIGFILE=/your/config/file
 
@@ -36,6 +36,8 @@ The file should contain the following contents::
    PI_AUDIT_KEY_PUBLIC = '/home/cornelius/src/privacyidea/public.pem'
    # PI_AUDIT_MODULE = <python audit module>
    # PI_AUDIT_SQL_URI = <special audit log DB uri>
+   # Truncate Audit entries to fit into DB columns
+   PI_AUDIT_SQL_TRUNCATE = True
    # PI_LOGFILE = '....'
    # PI_LOGLEVEL = 20
    # PI_INIT_CHECK_HOOK = 'your.module.function'
@@ -55,9 +57,23 @@ of an administrator.
 
 ``PI_INIT_CHECK_HOOK`` is a function in an external module, that will be
 called as decorator to ``token/init`` and ``token/assign``. This function
-takes the ``request`` and ``action`` (either "init" or "assing") as an
+takes the ``request`` and ``action`` (either "init" or "assign") as an
 arguments and can modify the request or raise an exception to avoid the
 request being handled.
+
+If you set ``PI_DB_SAFE_STORE`` to *True* the database layer will in the cases
+of ``tokenowner``, ``tokeinfo`` and ``tokenrealm`` read the id of the newly created
+database object in an additional SELECT statement and not return it directly. This is
+slower but more robust and can be necessary in large redundant setups.
+
+.. Note:: In certain cases (e.g. with Galera Cluster) it can happen that the database
+   node has no information about the object id directly during the write-process.
+   The database might respond with an error like "object has been deleted or its
+   row is otherwise not present". In this case setting ``PI_DB_SAFE_STORE``  to *True*
+   might help.
+
+Logging
+-------
 
 There are three config entries, that can be used to define the logging. These
 are ``PI_LOGLEVEL``, ``PI_LOGFILE``, ``PI_LOGCONFIG``. These are described in
@@ -113,7 +129,7 @@ to the audit log using the variable ``PI_AUDIT_SERVERNAME``.
 You can run the database for the audit module on another database or even
 server. For this you can specify the database URI via ``PI_AUDIT_SQL_URI``.
 
-``PI_AUDIT_TRUNCATE = True`` lets you truncate audit entries, that to the length
+``PI_AUDIT_SQL_TRUNCATE = True`` lets you truncate audit entries to the length
 of the database fields.
 
 In certain cases when you experiencing problems you may use the parameters
@@ -172,11 +188,11 @@ of corresponding public keys that are trusted for certain
 users and roles using the parameter ``PI_TRUSTED_JWT``::
 
    PI_TRUSTED_JWT = [{"public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEF...",
-                       "algorithm": "RS256",
-                       "role": "user",
-                       "realm": "realm1",
-                       "username": "userA",
-                       "resolver": "resolverX"}]
+                      "algorithm": "RS256",
+                      "role": "user",
+                      "realm": "realm1",
+                      "username": "userA",
+                      "resolver": "resolverX"}]
 
 
 This entry means, that the private key, that corresponds to the given
@@ -193,8 +209,8 @@ A JWT can be created like this::
                                     "username": "userA",
                                     "realm": "realm1",
                                     "resolver": "resolverX"},
-                                    key=private_key,
-                                    algorithm="RS256")
+                                    "key"=private_key,
+                                    "algorithm"="RS256")
 
 .. note:: The user and the realm do not necessarily need to exist in any
    resolver!
@@ -212,7 +228,27 @@ at :ref:`customize_3rd_party_tokens`.
 
 To make the new token type available in privacyIDEA,
 you need to specify a list of your 3rd party token class modules
-in ``pi.cfg`` using the parameter ``PI_TOKEN_MODULES``:
+in ``pi.cfg`` using the parameter ``PI_TOKEN_MODULES``::
 
     PI_TOKEN_MODULES = [ "myproject.cooltoken", "myproject.lametoken" ]
+
+.. _custom_web_ui:
+
+Custom Web UI
+-------------
+
+The Web UI is a single page application, that is initiated from the file
+``static/templates/index.html``. This file pulls all CSS, the javascript framework
+and all the javascript business logic.
+
+You can configure privacyIDEA to use your own WebUI, which is completely different and stored at another location.
+
+You can do this using the following config values::
+
+    PI_INDEX_HTML = "myindex.html"
+    PI_STATIC_FOLDER = "mystatic"
+    PI_TEMPLATE_FOLDER = "mystatic/templates"
+
+In this example the file ``mystatic/templates/myindex.html`` would be loaded
+as the initial single page application.
 

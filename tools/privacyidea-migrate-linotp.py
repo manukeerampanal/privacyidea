@@ -52,7 +52,7 @@ migrated tokens.
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.sql import select
-from sqlalchemy.schema import ForeignKey
+from sqlalchemy.schema import ForeignKey, Sequence
 from sqlalchemy import (Table, MetaData, Column, Integer, Unicode, Boolean,
                         UnicodeText)
 import sys
@@ -133,15 +133,12 @@ class Config(object):
 def reencrypt(enc_data, iv, old_key, new_key):
     # decrypt LinOTP
     iv = binascii.unhexlify(iv)
-    input = binascii.unhexlify(enc_data)
-    output = aes_cbc_decrypt(old_key, iv, input)
-    eof = len(output) - 1
-    if eof == -1:
+    input_data = binascii.unhexlify(enc_data)
+    output = aes_cbc_decrypt(old_key, iv, input_data)
+    if not output:
         raise Exception('invalid encoded secret!')
     # unpad
-    while output[eof] == '\0':
-        eof -= 1
-    output = output[0:eof-1]
+    output = output.rstrip(b'\0')
     data = binascii.unhexlify(output)
 
     # encrypt anew
@@ -178,7 +175,8 @@ def migrate(config_obj):
     metadata = MetaData()
 
     token_table = Table("token", metadata,
-                        Column("id", Integer, primary_key=True, nullable=False),
+                        Column("id", Integer, Sequence('token_seq'),
+                               primary_key=True, nullable=False),
                         Column("description", Unicode(80), default=u''),
                         Column("serial", Unicode(40), default=u'', unique=True,
                                nullable=False, index=True),
@@ -204,7 +202,8 @@ def migrate(config_obj):
                         Column("rollout_state", Unicode(10), default=u''))
 
     tokenowner_table = Table("tokenowner", metadata,
-                             Column("id", Integer, primary_key=True, nullable=False),
+                             Column("id", Integer, Sequence('tokenowner_seq'),
+                                    primary_key=True, nullable=False),
                              Column("token_id", Integer, ForeignKey("token.id"), nullable=False),
                              Column("resolver", Unicode(120), default=u"", index=True),
                              Column("user_id", Unicode(320), default=u"", index=True),
@@ -212,7 +211,8 @@ def migrate(config_obj):
                              )
 
     tokeninfo_table = Table("tokeninfo", metadata,
-                            Column("id", Integer, primary_key=True),
+                            Column("id", Integer, Sequence('tokeninfo_seq'),
+                                   primary_key=True),
                             Column("Key", Unicode(255), nullable=False),
                             Column("Value", UnicodeText(), default=u''),
                             Column("Type", Unicode(100), default=u''),
@@ -220,23 +220,29 @@ def migrate(config_obj):
                             Column("token_id", Integer()))
 
     tokenrealm_table = Table("tokenrealm", metadata,
-                             Column("id", Integer(), primary_key=True),
+                             Column("id", Integer(),
+                                    Sequence('tokenrealm_seq'),
+                                    primary_key=True),
                              Column("token_id", Integer()),
                              Column("realm_id", Integer()))
 
     realm_table = Table("realm", metadata,
-                        Column("id", Integer, primary_key=True),
+                        Column("id", Integer, Sequence('realm_seq'),
+                               primary_key=True),
                         Column("name", Unicode(255), default=u''),
                         Column("default",  Boolean(), default=False),
                         Column("option", Unicode(40), default=u''))
 
     resolver_table = Table("resolver", metadata,
-                           Column("id", Integer, primary_key=True),
+                           Column("id", Integer, Sequence('resolver_seq'),
+                                  primary_key=True),
                            Column("name", Unicode(255), default=u""),
                            Column("rtype", Unicode(255), default=u""))
 
     resolver_config_table = Table("resolverconfig", metadata,
-                                  Column("id", Integer, primary_key=True),
+                                  Column("id", Integer,
+                                         Sequence('resolverconf_seq'),
+                                         primary_key=True),
                                   Column("resolver_id", Integer),
                                   Column("Key", Unicode(255), default=u""),
                                   Column("Value", Unicode(2000), default=u""),
@@ -245,7 +251,9 @@ def migrate(config_obj):
                                   )
 
     resolverrealm_table = Table("resolverrealm", metadata,
-                                Column("id", Integer, primary_key=True),
+                                Column("id", Integer,
+                                       Sequence('resolverrealm_seq'),
+                                       primary_key=True),
                                 Column("resolver_id", Integer),
                                 Column("realm_id", Integer),
                                 Column("priority", Integer))
@@ -526,16 +534,16 @@ def migrate(config_obj):
 def usage():
     print("""
 privacyidea-migrate-linotp.py --generate-example-config [--config <config file>]
-    
+
     --generate-example-config, -g   Output an example config file. 
                                     This is a JSON file, that needs to be passed
                                     to this command.
-                                    
+
     --config, -c <file>             The config file, that contains the complete
                                     configuration.
-                                    
-{0!s}                                    
-    """.format(__doc__))
+
+{0!s}
+""".format(__doc__))
 
 
 def read_enckey(encfile):

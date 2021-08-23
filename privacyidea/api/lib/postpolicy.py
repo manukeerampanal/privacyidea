@@ -63,6 +63,7 @@ from privacyidea.lib.user import User
 from privacyidea.lib.realm import get_default_realm
 from privacyidea.lib.subscriptions import subscription_status
 from privacyidea.lib.utils import create_img
+from privacyidea.lib.config import get_privacyidea_node
 
 log = logging.getLogger(__name__)
 
@@ -164,7 +165,7 @@ def sign_response(request, response):
         log.debug(traceback.format_exc())
         return response
 
-    request.all_data = get_all_params(request.values, request.data)
+    request.all_data = get_all_params(request)
     # response can be either a Response object or a Tuple (Response, ErrorID)
     response_value = 200
     response_is_tuple = False
@@ -328,7 +329,7 @@ def add_user_detail_to_response(request, response):
     content = response.json
 
     # Check for ADD USER IN RESPONSE
-    detail_pol = Match.action_only(g, scope=SCOPE.AUTHZ, action=ACTION.ADDUSERINRESPONSE)\
+    detail_pol = Match.user(g, scope=SCOPE.AUTHZ, action=ACTION.ADDUSERINRESPONSE, user_object=request.User)\
         .policies(write_to_audit_log=False)
     if detail_pol and content.get("result", {}).get("value") and request.User:
         # The policy was set, we need to add the user
@@ -342,7 +343,7 @@ def add_user_detail_to_response(request, response):
         g.audit_object.add_policy([p.get("name") for p in detail_pol])
 
     # Check for ADD RESOLVER IN RESPONSE
-    detail_pol = Match.action_only(g, scope=SCOPE.AUTHZ, action=ACTION.ADDRESOLVERINRESPONSE)\
+    detail_pol = Match.user(g, scope=SCOPE.AUTHZ, action=ACTION.ADDRESOLVERINRESPONSE, user_object=request.User)\
         .policies(write_to_audit_log=False)
     if detail_pol and content.get("result", {}).get("value") and request.User:
         # The policy was set, we need to add the resolver and the realm
@@ -496,12 +497,14 @@ def get_webui_settings(request, response):
                                             user=loginname, realm=realm).action_values(unique=True)
         user_page_size_pol = Match.generic(g, scope=SCOPE.WEBUI, action=ACTION.USERPAGESIZE,
                                            user=loginname, realm=realm).action_values(unique=True)
-        token_wizard_2nd = (role == ROLE.USER
-                            and Match.generic(g, scope=SCOPE.WEBUI, action=ACTION.TOKENWIZARD2ND,
-                                          user=loginname, realm=realm).policies())
+        token_wizard_2nd = bool(role == ROLE.USER
+                                and Match.generic(g, scope=SCOPE.WEBUI, action=ACTION.TOKENWIZARD2ND,
+                                                  user=loginname, realm=realm).policies())
         admin_dashboard = (role == ROLE.ADMIN
                            and Match.generic(g, scope=SCOPE.WEBUI, action=ACTION.ADMIN_DASHBOARD,
-                                         user=loginname, realm=realm).any())
+                                             user=loginname, realm=realm).any())
+        token_rollover = Match.generic(g, scope=SCOPE.WEBUI, action=ACTION.TOKENROLLOVER,
+                                       user=loginname, realm=realm).action_values(unique=False)
         token_wizard = False
         dialog_no_token = False
         if role == ROLE.USER:
@@ -528,6 +531,7 @@ def get_webui_settings(request, response):
                                               user=loginname, realm=realm).action_values(unique=True)
         show_seed = Match.generic(g, scope=SCOPE.WEBUI, action=ACTION.SHOW_SEED,
                                   user=loginname, realm=realm).any()
+        show_node = Match.generic(g, scope=SCOPE.WEBUI, action=ACTION.SHOW_NODE, realm=realm).any()
         qr_ios_authenticator = Match.generic(g, scope=SCOPE.WEBUI, action=ACTION.SHOW_IOS_AUTHENTICATOR,
                                              user=loginname, realm=realm).any()
         qr_android_authenticator = Match.generic(g, scope=SCOPE.WEBUI, action=ACTION.SHOW_ANDROID_AUTHENTICATOR,
@@ -584,9 +588,11 @@ def get_webui_settings(request, response):
         content["result"]["value"]["dialog_no_token"] = dialog_no_token
         content["result"]["value"]["search_on_enter"] = len(search_on_enter) > 0
         content["result"]["value"]["timeout_action"] = timeout_action
+        content["result"]["value"]["token_rollover"] = token_rollover
         content["result"]["value"]["hide_welcome"] = hide_welcome
         content["result"]["value"]["hide_buttons"] = hide_buttons
         content["result"]["value"]["show_seed"] = show_seed
+        content["result"]["value"]["show_node"] = get_privacyidea_node() if show_node else ""
         content["result"]["value"]["subscription_status"] = subscription_status()
         content["result"]["value"]["qr_image_android"] = qr_image_android
         content["result"]["value"]["qr_image_ios"] = qr_image_ios

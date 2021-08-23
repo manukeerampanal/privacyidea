@@ -38,16 +38,15 @@ enroll
 
 type: bool
 
-There are ``enroll`` actions per token type. Thus you can 
-create policies that allow the user to enroll
-SMS tokens but not to enroll HMAC tokens.
+There are enrollment actions per token type, e.g. ``enrollHOTP``.
+The user is only allowed to enroll such specified token types.
 
-assgin
+assign
 ~~~~~~
 
 type: bool
 
-The user is allowed to assgin an existing token, that is
+The user is allowed to assign an existing token, that is
 located in his realm and that does not belong to any other user,
 by entering the serial number.
 
@@ -171,6 +170,13 @@ sets it.
 
 This takes the same values like the admin policy :ref:`admin_policies_otp_pin_contents`.
 
+otp_pin_set_random
+~~~~~~~~~~~~~~~~~~
+
+type: int
+
+The length of a random PIN set by the user.
+
 auditlog
 ~~~~~~~~
 type: bool
@@ -191,6 +197,17 @@ view older entries.
 
 Can be something like 10m (10 minutes), 10h (10 hours) or 10d (ten days).
 
+hide_audit_columns
+~~~~~~~~~~~~~~~~~~
+
+type: string
+
+This species a blank separated list of audit columns, that should be removed
+from the response (:ref:`rest_audit`) and also from the WebUI.
+For example a value ``sig_check log_level`` will hide these two columns.
+
+The list of available columns can be checked by examining the response of the
+request to the :ref:`rest_audit`.
 
 updateuser
 ~~~~~~~~~~
@@ -205,6 +222,13 @@ attributes in the user store.
 .. note:: To be able to edit the attributes, the resolver must be defined as
    editable.
 
+userlist
+~~~~~~~~
+
+type: bool
+
+If the ``userlist`` action is defined, the user is
+allowed to view his own user information.
 
 revoke
 ~~~~~~
@@ -309,3 +333,57 @@ The user does not see the value and can not change the value.
 For more details of this token type see :ref:`indexedsecret_token`.
 
 New in version 3.3.
+
+.. _user_trusted_attestation_CA:
+
+certificate_trusted_Attestation_CA_path
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+type: string
+
+A user can enroll a certificate token.
+If an attestation certificate is provided in addition, this policy holds the
+path to a directory, that contains trusted CA paths.
+Each PEM encoded file in this directory needs to contain the root CA certificate
+at the first position and the consecutive intermediate certificates.
+
+An additional enrollment policy :ref:`require_attestation`, if an attestation certificate
+is required.
+
+New in version 3.5.
+
+
+.. _user_set_custom_user_attributes:
+
+set_custom_user_attributes
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+type: string
+
+This defines how a user is allowed to set his own attributes.
+It uses the same setting as the admin policy :ref:`admin_set_custom_user_attributes`.
+
+.. note:: Using a '*' in this setting allows the user to set any attribute or any value and thus the user
+   can overwrite existing attributes from the user store. If policies, depending on user attributes
+   are defined, then the user would be able to change the matching of the policies.
+   Use with CAUTION!
+
+New in version 3.6
+
+.. _user_delete_custom_user_attributes:
+
+delete_custom_user_attributes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+type: string
+
+This defines how a user is allowed to delete his own attributes.
+It uses the same setting as the admin policy :ref:`admin_delete_custom_user_attributes`.
+
+.. note:: Using a '*' in this setting allows the user to delete any attribute and thus the user
+   can change overwritten attributes and revert to the user store attributes.
+   If policies, depending on user attributes
+   are defined, then the user would be able to change the matching of the policies.
+   Use with CAUTION!
+
+New in version 3.6

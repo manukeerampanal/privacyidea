@@ -27,18 +27,15 @@ setversion:
 
 translate:
 	grunt nggettext_extract
-	for language in de nl ; do \
+	for language in de nl fr ; do \
 		(cd po; msgmerge $$language.po template.pot > tmp.po; mv tmp.po $$language.po) ; \
 	done
-	# Especially edit German language
-	poedit po/de.po
 	grunt nggettext_compile
 
 translate-server:
 	(cd privacyidea; pybabel extract -F babel.cfg -o messages.pot .)
 	# pybabel init -i messages.pot -d translations -l de
 	(cd privacyidea; pybabel update -i messages.pot -d translations)
-	(poedit privacyidea/translations/de/LC_MESSAGES/messages.po)
 	# create the .mo file
 	(cd privacyidea; pybabel compile -d translations)
 
@@ -49,15 +46,17 @@ pypi:
 	gpg --detach-sign -a --default-key ${SIGNING_KEY} dist/*.tar.gz
 	twine upload dist/*.tar.gz dist/*.tar.gz.asc
 
-
-depdoc:
-	#sfood privacyidea | sfood-graph | dot -Tpng -o graph.png	
-	dot -Tpng dependencies.dot -o dependencies.png
-
 doc-man:
 	(cd doc; make man)
-	(cd doc/installation/system/pimanage; make man)
 
 doc-html:
 	(cd doc; make html)
 
+NPM_VERSION := $(shell npm --version 2>/dev/null)
+
+update-contrib:
+ifdef NPM_VERSION
+	(cd privacyidea/static && npm install && ./update_contrib.sh)
+else
+	@echo "Command 'npm' not found! It is needed to install the JS contrib libraries."
+endif

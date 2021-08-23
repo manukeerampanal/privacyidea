@@ -37,10 +37,10 @@ from privacyidea.api.lib.prepolicy import is_remote_user_allowed
 from privacyidea.lib.passwordreset import is_password_reset
 from privacyidea.lib.error import HSMException
 from privacyidea.lib.realm import get_realms
-from privacyidea.lib.policy import PolicyClass, ACTION, SCOPE, Match
+from privacyidea.lib.policy import PolicyClass, ACTION, SCOPE, Match, REMOTE_USER
 from privacyidea.lib.subscriptions import subscription_status
 from privacyidea.lib.utils import get_client_ip
-from privacyidea.lib.config import get_from_config, SYSCONF
+from privacyidea.lib.config import get_from_config, SYSCONF, get_privacyidea_node
 from privacyidea.lib.queue import has_job_queue
 
 DEFAULT_THEME = "/static/contrib/css/bootstrap-theme.css"
@@ -90,7 +90,7 @@ def single_page_application():
     translation_warning = current_app.config.get("PI_TRANSLATION_WARNING", False)
     # Get the logo file
     logo = current_app.config.get("PI_LOGO", "privacyIDEA1.png")
-    browser_lang = request.accept_languages.best_match(["en", "de", "de-DE", "nl"], default="en").split("-")[0]
+    browser_lang = request.accept_languages.best_match(["en", "de", "de-DE", "nl", "fr", "it", "es"], default="en").split("-")[0]
     # The page title can be configured in pi.cfg
     page_title = current_app.config.get("PI_PAGE_TITLE", "privacyIDEA Authentication System")
     # check if login with REMOTE_USER is allowed.
@@ -102,6 +102,8 @@ def single_page_application():
     realms = ""
     realm_dropdown = Match.action_only(g, scope=SCOPE.WEBUI, action=ACTION.REALMDROPDOWN)\
         .policies(write_to_audit_log=False)
+    show_node = get_privacyidea_node() \
+        if Match.generic(g, scope=SCOPE.WEBUI, action=ACTION.SHOW_NODE).any(write_to_audit_log=False) else ""
     if realm_dropdown:
         try:
             realm_dropdown_values = Match.action_only(g, scope=SCOPE.WEBUI, action=ACTION.REALMDROPDOWN) \
@@ -114,7 +116,9 @@ def single_page_application():
             realms = ",".join(get_realms())
 
     try:
-        if is_remote_user_allowed(request, write_to_audit_log=False):
+        r = is_remote_user_allowed(request, write_to_audit_log=False)
+        force_remote_user = r == REMOTE_USER.FORCE
+        if r != REMOTE_USER.DISABLE:
             remote_user = request.remote_user
         password_reset = is_password_reset(g)
         hsm_ready = True
@@ -148,11 +152,19 @@ def single_page_application():
     else:
         login_text = ""
 
+    gdpr_link = Match.action_only(g, action=ACTION.GDPR_LINK, scope=SCOPE.WEBUI) \
+        .action_values(unique=True, allow_white_space_in_action=True, write_to_audit_log=False)
+    if len(gdpr_link) and list(gdpr_link)[0] and sub_state not in [1, 2]:
+        gdpr_link = list(gdpr_link)[0]
+    else:
+        gdpr_link = ""
+
     render_context = {
         'instance': instance,
         'backendUrl': backend_url,
         'browser_lang': browser_lang,
         'remote_user': remote_user,
+        'force_remote_user': force_remote_user,
         'theme': theme,
         'translation_warning': translation_warning,
         'password_reset': password_reset,
@@ -163,10 +175,13 @@ def single_page_application():
         'customization_menu_file': customization_menu_file,
         'customization_baseline_file': customization_baseline_file,
         'realms': realms,
+        'show_node': show_node,
         'external_links': external_links,
         'login_text': login_text,
+        'gdpr_link': gdpr_link,
         'logo': logo,
         'page_title': page_title
     }
 
-    return send_html(render_template("index.html", **render_context))
+    index_page = current_app.config.get("PI_INDEX_HTML") or "index.html"
+    return send_html(render_template(index_page, **render_context))

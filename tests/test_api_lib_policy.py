@@ -34,9 +34,10 @@ from privacyidea.api.lib.prepolicy import (check_token_upload,
                                            init_token_defaults, _generate_pin_from_policy,
                                            encrypt_pin, check_otp_pin,
                                            enroll_pin,
+                                           init_registrationcode_length_contents,
                                            check_external, api_key_required,
                                            mangle, is_remote_user_allowed,
-                                           required_email, auditlog_age,
+                                           required_email, auditlog_age, hide_audit_columns,
                                            papertoken_count, allowed_audit_realm,
                                            u2ftoken_verify_cert,
                                            tantoken_count, sms_identifiers,
@@ -45,7 +46,8 @@ from privacyidea.api.lib.prepolicy import (check_token_upload,
                                            check_admin_tokenlist, pushtoken_disable_wait,
                                            webauthntoken_auth, webauthntoken_authz,
                                            webauthntoken_enroll, webauthntoken_request,
-                                           webauthntoken_allowed, check_application_tokentype)
+                                           webauthntoken_allowed, check_application_tokentype,
+                                           required_piv_attestation, check_custom_user_attributes)
 from privacyidea.lib.realm import set_realm as create_realm
 from privacyidea.lib.realm import delete_realm
 from privacyidea.api.lib.postpolicy import (check_serial, check_tokentype,
@@ -66,6 +68,7 @@ from privacyidea.lib.tokens.tantoken import TANACTION
 from privacyidea.lib.tokens.smstoken import SMSACTION
 from privacyidea.lib.tokens.pushtoken import PUSH_ACTION
 from privacyidea.lib.tokens.indexedsecrettoken import PIIXACTION
+from privacyidea.lib.tokens.registrationtoken import DEFAULT_LENGTH, DEFAULT_CONTENTS
 
 from flask import Request, g, current_app, jsonify
 from werkzeug.test import EnvironBuilder
@@ -1260,7 +1263,7 @@ class PrePolicyDecoratorTestCase(MyApiTestCase):
                    action="{0!s}={1!s}".format(ACTION.REMOTE_USER, REMOTE_USER.ACTIVE))
 
         r = is_remote_user_allowed(req)
-        self.assertTrue(r)
+        self.assertEqual(REMOTE_USER.ACTIVE, r)
 
         # Login for the REMOTE_USER is not allowed.
         # Only allowed for user "super", but REMOTE_USER=admin
@@ -1270,23 +1273,30 @@ class PrePolicyDecoratorTestCase(MyApiTestCase):
                    user="super")
 
         r = is_remote_user_allowed(req)
-        self.assertFalse(r)
+        self.assertEqual(REMOTE_USER.DISABLE, r)
 
         # The remote_user "super" is allowed to login:
         env["REMOTE_USER"] = "super"
         req = Request(env)
         r = is_remote_user_allowed(req)
-        self.assertTrue(r)
+        self.assertEqual(REMOTE_USER.ACTIVE, r)
 
         # check that Splt@Sign works correctly
         create_realm(self.realm1)
         set_privacyidea_config(SYSCONF.SPLITATSIGN, True)
         env["REMOTE_USER"] = "super@realm1"
         req = Request(env)
-        self.assertTrue(is_remote_user_allowed(req))
+        self.assertEqual(REMOTE_USER.ACTIVE, is_remote_user_allowed(req))
+
+        # Now set the remote force policy
+        set_policy(name="ruser",
+                   scope=SCOPE.WEBUI,
+                   action="{0!s}={1!s}".format(ACTION.REMOTE_USER, REMOTE_USER.FORCE),
+                   user="super")
+        self.assertEqual(REMOTE_USER.FORCE, is_remote_user_allowed(req))
 
         set_privacyidea_config(SYSCONF.SPLITATSIGN, False)
-        self.assertFalse(is_remote_user_allowed(req))
+        self.assertEqual(REMOTE_USER.DISABLE, is_remote_user_allowed(req))
 
         set_privacyidea_config(SYSCONF.SPLITATSIGN, True)
         delete_policy("ruser")
@@ -1495,6 +1505,47 @@ class PrePolicyDecoratorTestCase(MyApiTestCase):
 
         # finally delete policy
         delete_policy("a_age")
+
+    def test_18b_hide_audit_columns(self):
+        builder = EnvironBuilder(method='POST',
+                                 headers={})
+        env = builder.get_environ()
+        req = Request(env)
+        g.policy_object = PolicyClass()
+
+        # set a policy to hide the "serial" and the "action" columns in the audit response
+        set_policy(name="hide_audit_columns_admin",
+                   scope=SCOPE.ADMIN,
+                   action="{0!s}=serial action".format(ACTION.HIDE_AUDIT_COLUMNS))
+        g.logged_in_user = {"username": "admin1",
+                            "realm": "",
+                            "role": "admin"}
+        # request, that matches the policy
+        req.all_data = {"user": "Unknown"}
+        req.User = User("Unknown")
+        hide_audit_columns(req)
+        # Check if the hidden_columns was added
+        for col in ["serial", "action"]:
+            self.assertIn(col, req.all_data.get("hidden_columns"))
+        # delete admin policy
+        delete_policy("hide_audit_columns_admin")
+
+        # set a policy to hide the "number" and the "realm" columns in the audit response
+        set_policy(name="hide_audit_columns_user",
+                   scope=SCOPE.USER,
+                   action="{0!s}=number realm".format(ACTION.HIDE_AUDIT_COLUMNS))
+        g.logged_in_user = {"username": "user1",
+                            "realm": "",
+                            "role": "user"}
+        # request, that matches the policy
+        req.all_data = {"user": "Unknown"}
+        req.User = User("Unknown")
+        hide_audit_columns(req)
+        # Check if the hidden_columns was added
+        for col in ["number", "realm"]:
+            self.assertIn(col, req.all_data.get("hidden_columns"))
+        # delete user policy
+        delete_policy("hide_audit_columns_user")
 
     def test_19_papertoken_count(self):
         g.logged_in_user = {"username": "admin1",
@@ -1707,12 +1758,18 @@ class PrePolicyDecoratorTestCase(MyApiTestCase):
         # Set a policy for the firebase config to use.
         set_policy(name="push_pol",
                    scope=SCOPE.ENROLL,
-                   action="{0!s}=some-fb-config".format(PUSH_ACTION.FIREBASE_CONFIG))
+                   action="{0!s}=some-fb-config,"
+                          "{1!s}=https://privacyidea.com/enroll,"
+                          "{2!s}=10".format(PUSH_ACTION.FIREBASE_CONFIG,
+                                            PUSH_ACTION.REGISTRATION_URL,
+                                            PUSH_ACTION.TTL))
         g.policy_object = PolicyClass()
         req.all_data = {
             "type": "push"}
         pushtoken_add_config(req, "init")
         self.assertEqual(req.all_data.get(PUSH_ACTION.FIREBASE_CONFIG), "some-fb-config")
+        self.assertEqual(req.all_data.get(PUSH_ACTION.REGISTRATION_URL), "https://privacyidea.com/enroll")
+        self.assertEqual("10", req.all_data.get(PUSH_ACTION.TTL))
         self.assertEqual("1", req.all_data.get(PUSH_ACTION.SSL_VERIFY))
 
         # the request tries to inject a rogue value, but we assure sslverify=1
@@ -2914,6 +2971,151 @@ class PrePolicyDecoratorTestCase(MyApiTestCase):
         # Check that the tokentype was removed
         self.assertEqual(req.all_data.get("type"), None)
 
+    def test_35_require_piv_attestation(self):
+        from privacyidea.lib.tokens.certificatetoken import ACTION, REQUIRE_ACTIONS
+        builder = EnvironBuilder(method='POST',
+                                 data={'user': "cornelius"},
+                                 headers={})
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+
+        # Set a policy, that the application is allowed to specify tokentype
+        set_policy(name="pol1",
+                   scope=SCOPE.ENROLL,
+                   action="{0!s}={1!s}".format(ACTION.REQUIRE_ATTESTATION, REQUIRE_ACTIONS.REQUIRE_AND_VERIFY))
+        g.policy_object = PolicyClass()
+
+        # provide an empty attestation
+        req.all_data = {"attestation": "",
+                        "type": "certificate"}
+        req.User = User("cornelius", self.realm1)
+        # This will fail, since the attestation is required.
+        self.assertRaises(PolicyError, required_piv_attestation, req)
+        delete_policy("pol1")
+
+    def test_36_init_registrationcode_length_contents(self):
+        g.logged_in_user = {"username": "admin1",
+                            "realm": "",
+                            "role": "admin"}
+        builder = EnvironBuilder(method='POST',
+                                 data={'type': "registration"},
+                                 headers={})
+        env = builder.get_environ()
+        req = Request(env)
+
+        # first test without any policy
+        req.all_data = {"user": "cornelius", "realm": "home", "type": "registration"}
+        init_registrationcode_length_contents(req)
+        # Check, if the tokenlabel was added
+        self.assertEqual(req.all_data.get("registration.length"), DEFAULT_LENGTH)
+        self.assertEqual(req.all_data.get("registration.contents"), DEFAULT_CONTENTS)
+
+        # now create a policy for the length of the registration code
+        set_policy(name="reg_length",
+                   scope=SCOPE.ENROLL,
+                   action="{0!s}={1!s}".format(ACTION.REGISTRATIONCODE_LENGTH, 6))
+        set_policy(name="reg_contents",
+                   scope=SCOPE.ENROLL,
+                   action="{0!s}={1!s}".format(ACTION.REGISTRATIONCODE_CONTENTS, "+n"))
+        # request, that matches the policy
+        req.all_data = {"user": "cornelius", "realm": "home", "type": "registration"}
+        init_registrationcode_length_contents(req)
+        # Check, if the tokenlabel was added
+        self.assertEqual(req.all_data.get("registration.length"), "6")
+        self.assertEqual(req.all_data.get("registration.contents"), "+n")
+        # delete policy
+        delete_policy("reg_length")
+        delete_policy("reg_contents")
+
+    def test_40_custom_user_attributes(self):
+        g.logged_in_user = {"username": "admin1",
+                            "realm": "",
+                            "role": "admin"}
+        builder = EnvironBuilder(method='POST',
+                                 data={'type': "registration"},
+                                 headers={})
+        env = builder.get_environ()
+        req = Request(env)
+        req.User = User("cornelius", self.realm1)
+
+        # first test without any policy to delete the department. This is not allowed
+        req.all_data = {"user": "cornelius", "realm": self.realm1, "attrkey": "department"}
+        self.assertRaisesRegexp(PolicyError,
+                                "ERR303: You are not allowed to delete the custom user attribute department!",
+                                check_custom_user_attributes, req, "delete")
+
+        # set to allow deleting the department
+        set_policy("set_custom_attr", scope=SCOPE.ADMIN,
+                   action="{0!s}=department sth".format(ACTION.DELETE_USER_ATTRIBUTES))
+        req.all_data = {"user": "cornelius", "realm": self.realm1, "attrkey": "department"}
+        check_custom_user_attributes(req, "delete")
+
+        # Now try to delete a different key
+        req.all_data = {"user": "cornelius", "realm": self.realm1, "attrkey": "difkey"}
+        self.assertRaises(PolicyError, check_custom_user_attributes, req, "delete")
+
+        # Allow to delete diffkey
+        set_policy("set_custom_attr2", scope=SCOPE.ADMIN,
+                   action="{0!s}=difkey".format(ACTION.DELETE_USER_ATTRIBUTES))
+        req.all_data = {"user": "cornelius", "realm": self.realm1, "attrkey": "difkey"}
+        check_custom_user_attributes(req, "delete")
+
+        # Now we set the policy to allow to delete any attribute
+        set_policy("set_custom_attr2", scope=SCOPE.ADMIN,
+                   action="{0!s}=*".format(ACTION.DELETE_USER_ATTRIBUTES))
+        req.all_data = {"user": "cornelius", "realm": self.realm1, "attrkey": "department"}
+        check_custom_user_attributes(req, "delete")
+        req.all_data = {"user": "cornelius", "realm": self.realm1, "attrkey": "anykey"}
+        check_custom_user_attributes(req, "delete")
+
+        """
+        set custom attributes
+        """
+        # no policy set
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "department", "value": "finance"}
+        self.assertRaises(PolicyError, check_custom_user_attributes, req, "set")
+        set_policy("set_custom_attr", scope=SCOPE.ADMIN,
+                   action="{0!s}=:department: finance devel :color: * :*: 1 2 ".format(ACTION.SET_USER_ATTRIBUTES))
+        # Allow to set to finance
+        check_custom_user_attributes(req, "set")
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "department", "value": "devel"}
+        check_custom_user_attributes(req, "set")
+        # You are not allowed to set a different department
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "department", "value": "different"}
+        self.assertRaisesRegexp(PolicyError,
+                                "ERR303: You are not allowed to set the custom user attribute department!",
+                                check_custom_user_attributes, req, "set")
+
+        # You are allowed to set color to any value
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "color", "value": "blue"}
+        check_custom_user_attributes(req, "set")
+
+        # You are allowed to set any other value to 1 or 2
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "size", "value": "1"}
+        check_custom_user_attributes(req, "set")
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "size", "value": "2"}
+        check_custom_user_attributes(req, "set")
+        # But not to another value
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "size", "value": "3"}
+        self.assertRaises(PolicyError, check_custom_user_attributes, req, "set")
+
+        # Now you can set any key to any value
+        set_policy("set_custom_attr2", scope=SCOPE.ADMIN,
+                   action="{0!s}=:*: *".format(ACTION.SET_USER_ATTRIBUTES))
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "size", "value": "3"}
+        check_custom_user_attributes(req, "set")
+
 
 class PostPolicyDecoratorTestCase(MyApiTestCase):
 
@@ -3225,6 +3427,24 @@ class PostPolicyDecoratorTestCase(MyApiTestCase):
         self.assertFalse("user-resolver" in jresult.get("detail"), jresult)
         self.assertFalse("user-realm" in jresult.get("detail"), jresult)
 
+        # check with different realm in policy conditions
+        # if the user-name is evaluated
+        # in add_user_in_response policy
+        res = {"result": {"status": True,
+                          "value": True},
+               "detail": {"message": "matching 1 tokens",
+                          "serial": "HOTP123456",
+                          "type": "hotp"}}
+        resp = jsonify(res)
+        set_policy(name="pol_add_user",
+                   scope=SCOPE.AUTHZ,
+                   action=ACTION.ADDUSERINRESPONSE, client="10.0.0.0/8", realm=self.realm2)
+        g.policy_object = PolicyClass()
+
+        new_response = add_user_detail_to_response(req, resp)
+        jresult = new_response.json
+        self.assertNotIn("user", jresult.get("detail"), jresult)
+
         # set a policy that adds user resolver to detail
         set_policy(name="pol_add_resolver",
                    scope=SCOPE.AUTHZ,
@@ -3240,6 +3460,28 @@ class PostPolicyDecoratorTestCase(MyApiTestCase):
 
         delete_policy("pol_add_user")
         delete_policy("pol_add_resolver")
+
+        # check with different realm in policy conditions
+        # if the user-realm is evaluated
+        # in add_resolver_in_response policy
+        res = {
+            "result": {
+                "status": True,
+                "value": True},
+            "detail": {
+                "message": "matching 1 tokens",
+                "serial": "HOTP123456",
+                "type": "hotp"}}
+        resp = jsonify(res)
+        set_policy(name="pol_add_resolver",
+                   scope=SCOPE.AUTHZ,
+                   action=ACTION.ADDRESOLVERINRESPONSE, client="10.0.0.0/8", realm=self.realm2)
+        g.policy_object = PolicyClass()
+
+        new_response = add_user_detail_to_response(req, resp)
+        jresult = new_response.json
+        self.assertNotIn("user-realm", jresult.get("detail"), jresult)
+        self.assertNotIn("user-resolver", jresult.get("detail"), jresult)
 
     def test_05_autoassign_any_pin(self):
         # init a token, that does has no uwser

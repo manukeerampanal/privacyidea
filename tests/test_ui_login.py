@@ -9,6 +9,31 @@ from .base import MyTestCase
 from privacyidea.lib.policy import set_policy, SCOPE, ACTION, PolicyClass, delete_all_policies
 from privacyidea.lib.utils import to_unicode
 import re
+from privacyidea.app import create_app
+from privacyidea.models import db, save_config_timestamp
+
+
+class AlternativeWebUI(MyTestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = create_app('altUI', "")
+        cls.app_context = cls.app.app_context()
+        cls.app_context.push()
+        db.create_all()
+        # save the current timestamp to the database to avoid hanging cached
+        # data
+        save_config_timestamp()
+        db.session.commit()
+
+    def test_01_normal_login(self):
+        # We just test, if the alterrnative page is called
+        with self.app.test_request_context('/',
+                                           method='GET'):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(res.mimetype, 'text/html', res)
+            self.assertIn(b"This is an alternative UI", res.data)
 
 
 class LoginUITestCase(MyTestCase):
@@ -84,3 +109,12 @@ class LoginUITestCase(MyTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             self.assertTrue(b"<input type=hidden id=REMOTE_USER value=\"foo\">" in res.data)
+
+    def test_07_privacy_statement_link(self):
+        set_policy("gdpr_link", scope=SCOPE.WEBUI,
+                   action="{0!s}=https://privacyidea.org/".format(ACTION.GDPR_LINK))
+        with self.app.test_request_context('/',
+                                           method='GET'):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            self.assertTrue(b"https://privacyidea.org/" in res.data)

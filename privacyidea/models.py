@@ -52,11 +52,13 @@ from privacyidea.lib.crypto import (encrypt,
                                     get_rand_digit_str)
 from sqlalchemy import and_
 from sqlalchemy.schema import Sequence
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql.expression import ColumnElement
 from .lib.log import log_with
 from privacyidea.lib.utils import (is_true, convert_column_to_unicode,
                                    hexlify_and_unicode)
 from privacyidea.lib.crypto import pass_hash, verify_pass_hash
-
+from privacyidea.lib.framework import get_app_config_value
 
 log = logging.getLogger(__name__)
 
@@ -68,8 +70,15 @@ log = logging.getLogger(__name__)
 
 implicit_returning = True
 PRIVACYIDEA_TIMESTAMP = "__timestamp__"
+SAFE_STORE = "PI_DB_SAFE_STORE"
 
 db = SQLAlchemy()
+
+
+# Add fractions to the MySQL DataTime column type
+@compiles(db.DateTime, "mysql")
+def compile_datetime_mysql(type_, compiler, **kw):  # pragma: no cover
+    return "DATETIME(6)"
 
 
 class MethodsMixin(object):
@@ -135,12 +144,18 @@ class TimestampMethodsMixin(object):
 
 class Token(MethodsMixin, db.Model):
     """
-    The table "token" contains the basic token data like
+    The "Token" table contains the basic token data.
+
+    It contains data like
      * serial number
-     * assigned user
-     * secret key...
-    while the table "tokeninfo" contains additional information that is specific
-    to the tokentype.
+     * secret key
+     * PINs
+     * ...
+
+    The table :py:class:`privacyidea.models.TokenOwner` contains the owner
+    information of the specified token.
+    The table :py:class:`privacyidea.models.TokenInfo` contains additional information
+    that is specific to the tokentype.
     """
     __tablename__ = 'token'
     __table_args__ = {'mysql_row_format': 'DYNAMIC'}
@@ -286,12 +301,13 @@ class Token(MethodsMixin, db.Model):
     def set_realms(self, realms, add=False):
         """
         Set the list of the realms.
-        This is done by filling the tokenrealm table.
+
+        This is done by filling the :py:class:`privacyidea.models.TokenRealm` table.
+
         :param realms: realms
-        :type realms: list
-        :param add: If set, the realms are added. I.e. old realms are not
-            deleted
-        :type add: boolean
+        :type realms: list[str]
+        :param add: If set, the realms are added. I.e. old realms are not deleted
+        :type add: bool
         """
         # delete old TokenRealms
         if not add:
@@ -665,22 +681,84 @@ class TokenInfo(MethodsMixin, db.Model):
         self.Description = Description
 
     def save(self, persistent=True):
-        ti = TokenInfo.query.filter_by(token_id=self.token_id,
-                                           Key=self.Key).first()
+        ti_func = TokenInfo.query.filter_by(token_id=self.token_id,
+                                            Key=self.Key).first
+        ti = ti_func()
         if ti is None:
+            # create a new one
+            db.session.add(self)
+            db.session.commit()
+            if get_app_config_value(SAFE_STORE, False):
+                ti = ti_func()
+                ret = ti.id
+            else:
+                ret = self.id
+        else:
+            # update
+            TokenInfo.query.filter_by(token_id=self.token_id,
+                                      Key=self.Key).update({'Value': self.Value,
+                                                            'Description': self.Description,
+                                                            'Type': self.Type})
+            ret = ti.id
+        if persistent:
+            db.session.commit()
+        return ret
+
+
+class CustomUserAttribute(MethodsMixin, db.Model):
+    """
+    The table "customuserattribute" is used to store additional, custom attributes
+    for users.
+
+    A user is identified by the user_id,  the resolver_id and the realm_id.
+
+    The additional attributes are stored in Key and Value.
+    The Type can hold extra information like e.g. an encrypted value / password.
+
+    Note: Since the users are external, i.e. no objects in this database,
+          there is not logic reference on a database level.
+          Since users could be deleted from user stores
+          without privacyIDEA realizing that, this table could pile up
+          with remnants of attributes.
+    """
+    __tablename__ = 'customuserattribute'
+    id = db.Column(db.Integer(), Sequence("customuserattribute_seq"), primary_key=True)
+    user_id = db.Column(db.Unicode(320), default=u'', index=True)
+    resolver = db.Column(db.Unicode(120), default=u'', index=True)
+    realm_id = db.Column(db.Integer(), db.ForeignKey('realm.id'))
+    Key = db.Column(db.Unicode(255), nullable=False)
+    Value = db.Column(db.UnicodeText(), default=u'')
+    Type = db.Column(db.Unicode(100), default=u'')
+
+    def __init__(self, user_id, resolver, realm_id, Key, Value, Type=None):
+        """
+        Create a new customuserattribute for a user tuple
+        """
+        self.user_id = user_id
+        self.resolver = resolver
+        self.realm_id = realm_id
+        self.Key = Key
+        self.Value = convert_column_to_unicode(Value)
+        self.Type = Type
+
+    def save(self, persistent=True):
+        ua = CustomUserAttribute.query.filter_by(user_id=self.user_id,
+                                                 resolver=self.resolver,
+                                                 realm_id=self.realm_id,
+                                                 Key=self.Key).first()
+        if ua is None:
             # create a new one
             db.session.add(self)
             db.session.commit()
             ret = self.id
         else:
             # update
-            TokenInfo.query.filter_by(token_id=self.token_id,
-                                           Key=self.Key
-                                           ).update({'Value': self.Value,
-                                                     'Descrip'
-                                                     'tion': self.Description,
-                                                     'Type': self.Type})
-            ret = ti.id
+            CustomUserAttribute.query.filter_by(user_id=self.user_id,
+                                                resolver=self.resolver,
+                                                realm_id=self.realm_id,
+                                                Key=self.Key
+                                                ).update({'Value': self.Value, 'Type': self.Type})
+            ret = ua.id
         if persistent:
             db.session.commit()
         return ret
@@ -1092,15 +1170,20 @@ class TokenOwner(MethodsMixin, db.Model):
         self. user_id = user_id
 
     def save(self, persistent=True):
-        to = TokenOwner.query.filter_by(token_id=self.token_id,
-                                        user_id=self.user_id,
-                                        realm_id=self.realm_id,
-                                        resolver=self.resolver).first()
+        to_func = TokenOwner.query.filter_by(token_id=self.token_id,
+                                             user_id=self.user_id,
+                                             realm_id=self.realm_id,
+                                             resolver=self.resolver).first
+        to = to_func()
         if to is None:
             # This very assignment does not exist, yet:
             db.session.add(self)
             db.session.commit()
-            ret = self.id
+            if get_app_config_value(SAFE_STORE, False):
+                to = to_func()
+                ret = to.id
+            else:
+                ret = self.id
         else:
             ret = to.id
             # There is nothing to update
@@ -1154,14 +1237,20 @@ class TokenRealm(MethodsMixin, db.Model):
         """
         We only save this, if it does not exist, yet.
         """
-        tr = TokenRealm.query.filter_by(realm_id=self.realm_id,
-                                        token_id=self.token_id).first()
+        tr_func = TokenRealm.query.filter_by(realm_id=self.realm_id,
+                                             token_id=self.token_id).first
+        tr = tr_func()
         if tr is None:
             # create a new one
             db.session.add(self)
             db.session.commit()
-
-        ret = self.id
+            if get_app_config_value(SAFE_STORE, False):
+                tr = tr_func()
+                ret = tr.id
+            else:
+                ret = self.id
+        else:
+            ret = self.id
         return ret
 
 
@@ -1171,7 +1260,7 @@ class PasswordReset(MethodsMixin, db.Model):
     This table stores the recoverycodes sent to a given user
 
     The application should save the HASH of the recovery code. Just like the
-    password for the Admins the appliaction shall salt and pepper the hash of
+    password for the Admins the application shall salt and pepper the hash of
     the recoverycode. A database admin will not be able to inject a rogue
     recovery code.
 
@@ -1353,13 +1442,15 @@ def cleanup_challenges():
 
 class Policy(TimestampMethodsMixin, db.Model):
     """
-    The policy table contains policy definitions which control
-    the behaviour during
+    The policy table contains the policy definitions.
+
+    The Policies control the behaviour in the scopes
      * enrollment
      * authentication
      * authorization
      * administration
      * user actions
+     * webui
     """
     __tablename__ = "policy"
     __table_args__ = {'mysql_row_format': 'DYNAMIC'}
@@ -1471,7 +1562,7 @@ class Policy(TimestampMethodsMixin, db.Model):
              "time": self.time,
              "conditions": self.get_conditions_tuples(),
              "priority": self.priority}
-        action_list = [x.strip().split("=") for x in (self.action or "").split(
+        action_list = [x.strip().split("=", 1) for x in (self.action or "").split(
             ",")]
         action_dict = {}
         for a in action_list:
@@ -2585,6 +2676,8 @@ class Audit(MethodsMixin, db.Model):
     __table_args__ = {'mysql_row_format': 'DYNAMIC'}
     id = db.Column(db.Integer, Sequence("audit_seq"), primary_key=True)
     date = db.Column(db.DateTime)
+    startdate = db.Column(db.DateTime)
+    duration = db.Column(db.Interval(second_precision=6))
     signature = db.Column(db.Unicode(audit_column_length.get("signature")))
     action = db.Column(db.Unicode(audit_column_length.get("action")))
     success = db.Column(db.Integer)
@@ -2621,10 +2714,14 @@ class Audit(MethodsMixin, db.Model):
                  client="",
                  loglevel="default",
                  clearance_level="default",
-                 policies=""
+                 policies="",
+                 startdate=None,
+                 duration=None
                  ):
         self.signature = ""
         self.date = datetime.now()
+        self.startdate = startdate
+        self.duration = duration
         self.action = convert_column_to_unicode(action)
         self.success = success
         self.serial = convert_column_to_unicode(serial)
@@ -2673,9 +2770,10 @@ class AuthCache(MethodsMixin, db.Model):
     realm = db.Column(db.Unicode(120), default=u'', index=True)
     client_ip = db.Column(db.Unicode(40), default=u"")
     user_agent = db.Column(db.Unicode(120), default=u"")
+    auth_count = db.Column(db.Integer, default=0)
     # We can hash the password like this:
     # binascii.hexlify(hashlib.sha256("secret123456").digest())
-    authentication = db.Column(db.Unicode(64), default=u"")
+    authentication = db.Column(db.Unicode(255), default=u"")
 
     def __init__(self, username, realm, resolver, authentication,
                  first_auth=None, last_auth=None):
@@ -2683,8 +2781,8 @@ class AuthCache(MethodsMixin, db.Model):
         self.realm = realm
         self.resolver = resolver
         self.authentication = authentication
-        self.first_auth = first_auth
-        self.last_auth = last_auth
+        self.first_auth = first_auth if first_auth else datetime.utcnow()
+        self.last_auth = last_auth if last_auth else self.first_auth
 
 
 ### Periodic Tasks
@@ -2698,6 +2796,7 @@ class PeriodicTask(MethodsMixin, db.Model):
     id = db.Column(db.Integer, Sequence("periodictask_seq"), primary_key=True)
     name = db.Column(db.Unicode(64), unique=True, nullable=False)
     active = db.Column(db.Boolean, default=True, nullable=False)
+    retry_if_failed = db.Column(db.Boolean, default=True, nullable=False)
     interval = db.Column(db.Unicode(256), nullable=False)
     nodes = db.Column(db.Unicode(256), nullable=False)
     taskmodule = db.Column(db.Unicode(256), nullable=False)
@@ -2710,10 +2809,12 @@ class PeriodicTask(MethodsMixin, db.Model):
                                 lazy='dynamic',
                                 backref='periodictask')
 
-    def __init__(self, name, active, interval, node_list, taskmodule, ordering, options=None, id=None):
+    def __init__(self, name, active, interval, node_list, taskmodule, ordering, options=None, id=None,
+                 retry_if_failed=True):
         """
         :param name: Unique name of the periodic task as unicode
         :param active: a boolean
+        :param retry_if_failed: a boalean
         :param interval: a unicode specifying the periodicity of the task
         :param node_list: a list of unicodes, denoting the node names that should execute that task.
                           If we update an existing PeriodicTask entry, PeriodicTaskLastRun entries
@@ -2728,6 +2829,7 @@ class PeriodicTask(MethodsMixin, db.Model):
         self.id = id
         self.name = name
         self.active = active
+        self.retry_if_failed = retry_if_failed
         self.interval = interval
         self.nodes = u", ".join(node_list)
         self.taskmodule = taskmodule
@@ -2769,6 +2871,7 @@ class PeriodicTask(MethodsMixin, db.Model):
                 "interval": self.interval,
                 "nodes": [node.strip() for node in self.nodes.split(",")],
                 "taskmodule": self.taskmodule,
+                "retry_if_failed": self.retry_if_failed,
                 "last_update": self.aware_last_update,
                 "ordering": self.ordering,
                 "options": dict((option.key, option.value) for option in self.options),
@@ -2793,6 +2896,7 @@ class PeriodicTask(MethodsMixin, db.Model):
                 "nodes": self.nodes,
                 "taskmodule": self.taskmodule,
                 "ordering": self.ordering,
+                "retry_if_failed": self.retry_if_failed,
                 "last_update": self.last_update,
             })
         db.session.commit()
@@ -2953,3 +3057,4 @@ class MonitoringStats(MethodsMixin, db.Model):
         self.stats_key = key
         self.stats_value = value
         #self.save()
+

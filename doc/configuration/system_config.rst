@@ -1,9 +1,9 @@
+.. index:: system config, token default settings,
+
 .. _system_config:
 
 System Config
 -------------
-
-.. index:: system config, token default settings,
 
 The system configuration has three logical topics: Settings,
 token default settings and GUI settings.
@@ -18,8 +18,8 @@ Settings
 
 .. _splitatsign:
 
-Split @ Sign
-~~~~~~~~~~~~
+Use @ sign to split the username and the realm.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``splitAtSign`` defines if the username like *user@company* 
 given during authentication should
@@ -33,43 +33,23 @@ How a user is related to a realm is described here: :ref:`relate_realm`
 
 This option also affects the login via the :ref:`rest_auth`
 
-.. _return_saml_attributes:
 
-SAML Attributes
-~~~~~~~~~~~~~~~
-
-.. index:: SAML attributes
-
-``Return SAML attributes`` defines if during an SAML authentication request
-additional SAML attributes should be returned.
-Usually an authentication response only returns *true* or *false*.
-
-The SAML attributes are the known attributes that are defined in the
-attribute mapping e.g. of the LDAP resolver like *email*, *phone*,
-*givenname*, *surname* or any other attributes you fetch from the LDAP
-directory. For more information read :ref:`ldap_resolver`.
-
-In addition you can set the parameter ``ReturnSamlAttributesOnFail``. In this
-case the response contains the SAML attributes of the user, even if the user
-failed to authenticate.
-
-
-FailCounterIncOnFalsePin
-~~~~~~~~~~~~~~~~~~~~~~~~
+Increase the failcounter if the wrong PIN was entered.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 If during authentication the given PIN matches a token but the OTP value is
 wrong the failcounter of
 the tokens for which the PIN matches, is increased.
 If the given PIN does not match any token, by default no failcounter is
-increased. The later behaviour can be adapted by ``FailCounterIncOnFalsePin``.
+increased. The latter behaviour can be adapted by ``FailCounterIncOnFalsePin``.
 If ``FailCounterIncOnFalsePin`` is set and the given OTP PIN does not match
 any token, the failcounter of *all* tokens is increased.
 
 
 .. _clear_failcounter:
 
-Automatically clearing Failcounter
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Clear failcounter after *x* minutes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 If the failcounter reaches the maximum the token gets a timestamp, when the
 max fail count was reached. *After* the specified
@@ -88,6 +68,8 @@ A "0" means automatically clearing the fail counter is not used.
 
 Also see :ref:`brute_force`.
 
+.. todo:: Add description for ``Do not use an authentication counter per token.``
+
 
 .. _reset_failcounter_on_correct_pin:
 
@@ -104,21 +86,42 @@ The default behaviour is, that the correct PIN of a normal token will *not*
 reset the failcounter after the clearing timeout.
 
 
-Prepend PIN
-~~~~~~~~~~~
+Prepend the PIN in front of the OTP value.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``PrependPin`` defines if the OTP PIN should be given in front ("pin123456") 
-or in the back ("12345pin") of the OTP value.
+Defines if the OTP PIN should be given in front ("pin123456")
+or in the back ("123456pin") of the OTP value.
+
+
+.. index:: SAML attributes
+
+.. _return_saml_attributes:
+
+Include SAML attributes in the authentication response.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``Return SAML attributes`` defines if during an SAML authentication request
+additional SAML attributes should be returned.
+Usually an authentication response only returns *true* or *false*.
+
+The SAML attributes are the known attributes that are defined in the
+attribute mapping e.g. of the LDAP resolver like *email*, *phone*,
+*givenname*, *surname* or any other attributes you fetch from the LDAP
+directory. For more information read :ref:`ldap_resolver`.
+
+In addition you can set the parameter ``ReturnSamlAttributesOnFail``. In this
+case the response contains the SAML attributes of the user, even if the user
+failed to authenticate.
 
 
 .. index:: autoresync, autosync
 
 .. _autosync:
 
-AutoResync
-~~~~~~~~~~
+Automatic resync during authentication
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``Auto resync`` defines if the system should try to resync a token if a user
+Automatic *resync* defines if the system should try to resync a token if a user
 provides a wrong OTP value. AutoResync works like this:
 
 * If the counter of a wrong OTP value is within the resync window, the system
@@ -136,12 +139,14 @@ provides a wrong OTP value. AutoResync works like this:
 .. note:: AutoResync works for all HOTP and TOTP based tokens including SMS and
    Email tokens.
 
-.. index:: authenticating client, client, override client
+
+.. todo:: Describe ``Auto resync timeout``
+
 
 .. _user_cache_timeout:
 
-User Cache
-~~~~~~~~~~
+User Cache expiration in seconds
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The setting ``User Cache expiration in seconds`` is used to enable the user cache and
 configure its expiration timeout. If its value is set to ``0`` (which is the default value),
@@ -152,12 +157,12 @@ cache expire. For more information read :ref:`usercache`.
 .. note:: If the user cache is already enabled and you increase the expiration timeout,
    expired entries that still exist in the user cache could be considered active again!
 
+.. index:: Override client, map client, proxies, RADIUS server, authenticating client, client
+
 .. _override_client:
 
 Override Authorization Client
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. index:: Override client, map client, proxies, RADIUS server
 
 ``Override Authorization client`` is important with client specific
 policies (see :ref:`policies`) and RADIUS servers or other proxies. In
@@ -213,7 +218,7 @@ Reset Fail Counter
 ~~~~~~~~~~~~~~~~~~
 ``DefaultResetFailCount`` will reset the failcounter of a token if this token was
 used for a successful authentication. If not checked, the failcounter will not
-be resetted and must be resetted manually.
+be reset and must be reset manually.
 
 .. note:: The following settings are token specific value which are 
    set during enrollment.
@@ -224,9 +229,9 @@ be resetted and must be resetted manually.
 Maximum Fail Counter
 ~~~~~~~~~~~~~~~~~~~~
 
-``DefaultMaxFailCount`` is the maximum failcounter a token way get. If the
+``DefaultMaxFailCount`` is the maximum failcounter a token may get. If the
 failcounter exceeds this number the token can not be used unless the failcounter
-is resetted.
+is reset.
 
 .. note:: In fact the failcounter will only increase till this maxfailcount.
    Even if more failed authentication request occur, the failcounter will 
@@ -266,7 +271,7 @@ The default length of generated serial numbers is an 8 digit hex string.
 If you need another length, it can be configured in the database table ``Config``
 with the key word ``SerialLength``.
 
-No Authenitcation Counter
+No Authentication Counter
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Usually privacyIDEA keeps track of how often a token is used for authentication and

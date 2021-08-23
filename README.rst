@@ -1,10 +1,9 @@
-
 privacyIDEA
 ===========
 
-.. image:: https://travis-ci.org/privacyidea/privacyidea.svg?branch=master
+.. image:: https://travis-ci.com/privacyidea/privacyidea.svg?branch=master
     :alt: Build Status
-    :target: https://travis-ci.org/privacyidea/privacyidea
+    :target: https://travis-ci.com/privacyidea/privacyidea
 
 .. .. image:: https://circleci.com/gh/privacyidea/privacyidea/tree/master.svg?style=shield&circle-token=:circle-token
 ..     :alt: CircleCI
@@ -169,7 +168,7 @@ easy as running `pytest <http://pytest.org/>`_ with the following options::
 Contributing
 ============
 
-There are a lot of different way to contribute to privacyIDEA, even
+There are a lot of different ways to contribute to privacyIDEA, even
 if you are not a developer.
 
 If you found a security vulnerability please report it to

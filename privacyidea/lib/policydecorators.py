@@ -44,6 +44,7 @@ policy decorators for the API (pre/post) are defined in api/lib/policy
 The functions of this module are tested in tests/test_lib_policy_decorator.py
 """
 import logging
+import re
 
 from privacyidea.lib.policy import Match
 from privacyidea.lib.error import PolicyError, privacyIDEAError
@@ -156,28 +157,34 @@ def auth_cache(wrapped_function, user_object, passw, options=None):
     options = options or {}
     g = options.get("g")
     auth_cache_dict = None
+
     if g:
         auth_cache_dict = Match.user(g, scope=SCOPE.AUTH, action=ACTION.AUTH_CACHE,
                                      user_object=user_object).action_values(unique=True, write_to_audit_log=False)
         if auth_cache_dict:
-            # verify in cache and return an early success
             auth_times = list(auth_cache_dict)[0].split("/")
+
             # determine first_auth from policy!
             first_offset = parse_timedelta(auth_times[0])
-
-            if len(auth_times) == 2:
-                # Determine last_auth from policy
-                last_offset = parse_timedelta(auth_times[1])
-            else:
-                # If there is no last_auth, it is equal to first_auth
-                last_offset = first_offset
-
             first_auth = datetime.datetime.utcnow() - first_offset
-            last_auth = datetime.datetime.utcnow() - last_offset
+            last_auth = first_auth  # Default if no last auth exists
+            max_auths = 0  # Default value, 0 has no effect on verification
+
+            # Use auth cache when number of allowed authentications is defined
+            if len(auth_times) == 2:
+                if re.match(r"^\d+$", auth_times[1]):
+                    max_auths = int(auth_times[1])
+                else:
+                    # Determine last_auth delta from policy
+                    last_offset = parse_timedelta(auth_times[1])
+                    last_auth = datetime.datetime.utcnow() - last_offset
+
             result = verify_in_cache(user_object.login, user_object.realm,
                                      user_object.resolver, passw,
                                      first_auth=first_auth,
-                                     last_auth=last_auth)
+                                     last_auth=last_auth,
+                                     max_auths=max_auths)
+
             if result:
                 g.audit_object.add_policy(next(iter(auth_cache_dict.values())))
                 return True, {"message": "Authenticated by AuthCache."}
@@ -490,9 +497,9 @@ def login_mode(wrapped_function, *args, **kwds):
     that the authentication should be performed against privacyIDEA.
 
     :param wrapped_function: Usually the function check_webui_user
-    :param args: arguments user_obj and password
-    :param kwds: keyword arguments like options and !check_otp!
-    kwds["options"] contains the flask g
+    :param `*args`: arguments user_obj and password
+    :param `**kwds`: keyword arguments like options and !check_otp!
+        kwds["options"] contains the flask g
     :return: calls the original function with the modified "check_otp" argument
     """
     # if tokenclass.check_pin is called in any other way, options may be None
@@ -521,15 +528,16 @@ def login_mode(wrapped_function, *args, **kwds):
 def auth_otppin(wrapped_function, *args, **kwds):
     """
     Decorator to decorate the tokenclass.check_pin function.
+
     Depending on the ACTION.OTPPIN it
-    * either simply accepts an empty pin
-    * checks the pin against the userstore
-    * or passes the request to the wrapped_function
+     * either simply accepts an empty pin
+     * checks the pin against the userstore
+     * or passes the request to the wrapped_function
 
     :param wrapped_function: In this case the wrapped function should be
-    tokenclass.check_ping
-    :param *args: args[1] is the pin
-    :param **kwds: kwds["options"] contains the flask g
+        :py:func:`privacyidea.lib.tokenclass.TokenClass.check_pin`
+    :param `*args`: args[1] is the pin
+    :param `**kwds`: kwds["options"] contains the flask g
     :return: True or False
     """
     # if tokenclass.check_pin is called in any other way, options may be None
@@ -580,12 +588,11 @@ def config_lost_token(wrapped_function, *args, **kwds):
     how the lostToken should be generated.
 
     :param wrapped_function: Usually the function lost_token()
-    :param args: argument "serial" as the old serial number
-    :param kwds: keyword arguments like "validity", "contents", "pw_len"
-    kwds["options"] contains the flask g
-
+    :param `*args`: argument "serial" as the old serial number
+    :param `**kwds`: keyword arguments like "validity", "contents", "pw_len"
+        kwds["options"] contains the flask g
     :return: calls the original function with the modified "validity",
-    "contents" and "pw_len" argument
+        "contents" and "pw_len" argument
     """
     # if called in any other way, options may be None
     #  or it might have no element "g".

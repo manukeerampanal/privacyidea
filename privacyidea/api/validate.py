@@ -57,7 +57,7 @@ In case of authenticating a user:
  * :func:`privacyidea.lib.tokenclass.TokenClass.check_pin`
  * :func:`privacyidea.lib.tokenclass.TokenClass.check_otp`
 
-In case if authenitcating a serial number:
+In case if authenticating a serial number:
 
  * :func:`privacyidea.lib.token.check_serial_pass`
  * :func:`privacyidea.lib.token.check_token_list`
@@ -79,6 +79,7 @@ from privacyidea.lib.config import (return_saml_attributes, get_from_config,
                                     return_saml_attributes_on_fail,
                                     SYSCONF, ensure_no_config_object)
 from privacyidea.lib.audit import getAudit
+from privacyidea.api.lib.decorators import add_serial_from_response_to_g
 from privacyidea.api.lib.prepolicy import (prepolicy, set_realm,
                                            api_key_required, mangle,
                                            save_client_application_type,
@@ -121,7 +122,7 @@ def before_request():
     This is executed before the request
     """
     ensure_no_config_object()
-    request.all_data = get_all_params(request.values, request.data)
+    request.all_data = get_all_params(request)
     request.User = get_user_from_param(request.all_data)
     privacyidea_server = current_app.config.get("PI_AUDIT_SERVERNAME") or \
                          request.host
@@ -132,12 +133,13 @@ def before_request():
 
     g.policy_object = PolicyClass()
 
-    g.audit_object = getAudit(current_app.config)
+    g.audit_object = getAudit(current_app.config, g.startdate)
     g.event_config = EventConfiguration()
     # access_route contains the ip addresses of all clients, hops and proxies.
     g.client_ip = get_client_ip(request, get_from_config(SYSCONF.OVERRIDECLIENT))
     # Save the HTTP header in the localproxy object
     g.request_headers = request.headers
+    g.serial = getParam(request.all_data, "serial", default=None)
     g.audit_object.log({"success": False,
                         "action_detail": "",
                         "client": g.client_ip,
@@ -202,6 +204,7 @@ def offlinerefill():
 @postpolicy(check_tokentype, request=request)
 @postpolicy(check_serial, request=request)
 @postpolicy(autoassign, request=request)
+@add_serial_from_response_to_g
 @prepolicy(check_application_tokentype, request=request)
 @prepolicy(pushtoken_wait, request=request)
 @prepolicy(set_realm, request=request)
@@ -226,9 +229,9 @@ def check():
     an error occurred during sending of SMS or Email.
 
     In case ``/validate/radiuscheck`` is requested, the responses are
-    modified as follows: A successful authentication returns an empty HTTP
-    204 response. An unsuccessful authentication returns an empty HTTP
-    400 response. Error responses are the same responses as for the
+    modified as follows: A successful authentication returns an empty ``HTTP
+    204`` response. An unsuccessful authentication returns an empty ``HTTP
+    400`` response. Error responses are the same responses as for the
     ``/validate/check`` endpoint.
 
     :param serial: The serial number of the token, that tries to authenticate.
@@ -236,8 +239,8 @@ def check():
     :param realm: The realm of the user, who tries to authenticate. If the
         realm is omitted, the user is looked up in the default realm.
     :param type: The tokentype of the tokens, that are taken into account during
-        authentication. Requires authz policy application_tokentype.
-        Is ignored when a distinct serial is given.
+        authentication. Requires the *authz* policy :ref:`application_tokentype_policy`.
+        It is ignored when a distinct serial is given.
     :param pass: The password, that consists of the OTP PIN and the OTP value.
     :param otponly: If set to 1, only the OTP value is verified. This is used
         in the management UI. Only used with the parameter serial.
@@ -251,20 +254,20 @@ def check():
 
         .. sourcecode:: http
 
-           POST /validate/check HTTP/1.1
-           Host: example.com
-           Accept: application/json
+            POST /validate/check HTTP/1.1
+            Host: example.com
+            Accept: application/json
 
-           user=user
-           realm=realm1
-           pass=s3cret123456
+            user=user
+            realm=realm1
+            pass=s3cret123456
 
     **Example response** for a successful authentication:
 
-       .. sourcecode:: http
+        .. sourcecode:: http
 
-           HTTP/1.1 200 OK
-           Content-Type: application/json
+            HTTP/1.1 200 OK
+            Content-Type: application/json
 
             {
               "detail": {
@@ -281,13 +284,12 @@ def check():
               "version": "privacyIDEA unknown"
             }
 
-    **Example response** for this first part of a challenge response
-    authentication:
+    **Example response** for this first part of a challenge response authentication:
 
-       .. sourcecode:: http
+        .. sourcecode:: http
 
-           HTTP/1.1 200 OK
-           Content-Type: application/json
+            HTTP/1.1 200 OK
+            Content-Type: application/json
 
             {
               "detail": {
@@ -297,14 +299,16 @@ def check():
                 "multi_challenge: [ {"serial": "PIEM0000AB00",
                                      "transaction_id":  "12345678901234567890",
                                      "message": "Please enter otp from your
-                                     email"},
+                                     email",
+                                     "client_mode": "interactive"},
                                     {"serial": "PISM12345678",
                                      "transaction_id": "12345678901234567890",
                                      "message": "Please enter otp from your
-                                     SMS"}
+                                     SMS",
+                                     "client_mode": "interactive"}
                 ]
               },
-              "id": 1,
+              "id": 2,
               "jsonrpc": "2.0",
               "result": {
                 "status": true,
@@ -317,11 +321,16 @@ def check():
     with an SMS. The application and thus the user has to decide, which one
     to use. They can use either.
 
-    .. note:: All challenge response tokens have the same transaction_id in
+    The challenges also contain the information of the "client_mode". This
+    tells the plugin, whether it should display an input field to ask for the
+    OTP value or e.g. to poll for an answered authentication.
+    Read more at :ref:`client_modes`.
+
+    .. note:: All challenge response tokens have the same ``transaction_id`` in
        this case.
 
 
-    **Example response** for a successful authentication with /samlcheck:
+    **Example response** for a successful authentication with ``/samlcheck``:
 
        .. sourcecode:: http
 
@@ -353,7 +362,7 @@ def check():
               "version": "privacyIDEA unknown"
             }
 
-    The response in value->attributes can contain additional attributes
+    The response in ``value->attributes`` can contain additional attributes
     (like "myOwn") which you can define in the LDAP resolver in the attribute
     mapping.
     """
@@ -363,11 +372,12 @@ def check():
     otp_only = getParam(request.all_data, "otponly")
     token_type = getParam(request.all_data, "type")
     options = {"g": g,
-               "clientip": g.client_ip}
+               "clientip": g.client_ip,
+               "user": user}
     # Add all params to the options
     for key, value in request.all_data.items():
-            if value and key not in ["g", "clientip"]:
-                options[key] = value
+        if value and key not in ["g", "clientip", "user"]:
+            options[key] = value
 
     g.audit_object.log({"user": user.login,
                         "resolver": user.resolver,
@@ -411,13 +421,14 @@ def check():
                         "success": success,
                         "serial": serial or details.get("serial"),
                         "token_type": details.get("type")})
-    return send_result(result, details=details)
+    return send_result(result, rid=2, details=details)
 
 
 @validate_blueprint.route('/triggerchallenge', methods=['POST', 'GET'])
 @admin_required
 @postpolicy(is_authorized, request=request)
 @postpolicy(mangle_challenge_response, request=request)
+@add_serial_from_response_to_g
 @check_user_or_serial_in_request(request)
 @prepolicy(check_application_tokentype, request=request)
 @prepolicy(check_base_action, request, action=ACTION.TRIGGERCHALLENGE)
@@ -448,50 +459,91 @@ def trigger_challenge():
     **Example response** for a successful triggering of challenge:
 
        .. sourcecode:: http
+       
+            HTTP/1.1 200 OK
+            Content-Type: application/json
 
-           {"jsonrpc": "2.0",
-            "signature": "1939...146964",
-            "detail": {"transaction_ids": ["03921966357577766962"],
-                       "messages": ["Enter the OTP from the SMS:"],
-                       "threadid": 140422378276608},
-            "versionnumber": "unknown",
-            "version": "privacyIDEA unknown",
-            "result": {"status": true,
-                       "value": 1},
-            "time": 1482223663.517212,
-            "id": 1}
+            {
+               "detail": {
+                    "client_mode": "interactive",
+                    "message": "please enter otp: , please enter otp: ",
+                    "messages":     [
+                        "please enter otp: ",
+                        "please enter otp: "
+                    ],
+                    "multi_challenge": [
+                        {
+                            "client_mode": "interactive",
+                            "message": "please enter otp: ",
+                            "serial": "TOTP000026CB",
+                            "transaction_id": "11451135673179897001",
+                            "type": "totp"
+                        },
+                        {
+                            "client_mode": "interactive",
+                            "message": "please enter otp: ",
+                            "serial": "OATH0062752C",
+                            "transaction_id": "11451135673179897001",
+                            "type": "hotp"
+                        }
+                    ],
+                    "serial": "OATH0062752C",
+                    "threadid": 140329819764480,
+                    "transaction_id": "11451135673179897001",
+                    "transaction_ids": [
+                        "11451135673179897001",
+                        "11451135673179897001"
+                    ],
+                    "type": "hotp"
+               },
+               "id": 2,
+               "jsonrpc": "2.0",
+               "result": {
+                   "status": true,
+                   "value": 2
+               }
 
     **Example response** for response, if the user has no challenge token:
 
-       .. sourcecode:: http
+        .. sourcecode:: http
 
-           {"detail": {"messages": [],
-                       "threadid": 140031212377856,
-                       "transaction_ids": []},
-            "id": 1,
-            "jsonrpc": "2.0",
-            "result": {"status": true,
-                       "value": 0},
-            "signature": "205530282...54508",
-            "time": 1484303812.346576,
-            "version": "privacyIDEA 2.17",
-            "versionnumber": "2.17"}
+            HTTP/1.1 200 OK
+            Content-Type: application/json
+
+            {
+              "detail": {"messages": [],
+                         "threadid": 140031212377856,
+                         "transaction_ids": []},
+              "id": 1,
+              "jsonrpc": "2.0",
+              "result": {"status": true,
+                         "value": 0},
+              "signature": "205530282...54508",
+              "time": 1484303812.346576,
+              "version": "privacyIDEA 2.17",
+              "versionnumber": "2.17"
+            }
 
     **Example response** for a failed triggering of a challenge. In this case
-        the ``status`` will be ``false``.
+    the ``status`` will be ``false``.
 
-       .. sourcecode:: http
+        .. sourcecode:: http
 
-           {"detail": null,
-            "id": 1,
-            "jsonrpc": "2.0",
-            "result": {"error": {"code": 905,
-                                 "message": "ERR905: The user can not be
-                                 found in any resolver in this realm!"},
-                       "status": false},
-            "signature": "14468...081555",
-            "time": 1484303933.72481,
-            "version": "privacyIDEA 2.17"}
+            HTTP/1.1 200 OK
+            Content-Type: application/json
+
+            {
+              "detail": null,
+              "id": 1,
+              "jsonrpc": "2.0",
+              "result": {"error": {"code": 905,
+                                   "message": "ERR905: The user can not be
+                                   found in any resolver in this realm!"},
+                         "status": false},
+              "signature": "14468...081555",
+              "time": 1484303933.72481,
+              "version": "privacyIDEA 2.17"
+            }
 
     """
     user = request.User
@@ -502,6 +554,10 @@ def trigger_challenge():
     options = {"g": g,
                "clientip": g.client_ip,
                "user": user}
+    # Add all params to the options
+    for key, value in request.all_data.items():
+        if value and key not in ["g", "clientip", "user"]:
+            options[key] = value
 
     token_objs = get_tokens(serial=serial, user=user, active=True, revoked=False, locked=False, tokentype=token_type)
     # Only use the tokens, that are allowed to do challenge response
@@ -519,7 +575,7 @@ def trigger_challenge():
         "serial": ",".join(challenge_serials),
     })
 
-    return send_result(result_obj, details=details)
+    return send_result(result_obj, rid=2, details=details)
 
 
 @validate_blueprint.route('/polltransaction', methods=['GET'])

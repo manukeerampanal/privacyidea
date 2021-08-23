@@ -16,6 +16,7 @@ getToken....
 from .base import MyTestCase, FakeAudit, FakeFlaskG
 from privacyidea.lib.user import (User)
 from privacyidea.lib.tokenclass import TokenClass, TOKENKIND, FAILCOUNTER_EXCEEDED, FAILCOUNTER_CLEAR_TIMEOUT
+from privacyidea.lib.token import weigh_token_type
 from privacyidea.lib.tokens.totptoken import TotpTokenClass
 from privacyidea.models import (Token, Challenge, TokenRealm)
 from privacyidea.lib.config import (set_privacyidea_config, get_token_types, delete_privacyidea_config, SYSCONF)
@@ -316,6 +317,13 @@ class TokenTestCase(MyTestCase):
         self.assertRaises(TokenAdminError, init_token, {"otpkey": "1234",
                                                         "serial": "NEW001",
                                                         "type": "totp"})
+
+        # try to update the same token with another user assignment
+        self.assertRaises(TokenAdminError, init_token, {"otpkey": "1234",
+                                                        "serial": "NEW001"},
+                          user=User(login="hans", realm=self.realm1))
+        # test that token was not assigned to the other user
+        self.assertTrue(tokenobject.user == User(login="cornelius", realm=self.realm1))
 
         # update the existing token
         self.assertTrue(tokenobject.token.otplen == 6, tokenobject.token.otplen)
@@ -682,8 +690,8 @@ class TokenTestCase(MyTestCase):
         res, reply = check_token_list(tokenobject_list, "hotppin40123456")
         self.assertFalse(res)
         failcount = hotp_tokenobject.token.failcount
-        self.assertTrue(failcount == old_failcount + 1, (old_failcount,
-                                                         failcount))
+        self.assertEqual(failcount, old_failcount + 1, (old_failcount,
+                                                        failcount))
 
         # if there is no token with at least a correct pin, we increase all
         # failcounters
@@ -692,8 +700,8 @@ class TokenTestCase(MyTestCase):
         res, reply = check_token_list(tokenobject_list, "everythingiswrong")
         self.assertFalse(res)
         failcount = hotp_tokenobject.token.failcount
-        self.assertTrue(failcount == old_failcount + 1, (old_failcount,
-                                                         failcount))
+        self.assertEqual(failcount, old_failcount + 1, (old_failcount,
+                                                        failcount))
 
         # Now we do some successful auth with the HOTP token
         tokenobject_list = get_tokens(serial="hotptoken")
@@ -953,15 +961,21 @@ class TokenTestCase(MyTestCase):
 
         self.assertTrue(tokens[0].get("serial") == "A8",
                         tokens[0])
-        self.assertTrue(tokens[-1].get("serial") == "hotptoken",
-                        tokens[-1])
+        # SQLite does not sort like other DBs
+        if self.app.config['SQLALCHEMY_DATABASE_URI'].startswith('sqlite'):
+            self.assertEqual('hotptoken', tokens[-1].get("serial"), tokens[-1])
+        else:
+            self.assertEqual('X', tokens[-1].get("serial"), tokens[-1])
 
         # Reverse sorting
         tokendata = get_tokens_paginate(sortby=Token.serial, page=1, psize=100,
                                         sortdir="desc")
         tokens = tokendata.get("tokens")
 
-        self.assertTrue(tokens[0].get("serial") == "hotptoken")
+        if self.app.config['SQLALCHEMY_DATABASE_URI'].startswith('sqlite'):
+            self.assertEqual('hotptoken', tokens[0].get("serial"), tokens[0])
+        else:
+            self.assertEqual('X', tokens[0].get("serial"), tokens[0])
         self.assertTrue(tokens[-1].get("serial") == "A8")
 
         # sort with string column
@@ -969,15 +983,34 @@ class TokenTestCase(MyTestCase):
                                         sortdir="asc")
         tokens = tokendata.get("tokens")
 
-        self.assertTrue(tokens[-1].get("serial") == "hotptoken")
+        if self.app.config['SQLALCHEMY_DATABASE_URI'].startswith('sqlite'):
+            self.assertEqual('hotptoken', tokens[-1].get("serial"), tokens[-1])
+        else:
+            self.assertEqual('X', tokens[-1].get("serial"), tokens[-1])
         self.assertTrue(tokens[0].get("serial") == "A8")
 
         tokendata = get_tokens_paginate(sortby="serial", page=1, psize=100,
                                         sortdir="desc")
         tokens = tokendata.get("tokens")
 
-        self.assertTrue(tokens[0].get("serial") == "hotptoken")
+        if self.app.config['SQLALCHEMY_DATABASE_URI'].startswith('sqlite'):
+            self.assertEqual('hotptoken', tokens[0].get("serial"), tokens[0])
+        else:
+            self.assertEqual('X', tokens[0].get("serial"), tokens[0])
         self.assertTrue(tokens[-1].get("serial") == "A8")
+
+        # try a different sort key
+        tokendata = get_tokens_paginate(sortby="id", page=1, psize=100)
+        tokens = tokendata.get("tokens")
+
+        self.assertEqual(1, tokens[0].get("id"), tokens[0])
+        self.assertGreaterEqual(tokens[-1].get("id"), len(tokens), tokens[-1])
+
+        # unknown sort key results in sorting by serial
+        tokendata = get_tokens_paginate(sortby="unknown", page=1, psize=100)
+        tokens = tokendata.get("tokens")
+
+        self.assertEqual('A8', tokens[0].get("serial"), tokens[0])
 
     def test_43_encryptpin(self):
         serial = "ENC01"
@@ -1211,9 +1244,11 @@ class TokenTestCase(MyTestCase):
         self.assertEqual(multi_challenge[0].get("serial"), "CR2A")
         self.assertEqual(transaction_id,
                          multi_challenge[0].get("transaction_id"))
+        self.assertEqual("interactive", multi_challenge[0].get("client_mode"))
         self.assertEqual(transaction_id,
                          multi_challenge[1].get("transaction_id"))
         self.assertEqual(multi_challenge[1].get("serial"), "CR2B")
+        self.assertEqual("interactive", multi_challenge[1].get("client_mode"))
 
         # There are two challenges in the database
         r = Challenge.query.filter(Challenge.transaction_id ==
@@ -1556,6 +1591,16 @@ class TokenTestCase(MyTestCase):
         self.assertTrue(r)
         remove_token(serial)
 
+    def test_59_weigh_token_types(self):
+
+        class dummy_token(object):
+            def __init__(self, type):
+                self.type = type
+        self.assertEqual(1000, weigh_token_type(dummy_token("push")))
+        self.assertTrue(weigh_token_type(dummy_token("push")) > weigh_token_type(dummy_token("hotp")))
+        self.assertTrue(weigh_token_type(dummy_token("push")) > weigh_token_type(dummy_token("HOTP")))
+        self.assertTrue(weigh_token_type(dummy_token("PUSH")) > weigh_token_type(dummy_token("hotp")))
+
 
 class TokenOutOfBandTestCase(MyTestCase):
 
@@ -1726,6 +1771,7 @@ class TokenFailCounterTestCase(MyTestCase):
         g.policy_object = PolicyClass()
         g.audit_object = FakeAudit()
         g.client_ip = None
+        g.serial = None
         options = {"g": g}
 
         check_token_list([token1, token2], pin1, user=user,

@@ -26,7 +26,7 @@ type: string
 
 This action defines how the fixed password part during
 authentication should be validated.
-Each token has its own OTP PIN, but you can choose
+Each token has its own OTP PIN, but the administrator can choose
 how the authentication should be processed:
 
 ``otppin=tokenpin``
@@ -78,7 +78,7 @@ for the RADIUS server.
 
 .. note:: The passthru policy overrides the authorization policy
    for :ref:`tokentype_policy`. I.e. a user may authenticate due
-   to the passthru    policy (since he has no token)
+   to the passthru policy (since he has no token)
    although a tokentype policy is active!
 
 .. warning:: If the user has the right to delete his
@@ -144,6 +144,7 @@ If the user does not exist, the authentication request is successful.
 .. warning:: Only use this if you know exactly what you are doing.
 
 
+.. _smstext:
 
 smstext
 ~~~~~~~
@@ -153,18 +154,45 @@ smstext
 type: string
 
 This is the text that is sent via SMS to the user trying to
-authenticate with an SMS token.
-You can use the tags *<otp>* and *<serial>*.
+authenticate with an SMS token. This can contain the tags *<otp>* and *<serial>*.
 Texts containing whitespaces must be enclosed in single quotes.
 
 Starting with version 2.20 you can use the tag *{challenge}*. This will add
 the challenge data that was passed in the first authentication request in the
 challenge parameter. This could contain banking transaction data.
 
+Starting with version 3.6 the `smstext` can contain a lot more tags similar to the
+policy :ref:`emailtext`:
+
+  * {otp} or *<otp>* the One-Time-Password
+  * {serial} or *<serial>* the serial number of the token.
+  * {user} the given name of the token owner.
+  * {givenname} the given name of the token owner.
+  * {surname} the surname of the token owner.
+  * {username} the loginname of the token owner.
+  * {userrealm} the realm of the token owner.
+  * {tokentype} the type of the token.
+  * {recipient_givenname} the given name of the recipient.
+  * {recipient_surname} the surname of the recipient.
+  * {time} the current server time in the format HH:MM:SS.
+  * {date} the current server date in the format YYYY-MM-DD
+
 In the :ref:`sms_gateway_config` the tag *{otp}* will be replaced by the custom
 message, set with this policy.
 
 Default: *<otp>*
+
+.. note:: The length of an SMS is limited to 140 characters due to the definition of SMS.
+   You should take care, that the *smstext* does not exceed this limit. SMS gateways could
+   reject too long messages or the delivery could fail.
+
+.. note:: Some apps may be able to handle incoming OTPs as a so called
+   `origin-bound one-time code <https://github.com/wicg/sms-one-time-codes>`_
+   in the format::
+
+     Your OTP is {otp}
+     @privacyidea.mydomain.com #{otp}
+
 
 smsautosend
 ~~~~~~~~~~~
@@ -177,6 +205,7 @@ A new OTP value will be sent via SMS if the user authenticated
 successfully with his SMS token. Thus the user does not
 have to trigger a new SMS when he wants to login again.
 
+.. _emailtext:
 
 emailtext
 ~~~~~~~~~
@@ -315,6 +344,23 @@ successfully. E.g. if the user enters two different new PINs, the authentication
 
 .. note:: The application must support several consecutive challenge response requests.
 
+.. _policy_resync_via_multichallenge:
+
+resync_via_multichallenge
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+type: bool
+
+This policy is based on the global setting :ref:`autosync`.
+If *AutoResync* is enabled and this policy is configured, a user can synchronize
+his token during authentication via challenge response.
+
+If privacyIDEA realizes, that the first given OTP value is within the syncwindow,
+a challenge will be presented to the user saying "To resync your token, please enter the next OTP value".
+In contrast to the generic AutoResync a user has to enter the token PIN only once.
+
+.. note:: The application must support several consecutive challenge response requests.
+
 
 .. _policy_u2f_facets:
 
@@ -356,13 +402,20 @@ type: string
 
 The Authentication Cache caches the credentials of a successful
 authentication and allows to use the same credentials - also with an OTP
-value - for the specified amount of time.
+value - for the specified amount of time and optionally for a specified number
+of authentications.
 
-The time to cache the credentials can be specified like "4h", "5m", "2d"
-(hours, minutes days) or "4h/5m". The notation 4h/5m means, that credentials
-are cached for 4 hours, but only may be used again, if every 5 minutes the
+The time to cache the credentials can be specified like "4h", "5m", "2d", "3s"
+(hours, minutes, days, seconds). The number of allowed authentications can be
+specified as a whole number, greater than zero.
+
+The notation "4h/5m" means, that credentials
+are cached for 4 hours, but may only be used again, if every 5 minutes the
 authentication occurs. If the authentication with the same credentials would
 not occur within 5 minutes, the credentials can not be used anymore.
+
+The notation "2m/3" means, that credentials are cached for 2 minutes, but may only be used 3 times
+in this timeframe.
 
 In future implementations the caching of the credentials could also be
 dependent on the clients IP address and the user agent.
@@ -475,9 +528,20 @@ The following options are available:
 
 The default is to ``allow`` polling
 
+.. _policy_push_ssl_verify_auth:
+
+push_ssl_verify
+~~~~~~~~~~~~~~~
+
+type: int
+
+The smartphone needs to verify the SSL certificate of the privacyIDEA server during
+the authentication with push tokens. By default, the verification is enabled. To disable
+verification during enrollment, see :ref:`policy_push_ssl_verify_enrollment`.
+
 .. _policy_challenge_text:
 
-challenge_text, challenge_text_header, challenge_test_footer
+challenge_text, challenge_text_header, challenge_text_footer
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. index:: Challenge Text Policy
@@ -514,6 +578,29 @@ The text needs to contain the python formatting tag *{0!s}* which will
 be replaced with the list of the requested positions.
 
 For more details of this token type see :ref:`indexedsecret_token`.
+
+
+.. _policy_webauthn_challenge_text_auth:
+
+webauthn_challenge_text
+~~~~~~~~~~~~~~~~~~~~~~~
+
+type: str
+
+Use an alternate challenge text for requesting the user to confirm with
+his WebAuthn token during authentication. This might be different from the
+challenge text received during enrollment
+(see :ref:`policy_webauthn_challenge_text_enrollment`).
+
+
+email_challenge_text, sms_challenge_text, u2f_challenge_text
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+type: str
+
+With these actions the administrator may set alternative challenge texts for email, SMS
+and U2F tokens.
+
 
 indexedsecret_count
 ~~~~~~~~~~~~~~~~~~~

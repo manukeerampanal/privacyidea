@@ -60,39 +60,6 @@ myApp.controller("tokenController", function (TokenFactory, ConfigFactory,
         }
     };
 
-    if ($scope.loggedInUser.role === "admin") {
-        /*
-        * Functions to check and to create a default realm. At the moment this is
-        * in the tokenview, as the token view is the first view. This could be
-        * changed to be located anywhere else.
-        */
-        ConfigFactory.getRealms(function (data) {
-            // Check if there is a realm defined, or if we should display the
-            // Auto Create Dialog
-            var number_of_realms = Object.keys(data.result.value).length;
-            if (number_of_realms === 0) {
-                $('#dialogAutoCreateRealm').modal();
-            }
-        });
-        /*
-         Welcome dialog, which displays a lot of information to the
-         administrator.
-
-         We display it if
-         subscription_state = 0 and hide_welcome = false
-         subscription_state = 1
-         subscription_state = 2
-         */
-        if ($scope.welcomeStep < 4) {
-            // We did not walk through the welcome dialog, yet.
-            if (($scope.subscription_state === 0 && !$scope.hide_welcome) ||
-                ($scope.subscription_state === 1) ||
-                ($scope.subscription_state === 2)) {
-                $('#dialogWelcome').modal("show");
-            }
-        }
-    }
-
     // single token function
     $scope.reset = function (serial) {
         TokenFactory.reset(serial, $scope.get);
@@ -209,10 +176,15 @@ myApp.controller("tokenEnrollController", ["$scope", "TokenFactory", "$timeout",
         hashlib: "sha1",
         'radius.system_settings': true
     };
+    if ($state.includes('token.rollover')) {
+        $scope.form.serial = $stateParams.tokenSerial;
+        $scope.form.type = $stateParams.tokenType;
+    }
     $scope.vasco = {
         // Note: A primitive does not work in the ng-model of the checkbox!
         useIt: false
     };
+    $scope.enrolling = false;
 
     $scope.formInit = {
         tokenTypes: {"hotp": gettextCatalog.getString("HOTP: event based One Time Passwords"),
@@ -314,6 +286,10 @@ myApp.controller("tokenEnrollController", ["$scope", "TokenFactory", "$timeout",
             // only load RADIUS servers when the user actually tries to enroll a RADIUS token,
             // because the user might not be allowed to list RADIUS servers
             $scope.getRADIUSIdentifiers();
+        }
+        if ($scope.form.type === "remote") {
+            // fetch the privacyIDEA servers
+            $scope.getPrivacyIDEAServers();
         }
         if ($scope.form.type === "certificate") {
             $scope.getCAConnectors();
@@ -490,6 +466,7 @@ myApp.controller("tokenEnrollController", ["$scope", "TokenFactory", "$timeout",
     };
 
     $scope.enrollToken = function () {
+        $scope.enrolling = true;
         //debug: console.log($scope.newUser.user);
         //debug: console.log($scope.newUser.realm);
         //debug: console.log($scope.newUser.pin);
@@ -498,7 +475,9 @@ myApp.controller("tokenEnrollController", ["$scope", "TokenFactory", "$timeout",
         $scope.form.validity_period_start = date_object_to_string($scope.form.validity_period_start);
         $scope.form.validity_period_end = date_object_to_string($scope.form.validity_period_end);
         TokenFactory.enroll($scope.newUser,
-            $scope.form, $scope.callback);
+            $scope.form, $scope.callback,
+            function (data) {$scope.enrolling=false;}
+            );
     };
 
     $scope.pollTokenInfo = function () {
@@ -564,6 +543,13 @@ myApp.controller("tokenEnrollController", ["$scope", "TokenFactory", "$timeout",
     $scope.getRADIUSIdentifiers = function() {
         ConfigFactory.getRadiusNames(function(data){
             $scope.radiusIdentifiers = data.result.value;
+        });
+    };
+
+    // get the list of configured privacyIDEA server identifiers
+    $scope.getPrivacyIDEAServers = function() {
+        ConfigFactory.getPrivacyidea(function(data){
+            $scope.privacyIDEAServers = data.result.value;
         });
     };
 
@@ -698,11 +684,13 @@ myApp.controller("tokenImportController", function ($scope, Upload,
                 data: {file: file,
                     type: $scope.form.type,
                     psk: $scope.form.psk,
+                    pskcValidateMAC: $scope.form.validateMAC,
                     password: $scope.form.password,
                     tokenrealms: $scope.form.realm},
             }).then(function (resp) {
                 $scope.uploadedFile = resp.config.data.file.name;
-                $scope.uploadedTokens = resp.data.result.value;
+                $scope.uploadedTokens = resp.data.result.value.n_imported;
+                $scope.notImportedTokens = resp.data.result.value.n_not_imported;
             }, function (error) {
                 if (error.data.result.error.code === -401) {
                     $state.go('login');

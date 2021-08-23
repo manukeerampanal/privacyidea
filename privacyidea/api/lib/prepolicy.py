@@ -78,7 +78,7 @@ from privacyidea.lib.user import (get_user_from_param, get_default_realm,
 from privacyidea.lib.token import (get_tokens, get_realms_of_token, get_token_type, get_token_owner)
 from privacyidea.lib.utils import (parse_timedelta, is_true, generate_charlists_from_pin_policy,
                                    check_pin_contents, get_module_class,
-                                   determine_logged_in_userparams)
+                                   determine_logged_in_userparams, parse_string_to_dict)
 from privacyidea.lib.crypto import generate_password
 from privacyidea.lib.auth import ROLE
 from privacyidea.api.lib.utils import getParam, attestation_certificate_allowed, is_fqdn
@@ -506,6 +506,40 @@ def init_token_defaults(request=None, action=None):
     return True
 
 
+def init_registrationcode_length_contents(request=None, action=None):
+    """
+    This policy function is to be used as a decorator in the API token init function.
+
+    If there is a valid policy set the action values of REGISTRATIONCODE_LENGTH
+    and REGISTRATIONCODE_CONTENTS are added to request.all_data as
+
+    { 'registration.length': '10', 'registration.contents': 'cn' }
+    """
+    from privacyidea.lib.tokens.registrationtoken import DEFAULT_LENGTH, DEFAULT_CONTENTS
+    no_content_policy = True
+    no_length_policy = True
+    params = request.all_data
+    tokentype = params.get("type")
+    if tokentype == "registration":
+        user_object = get_user_from_param(params)
+        length_pols = Match.user(g, scope=SCOPE.ENROLL, action=ACTION.REGISTRATIONCODE_LENGTH,
+                                user_object=user_object).action_values(unique=True)
+        if len(length_pols) == 1:
+            request.all_data[ACTION.REGISTRATIONCODE_LENGTH] = list(length_pols)[0]
+            no_length_policy = False
+        content_pols = Match.user(g, scope=SCOPE.ENROLL, action=ACTION.REGISTRATIONCODE_CONTENTS,
+                                user_object=user_object).action_values(unique=True)
+        if len(content_pols) == 1:
+            request.all_data[ACTION.REGISTRATIONCODE_CONTENTS] = list(content_pols)[0]
+            no_content_policy = False
+    # if there is no policy, set defaults.
+    if no_length_policy:
+        request.all_data[ACTION.REGISTRATIONCODE_LENGTH] = DEFAULT_LENGTH
+    if no_content_policy:
+        request.all_data[ACTION.REGISTRATIONCODE_CONTENTS] = DEFAULT_CONTENTS
+    return True
+
+
 def init_tokenlabel(request=None, action=None):
     """
     This policy function is to be used as a decorator in the API init function.
@@ -864,6 +898,65 @@ def required_email(request=None, action=None):
     return True
 
 
+def check_custom_user_attributes(request=None, action=None):
+    """
+    This pre condition checks for the policies delete_custom_user_attributes and
+    set_custom_user_attributes, if the user or admin is allowed to set or deleted
+    the requested attribute.
+
+    It decorates POST /user/attribute and DELETE /user/attribute/...
+
+    :param request: The request that is intercepted during the API call
+    :type request: Request Object
+    :param action: An optional action, (would be set/delete)
+    :return: Raises a PolicyError, if the wrong attribute is given.
+    """
+    ERROR = "You are not allowed to {0!s} the custom user attribute {1!s}!"
+    is_allowed = False
+    if action == "delete":
+        attr_pol_dict = Match.admin_or_user(g, action=ACTION.DELETE_USER_ATTRIBUTES,
+                                            user_obj=request.User).action_values(unique=False,
+                                                                                 allow_white_space_in_action=True)
+        attr_key = request.all_data.get("attrkey")
+        for attr_pol_val in attr_pol_dict:
+            attr_pol_list = [x.strip() for x in attr_pol_val.strip().split() if x]
+            if attr_key in attr_pol_list or "*" in attr_pol_list:
+                is_allowed = True
+                break
+        if is_allowed:
+            g.audit_object.add_policy(attr_pol_dict.get(attr_pol_val))
+        else:
+            raise PolicyError(ERROR.format(action, attr_key))
+    elif action == "set":
+        attr_pol_dict = Match.admin_or_user(g, action=ACTION.SET_USER_ATTRIBUTES,
+                                            user_obj=request.User).action_values(unique=False,
+                                                                                 allow_white_space_in_action=True)
+        attr_key = request.all_data.get("key")
+        attr_value = request.all_data.get("value")
+        for pol_string in attr_pol_dict:
+            pol_dict = parse_string_to_dict(pol_string)
+            if attr_value in pol_dict.get(attr_key, []):
+                # It is allowed to set the key to this value
+                is_allowed = True
+                break
+            if attr_value in pol_dict.get("*", []):
+                # this value can be set in any key
+                is_allowed = True
+                break
+            if "*" in pol_dict.get(attr_key, []):
+                # This key can be set to any value
+                is_allowed = True
+                break
+            if "*" in pol_dict.get("*", []):
+                # Any key can be set to any value
+                is_allowed = True
+                break
+        if is_allowed:
+            g.audit_object.add_policy(attr_pol_dict.get(pol_string))
+        else:
+            raise PolicyError(ERROR.format(action, attr_key))
+
+
 def auditlog_age(request=None, action=None):
     """
     This pre condition checks for the policy auditlog_age and set the
@@ -894,6 +987,29 @@ def auditlog_age(request=None, action=None):
 
         log.debug("auditlog_age: {0!s}".format(timelimit_s))
         request.all_data["timelimit"] = timelimit_s
+
+    return True
+
+
+def hide_audit_columns(request=None, action=None):
+    """
+    This pre condition checks for the policy hide_audit_columns and sets the
+    "hidden_columns" parameter for the audit search. The given columns will be
+    removed from the returned audit dict.
+
+    Check ACTION.HIDE_AUDIT_COLUMNS
+
+    The decorator should wrap GET /audit/
+
+    :param request: The request that is intercepted during the API call
+    :type request: Request Object
+    :param action: An optional Action
+    :type action: basestring
+    :returns: Always true. Modified the parameter request
+    """
+    hidden_columns = Match.admin_or_user(g, action=ACTION.HIDE_AUDIT_COLUMNS,
+                                         user_obj=request.User).action_values(unique=False)
+    request.all_data["hidden_columns"] = list(hidden_columns)
 
     return True
 
@@ -1037,12 +1153,6 @@ def check_base_action(request=None, action=None, anonymous=False):
         # get the realm by the serial:
         if not realm and params.get("serial"):
             realm = get_realms_of_token(params.get("serial"),
-                                        only_first_realm=True)
-
-        # get the realm by the serial, while the serial is part of the URL like
-        # DELETE /token/serial
-        if not realm and request.view_args and request.view_args.get("serial"):
-            realm = get_realms_of_token(request.view_args.get("serial"),
                                         only_first_realm=True)
 
     # In this case we do not pass the user_object, since the realm is also determined
@@ -1206,9 +1316,9 @@ def is_remote_user_allowed(req, write_to_audit_log=True):
     :param req: The flask request, containing the remote user and the client IP
     :param write_to_audit_log: whether the policy name should be added to the audit log entry
     :type write_to_audit_log: bool
-    :return: a bool value
+    :return: Return a value or REMOTE_USER, can be "disable", "active" or "force".
+    :rtype: str
     """
-    res = False
     if req.remote_user:
         loginname, realm = split_user(req.remote_user)
         realm = realm or get_default_realm()
@@ -1219,10 +1329,10 @@ def is_remote_user_allowed(req, write_to_audit_log=True):
                                                                 write_to_audit_log=write_to_audit_log)
         # there should be only one action value here
         if ruser_active:
-            if list(ruser_active)[0] == REMOTE_USER.ACTIVE:
-                res = True
+            return list(ruser_active)[0]
 
-    return res
+    # Return default "disable"
+    return REMOTE_USER.DISABLE
 
 
 def save_client_application_type(request, action):
@@ -1306,6 +1416,22 @@ def pushtoken_add_config(request, action):
             request.all_data[PUSH_ACTION.SSL_VERIFY] = list(ssl_verify)[0]
         else:
             request.all_data[PUSH_ACTION.SSL_VERIFY] = "1"
+
+        # Get the TTL and the registration URL from the policies
+        registration_url = Match.user(g, scope=SCOPE.ENROLL, action=PUSH_ACTION.REGISTRATION_URL,
+                                      user_object=request.User if request.User else None) \
+            .action_values(unique=True, allow_white_space_in_action=True)
+        if len(registration_url) == 1:
+            request.all_data[PUSH_ACTION.REGISTRATION_URL] = list(registration_url)[0]
+        else:
+            raise PolicyError("Missing enrollment policy for push token: {0!s}".format(PUSH_ACTION.REGISTRATION_URL))
+        ttl = Match.user(g, scope=SCOPE.ENROLL, action=PUSH_ACTION.TTL,
+                         user_object=request.User if request.User else None) \
+            .action_values(unique=True, allow_white_space_in_action=True)
+        if len(ttl) == 1:
+            request.all_data[PUSH_ACTION.TTL] = list(ttl)[0]
+        else:
+            request.all_data[PUSH_ACTION.TTL] = "10"
 
 
 def u2ftoken_verify_cert(request, action):
@@ -1941,3 +2067,34 @@ def _attestation_certificate_allowed(attestation_cert, allowed_certs_pols):
         else None
 
     return attestation_certificate_allowed(cert_info, allowed_certs_pols)
+
+
+def required_piv_attestation(request, action=None):
+    """
+    This is a token specific decorator for certificate tokens for the endpoint
+    /token/init
+    According to the policy scope=SCOPE.ENROLL,
+    action=REQUIRE_ATTESTATION an exception is raised, if no attestation parameter is given.
+
+    It also checks the policy if the attestation should be verified and sets the
+    parameter verify_attestation accordingly.
+
+    :param request:
+    :param action:
+    :return:
+    """
+    from privacyidea.lib.tokens.certificatetoken import ACTION, REQUIRE_ACTIONS
+    ttype = request.all_data.get("type")
+    if ttype and ttype.lower() == "certificate":
+        # Get attestation certificate requirement
+        require_att = Match.user(g, scope=SCOPE.ENROLL, action=ACTION.REQUIRE_ATTESTATION,
+                                     user_object=request.User if request.User else None).action_values(unique=True)
+        if REQUIRE_ACTIONS.REQUIRE_AND_VERIFY in list(require_att):
+            if not request.all_data.get("attestation"):
+                # There is no attestation certificate in the request, although it is required!
+                log.warning("The request is missing an attestation certificate. {0!s}".format(require_att))
+                raise PolicyError("A policy requires that you provide an attestation certificate.")
+
+        # Add parameter verify_attestation
+        request.all_data["verify_attestation"] = REQUIRE_ACTIONS.VERIFY in list(require_att) or \
+                                                 REQUIRE_ACTIONS.REQUIRE_AND_VERIFY in list(require_att)

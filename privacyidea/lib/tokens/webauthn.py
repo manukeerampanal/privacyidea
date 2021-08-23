@@ -1493,7 +1493,7 @@ class WebAuthnAssertionResponse(object):
             # ceremony was initiated, verify that credential.id identifies one
             # of the public key credentials that were listed in allowCredentials.
             if self.allow_credentials and self.assertion_response.get('id') not in self.allow_credentials:
-                raise AuthenticationRejectedException('Invalid credential.')
+                raise AuthenticationRejectedException('Credential not allowed.')
 
             # Step 2.
             #
@@ -1502,7 +1502,8 @@ class WebAuthnAssertionResponse(object):
             # identified by credential.id.
             user_handle = self.assertion_response.get('userHandle')
             if user_handle and not user_handle == self.webauthn_user.user_id:
-                raise AuthenticationRejectedException('Invalid credential.')
+                raise AuthenticationRejectedException('Invalid credential: user '
+                                                      'handle does not match.')
 
             # Step 3.
             #
@@ -1659,11 +1660,7 @@ class WebAuthnAssertionResponse(object):
             #             case, or not, or fails the authentication ceremony
             #             or not, is Relying Party-specific.
             sign_count = struct.unpack('!I', a_data[33:37])[0]
-            if not sign_count:
-                raise AuthenticationRejectedException('Unable to parse sign_count.')
-            if not isinstance(self.webauthn_user.sign_count, int) or self.webauthn_user.sign_count < 0:
-                raise WebAuthnUserDataMissing('sign_count missing from WebAuthnUser.')
-            if sign_count <= self.webauthn_user.sign_count:
+            if (sign_count != 0 or self.webauthn_user.sign_count != 0) and sign_count <= self.webauthn_user.sign_count:
                 raise AuthenticationRejectedException('Duplicate authentication detected.')
 
             # Step 18.

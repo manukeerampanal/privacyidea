@@ -1,9 +1,9 @@
 .. _webui:
 
-.. index:: ! webui, ! WebUI
-
 WebUI
 =====
+
+.. index:: ! webui, ! WebUI
 
 privacyIDEA comes with a web-based user interface which is used to manage and configure
 the privacyIDEA server. It is also used a self-service portal for the average user, who
@@ -11,7 +11,7 @@ manages his own tokens. This section gives an overview on the interface and link
 respective sections in the documentation.
 
 Dashboard
-------
+---------
 
 .. index:: dashboard
 
@@ -42,7 +42,7 @@ user. The administrator can see all the details of the token.
 The administrator can click on one token, to show more details of this token
 and to perform actions on this token. Read on in :ref:`token_details`.
 
-.. _usersview::
+.. _usersview:
 
 Users
 -----
@@ -77,6 +77,7 @@ Read about the functionality of the users view in the following sections.
 
    user_details
    manage_users
+   user_attributes
 
 
 Machines
@@ -89,8 +90,7 @@ In most cases there is no need to manage machines and this view is empty.
 .. figure:: images/machinesview.png
    :width: 500
 
-    *The Machines view.*
-
+   *The Machines view.*
 
 
 Config
@@ -103,22 +103,22 @@ behavior of the system, manages the :ref:`eventhandler` and lets the user set up
 .. figure:: ../configuration/images/system-config.png
    :width: 500
 
-    *The Config section is the heart of the privacyIDEA server.*
+   *The Config section is the heart of the privacyIDEA server.*
 
 Audit
--------
+-----
 
 In this tab, the :ref:`audit` log is displayed which lists all events the server registers.
 
 .. figure:: ../audit/auditlog.png
    :width: 500
 
-    *Events can be displayed in the Audit log.*
+   *Events can be displayed in the Audit log.*
 
 .. _components:
 
 Components
--------
+----------
 
 .. index:: Components
 
@@ -137,3 +137,4 @@ are connected to your network.
 
 Subscriptions, e.g. with `NetKnights <https://netknights.it/en/>`_, the
 company behind privacyIDEA, can also be viewed and managed in this tab.
+

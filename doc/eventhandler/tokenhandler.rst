@@ -70,6 +70,10 @@ would create a TOTP token, that uses the SHA256 hashing algorithm instead of SHA
 ``genkey: 0`` overrides the default behaviour of generating an OTP secret. Instead the
 fixed OTP secret "31323334" (``otpkey``) is used.
 
+If the tokentype is set to "email" or "sms", you can also specify an SMTP server or SMS gateway
+configuration for the token enrolled by selecting a configuration in the corresponding field
+(**smtp_identifier** or **sms_identifier**). If none is selected, then the default system configuration
+will be used.
 
 set description
 ...............
@@ -80,7 +84,7 @@ request will be set.
 You can use the tag ``{current_time}`` or ``{now}`` to set the current
 timestamp. In addition you can append an offset to *current_time* or *now*
 like ``{now}-12d`` or ``{now}+10m``. This would write a timestamp which is 12
-days in the passt or 10 minutes in the future. The plus or minus must follow
+days in the past or 10 minutes in the future. The plus or minus must follow
 without blank, allowed time identifiers are s (seconds), m (minutes), h
 (hours) and d (days).
 
@@ -168,6 +172,29 @@ set failcounter
 Using the action ``set failcounter`` you can reset the fail counter by
 setting it to 0 or also "block" the token by setting the fail counter to what
 ever value the "max_fail" is, e.g. 10. Only integer values are allowed.
+
+See :ref:`failcounter`.
+
+change failcounter
+..................
+
+Using the action ``change failcounter`` you can increase or decrease the fail counter.
+Positive and negative integer values are allowed. Positive values will increase the
+fail counter, negative values will decrease it.
+
+.. note:: To limit a token handler in decreasing the fail counter, you may use the
+   event handler condition **failcounter** (c.f. :ref:`handlerconditions`) and set
+   it to e.g. ">-5". Once this condition is not met anymore, the event handler will
+   not be triggered.
+
+set max failcount
+.................
+
+Using the action ``set max failcount`` you can set the maximum failcounter of a
+token to the specific value.
+Only integer values are allowed.
+
+See :ref:`failcounter`.
 
 set random pin
 ..............

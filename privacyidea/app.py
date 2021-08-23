@@ -136,6 +136,10 @@ def create_app(config_name="development",
     # If this file does not exist, we create an error!
     app.config.from_envvar(ENV_KEY, silent=True)
 
+    # We allow to set different static folders
+    app.static_folder = app.config.get("PI_STATIC_FOLDER", "static/")
+    app.template_folder = app.config.get("PI_TEMPLATE_FOLDER", "static/templates/")
+
     app.register_blueprint(validate_blueprint, url_prefix='/validate')
     app.register_blueprint(token_blueprint, url_prefix='/token')
     app.register_blueprint(system_blueprint, url_prefix='/system')
@@ -217,9 +221,12 @@ def create_app(config_name="development",
         # otherwise try to guess the language from the user accept
         # header the browser transmits.  We support de/fr/en in this
         # example.  The best match wins.
-        return request.accept_languages.best_match(['de',
+        return request.accept_languages.best_match(['de', 'nl',
                                                     'fr', 'it', 'es', 'en'])
 
     queue.register_app(app)
+
+    logging.debug(u"Reading application from the static folder {0!s} and "
+                  u"the template folder {1!s}".format(app.static_folder, app.template_folder))
 
     return app

@@ -105,6 +105,16 @@ The default behaviour is to use the serial number.
    You should rather use a label like "{user}@{realm}",
    which would result in "@".
 
+appimageurl
+~~~~~~~~~~~
+
+.. index:: Token Image, FreeOTP
+
+type: string
+
+With this action the administrator may specify the URL to a token image which is included in the
+QR code during enrollment (key in otpauth URL: ``image``). It is used by some smartphone
+apps like FreeOTP.
 
 .. _autoassignment:
 
@@ -198,24 +208,43 @@ change_pin_every
 type: string
 
 This policy requires the user to change the PIN of his token on a regular
-basis. Enter a value follewed by "d", e.g. change the PIN every 180 days will
+basis. Enter a value followed by "d", e.g. change the PIN every 180 days will
 be "180d".
 
 The date, when the PIN needs to be changed, is returned in the API response
-of */validate/check*. For more information see :ref:`change_pin_first_use`.
+of */validate/check*. For more information see :ref:`policy_change_pin_first_use`.
 To specify the contents of the PIN see :ref:`user_policies`.
 
-otp_pin_encrypt
-~~~~~~~~~~~~~~~
+encrypt_pin
+~~~~~~~~~~~
 
 type: bool
 
 If set the OTP PIN of a token will be encrypted. The default
 behaviour is to hash the OTP PIN, which is safer.
 
+registration.length
+~~~~~~~~~~~~~~~~~~~
 
-lostTokenPWLen
-~~~~~~~~~~~~~~
+.. index:: registration token
+
+type: int
+
+This is the length of the generated registration codes.
+
+registration.contents
+~~~~~~~~~~~~~~~~~~~~~
+
+type: string
+
+contents: cns
+
+This defines what characters the registrationcodes should contain.
+
+This takes the same values like the admin policy :ref:`admin_policies_otp_pin_contents`.
+
+losttoken_PW_length
+~~~~~~~~~~~~~~~~~~~
 
 .. index:: lost token
 
@@ -223,8 +252,8 @@ type: int
 
 This is the length of the generated password for the lost token process.
  
-lostTokenPWContents
-~~~~~~~~~~~~~~~~~~~
+losttoken_PW_contents
+~~~~~~~~~~~~~~~~~~~~~
 
 type: string
 
@@ -247,8 +276,8 @@ password like *AC#!49MK))*.
    part of the password. Also ``C`` would again add the character "I", which is
    not part of Base58.
 
-lostTokenValid
-~~~~~~~~~~~~~~
+losttoken_valid
+~~~~~~~~~~~~~~~
 
 type: int
 
@@ -260,8 +289,8 @@ yubikey_access_code
 
 type: string
 
-This is a 12 character long access code in hex format to be used to initialize yubikeys. If
-no access code is set, yubikeys can be re-initialized by everybody. You can choose
+This is a 12 character long access code in hex format to be used to initialize Yubikeys. If
+no access code is set, Yubikeys can be re-initialized by everybody. You can choose
 a company wide access code, so that Yubikeys can only be re-initialized by your own system.
 
 You can add two access codes separated by a colon to change from one access code to the other.
@@ -334,8 +363,8 @@ This is new in version 2.21.
 
 .. _force_app_pin:
 
-.. hotp_force_app_pin, totp_force_app_pin
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+hotp_force_app_pin, totp_force_app_pin
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 type: bool
 
@@ -363,6 +392,42 @@ This way even different Firebase configurations could be
 used depending on the user's realm or the IP address.
 
 This is new in version 3.0.
+
+Starting with version 3.6, if the push token is supposed to run in poll-only mode,
+then the entry "poll only" can be selected instead of a firebase configuration.
+In this mode, neither the privacyIDEA server nor the smartphone app will connect to Google
+Firebase during enrollment or authentication.
+Note, that you also need to set the authentication policy
+:ref:`policy_auth_push_allow_poll` to allow the push token to poll for challenges.
+
+push_registration_url
+~~~~~~~~~~~~~~~~~~~~~
+
+type: string
+
+This is the URL of your privacyIDEA server, which the push App should
+connect to for the second registration step.
+This URL usually ends with ``/ttype/push``. Note, that the smartphone app
+may connect to a different privacyIDEA URL than the URL of the privacyIDEA Web UI.
+
+push_ttl
+~~~~~~~~
+
+This is the time (in minutes) how long the privacyIDEA server
+accepts the response of the second registration step.
+The smartphone could have connection issues, so the second step
+could take some time to happen.
+
+.. _policy_push_ssl_verify_enrollment:
+
+push_ssl_verify
+~~~~~~~~~~~~~~~
+
+type: int
+
+The smartphone needs to verify the SSL certificate of the privacyIDEA server during
+the enrollment of push tokens. By default, the verification is enabled. To disable
+verification during authentication, see :ref:`policy_push_ssl_verify_auth`.
 
 .. _policy_webauthn_enroll_relying_party_id:
 
@@ -616,6 +681,44 @@ in the attestation certificate matches accordingly the token can be enrolled.
 
 .. note:: If you configure this, you will likely also want to configure
     :ref:`policy_webauthn_authz_req`.
+
+
+.. _policy_webauthn_challenge_text_enrollment:
+
+webauthn_challenge_text
+~~~~~~~~~~~~~~~~~~~~~~~
+
+type: str
+
+Use an alternate challenge text for requesting the user to confirm with
+his WebAuthn token during enrollment. This might be different from the
+challenge text received during authentication
+(see :ref:`policy_webauthn_challenge_text_auth`).
+
+
+.. _require_attestation:
+
+certificate_require_attestation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+type: string
+
+When enrolling a certificate token, privacyIDEA can require that an attestation
+certificate is passed along to verify, if the key pair was generated on a (PIV) smartcard.
+
+This policy can be set to:
+
+* ``ignore`` (default): Ignore any existence of an attestation certificate
+* ``verify``: If an attestation certificate is passed along during enrollment,
+  the attestation certificate gets verified.
+* ``require_and_verify``: An attestation certificate is required and verified. If no attestation certificate
+  is provided, the enrollment will fail.
+
+The trusted root certificate authorities and intermediate certificate authorities can be configured via
+the policies :ref:`admin_trusted_attestation_CA` and :ref:`user_trusted_attestation_CA`
+
+
+
 
 .. rubric:: Footnotes
 

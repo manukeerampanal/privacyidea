@@ -64,14 +64,14 @@ is not allowed to list any tokens.
    the admin will have list rights on all mentioned realms
    independent on the priority of the policies.
 
-init
-~~~~
+enroll
+~~~~~~
 
 type: bool
 
-There are ``init`` actions per token type. Thus you can 
-create policy that allow an administrator to enroll 
-SMS tokens but not to enroll HMAC tokens.
+There are enrollment actions per token type, e.g. ``enrollHOTP``. Only those token
+types are selectable in the WebUI during enrollment which are allowed by their
+corresponding enroll policy action.
 
 enable
 ~~~~~~
@@ -109,8 +109,10 @@ type: bool
 Tokens can have additional token information, which can be
 viewed in the :ref:`token_details`.
 
-If the ``set`` action is defined, the administrator allowed
-to set those token information.
+If the ``set`` action is defined, the is administrator allowed
+to set those token properties like ``description``, ``max_failcount``
+or ``validity_period_start`` at the ``/token/set`` endpoints
+(see :ref:`rest_token`).
 
 setpin
 ~~~~~~
@@ -127,6 +129,13 @@ type: bool
 
 If the ``setrandompin`` action is defined, the administrator
 is allowed to call the endpoint, that sets a random token PIN.
+
+settokeninfo
+~~~~~~~~~~~~
+
+type: bool
+
+The administrator is allowed to manually set and delete token info.
 
 enrollpin
 ~~~~~~~~~
@@ -206,7 +215,7 @@ characters ``+`` and ``-``.
 ``-s`` (denial)
 
    The PIN must not contain a special character.
-   **test1234* would be a valid PIN. *test12$$* would not.
+   *test1234* would be a valid PIN. *test12$$* would not.
 
 ``+cn`` (grouping)
 
@@ -237,6 +246,12 @@ This policy is needed to define how long the PIN will be.
 
 .. note:: The PIN will consist of digits and letters.
 
+reset
+~~~~~
+
+type: bool
+
+The administrator is allowed to reset the fail counter of a token.
 
 resync
 ~~~~~~
@@ -269,29 +284,44 @@ is allowed to unassign tokens from a user. I.e. the
 administrator can remove the link between the token 
 and the user. The token still continues to exist in the system.
 
-import
-~~~~~~
+importtokens
+~~~~~~~~~~~~
 
 type: bool
 
-If the ``import`` action is defined, the administrator is 
+If the ``importtokens`` action is defined, the administrator is
 allowed to import token seeds from a token file, thus
 creating many new token objects in the systems database.
 
 The right to upload tokens can be limited to certain realms.
 Thus the administrator could only upload tokens into realm he is allowed to manage.
 
-remove
+delete
 ~~~~~~
 
 type: bool
 
-If the ``remove`` action is defined, the administrator is
+If the ``delete`` action is defined, the administrator is
 allowed to delete a token from the system. 
 
-.. note:: If a token is removed, it can not be recovered.
+.. note:: If a token is deleted, it can not be recovered.
 
 .. note:: All audit entries of this token still exist in the audit log.
+
+spass_otp_pin_contents
+~~~~~~~~~~~~~~~~~~~~~~
+
+type: str
+
+
+
+spass_otp_pin_minlength and spass_otp_pin_maxlength
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+type: int
+
+These policy actions define the required minimal and allowed maximal pin length
+for :ref:`spass_token`.
 
 userlist
 ~~~~~~~~
@@ -306,23 +336,21 @@ he should only work with tokens, but not see all users at once.
 .. note:: If an administrator has any right in a realm, the administrator
    is also allowed to view the token list.
 
-checkstatus
-~~~~~~~~~~~
+getchallenges
+~~~~~~~~~~~~~
 
 type: bool
 
-If the ``checkstatus`` action is defined, the administrator is 
+If the ``getchallenges`` action is defined, the administrator is
 allowed to check the status of open challenge requests.
 
-manageToken
+tokenrealms
 ~~~~~~~~~~~
 
 type: bool
 
-If the ``manageToken`` action is defined, the administrator is allowed
+If the ``tokenrealms`` action is defined, the administrator is allowed
 to manage the realms of a token.
-
-.. index:: realm administrator
 
 A token may be located in multiple realms. This can be interesting if
 you have a pool of spare tokens and several realms but want to 
@@ -505,6 +533,34 @@ Allow the administrator to read :ref:`eventhandler`.
    or realms. Having the right to read event handlers, will allow the
    administrator to see all event handler definitions.
 
+radiusserver_write
+~~~~~~~~~~~~~~~~~~
+
+type: bool
+
+Allow the administrator to write or delete :ref:`radiusserver_config` definitions.
+
+radiusserver_read
+~~~~~~~~~~~~~~~~~
+
+type: bool
+
+Allow the administrator to read the :ref:`radiusserver_config` definitions.
+
+privacyideaserver_write
+~~~~~~~~~~~~~~~~~~~~~~~
+
+type: bool
+
+Allow the administrator to write or delete :ref:`privacyideaserver_config` definitions.
+
+privacyideaserver_read
+~~~~~~~~~~~~~~~~~~~~~~
+
+type: bool
+
+Allow the administrator to read the :ref:`privacyideaserver_config` definitions.
+
 
 policywrite, policyread, policydelete
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -544,6 +600,30 @@ type: bool
 Allow the administrator to write, read or delete system configuration.
 
 
+caconnectorwrite, caconnectorread, caconnectordelete
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+type: bool
+
+Allow the administrator to write, read or delete CA connectors.
+
+
+statistics_read
+~~~~~~~~~~~~~~~
+
+type: bool
+
+This action allows the reading of the statistics at the :ref:`rest_monitoring`.
+
+
+statistics_delete
+~~~~~~~~~~~~~~~~~
+
+type: bool
+
+This action allows to delete statistics at the :ref:`rest_monitoring`.
+
+
 auditlog
 ~~~~~~~~
 
@@ -562,10 +642,10 @@ type: bool
 
 The administrator is allowed to download the audit log.
 
-.. note:: The download is not restricted to filters and audit age.
+.. note:: The download is **not** restricted to filters, hidden columns and audit age.
    Thus, if you want to avoid, that an administrator can see older
-   logs, you need to disallow downloading the data. Otherwise he
-   may download the audit log and look at older entries manually.
+   logs or columns, hidden by `hide_audit_columns`, you need to disallow downloading the data.
+   Otherwise he may download the audit log and look at older entries manually.
 
 auditlog_age
 ~~~~~~~~~~~~
@@ -578,7 +658,19 @@ view older entries.
 
 Can be something like 10m (10 minutes), 10h (10 hours) or 10d (ten days).
 
-trigger_challenge
+hide_audit_columns
+~~~~~~~~~~~~~~~~~~
+
+type: string
+
+This species a blank separated list of audit columns, that should be removed
+from the response and also from the WebUI.
+For example a value ``sig_check log_level`` will hide these two columns.
+
+The list of available columns can be checked by examining the response of the
+request to the :ref:`rest_audit`.
+
+triggerchallenge
 ~~~~~~~~~~~~~~~~~
 
 type: bool
@@ -674,3 +766,124 @@ The admin does not know the secret and can not change the secret.
 For more details of this token type see :ref:`indexedsecret_token`.
 
 New in version 3.3.
+
+.. _admin_trusted_attestation_CA:
+
+certificate_trusted_Attestation_CA_path
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+type: string
+
+An administrator can enroll a certificate token for a user.
+If an attestation certificate is provided in addition, this policy holds the
+path to a directory, that contains trusted CA paths.
+Each PEM encoded file in this directory needs to contain the root CA certificate
+at the first position and the consecutive intermediate certificates.
+
+An additional enrollment policy :ref:`require_attestation`, if an attestation certificate
+is required.
+
+New in version 3.5.
+
+.. _admin_set_custom_user_attributes:
+
+set_custom_user_attributes
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+type: string
+
+New in version 3.6
+
+This policy defines which additional attributes an administrator is allowed to set.
+It can also define, to which value the admin is allowed to set such attribute.
+For allowing all values, the asterisk ("*") is used.
+
+.. note:: Commas are not allowed in policy actions value, so the setting has to
+   be defined by separating colons (":") and spaces.
+
+Each key is enclosed in colons and followed by a list of values separated by whitespaces,
+thus values are not allowed to contain whitespaces.
+
+Example:
+
+    ``:department: sales finance :city: * :*: 1 2``
+
+``:department: sales finance`` means that the administrator can set an additional
+attribute "department" with the allowed values of "sales" or "finance".
+
+``:city: *`` means that the administrator can set an additional attribute
+"city" to any value.
+
+``:*: 1 2`` means that the administrator can set any other additional attribute
+either to the value "1" or to the value "2".
+
+
+.. _admin_delete_custom_user_attributes:
+
+delete_custom_user_attributes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+type: string
+
+This takes a space separated list of attributes that the administrator is allowed to
+delete. You can use the asterisk "*" to indicate, that this policy allows the
+administrator to delete any additional attribute.
+
+Example:
+
+    ``attr1 attr2 department``
+
+The administrator is allowed to delete the attributes "attr1", "attr2" and
+the attributes "department" of the corresponding users.
+
+.. note:: If this policy is not set, the admin is not allowed to delete any
+   custom user attributes.
+
+New in version 3.6
+
+.. _admin_machinelist:
+
+machinelist
+~~~~~~~~~~~
+
+type: bool
+
+The administrator is allowed to list the machines.
+
+manage_machine_tokens
+~~~~~~~~~~~~~~~~~~~~~
+
+type: bool
+
+The administrator is allowed to attach and detach tokens to machines to enable the use with
+one of the available appliactions. See :ref:`machines`.
+
+fetch_authentication_items
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+type: bool
+
+The administrator is allowed to fetch authentication items of tokens assigned to machines.
+It grants access to the ``/machine/authitem`` endpoints (see :ref:`rest_machine`).
+
+clienttype
+~~~~~~~~~~
+
+type: bool
+
+This policy action allows the admin to view the list of clients which authenticate to privacyIDEA
+at the :ref:`rest_client`.
+
+managesubscription
+~~~~~~~~~~~~~~~~~~
+
+type: bool
+
+The administrator is able to view and change the subscriptions.
+It grants access to the :ref:`rest_subscriptions`.
+
+set_hsm_password
+~~~~~~~~~~~~~~~~
+
+The administrator is able to set the password of the hardware security module.
+It grants access to the `/system/hsm` endpoint (see :ref:`rest_system`).

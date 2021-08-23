@@ -13,6 +13,7 @@ from privacyidea.lib.event import set_event, delete_event
 from privacyidea.lib.eventhandler.base import CONDITION
 from privacyidea.lib.token import get_tokens, remove_token
 from privacyidea.lib.user import User
+from privacyidea.lib.utils import to_unicode
 from . import ldap3mock
 
 
@@ -504,6 +505,19 @@ class AuthApiTestCase(MyApiTestCase):
         self.assertEqual(aentry['success'], 1, aentry)
         self.assertEqual(aentry['policies'], 'remote', aentry)
 
+        # check that the policy remote_user=force passes the necessary hidden tag to the
+        # login window
+        set_policy(name="remote", scope=SCOPE.WEBUI, realm=self.realm1,
+                   action="{0!s}={1!s}".format(ACTION.REMOTE_USER, REMOTE_USER.FORCE))
+        with self.app.test_request_context('/',
+                                           method='GET',
+                                           environ_base={"REMOTE_USER": "cornelius@realm1"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            # The login page contains the info about force remote_user, which will hide the
+            # "login with credentials" button.
+            self.assertIn(u'input type=hidden id=FORCE_REMOTE_USER value="True"', to_unicode(res.data))
+
         # bind the remote user policy to an unknown realm
         set_policy(name="remote", scope=SCOPE.WEBUI, realm='unknown',
                    action="{0!s}={1!s}".format(ACTION.REMOTE_USER, REMOTE_USER.ACTIVE))
@@ -545,7 +559,7 @@ class AuthApiTestCase(MyApiTestCase):
 class DuplicateUserApiTestCase(MyApiTestCase):
 
     def test_01_admin_and_user_same_name(self):
-        # Test the logging, if admin and user have the same name (testamdin/testpw)
+        # Test the logging, if admin and user have the same name (testadmin/testpw)
         # Now create a default realm, that contains the used "testadmin"
         rid = save_resolver({"resolver": self.resolvername1,
                              "type": "passwdresolver",
@@ -572,7 +586,7 @@ class DuplicateUserApiTestCase(MyApiTestCase):
                 self.assertIn('token', result.get("value"), result)
                 # role should be 'admin'
                 self.assertEqual('admin', result['value']['role'], result)
-            mock_log.assert_called_with("Local admin 'testadmin' successfully logged in.")
+            mock_log.assert_any_call("Local admin 'testadmin' successfully logged in.")
 
         # If a user logs in, with the same name as the admin, this event is logged in warning
         with mock.patch("logging.Logger.warning") as mock_log:
@@ -590,6 +604,22 @@ class DuplicateUserApiTestCase(MyApiTestCase):
             # check if we have this log entry
             mock_log.assert_called_with("A user 'testadmin' exists as local admin and as user "
                                         "in your default realm!")
+
+        # Check that a wrong/missing password doesn't trigger the warning in the log
+        with mock.patch("logging.Logger.warning") as mock_log:
+            with self.app.test_request_context('/auth',
+                                               method='POST',
+                                               data={"username": "testadmin",
+                                                     "password": "unknown"}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(401, res.status_code, res)
+                result = res.json.get("result")
+                self.assertFalse(result.get("status"), result)
+                self.assertEqual(result.get("error").get('code'), 4031, result)
+                self.assertEqual(result.get("error").get('message'),
+                                 'Authentication failure. Wrong credentials', result)
+            # check if we have the correct log entry
+            mock_log.assert_called_with("user uid 1004 failed to authenticate")
 
 
 class AAPreEventHandlerTest(MyApiTestCase):

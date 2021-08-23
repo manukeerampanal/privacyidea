@@ -8,11 +8,10 @@ token types. They each have different requirements concerning configuration and 
 the authentication works. This chapter explains the authentication modes, lists the
 supported hardware and software tokens and explains how the token types can be used
 with privacyIDEA.
+Tools which facilitate and automate token enrollment are found in :ref:`enrollment_tools`.
 
 .. toctree::
    :maxdepth: 1
-   :glob:
-   :numbered:
 
    authentication_modes.rst
    supported_tokens.rst

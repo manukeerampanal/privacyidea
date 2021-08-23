@@ -55,23 +55,6 @@ privacyIDEA community website `tagged with push token <https://www.privacyidea.o
    The project number of the Firebase project, that is used to
    connect the app to.
 
-**registration URL**
-
-   This is the URL of your privacyIDEA server, which the push App should
-   connect to for the second registration step.
-   This URL usually ends with ``/ttype/push``. Note, that the FQDN
-   of your privacyIDEA server could be different for the smartphone
-   App to connect to, than you usually use for connecting via the
-   Web interface.
-
-**time to live**
-
-   This is the time (in seconds) how long the privacyIDEA server
-   accepts the response of the second registration step.
-   The smartphone could have connection issues, so the second step
-   could take some time to happen.
-
-
 You can get all the necessary values *JSON config file*,
 *project ID*, *project number*, *app ID* and *API key*
 from your Firebase console.
@@ -102,6 +85,10 @@ behaviour of the SMS Gateway definition.
 **REGEXP**
 
    Regular expression to modify the phone number to make it compatible with provider.
+
+   *Example*: If you want to replace the leading zero with your country code like
+   0123456789 -> 0049123456789, then you need to enter ``/^0/0049/``.
+
 
 **HTTP_METHOD**
 
@@ -151,8 +138,9 @@ POST request.
    you need an options, that has the same name as a parameter, you must not
    fill in the corresponding parameter.
 
-.. note:: You can use the tags ``{phone}`` and ``{otp}`` to specify the mobile
-   number and the otp value.
+.. note:: You can use the tags ``{phone}`` to specify the phone number. The tag ``{otp}``
+   will be replaced simply with the OTP value or with the contents created
+   by the policy :ref:`smstext`.
 
 Examples
 ........
@@ -174,7 +162,7 @@ Set the additional **options** to be passed as HTTP GET parameters:
  * text: "Your OTP value is {otp}"
  * to: {phone}
 
-This will consturct an HTTP GET request like this::
+This will construct an HTTP GET request like this::
 
    http://api.clickatell.com/http/sendmsg?user=YOU&password=YOU&\
         api_id=YOUR API ID&text=....&to=....
@@ -320,5 +308,5 @@ This is the file name of the script without the directory part.
 
 **BACKGROUND**
 
-Here you can choose, whether the sript should be started and run in the background or if the
+Here you can choose, whether the script should be started and run in the background or if the
 HTTP requests waits for the script to finish.

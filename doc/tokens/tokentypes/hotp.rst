@@ -7,8 +7,8 @@ The HOTP token is - together with the :ref:`totp_token` - the most common token.
 The HOTP Algorithm is defined in
 `RFC4225 <https://tools.ietf.org/html/rfc4226>`_. The HOTP token is an event
 base token.
-The HOTP algorithm has some parameter, like if the generated OTP value will
-be 6 digits or 8 digits or if the SHA1 oder the SHA256 hashing algorithm is
+The HOTP algorithm has some parameter, like if the generated :term:`OTP` value will
+be 6 digits or 8 digits or if the SHA1 or the SHA256 hashing algorithm is
 used.
 
 The HOTP token implements the :ref:`authenticate mode <authentication_mode_authenticate>`.
@@ -41,7 +41,7 @@ privacyIDEA also supports the following seedable HOTP tokens:
 
 * SafeNet eToken NG OTP
 * SafeNet eToken Pass
-* Yubikey in OATH mode
+* Yubikey in OATH mode (See :ref:`yubikey_enrollment_tools` on how to enroll Yubikeys in HOTP mode.)
 * Daplug
 
 Those tokens can be initialized by privacyIDEA. Thus you can be sure, that
@@ -73,6 +73,8 @@ The Google Authenticator can be enrolled easily in HOTP mode using
 the QR-Code enrollment Feature.
 
 The Google Authenticator is available for iOS, Android and Blackberry devices.
+
+.. _hotp_token_enrollment:
 
 Enrollment
 ~~~~~~~~~~

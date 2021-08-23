@@ -80,7 +80,6 @@
     <div class="form-group">
         <label for="scope" class="col-sm-3 control-label">
             Scope</label>
-
         <div class="col-sm-9">
             <div isteven-multi-select
                  id="selectScope"
@@ -114,7 +113,7 @@
          ng-show="checkRight('policywrite')">
         <button ng-click="createPolicy()"
                 id="createPolicyButton"
-                ng-disabled="formPolicyAdd.$invalid"
+                ng-disabled="formPolicyAdd.$invalid || selectedScope.length === 0"
                 class="btn btn-primary">
             <span class="glyphicon glyphicon-plus"></span>
             <span translate>Create Policy</span>
@@ -269,22 +268,21 @@
         </div>
         <div class="tab-pane action" id="action">
             <h3 translate>Action</h3>
-            <div class="form-group">
-                <label for="action" class="col-sm-3 control-label">
-                    <translate>Action</translate>
-                    <br>
-                    <button class="btn btn-sm btn-success"
-                            ng-show="!onlySelectedVisible"
-                            ng-click="onlySelectedVisible=true">
-                        <translate>Show selected actions only</translate>
-                    </button>
-                    <button class="btn btn-sm btn-success"
-                            ng-show="onlySelectedVisible"
-                            ng-click="onlySelectedVisible=false">
-                        <translate>Show all actions</translate>
-                    </button>
-                </label>
-
+            <div class="row">
+                <div class="col-sm-3">
+                    <label for="action">
+                        <button class="btn btn-sm btn-success"
+                                ng-show="!onlySelectedVisible"
+                                ng-click="onlySelectedVisible=true">
+                            <translate>Show selected actions only</translate>
+                        </button>
+                        <button class="btn btn-sm btn-success"
+                                ng-show="onlySelectedVisible"
+                                ng-click="onlySelectedVisible=false">
+                            <translate>Show all actions</translate>
+                        </button>
+                    </label>
+                </div>
                 <div class="col-sm-9">
                     <div class="input-group">
                         <input type="text" ng-model="action_filter"
@@ -297,6 +295,10 @@
                             <span class="glyphicon glyphicon-remove-circle"></span>
                         </span>
                     </div>
+                </div>
+            </div>
+            <div class="row">
+                <div class="col-sm-12">
                     <div ng-show="isActionValues" class="mt-5px">
                         <uib-accordion close-others="false">
                             <div uib-accordion-group
@@ -308,15 +310,16 @@
                                     <tr ng-repeat="action in actions"
                                         ng-show="(actionCheckBox[action.name] ||
                                     !onlySelectedVisible) &&
-                                    action.name.toLowerCase().match(action_filter.toLowerCase()) !== null"
+                                    (action.name.toLowerCase().match(action_filter.toLowerCase()) !== null ||
+                                    action.desc.toLowerCase().match(action_filter.toLowerCase()) !== null)"
                                         ng-if="action.group===null || actionGroup===action.group">
                                         <td>
+                                            <input type="checkbox"
+                                                   name="{{ action.name }}"
+                                                   ng-model="actionCheckBox[action.name]"
+                                                   id="cb_{{ action.name }}">
                                             <label for="cb_{{ action.name }}">
-                                                <input type="checkbox"
-                                                       name="{{ action.name }}"
-                                                       ng-model="actionCheckBox[action.name]"
-                                                       id="cb_{{ action.name }}">
-                                                {{ action.name }}
+                                                   {{ action.name }}
                                             </label>
                                         </td>
 
@@ -375,7 +378,7 @@
                                             <!-- This is the description of the policy action
                                              -->
                                             <p class="help help-block">
-                                                {{ action.desc }}
+                                               {{ action.desc }}
                                             </p>
                                         </td>
                                     </tr>
@@ -391,7 +394,7 @@
          ng-show="checkRight('policywrite')">
         <button ng-click="createPolicy()"
                 id="createPolicyButton"
-                ng-disabled="formPolicyAdd.$invalid"
+                ng-disabled="formPolicyAdd.$invalid || selectedScope.length === 0"
                 class="btn btn-primary">
             <span class="glyphicon glyphicon-plus"></span>
             <span translate>Create Policy</span>

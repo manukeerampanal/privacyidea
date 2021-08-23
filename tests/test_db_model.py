@@ -230,10 +230,14 @@ class TokenModelTestCase(MyTestCase):
         self.assertEqual(u'Hellö', t2.get_otpkey().getKey().decode('utf8'), t2)
 
         # key too long
-        # TODO should this throw an error? otherwise the DB would complain
         k = os.urandom(256)
         t2.set_otpkey(k)
         self.assertGreater(len(t2.key_enc), Token.key_enc.property.columns[0].type.length)
+
+        # SQLite supports writing too long data, all others don't.
+        if db.engine.name != 'sqlite':
+            self.assertRaises(Exception, db.session.commit)
+            db.session.rollback()
 
         # set an empty token description
         self.assertEqual(t2.set_description(desc=None), '')
@@ -687,8 +691,14 @@ class TokenModelTestCase(MyTestCase):
         gw.delete()
 
     def test_21_add_update_delete_clientapp(self):
-        ClientApplication(ip="1.2.3.4", hostname="host1",
-                          clienttype="PAM", node="localnode").save()
+        # MySQLs DATETIME type supports only seconds so we have to mock now()
+        current_time = datetime(2018, 3, 4, 5, 6, 8)
+        with mock.patch('privacyidea.models.datetime') as mock_dt:
+            mock_dt.now.return_value = current_time
+
+            ClientApplication(ip="1.2.3.4", hostname="host1",
+                              clienttype="PAM", node="localnode").save()
+
         c = ClientApplication.query.filter(ClientApplication.ip == "1.2.3.4").first()
         self.assertEqual(c.hostname, "host1")
         self.assertEqual(c.ip, "1.2.3.4")
@@ -700,7 +710,7 @@ class TokenModelTestCase(MyTestCase):
         ClientApplication(ip="1.2.3.4", hostname="host1",
                           clienttype="PAM", node="localnode").save()
         c = ClientApplication.query.filter(ClientApplication.ip == "1.2.3.4").first()
-        self.assertTrue(c.lastseen > t1)
+        self.assertGreater(c.lastseen, t1, c)
 
         ClientApplication.query.filter(ClientApplication.id == c.id).delete()
         c = ClientApplication.query.filter(ClientApplication.ip == "1.2.3.4").first()
@@ -745,7 +755,9 @@ class TokenModelTestCase(MyTestCase):
         username = "cornelius"
         resolver = "resolver1"
         user_id = 1
-        timestamp = datetime.now()
+        # we don't need a timestamp with microseconds here, the MySQL DATETIME
+        # type doesn't support it out of the box anyway
+        timestamp = datetime.now().replace(microsecond=0)
 
         # create a user in the cache
         cached_user = UserCache(username, username, resolver, user_id, timestamp)
@@ -859,6 +871,7 @@ class TokenModelTestCase(MyTestCase):
                 "foo": "bar"
             })
 
+
         self.assertEqual(PeriodicTask.query.filter_by(name="task1").one(), task1)
         self.assertEqual(PeriodicTask.query.filter_by(name="some other task").one(), task2)
         self.assertEqual(PeriodicTaskOption.query.filter_by(periodictask_id=task1.id, key="KEY2").one().value,
@@ -879,6 +892,7 @@ class TokenModelTestCase(MyTestCase):
                 "KEY2": "True",
                 "key3": u"öfføff",
             },
+            "retry_if_failed": True,
             "last_runs": {}})
 
         # register a run
@@ -907,6 +921,7 @@ class TokenModelTestCase(MyTestCase):
                              "ordering": 3,
                              "options": {"KEY2": "value number 2",
                                          "key 4": "1234"},
+                             'retry_if_failed': True,
                              "last_runs": {
                                  "localhost": datetime(2018, 3, 4, 5, 6, 7, tzinfo=tzutc()),
                                  "otherhost": datetime(2018, 8, 9, 10, 11, 12, tzinfo=tzutc()),
@@ -929,6 +944,7 @@ class TokenModelTestCase(MyTestCase):
                              "ordering": 3,
                              "options": {"KEY2": "value number 2",
                                          "key 4": "1234"},
+                             'retry_if_failed': True,
                              "last_runs": {
                                  "localhost": datetime(2018, 3, 4, 5, 6, 8, tzinfo=tzutc()),
                                  "otherhost": datetime(2018, 8, 9, 10, 11, 12, tzinfo=tzutc()),

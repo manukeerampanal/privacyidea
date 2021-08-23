@@ -23,8 +23,8 @@ All HTML views are contained in::
 
     static/components/<component>/views/<view>.html
 
-You can find them on `GitHub <https://github.com/privacyidea/privacyidea/tree/master/privacyidea/static>` or
-at the according location in your installation.
+You can find them on `GitHub <https://github.com/privacyidea/privacyidea/tree/master/privacyidea/static>`_
+or at the according location in your installation.
 
 Follow these basic steps:
 
@@ -92,6 +92,21 @@ The file in the file system is located at *privacyidea/static/contrib/css*.
 You might add a directory *privacyidea/static/custom/css/* and add your CSS
 file there.
 
+The CSS you specify here adds to the already existing styles. Thus a convenient way for
+using this setting is to help you distinguish different privacyIDEA instances like "testing", "acceptances"
+and "production" or different nodes in a redundant setup.
+
+You can create a simple CSS file *[..]/privacyidea/static/custom/css/testing.css* like::
+
+    body {
+        background-color: green;
+    }
+
+and then set in the pi.cfg::
+
+    PI_CSS = "/static/custom/css/testing.css"
+
+This way your testing instance will be immediately distinguishable due to the green background.
 
 Use web server rewrite modules
 ..............................
@@ -131,7 +146,7 @@ Logo
 ~~~~
 
 The default logo is located at ``privacyidea/static/css/privacyIDEA1.png``.
-If you want to use your own logo, you can put youf file "mylogo.png" just
+If you want to use your own logo, you can put your file "mylogo.png" just
 in the same folder and set
 
    PI_LOGO = "mylogo.png"
@@ -220,3 +235,10 @@ and
 
 The list of the token modules you want to add, must be specified in ``pi.cfg``.
 See :ref:`picfg_3rd_party_tokens`.
+
+Custom Web UI
+~~~~~~~~~~~~~
+
+You can also write your complete new WebUI.
+To do so you need to specify files and folders in ``pi.cfg``.
+Read more about this at :ref:`custom_web_ui`.

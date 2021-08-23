@@ -2,6 +2,7 @@
 
 import unittest
 import mock
+from sqlalchemy.orm.session import close_all_sessions
 
 from privacyidea.app import create_app
 from privacyidea.config import TestingConfig
@@ -11,6 +12,7 @@ from privacyidea.lib.realm import (set_realm)
 from privacyidea.lib.user import User
 from privacyidea.lib.auth import create_db_admin
 from privacyidea.lib.auditmodules.base import Audit
+from privacyidea.lib.lifecycle import call_finalizers
 
 
 PWFILE = "tests/testdata/passwords"
@@ -23,6 +25,7 @@ class FakeFlaskG(object):
     audit_object = None
     client_ip = None
     request_headers = None
+    serial = None
 
 
 class FakeAudit(Audit):
@@ -169,8 +172,10 @@ class MyTestCase(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        db.session.remove()
+        call_finalizers()
+        close_all_sessions()
         db.drop_all()
+        db.engine.dispose()
         cls.app_context.pop()
 
     def authenticate(self):

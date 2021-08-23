@@ -10,8 +10,9 @@ from privacyidea.lib.policy import (set_policy, delete_policy, SCOPE, ACTION,
                                     enable_policy,
                                     PolicyClass)
 from privacyidea.lib.token import (get_tokens, init_token, remove_token, get_tokens_from_serial_or_user, enable_token,
-                                   check_serial_pass, get_realms_of_token)
+                                   check_serial_pass, get_realms_of_token, assign_token)
 from privacyidea.lib.user import User
+from privacyidea.lib.event import set_event, delete_event, EventConfiguration
 from privacyidea.lib.caconnector import save_caconnector
 from six.moves.urllib.parse import urlencode
 from privacyidea.lib.tokenclass import DATE_FORMAT
@@ -26,6 +27,7 @@ IMPORTPSKC = "tests/testdata/pskc-aes.xml"
 IMPORTPSKC_PASS = "tests/testdata/pskc-password.xml"
 PSK_HEX = "12345678901234567890123456789012"
 YUBICOFILE = "tests/testdata/yubico-oath.csv"
+YUBICOFILE_LONG = "tests/testdata/yubico-oath-long.csv"
 OTPKEY = "3132333435363738393031323334353637383930"
 OTPKEY2 = "010fe88d31948c0c2e3258a4b0f7b11956a258ef"
 CAKEY = "cakey.pem"
@@ -124,6 +126,83 @@ class API000TokenAdminRealmList(MyApiTestCase):
             # we have two tokens
             self.assertEqual(0, result.get("value").get("count"))
 
+
+class APIAttestationTestCase(MyApiTestCase):
+
+    def test_00_realms_and_ca(self):
+        # Setup realms and CA
+        self.setUp_user_realms()
+        cwd = os.getcwd()
+        # setup ca connector
+        r = save_caconnector({"cakey": CAKEY,
+                              "cacert": CACERT,
+                              "type": "local",
+                              "caconnector": "localCA",
+                              "openssl.cnf": OPENSSLCNF,
+                              "CSRDir": "",
+                              "CertificateDir": "",
+                              "WorkingDir": cwd + "/" + WORKINGDIR})
+
+    def test_01_enroll_certificate(self):
+        # Enroll a certificate without a policy
+        from .test_lib_tokens_certificate import YUBIKEY_CSR, BOGUS_ATTESTATION, YUBIKEY_ATTEST, ACTION
+
+        # A bogus attestation certificate will fail!
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={"type": "certificate",
+                                                 "request": YUBIKEY_CSR,
+                                                 "attestation": BOGUS_ATTESTATION,
+                                                 "ca": "localCA"},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            result = res.json.get("result")
+            self.assertEqual(400, res.status_code)
+            self.assertEqual(10, result.get("error").get("code"))
+            self.assertEqual('ERR10: certificate request does not match attestation certificate.',
+                             result.get("error").get("message"))
+
+        # If a valid attestation certificate can not be verified due to missing CA path, we will fail.
+        from privacyidea.lib.tokens.certificatetoken import ACTION, REQUIRE_ACTIONS
+        set_policy(name="pol_verify",
+                   scope=SCOPE.ENROLL,
+                   action="{0!s}={1!s}".format(ACTION.REQUIRE_ATTESTATION, REQUIRE_ACTIONS.REQUIRE_AND_VERIFY))
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={"type": "certificate",
+                                                 "request": YUBIKEY_CSR,
+                                                 "attestation": YUBIKEY_ATTEST,
+                                                 "ca": "localCA"},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            result = res.json.get("result")
+            self.assertEqual(400, res.status_code)
+            self.assertEqual(10, result.get("error").get("code"))
+            self.assertEqual('ERR10: Failed to verify certificate chain of attestation certificate.',
+                             result.get("error").get("message"))
+
+        # The admin enrolls the certificate, so we need an admin policy
+        set_policy("pol1", scope=SCOPE.ADMIN,
+                   action="{0!s}=tests/testdata/attestation/".format(ACTION.TRUSTED_CA_PATH))
+        set_policy("pol2", scope=SCOPE.ADMIN,
+                   action="enrollCERTIFICATE")
+
+        # If the attestation certificate matches and it is trusted, then we succeed.
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={"type": "certificate",
+                                                 "request": YUBIKEY_CSR,
+                                                 "attestation": YUBIKEY_ATTEST,
+                                                 "ca": "localCA"},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            result = res.json.get("result")
+            self.assertEqual(200, res.status_code)
+            self.assertTrue(result.get("value"))
+
+        delete_policy("pol1")
+        delete_policy("pol2")
+        delete_policy("pol_verify")
 
 class APITokenTestCase(MyApiTestCase):
 
@@ -561,7 +640,9 @@ class APITokenTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 400, res)
 
-        # disable token
+        # disable an assigned token
+        r = assign_token("EToken", User("hans", self.realm1))
+        self.assertTrue(r)
         with self.app.test_request_context('/token/disable/EToken',
                                            method='POST',
                                            data={},
@@ -570,6 +651,16 @@ class APITokenTestCase(MyApiTestCase):
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
             self.assertTrue(result.get("value") == 1, result)
+
+        # Check for the disabled token in the audit log, that also the user object is added
+        with self.app.test_request_context('/audit/',
+                                           method='GET',
+                                           data={'action': "*disable*", "serial": "EToken"},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            jres = res.json
+            self.assertEqual(jres['result']['value']['auditdata'][0]['user'], "hans")
 
         # disable a disabled token will not count, so the value will be 0
         with self.app.test_request_context('/token/disable',
@@ -937,7 +1028,7 @@ class APITokenTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            value = result.get("value")
+            value = result.get("value")['n_imported']
             self.assertTrue(value == 3, result)
         # check for a successful audit entry
         entry = self.find_most_recent_audit_entry(action='*/token/load/*')
@@ -955,7 +1046,7 @@ class APITokenTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            value = result.get("value")
+            value = result.get("value")['n_imported']
             self.assertTrue(value == 3, result)
 
         # Load yubico.csv
@@ -969,7 +1060,7 @@ class APITokenTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            value = result.get("value")
+            value = result.get("value")['n_imported']
             self.assertTrue(value == 3, result)
 
         # check if the token was put into self.realm1
@@ -1012,7 +1103,7 @@ class APITokenTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            value = result.get("value")
+            value = result.get("value")['n_imported']
             self.assertTrue(value == 1, result)
 
         # Load PSKC file, encrypted Password
@@ -1026,8 +1117,40 @@ class APITokenTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            value = result.get("value")
+            value = result.get("value")['n_imported']
             self.assertTrue(value == 1, result)
+
+    def test_11_load_tokens_tokenhandler(self):
+
+        # create a new event to disable tokens after import
+        r = set_event("token_disable", ["token_load"], "Token",
+                      "disable", position="post")
+        events = EventConfiguration()
+        event_id = [event['id'] for event in events.events if event['name'] == 'token_disable'][0]
+
+        # Load yubico.csv
+        with self.app.test_request_context('/token/load/yubico.csv',
+                                            method="POST",
+                                            data={"type": "yubikeycsv",
+                                                  "tokenrealms": self.realm1,
+                                                  "file": (YUBICOFILE_LONG,
+                                                           "yubico.csv")},
+                                            headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            value = result.get("value")['n_imported']
+            self.assertTrue(value == 100, result)
+
+        # check if imported tokens were disabled by event handler
+        tokenobject_list = get_tokens(serial_wildcard="UBOM*", active=False)
+        self.assertEqual(len(tokenobject_list), 100)
+
+        # remove tokens
+        for tok in tokenobject_list:
+            remove_token(serial=tok.token.serial)
+        # remove event
+        delete_event(event_id)
 
     def test_11_load_tokens_only_to_specific_realm(self):
         # Load token to a realm
@@ -1047,7 +1170,7 @@ class APITokenTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            value = result.get("value")
+            value = result.get("value")['n_imported']
             self.assertTrue(value == 3, result)
         # Now check, if the tokens are in the realm
         from privacyidea.lib.token import get_realms_of_token
@@ -1068,7 +1191,7 @@ class APITokenTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            value = result.get("value")
+            value = result.get("value")['n_imported']
             self.assertTrue(value == 3, result)
         # Now check, if the tokens are in the realm
         r = get_realms_of_token("token01")
@@ -1371,6 +1494,27 @@ class APITokenTestCase(MyApiTestCase):
             self.assertTrue(res.status_code == 200, res)
             result = json.loads(res.data.decode('utf8')).get("result")
             self.assertEqual(len(result["value"]["tokens"]), 2)
+
+        # Finally we try to enroll a certificate with an attestation certificate required:
+        from privacyidea.lib.tokens.certificatetoken import ACTION, REQUIRE_ACTIONS
+        set_policy(name="pol1",
+                   scope=SCOPE.ENROLL,
+                   action="{0!s}={1!s}".format(ACTION.REQUIRE_ATTESTATION, REQUIRE_ACTIONS.REQUIRE_AND_VERIFY))
+        with self.app.test_request_context('/token/init',
+                                           data={"type": "certificate",
+                                                 "request": REQUEST,
+                                                 "ca": "localCA"},
+                                           method="POST",
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 403, res)
+            result = res.json.get("result")
+            self.assertFalse(result.get("status"))
+            self.assertEqual(result.get("error").get("message"),
+                             "A policy requires that you provide an attestation certificate.")
+
+        delete_policy("pol1")
+
 
     def test_18_revoke_token(self):
         self._create_temp_token("RevToken")

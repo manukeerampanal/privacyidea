@@ -563,11 +563,19 @@ class TokenBaseTestCase(MyTestCase):
                                                 realm=self.realm1),
                                             "test123456")
         self.assertFalse(resp, resp)
+
+        # A the token has not DB entry in the challenges table, basically
+        # "is_cahllenge_response"
         resp = token.is_challenge_response(User(login="cornelius",
                                                 realm=self.realm1),
                                             "test123456",
                                             options={"transaction_id": transaction_id})
-        # The token has not DB entry in the challenges table
+        self.assertTrue(resp)
+        # ... but is does not "has_db_challenge_response"
+        resp = token.has_db_challenge_response(User(login="cornelius",
+                                                realm=self.realm1),
+                                               "test123456",
+                                               options={"transaction_id": transaction_id})
         self.assertFalse(resp)
 
         # Create a challenge
@@ -790,6 +798,13 @@ class TokenBaseTestCase(MyTestCase):
         r = token_obj.check_last_auth_newer("10h")
         self.assertFalse(r)
         r = token_obj.check_last_auth_newer("2d")
+        self.assertTrue(r)
+
+        # Test a fault last_auth entry does not computer to True
+        token_obj.add_tokeninfo(ACTION.LASTAUTH, "faulty format")
+        r = token_obj.check_last_auth_newer("10h")
+        self.assertFalse(r)
+
         token_obj.delete_token()
 
     def test_39_generate_sym_key(self):

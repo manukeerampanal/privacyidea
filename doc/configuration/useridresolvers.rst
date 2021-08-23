@@ -22,11 +22,11 @@ protocol to access userstores.
 privacyIDEA already comes with UserIdResolvers to talk to all these
 user stores:
 
- * Flatfile resolver,
- * LDAP resolver,
- * SQL resolver,
- * SCIM resolver.
- * HTTP resolver.
+ * :ref:`flatfile_resolver`
+ * :ref:`ldap_resolver`
+ * :ref:`sql_resolver`
+ * :ref:`scim_resolver`
+ * :ref:`http_resolver`
 
 .. note:: New resolver types (python modules) can be added easily. See the
    module section for this
@@ -183,8 +183,10 @@ The *Server pool retry rounds* and *Server pool skip timeout* settings configure
 the LDAP server pool. When establishing a LDAP connection, the resolver uses a round-robin
 strategy to select a LDAP server from the pool. If the current server is not reachable, it is removed
 from the pool and will be re-inserted after the number of seconds specified in the *skip timeout*.
-If no server from the pool is reachable, the servers are queried again from the beginning. If
-a reachable server has not been found after the number of rounds specified in the *retry rounds*,
+If the pool is empty after a round, a timeout is added before the next round is started.
+The ldap3 module defaults system wide to 10 seconds before starting the next round.
+This timeout can be changed by setting ``PI_LDAP_POOLING_LOOP_TIMEOUT`` to an integer in seconds in ``pi.cfg``.
+If no reachable server could be found after the number of rounds specified in the *retry rounds*,
 the request fails.
 
 By default, knowledge about unavailable pool servers is not persisted between requests.
@@ -193,19 +195,23 @@ has not passed yet. If the *Per-process server pool* is enabled, knowledge about
 servers is persisted within each process. This setting may improve performance in situations in
 which a LDAP server from the pool is down for extended periods of time.
 
+TLS Version
+~~~~~~~~~~~
+
+When using TLS, you may specify the TLS version to use. Starting from version 3.6, privacyIDEA offers
+TLS v1.3 by default.
+
+
 TLS certificates
 ~~~~~~~~~~~~~~~~
 
-Starting with privacyIDEA 2.18, in case of encrypted LDAPS
-connections privacyIDEA can verify the TLS
-certificate. (Python >= 2.7.9 required)
-To have privacyIDEA verify the TLS certificate, you need to check the
-according checkbox.
+When using TLS with LDAP, you can tell privacyIDEA to verify the certificate. The according
+checkbox is visible in the WebUI if the target URL starts with *ldaps* or when using STARTTLS.
 
 You can specify a file with the trusted CA certificate, that signed the
 TLS certificate. The default CA filename is */etc/privacyidea/ldap-ca.crt*
 and can contain a list of base64 encoded CA certificates.
-PrivacyIDEA will use the CA file if specifed. If you leave the field empty
+PrivacyIDEA will use the CA file if specified. If you leave the field empty
 it will also try the system certificate store (*/etc/ssl/certs/ca-certificates.crt*
 or */etc/ssl/certs/ca-bundle.crt*).
 
@@ -218,7 +224,7 @@ I.e. you can create and modify users from within privacyIDEA.
 There are two additional configuration parameters for this case.
 
 ``DN Template`` defines how the DN of the new LDAP object should be created. You can use *username*, *surname*,
-*givenname* and *basedn* to create the distiguished name.
+*givenname* and *basedn* to create the distinguished name.
 
 **Examples**:
 
@@ -247,6 +253,8 @@ the user listing API with the parameter *accountExpires=1* and you will only
 see expired accounts.
 
 This functionality is used with the script *privacyidea-expired-users*.
+
+.. _sql_resolver:
 
 SQL resolver
 ............
@@ -325,6 +333,8 @@ waits to get a connection from the pool.
 .. note:: The ``Additional connection parameters``
    refer to the SQLAlchemy connection but are not used at the moment.
 
+.. _scim_resolver:
+
 SCIM resolver
 .............
 
@@ -334,7 +344,7 @@ SCIM is a "System for Cross-domain Identity Management". SCIM is a REST-based
 protocol that can be used to ease identity management in the cloud.
 
 The SCIM resolver is tested in basic functions with OSIAM [#osiam]_,
-the "Open Source Idenity & Access Management".
+the "Open Source Identity & Access Management".
 
 To connect to a SCIM service you need to provide a URL to an authentication 
 server and a URL to the resource server. The authentication server is used to
@@ -355,7 +365,7 @@ The available attributes for the ``Attribute mapping`` are:
  * mobile,
  * email.
 
-.. _httpresolver:
+.. _http_resolver:
 
 HTTP resolver
 .............
@@ -396,7 +406,7 @@ for parsing, e.g.
 
 .. code-block:: json
 
-   { "username": "{Username}", "email": "{Email}", "phone": "{Phone_Numbers.Phone} }
+   { "username": "{Username}", "email": "{Email}", "phone": "{Phone_Numbers.Phone}" }
 
 For APIs which return ``200 OK`` also for a negative response, ``Special error handling`` can be activated to treat
 the request as unsuccessful if the response contains certain content.

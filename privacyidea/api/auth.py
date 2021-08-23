@@ -59,7 +59,7 @@ from privacyidea.lib.audit import getAudit
 from privacyidea.lib.auth import (check_webui_user, ROLE, verify_db_admin,
                                   db_admin_exist)
 from privacyidea.lib.user import User, split_user, log_used_user
-from privacyidea.lib.policy import PolicyClass
+from privacyidea.lib.policy import PolicyClass, REMOTE_USER
 from privacyidea.lib.realm import get_default_realm, realm_is_defined
 from privacyidea.api.lib.postpolicy import (postpolicy, get_webui_settings, add_user_detail_to_response, check_tokentype, 
                                             check_tokeninfo, check_serial, no_detail_on_fail, no_detail_on_success,
@@ -69,7 +69,7 @@ from privacyidea.api.lib.prepolicy import (is_remote_user_allowed, prepolicy,
                                            webauthntoken_auth)
 from privacyidea.api.lib.utils import (send_result, get_all_params,
                                        verify_auth_token, getParam)
-from privacyidea.lib.utils import get_client_ip, hexlify_and_unicode
+from privacyidea.lib.utils import get_client_ip, hexlify_and_unicode, to_unicode
 from privacyidea.lib.config import get_from_config, SYSCONF, ensure_no_config_object
 from privacyidea.lib.event import event, EventConfiguration
 from privacyidea.lib import _
@@ -88,7 +88,7 @@ def before_request():
     This is executed before the request
     """
     ensure_no_config_object()
-    request.all_data = get_all_params(request.values, request.data)
+    request.all_data = get_all_params(request)
     privacyidea_server = current_app.config.get("PI_AUDIT_SERVERNAME") or \
                          request.host
     g.policy_object = PolicyClass()
@@ -97,6 +97,9 @@ def before_request():
     # access_route contains the ip adresses of all clients, hops and proxies.
     g.client_ip = get_client_ip(request,
                                 get_from_config(SYSCONF.OVERRIDECLIENT))
+    # Save the HTTP header in the localproxy object
+    g.request_headers = request.headers
+    g.serial = getParam(request.all_data, "serial", default=None)
     g.audit_object.log({"success": False,
                         "client": g.client_ip,
                         "client_user_agent": request.user_agent.browser,
@@ -254,7 +257,7 @@ def get_auth_token():
     user_obj = User()
 
     # Check if the remote user is allowed
-    if (request.remote_user == username) and is_remote_user_allowed(request):
+    if (request.remote_user == username) and is_remote_user_allowed(request) != REMOTE_USER.DISABLE:
         # Authenticated by the Web Server
         # Check if the username exists
         # 1. in local admins
@@ -306,9 +309,11 @@ def get_auth_token():
                                                     superuser_realms=
                                                     superuser_realms)
         details = details or {}
-        if db_admin_exist(loginname) and realm == get_default_realm():
+        if db_admin_exist(loginname) and user_auth and realm == get_default_realm():
             # If there is a local admin with the same login name as the user
             # in the default realm, we inform about this in the log file.
+            # This condition can only be checked if the user was authenticated as it
+            # is the only way to verify if such a user exists.
             log.warning("A user '{0!s}' exists as local admin and as user in "
                         "your default realm!".format(loginname))
         if role == ROLE.ADMIN:
@@ -364,11 +369,11 @@ def get_auth_token():
                         "authtype": authtype,
                         "exp": datetime.utcnow() + validity,
                         "rights": rights},
-                       secret, algorithm='HS256').decode('utf8')
+                       secret, algorithm='HS256')
 
     # Add the role to the response, so that the WebUI can make decisions
     # based on this (only show selfservice, not the admin part)
-    return send_result({"token": token,
+    return send_result({"token": to_unicode(token),
                         "role": role,
                         "username": loginname,
                         "realm": realm,

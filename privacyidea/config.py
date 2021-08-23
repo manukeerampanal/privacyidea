@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 import os
 import logging
 import random
@@ -81,6 +83,7 @@ class TestingConfig(Config):
     PI_ENCFILE_ENC = "tests/testdata/enckey.enc"
     PI_LOGLEVEL = logging.INFO
     PI_GNUPG_HOME = "tests/testdata/gpg"
+    PI_AUDIT_SQL_TRUNCATE = True
     CACHE_TYPE = "None"
     PI_SCRIPT_HANDLER_DIRECTORY = "tests/testdata/scripts/"
     PI_NOTIFICATION_HANDLER_SPOOLDIRECTORY = "tests/testdata/"
@@ -111,6 +114,12 @@ class TestingConfig(Config):
                        "realm": "realm1",
                        "username": "userA",
                        "resolver": "resolverX"}]
+
+
+class AltUIConfig(TestingConfig):
+    PI_INDEX_HTML = "testui.html"
+    PI_STATIC_FOLDER = "../tests/testdata/altstatic"
+    PI_TEMPLATE_FOLDER = "../tests/testdata/altstatic/templates"
 
 
 class ProductionConfig(Config):
@@ -154,5 +163,6 @@ config = {
     'testing': TestingConfig,
     'production': ProductionConfig,
     'default': DevelopmentConfig,
-    'heroku': HerokuConfig
+    'heroku': HerokuConfig,
+    'altUI': AltUIConfig
 }
