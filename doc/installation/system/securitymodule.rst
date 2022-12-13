@@ -52,25 +52,6 @@ To do so run::
 .. note:: If the security module is not operational yet, you might get an
    error message "HSM not ready.".
 
-PKCS11 Security Module
------------------------
-
-The PKCS11 Security Module can be used to encrypt data with an hardware
-security module, that is connected via the PKCS11 interface. To encrypt and
-decrypt data you can use an RSA key pair that is stored on the HSM.
-
-To activate this module add the following to the configuration file
-(:ref:`cfgfile`)
-
-   PI_HSM_MODULE = "privacyidea.lib.security.pkcs11.PKCS11SecurityModule"
-
-Additional attributes are
-
-``PI_HSM_MODULE_MODULE`` which takes the pkcs11 library. This is the full
-specified path to the shared object file in the file system.
-
-``PI_HSM_MODULE_KEY_ID`` is the key id (integer) on the HSM.
-
 AES HSM Security Module
 -----------------------
 
@@ -83,7 +64,7 @@ This module uses three keys, similarly to the content of
 ``PI_ENCFILE``, identified as ``token``, ``config`` and ``value``.
 
 To activate this module add the following to the configuration file
-(:ref:`cfgfile`)
+(:ref:`cfgfile`)::
 
    PI_HSM_MODULE = "privacyidea.lib.security.aeshsm.AESHardwareSecurityModule"
 
@@ -94,6 +75,11 @@ specified path to the shared object file in the file system.
 
 ``PI_HSM_MODULE_SLOT`` is the slot on the HSM where the keys are
 located (default: ``1``).
+
+You can set the slot number to -1 if there is only one slot available and you do
+not know the slot number. Then privacyIDEA will determine the one and only slot number and
+use this one.
+
 
 ``PI_HSM_MODULE_PASSWORD`` is the password to access the slot.
 
@@ -119,3 +105,80 @@ this prefix, ``_`` and the key identifier (respectively ``token``,
 
 ``PI_HSM_MODULE_KEY_LABEL_VALUE`` is the label for ``value`` key
 (defaults to value based on ``PI_HSM_MODULE_KEY_LABEL`` setting).
+
+Encrypt Key Security Module
+---------------------------
+
+The Encrypt Key Security Module uses a hardware security module (HSM)
+to decrypt the encrypted encryption key. Within the HSM a private RSA key is
+used to decrypt an encrypted file like `/etc/privacyidea/enckey.enc`.
+
+With the first request to each process of the privacyIDEA server, the HSM is used
+to decrypt the encryption key. After that the encryption key is kept in memory during run time.
+
+To activate this module add the following to the configuration file
+(:ref:`cfgfile`)
+
+    PI_HSM_MODULE = "privacyidea.lib.security.encryptkey.EncryptKeyHardwareSecurityModule"
+
+Further attributes are
+``PI_HSM_MODULE_MODULE`` which takes the pkcs11 library. This is the fully
+specified path to the shared object file in the file system.
+
+``PI_HSM_MODULE_SLOT`` is the slot on the HSM where the keys are
+located. This is an integer value.
+Alternatively you can specify ``PI_HSM_MODULE_SLOTNAME`` which would be the descriptive name
+of this slot.
+
+To use the correct key in this slot you can either specify the key by providing
+``PI_HSM_MODULE_KEYID`` with the integer id of the key or
+``PI_HSM_MODULE_KEYLABEL``  with the descriptive label of the key.
+
+The ``PI_HSM_MODULE_TIMEOUT`` can be used to define an integer value for a HSM lock timeout. The default is 15 seconds.
+
+Using the key ``PI_HSM_MODULE_LOCK_DIR`` you can define a different locking directory.
+The default is ``/dev/shm/pilock/``. Note, that the locking directory is created or removed by privacyIDEA
+when acquiring or releasing the lock on the HSM and you must not create this directory manually!
+
+.. note:: Some HSM fail to provide a correct keyid and it is necessary to use the key label.
+
+The last two mandatory attributes are ``PI_HSM_MODULE_PASSWORD`` which holds the password of the slot
+and ``PI_HSM_MODULE_ENCFILE`` which specifies the encrypted encryption key.
+
+You could e.g. use a Yubikey this way::
+
+    PI_HSM_MODULE = "privacyidea.lib.security.encryptkey.EncryptKeyHardwareSecurityModule"
+    PI_HSM_MODULE_MODULE = "/usr/lib/libykcs11.so"
+    PI_HSM_MODULE_SLOTNAME = "Yubico YubiKey"
+    PI_HSM_MODULE_KEYLABEL = 'Private key for PIV Authentication'
+    PI_HSM_MODULE_PASSWORD = 'yourPin'
+    PI_HSM_MODULE_ENCFILE = "/etc/privacyidea/enckey.enc"
+
+To encrypt an existing key file you can use the module like this::
+
+    python encryptkey.py --module /usr/lib/libykcs11.so --keyid 1 --slotname "Yubico YubiKey"  \
+                         --infile enckey --outfile enckey.enc
+
+If your key in the HSM is identified by a key label, then you can encrypt the existing key file like this::
+
+    python encryptkey.py --module /usr/lib/libykcs11.so --keylabel "my secret key" --slotname "Yubico YubiKey" \
+                         --infile enckey --outfile enckey.enc
+
+Preloading of encryption keys
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This security module allows you to preload the encryption keys. I.e. privacyIDEA can use the HSM to decrypt
+the keys before the first request is sent to privacyIDEA. To do so, you need to modify the wsgi script
+(See :ref:`wsgiscript`) and add the parameter `init_hsm`::
+
+    application = create_app(config_name="production",
+                             config_file="/etc/privacyidea/pi.cfg", init_hsm=True)
+
+Moreover, you need to add the `WSGIImportScript` statement to your Apache2 configuration::
+
+    WSGIApplicationGroup %{GLOBAL}
+    WSGIImportScript /etc/privacyidea/privacyideaapp.wsgi process-group=privacyidea application-group=%{GLOBAL}
+
+.. note:: Please note, that this security module uses a lock file, to handle concurrent access to the HSM.
+   In certain cases of errors the log file could remain and not cleaned up.
+   Ensure, that the directory `/dev/shm/pilock/` does *not* exist at Apache2 startup.

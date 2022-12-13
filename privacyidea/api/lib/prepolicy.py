@@ -77,13 +77,15 @@ from privacyidea.lib.user import (get_user_from_param, get_default_realm,
                                   split_user, User)
 from privacyidea.lib.token import (get_tokens, get_realms_of_token, get_token_type, get_token_owner)
 from privacyidea.lib.utils import (parse_timedelta, is_true, generate_charlists_from_pin_policy,
-                                   check_pin_contents, get_module_class,
+                                   get_module_class,
                                    determine_logged_in_userparams, parse_string_to_dict)
 from privacyidea.lib.crypto import generate_password
 from privacyidea.lib.auth import ROLE
 from privacyidea.api.lib.utils import getParam, attestation_certificate_allowed, is_fqdn
 from privacyidea.lib.clientapplication import save_clientapplication
 from privacyidea.lib.config import (get_token_class)
+from privacyidea.lib.tokenclass import ROLLOUTSTATE
+from privacyidea.lib.tokens.certificatetoken import ACTION as CERTIFICATE_ACTION
 import functools
 import jwt
 import re
@@ -96,7 +98,8 @@ from privacyidea.lib.tokens.webauthn import (WebAuthnRegistrationResponse,
                                              ATTESTATION_FORMS)
 from privacyidea.lib.tokens.webauthntoken import (WEBAUTHNACTION,
                                                   DEFAULT_PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE,
-                                                  PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE_OPTIONS,
+                                                  PUBLIC_KEY_CREDENTIAL_ALGORITHMS,
+                                                  PUBKEY_CRED_ALGORITHMS_ORDER,
                                                   DEFAULT_TIMEOUT, DEFAULT_ALLOWED_TRANSPORTS,
                                                   DEFAULT_USER_VERIFICATION_REQUIREMENT,
                                                   DEFAULT_AUTHENTICATOR_ATTESTATION_LEVEL,
@@ -506,37 +509,52 @@ def init_token_defaults(request=None, action=None):
     return True
 
 
-def init_registrationcode_length_contents(request=None, action=None):
+def init_token_length_contents(request=None, action=None):
     """
     This policy function is to be used as a decorator in the API token init function.
 
-    If there is a valid policy set the action values of REGISTRATIONCODE_LENGTH
-    and REGISTRATIONCODE_CONTENTS are added to request.all_data as
+    It can set the parameters for automatic code or password created in regards to length and
+    contents for the tokentypes 'registration' and 'pw'.
+
+    If there is a valid policy set the action values of REGISTRATIONCODE_LENGTH / PASSWORD_LENGTH
+    and REGISTRATIONCODE_CONTENTS / PASSWORD_CONTENTS are added to request.all_data as
 
     { 'registration.length': '10', 'registration.contents': 'cn' }
+    or
+    { 'pw.length': '10', 'pw.contents': 'cn' }
     """
-    from privacyidea.lib.tokens.registrationtoken import DEFAULT_LENGTH, DEFAULT_CONTENTS
     no_content_policy = True
     no_length_policy = True
     params = request.all_data
     tokentype = params.get("type")
-    if tokentype == "registration":
-        user_object = get_user_from_param(params)
-        length_pols = Match.user(g, scope=SCOPE.ENROLL, action=ACTION.REGISTRATIONCODE_LENGTH,
-                                user_object=user_object).action_values(unique=True)
-        if len(length_pols) == 1:
-            request.all_data[ACTION.REGISTRATIONCODE_LENGTH] = list(length_pols)[0]
-            no_length_policy = False
-        content_pols = Match.user(g, scope=SCOPE.ENROLL, action=ACTION.REGISTRATIONCODE_CONTENTS,
-                                user_object=user_object).action_values(unique=True)
-        if len(content_pols) == 1:
-            request.all_data[ACTION.REGISTRATIONCODE_CONTENTS] = list(content_pols)[0]
-            no_content_policy = False
+
+    if tokentype == 'registration':
+        from privacyidea.lib.tokens.registrationtoken import DEFAULT_LENGTH, DEFAULT_CONTENTS
+        length_action = ACTION.REGISTRATIONCODE_LENGTH
+        contents_action = ACTION.REGISTRATIONCODE_CONTENTS
+    elif tokentype == 'pw':
+        from privacyidea.lib.tokens.passwordtoken import DEFAULT_LENGTH, DEFAULT_CONTENTS
+        length_action = ACTION.PASSWORD_LENGTH
+        contents_action = ACTION.PASSWORD_CONTENTS
+    else:
+        return True
+
+    user_object = get_user_from_param(params)
+    length_pols = Match.user(g, scope=SCOPE.ENROLL, action=length_action,
+                            user_object=user_object).action_values(unique=True)
+    if len(length_pols) == 1:
+        request.all_data[length_action] = list(length_pols)[0]
+        no_length_policy = False
+    content_pols = Match.user(g, scope=SCOPE.ENROLL, action=contents_action,
+                            user_object=user_object).action_values(unique=True)
+    if len(content_pols) == 1:
+        request.all_data[contents_action] = list(content_pols)[0]
+        no_content_policy = False
     # if there is no policy, set defaults.
     if no_length_policy:
-        request.all_data[ACTION.REGISTRATIONCODE_LENGTH] = DEFAULT_LENGTH
+        request.all_data[length_action] = DEFAULT_LENGTH
     if no_content_policy:
-        request.all_data[ACTION.REGISTRATIONCODE_CONTENTS] = DEFAULT_CONTENTS
+        request.all_data[contents_action] = DEFAULT_CONTENTS
     return True
 
 
@@ -585,6 +603,70 @@ def init_tokenlabel(request=None, action=None):
         request.all_data[ACTION.FORCE_APP_PIN] = True
 
     return True
+
+
+def init_ca_connector(request=None, action=None):
+    """
+    This is a pre decorator for the endpoint '/token/init'.
+    It reads the policy scope=enrollment, action=certificate_ca_connector and
+    sets the API parameter "ca" accordingly.
+
+    :param request: The request to enhance
+    :return: None, but we modify the request
+    """
+    params = request.all_data
+    user_object = get_user_from_param(params)
+    token_type = getParam(request.all_data, "type", optional)
+    if token_type and token_type.lower() == "certificate":
+        # get the CA connectors from the policies
+        ca_pols = Match.user(g, scope=SCOPE.ENROLL, action=CERTIFICATE_ACTION.CA_CONNECTOR,
+                             user_object=user_object).action_values(unique=True)
+        if len(ca_pols) == 1:
+            # The policy was set, so we need to set the CA in the request
+            request.all_data["ca"] = list(ca_pols)[0]
+
+
+def init_ca_template(request=None, action=None):
+    """
+    This is a pre decorator for the endpoint '/token/init'.
+    It reads the policy scope=enrollment, action=certificate_template and
+    sets the API parameter "template" accordingly.
+
+    :param request: The request to enhance
+    :return: None, but we modify the request
+    """
+    params = request.all_data
+    user_object = get_user_from_param(params)
+    token_type = getParam(request.all_data, "type", optional)
+    if token_type and token_type.lower() == "certificate":
+        # get the CA template from the policies
+        template_pols = Match.user(g, scope=SCOPE.ENROLL, action=CERTIFICATE_ACTION.CERTIFICATE_TEMPLATE,
+                                   user_object=user_object).action_values(unique=True)
+        if len(template_pols) == 1:
+            # The policy was set, so we need to set the template in the request
+            request.all_data["template"] = list(template_pols)[0]
+
+
+def init_subject_components(request=None, action=None):
+    """
+    This is a pre decorator for the endpoint '/token/init'.
+    It reads the policy scope=enrollment, action=certificate_request_subject_component and
+    sets the API parameter "subject_component" accordingly.
+
+    :param request: The request to enhance
+    :return: None, but we modify the request
+    """
+    params = request.all_data
+    user_object = get_user_from_param(params)
+    token_type = getParam(request.all_data, "type", optional)
+    if token_type and token_type.lower() == "certificate":
+        # get the subject list from the policies
+        subject_pols = Match.user(g, scope=SCOPE.ENROLL,
+                                  action=CERTIFICATE_ACTION.CERTIFICATE_REQUEST_SUBJECT_COMPONENT,
+                                  user_object=user_object).action_values(unique=False)
+        if len(list(subject_pols)):
+            # The policy was set, we need to add the list to the parameters
+            request.all_data["subject_components"] = list(subject_pols)
 
 
 def twostep_enrollment_activation(request=None, action=None):
@@ -674,6 +756,34 @@ def twostep_enrollment_parameters(request=None, action=None):
                                           user_object=request.User).action_values(unique=True)
             if action_values:
                 request.all_data[parameter] = list(action_values)[0]
+
+
+def verify_enrollment(request=None, action=None):
+    """
+    This is used to verify an already enrolled token.
+    The parameter "verify" is used to do so. If successful,
+    the current rollout_state "verify" of the token will be changed to "enrolled".
+
+    :param request:
+    :param action:
+    :return:
+    """
+    serial = getParam(request.all_data, "serial", optional)
+    verify = getParam(request.all_data, "verify", optional)
+    if verify and serial:
+        # Only now, we check if we need to verify
+        tokenobj_list = get_tokens(serial=serial)
+        if len(tokenobj_list) == 1:
+            tokenobj = tokenobj_list[0]
+            if tokenobj.rollout_state == ROLLOUTSTATE.VERIFYPENDING:
+                log.debug("Verifying the token enrollment for token {0!s}.".format(serial))
+                r = tokenobj.verify_enrollment(verify)
+                log.info("Result of enrollment verification for token {0!s}: {1!s}".format(serial, r))
+                if r:
+                    tokenobj.token.rollout_state = ROLLOUTSTATE.ENROLLED
+                else:
+                    from privacyidea.lib.error import ParameterError
+                    raise ParameterError("Verification of the new token failed.")
 
 
 def check_max_token_user(request=None, action=None):
@@ -1812,6 +1922,7 @@ def webauthntoken_enroll(request, action):
     WEBAUTHNACTION.PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE,
     WEBAUTHNACTION.AUTHENTICATOR_ATTESTATION_LEVEL,
     WEBAUTHNACTION.AUTHENTICATOR_ATTESTATION_FORM,
+    WEAUTHNACTION.AVOID_DOUBLE_REGISTRATION,
     WEBAUTHNACTION.AUTHENTICATOR_SELECTION_LIST, and
     ACTION.CHALLENGETEXT, respectively.
 
@@ -1872,20 +1983,21 @@ def webauthntoken_enroll(request, action):
                and list(authenticator_attachment_policies)[0] in AUTHENTICATOR_ATTACHMENT_TYPES \
             else None
 
-        public_key_credential_algorithm_preference_policies = Match\
-            .user(g,
-                  scope=SCOPE.ENROLL,
-                  action=WEBAUTHNACTION.PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE,
-                  user_object=request.User if hasattr(request, 'User') else None) \
-            .action_values(unique=True)
-        public_key_credential_algorithm_preference = list(public_key_credential_algorithm_preference_policies)[0] \
-            if public_key_credential_algorithm_preference_policies \
+        # we need to set `unique` to False since this policy can contain multiple values
+        public_key_credential_algorithm_pref_policies = Match.user(
+            g,
+            scope=SCOPE.ENROLL,
+            action=WEBAUTHNACTION.PUBLIC_KEY_CREDENTIAL_ALGORITHMS,
+            user_object=request.User if hasattr(request, 'User') else None
+        ).action_values(unique=False)
+        public_key_credential_algorithm_pref = public_key_credential_algorithm_pref_policies.keys() \
+            if public_key_credential_algorithm_pref_policies \
             else DEFAULT_PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE
-        if public_key_credential_algorithm_preference not in PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE_OPTIONS.keys():
+        if not all([x in PUBLIC_KEY_CREDENTIAL_ALGORITHMS for x in public_key_credential_algorithm_pref]):
             raise PolicyError(
                 "{0!s} must be one of {1!s}"
-                    .format(WEBAUTHNACTION.PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE,
-                            ', '.join(PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE_OPTIONS.keys())))
+                    .format(WEBAUTHNACTION.PUBLIC_KEY_CREDENTIAL_ALGORITHMS,
+                            ', '.join(PUBLIC_KEY_CREDENTIAL_ALGORITHMS.keys())))
 
         authenticator_attestation_level_policies = Match\
             .user(g,
@@ -1927,19 +2039,28 @@ def webauthntoken_enroll(request, action):
             if challengetext_policies \
             else DEFAULT_CHALLENGE_TEXT_ENROLL
 
+        avoid_double_registration_policy = Match\
+            .user(g,
+                  scope=SCOPE.ENROLL,
+                  action=WEBAUTHNACTION.AVOID_DOUBLE_REGISTRATION,
+                  user_object=request.User if hasattr(request, 'User') else None).any()
+
         request.all_data[WEBAUTHNACTION.RELYING_PARTY_ID] = rp_id
         request.all_data[WEBAUTHNACTION.RELYING_PARTY_NAME] = rp_name
 
         request.all_data[WEBAUTHNACTION.AUTHENTICATOR_ATTACHMENT] \
             = authenticator_attachment
-        request.all_data[WEBAUTHNACTION.PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE] \
-            = PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE_OPTIONS[public_key_credential_algorithm_preference]
+        request.all_data[WEBAUTHNACTION.PUBLIC_KEY_CREDENTIAL_ALGORITHMS] \
+            = [PUBLIC_KEY_CREDENTIAL_ALGORITHMS[x]
+               for x in PUBKEY_CRED_ALGORITHMS_ORDER
+               if x in public_key_credential_algorithm_pref]
         request.all_data[WEBAUTHNACTION.AUTHENTICATOR_ATTESTATION_LEVEL] \
             = authenticator_attestation_level
         request.all_data[WEBAUTHNACTION.AUTHENTICATOR_ATTESTATION_FORM] \
             = authenticator_attestation_form
         request.all_data["{0!s}_{1!s}".format(WebAuthnTokenClass.get_class_type(), ACTION.CHALLENGETEXT)] \
             = challengetext
+        request.all_data[WEBAUTHNACTION.AVOID_DOUBLE_REGISTRATION] = avoid_double_registration_policy
 
     return True
 
@@ -2050,8 +2171,8 @@ def _attestation_certificate_allowed(attestation_cert, allowed_certs_pols):
     against, while attestation_certificate_required() expects the plain fields
     from the token info, containing just the issuer, serial and subject.
 
-    :param cert_info: The cert.
-    :type cert_info: X509 or None
+    :param attestation_cert: The attestation certificate.
+    :type attestation_cert: OpenSSL.crypto.X509 or None
     :param allowed_certs_pols: The policies restricting enrollment, or authorization.
     :type allowed_certs_pols: dict or None
     :return: Whether the token should be allowed to complete enrollment, or authorization, based on its attestation.
@@ -2098,3 +2219,37 @@ def required_piv_attestation(request, action=None):
         # Add parameter verify_attestation
         request.all_data["verify_attestation"] = REQUIRE_ACTIONS.VERIFY in list(require_att) or \
                                                  REQUIRE_ACTIONS.REQUIRE_AND_VERIFY in list(require_att)
+
+
+def hide_tokeninfo(request=None, action=None):
+    """
+    This decorator checks for the policy `hide_tokeninfo` and sets the
+    `hidden_tokeninfo` parameter.
+
+    The given tokeninfo keys will be removed from the response.
+
+    The decorator wraps GET /token/
+
+    :param request: The request that is intercepted during the API call
+    :type request: Request Object
+    :param action: An optional Action
+    :type action: str
+    :return: Always true. Modifies the parameter `request`
+    :rtype: bool
+    """
+    hidden_fields = Match.admin_or_user(g, action=ACTION.HIDE_TOKENINFO,
+                                        user_obj=request.User)\
+        .action_values(unique=False)
+
+    request.all_data['hidden_tokeninfo'] = list(hidden_fields)
+    return True
+
+
+def increase_failcounter_on_challenge(request=None, action=None):
+    """
+    This is a decorator for /validate/check, validate/triggerchallenge and auth
+    which sets the parameter increase_failcounter_on_challenge
+    """
+    inc_fail_counter = Match.user(g, scope=SCOPE.AUTH, action=ACTION.INCREASE_FAILCOUNTER_ON_CHALLENGE,
+                                  user_object=request.User if hasattr(request, 'User') else None).any()
+    request.all_data["increase_failcounter_on_challenge"] = inc_fail_counter

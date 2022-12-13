@@ -6,11 +6,15 @@ This file contains the event handlers tests. It tests:
 lib/eventhandler/usernotification.py (one event handler module)
 lib/event.py (the decorator)
 """
-
 import responses
 import os
 import mock
 
+from mock import patch, MagicMock
+from privacyidea.lib.eventhandler.customuserattributeshandler import (CustomUserAttributesHandler,
+                                                                      ACTION_TYPE as CUAH_ACTION_TYPE)
+from privacyidea.lib.eventhandler.customuserattributeshandler import USER_TYPE
+from privacyidea.lib.eventhandler.webhookeventhandler import ACTION_TYPE, WebHookHandler, CONTENT_TYPE
 from privacyidea.lib.eventhandler.usernotification import UserNotificationEventHandler
 from .base import MyTestCase, FakeFlaskG, FakeAudit
 from privacyidea.lib.config import get_config_object
@@ -40,6 +44,7 @@ from dateutil.parser import parse as parse_date_string
 from dateutil.tz import tzlocal
 from privacyidea.app import PiResponseClass as Response
 from collections import OrderedDict
+
 
 class EventHandlerLibTestCase(MyTestCase):
 
@@ -1226,7 +1231,7 @@ class RequestManglerTestCase(MyTestCase):
 
         # The request does not contain the match_parameter, thus the
         # parameter in question will not be modified
-        req.all_data = {"user": "givenname.surname@company.com" }
+        req.all_data = {"user": "givenname.surname@company.com"}
         options = {"g": g,
                    "request": req,
                    "response": resp,
@@ -1382,7 +1387,6 @@ class ResponseManglerTestCase(MyTestCase):
         self.assertEqual(resp.data, csv)
 
     def test_02_set_response(self):
-
         g = FakeFlaskG()
         audit_object = FakeAudit()
         builder = EnvironBuilder(method='POST',
@@ -2358,3 +2362,514 @@ class TokenEventTestCase(MyTestCase):
         self.assertEqual(fc, 123)
 
         remove_token("SPASS01")
+
+    def test_13_tokengroup(self):
+        # setup realms
+        self.setUp_user_realms()
+        # create a tokengroup
+        from privacyidea.lib.tokengroup import set_tokengroup, delete_tokengroup
+        set_tokengroup("group1")
+
+        init_token({"serial": "SPASS01", "type": "spass"},
+                   User("cornelius", self.realm1))
+        t = get_tokens(serial="SPASS01")
+        uid = t[0].get_user_id()
+        self.assertEqual(uid, "1000")
+
+        g = FakeFlaskG()
+        audit_object = FakeAudit()
+        audit_object.audit_data["serial"] = "SPASS01"
+
+        g.logged_in_user = {"username": "admin",
+                            "role": "admin",
+                            "realm": ""}
+        g.audit_object = audit_object
+
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "SPASS01"},
+                                 headers={})
+
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.all_data = {"serial": "SPASS01", "type": "spass"}
+        resp = Response()
+        resp.data = """{"result": {"value": true}}"""
+
+        # The count window of the token will be set to 123
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {"options": {"tokengroup": "group1"}
+                                   }
+                   }
+
+        t_handler = TokenEventHandler()
+        res = t_handler.do(ACTION_TYPE.ADD_TOKENGROUP, options=options)
+        self.assertTrue(res)
+        # Check if the token as the group assigned
+        tok = get_tokens(serial="SPASS01")[0]
+        self.assertEqual(1, len(tok.token.tokengroup_list))
+        tg = tok.token.tokengroup_list[0]
+        self.assertEqual(tg.tokengroup.name, "group1")
+
+        # now remove the tokengroup
+        t_handler = TokenEventHandler()
+        res = t_handler.do(ACTION_TYPE.REMOVE_TOKENGROUP, options=options)
+        self.assertTrue(res)
+
+        tok = get_tokens(serial="SPASS01")[0]
+        self.assertEqual(0, len(tok.token.tokengroup_list))
+
+        remove_token("SPASS01")
+
+
+class CustomUserAttributesTestCase(MyTestCase):
+
+    def test_01_event_set_attributes_logged_in_user(self):
+
+        # Setup realm and user
+        self.setUp_user_realms()
+
+        user = User("hans", self.realm1)
+        g = FakeFlaskG()
+        g.logged_in_user = {'username': 'hans',
+                            'realm': self.realm1}
+
+        # The attributekey will be set as "test" and the attributevalue as "check"
+        options = {"g": g,
+                   "handler_def": {
+                       "options": {"user": "logged_in_user",
+                                   "attrkey": "test",
+                                   "attrvalue": "check"}}
+                   }
+        t_handler = CustomUserAttributesHandler()
+        res = t_handler.do("set_custom_user_attributes", options=options)
+        self.assertTrue(res)
+
+        # Check that the user has the correct attribute
+        a = user.attributes
+        self.assertIn('test', a, user)
+        self.assertEqual('check', a.get('test'), user)
+
+    def test_02_event_delete_attributes(self):
+
+        # Setup realm and user
+        self.setUp_user_realms()
+
+        user = User("hans", self.realm1)
+        g = FakeFlaskG()
+        g.logged_in_user = {'username': 'hans',
+                            'realm': self.realm1}
+        # Setup user attribute
+        ret = user.set_attribute('test', 'check')
+        self.assertTrue(ret)
+        a = user.attributes
+        if "test" in a:
+            b = a.get("test")
+            self.assertEqual('check', b)
+
+        # The eventhandler will delete the user-attribute
+        options = {"g": g,
+                   "attrkey": "test",
+                   "attrvalue": "check",
+                   "handler_def": {
+                       "options": {"user": "logged_in_user"}}
+                   }
+        t_handler = CustomUserAttributesHandler()
+        res = t_handler.do("delete_custom_user_attributes", options)
+        self.assertTrue(res)
+
+        # Check that the user attribute is deleted
+        self.assertNotIn("test", user.attributes, user)
+
+    def test_03_event_set_attributes_tokenowner(self):
+        # Tokenowner is the default
+        # Setup realm and user
+        self.setUp_user_realms()
+
+        init_token({"serial": "SPASS01", "type": "spass"},
+                   User("cornelius", self.realm1))
+        g = FakeFlaskG()
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "SPASS01"},
+                                 headers={})
+
+        env = builder.get_environ()
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.all_data = {"serial": "SPASS01"}
+        req.User = User("cornelius", self.realm1)
+
+        # The attributekey will be set as "test" and the attributevalue as "check"
+        options = {"g": g,
+                   "request": req,
+                   "handler_def": {"conditions": {"tokentype": "totp,spass,oath,"},
+                                   "options": {"attrkey": "test",
+                                               "attrvalue": "check",
+                                               "user": USER_TYPE.TOKENOWNER}}}
+        t_handler = CustomUserAttributesHandler()
+        res = t_handler.do(CUAH_ACTION_TYPE.SET_CUSTOM_USER_ATTRIBUTES, options=options)
+        self.assertTrue(res)
+
+        # Check that the user has the correct attribute
+        a = req.User.attributes
+        self.assertIn('test', a, req.User)
+        self.assertEqual('check', a.get('test'), req.User)
+
+    def test_04_delete_not_existing_attribute(self):
+
+        # Setup realm and user
+        self.setUp_user_realms()
+
+        user = User("hans", self.realm1)
+        g = FakeFlaskG()
+        g.logged_in_user = {'username': 'hans',
+                            'realm': self.realm1}
+        # Check that the attribute does not exist
+        self.assertNotIn('test', user.attributes, user)
+
+        # The eventhandler will delete the user-attribute
+        options = {"g": g,
+                   "handler_def": {
+                       "options": {"attrkey": "test",
+                                   "attrvalue": "check",
+                                   "user": USER_TYPE.LOGGED_IN_USER}}
+                   }
+        t_handler = CustomUserAttributesHandler()
+        res = t_handler.do(CUAH_ACTION_TYPE.DELETE_CUSTOM_USER_ATTRIBUTES, options)
+        self.assertFalse(res)
+
+        # Check that the user attribute is deleted
+        b = user.attributes
+        if "test" not in b:
+            self.assertTrue(True)
+        else:
+            self.assertTrue(False)
+
+    def test_05_overwrite_existing_attribute(self):
+
+        # Setup realm and user
+        self.setUp_user_realms()
+
+        user = User("hans", self.realm1)
+        g = FakeFlaskG()
+        g.logged_in_user = {'username': 'hans',
+                            'realm': self.realm1}
+        # Setup user attribute
+        ret = user.set_attribute('test', 'old')
+        self.assertTrue(ret)
+        a = user.attributes
+        if "test" in a:
+            b = a.get("test")
+            self.assertEqual('old', b)
+
+        # The attributekey will be set as "test" and the attributevalue as "check"
+        options = {"g": g,
+                   "handler_def": {
+                       "options": {"user": USER_TYPE.LOGGED_IN_USER,
+                                   "attrkey": "test",
+                                   "attrvalue": "new"}}
+                   }
+        t_handler = CustomUserAttributesHandler()
+        res = t_handler.do(CUAH_ACTION_TYPE.SET_CUSTOM_USER_ATTRIBUTES, options=options)
+        self.assertTrue(res)
+
+        # Check that the user has the correct attribute
+        a = user.attributes
+        self.assertIn('test', a, user)
+        self.assertEqual('new', a.get('test'), user)
+
+
+class WebhookTestCase(MyTestCase):
+
+    @patch('requests.post')
+    def test_01_send_webhook(self, mock_post):
+        with mock.patch("logging.Logger.info") as mock_log:
+            mock_post.return_value.status_code = 200
+            mock_post.return_value.json.return_value = 'response'
+            # Setup realm and user
+            self.setUp_user_realms()
+
+            user = User("hans", self.realm1)
+            g = FakeFlaskG()
+            g.logged_in_user = {'username': 'hans',
+                                'realm': self.realm1}
+
+            t_handler = WebHookHandler()
+            options = {"g": g,
+                       "handler_def": {
+                           "options": {"URL":
+                                           'http://test.com',
+                                       "content_type":
+                                           CONTENT_TYPE.URLENCODED,
+                                       "data":
+                                           'This is a test'
+                                       }
+                       }
+                       }
+            res = t_handler.do("post_webhook", options=options)
+            self.assertTrue(res)
+            text = 'A webhook is send to {0!r} with the text: {1!r}'.format(
+                'http://test.com', 'This is a test')
+            mock_log.assert_any_call(text)
+            mock_log.assert_called_with(200)
+
+            options = {"g": g,
+                       "handler_def": {
+                           "options": {"URL":
+                                           'http://test.com',
+                                       "content_type":
+                                           CONTENT_TYPE.JSON,
+                                       "data":
+                                           'This is a test'
+                                       }
+                       }
+                       }
+            res = t_handler.do("post_webhook", options=options)
+            self.assertTrue(res)
+            text = 'A webhook is send to {0!r} with the text: {1!r}'.format(
+                'http://test.com', 'This is a test')
+            mock_log.assert_any_call(text)
+            mock_log.assert_called_with(200)
+
+    def test_02_actions_and_positions(self):
+        positions = WebHookHandler().allowed_positions
+        self.assertEqual(positions, ["post", "pre"])
+        actions = WebHookHandler().actions
+        self.assertEqual(actions, {'post_webhook': {
+            "URL": {
+                "type": "str",
+                "required": True,
+                "description": ("The URL the WebHook is posted to")
+            },
+            "content_type": {
+                "type": "str",
+                "required": True,
+                "description": ("The encoding that is sent to the WebHook, for example json"),
+                "value": [
+                    CONTENT_TYPE.JSON,
+                    CONTENT_TYPE.URLENCODED]
+            },
+            "replace": {
+                "type": "bool",
+                "required": True,
+                "description": ("You can replace placeholder like {logged_in_user}")
+            },
+            "data": {
+                "type": "str",
+                "required": True,
+                "description": ('The data posted in the WebHook')
+            }
+        }})
+
+    def test_03_wrong_action_type(self):
+        with mock.patch("logging.Logger.warning") as mock_log:
+            # Setup realm and user
+            self.setUp_user_realms()
+
+            user = User("hans", self.realm1)
+            g = FakeFlaskG()
+            g.logged_in_user = {'username': 'hans',
+                                'realm': self.realm1}
+
+            t_handler = WebHookHandler()
+            options = {"g": g,
+                       "handler_def": {
+                           "options": {"URL":
+                                           'http://test.com',
+                                       "content_type":
+                                           CONTENT_TYPE.URLENCODED,
+                                       "data":
+                                           'This is a test'
+                                       }
+                       }
+                       }
+            res = t_handler.do("False_Type", options=options)
+            self.assertFalse(res)
+            text = 'Unknown action value: False_Type'
+            mock_log.assert_any_call(text)
+
+    def test_04_wrong_content_type(self):
+        with mock.patch("logging.Logger.warning") as mock_log:
+            # Setup realm and user
+            self.setUp_user_realms()
+
+            user = User("hans", self.realm1)
+            g = FakeFlaskG()
+            g.logged_in_user = {'username': 'hans',
+                                'realm': self.realm1}
+
+            t_handler = WebHookHandler()
+            options = {"g": g,
+                       "handler_def": {
+                           "options": {"URL":
+                                           'http://test.com',
+                                       "content_type":
+                                           'False_Type',
+                                       "data":
+                                           'This is a test'
+                                       }
+                       }
+                       }
+            res = t_handler.do("post_webhook", options=options)
+            self.assertFalse(res)
+            text = 'Unknown content type value: False_Type'
+            mock_log.assert_any_call(text)
+
+    def test_05_wrong_url(self):
+        # Setup realm and user
+        self.setUp_user_realms()
+
+        user = User("hans", self.realm1)
+        g = FakeFlaskG()
+        g.logged_in_user = {'username': 'hans',
+                            'realm': self.realm1}
+
+        t_handler = WebHookHandler()
+        options = {"g": g,
+                   "handler_def": {
+                       "options": {"URL":
+                                       'http://xyz.blablba',
+                                   "content_type":
+                                       CONTENT_TYPE.JSON,
+                                   "data":
+                                       'This is a test'
+                                   }
+                   }
+                   }
+        res = t_handler.do("post_webhook", options=options)
+        self.assertFalse(res)
+
+    @patch('requests.post')
+    def test_06_replace_function(self, mock_post):
+        with mock.patch("logging.Logger.info") as mock_log:
+            mock_post.return_value.status_code = 200
+            mock_post.return_value.json.return_value = 'response'
+            # Setup realm and user
+            self.setUp_user_realms()
+
+            user = User("hans", self.realm1)
+            g = FakeFlaskG()
+            g.logged_in_user = {'username': 'hans',
+                                'realm': self.realm1}
+
+            t_handler = WebHookHandler()
+            options = {"g": g,
+                       "handler_def": {
+                           "options": {"URL":
+                                           'http://test.com',
+                                       "content_type":
+                                           CONTENT_TYPE.URLENCODED,
+                                       "replace":
+                                           True,
+                                       "data":
+                                           'This is {logged_in_user} from realm {realm}'
+                                       }
+                       }
+                       }
+            res = t_handler.do("post_webhook", options=options)
+            self.assertTrue(res)
+            text = 'A webhook is send to {0!r} with the text: {1!r}'.format(
+                'http://test.com', 'This is hans from realm realm1')
+            mock_log.assert_any_call(text)
+            mock_log.assert_called_with(200)
+
+    @patch('requests.post')
+    def test_07_replace_function_error(self, mock_post):
+        with mock.patch("logging.Logger.warning") as mock_log:
+            with mock.patch("logging.Logger.info") as mock_info:
+                mock_post.return_value.status_code = 200
+                mock_post.return_value.json.return_value = 'response'
+
+                # Setup realm and user
+                self.setUp_user_realms()
+
+                init_token({"serial": "SPASS01", "type": "spass"},
+                           User("cornelius", self.realm1))
+                g = FakeFlaskG()
+                builder = EnvironBuilder(method='POST',
+                                         data={'serial': "SPASS01"},
+                                         headers={})
+
+                env = builder.get_environ()
+                env["REMOTE_ADDR"] = "10.0.0.1"
+                g.client_ip = env["REMOTE_ADDR"]
+                req = Request(env)
+                req.all_data = {"serial": "SPASS01"}
+                req.User = User("cornelius", self.realm1)
+
+                t_handler = WebHookHandler()
+                options = {"g": g,
+                           "request": req,
+                           "handler_def": {
+                               "options": {"URL":
+                                               'http://test.com',
+                                           "content_type":
+                                               CONTENT_TYPE.JSON,
+                                           "replace":
+                                               True,
+                                           "data":
+                                               '{{token_serial} {token_owner} {user_realm}}'
+                                           }
+                           }
+                           }
+                res = t_handler.do("post_webhook", options=options)
+                self.assertTrue(res)
+                mock_log.assert_any_call("Unable to replace placeholder: (Single '}' encountered in format string)!"
+                                         " Please check the webhooks data option.")
+                text = 'A webhook is send to {0!r} with the text: {1!r}'.format(
+                    'http://test.com', '{{token_serial} {token_owner} {user_realm}}')
+                mock_info.assert_any_call(text)
+                mock_info.assert_called_with(200)
+
+    @patch('requests.post')
+    def test_08_replace_function_typo(self, mock_post):
+        with mock.patch("logging.Logger.warning") as mock_log:
+            with mock.patch("logging.Logger.info") as mock_info:
+                mock_post.return_value.status_code = 200
+                mock_post.return_value.json.return_value = 'response'
+
+                # Setup realm and user
+                self.setUp_user_realms()
+
+                init_token({"serial": "SPASS01", "type": "spass"},
+                           User("cornelius", self.realm1))
+                g = FakeFlaskG()
+                builder = EnvironBuilder(method='POST',
+                                         data={'serial': "SPASS01"},
+                                         headers={})
+
+                env = builder.get_environ()
+                env["REMOTE_ADDR"] = "10.0.0.1"
+                g.client_ip = env["REMOTE_ADDR"]
+                req = Request(env)
+                req.all_data = {"serial": "SPASS01"}
+                req.User = User("cornelius", self.realm1)
+
+                t_handler = WebHookHandler()
+                options = {"g": g,
+                           "request": req,
+                           "handler_def": {
+                               "options": {"URL":
+                                               'http://test.com',
+                                           "content_type":
+                                               CONTENT_TYPE.JSON,
+                                           "replace":
+                                               True,
+                                           "data":
+                                               'The token serial is {token_seril}'
+                                           }
+                           }
+                           }
+                res = t_handler.do("post_webhook", options=options)
+                self.assertTrue(res)
+                mock_log.assert_any_call("Unable to replace placeholder: ('token_seril')!"
+                                         " Please check the webhooks data option.")
+                text = 'A webhook is send to {0!r} with the text: {1!r}'.format(
+                    'http://test.com', 'The token serial is {token_seril}')
+                mock_info.assert_any_call(text)
+                mock_info.assert_called_with(200)

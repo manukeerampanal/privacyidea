@@ -10,6 +10,8 @@ the privacyIDEA server. It is also used a self-service portal for the average us
 manages his own tokens. This section gives an overview on the interface and links the
 respective sections in the documentation.
 
+.. _dashboard:
+
 Dashboard
 ---------
 
@@ -24,6 +26,8 @@ access is displayed in the dashboard.
 
 .. figure:: images/dashboard.png
    :width: 500
+
+.. _tokensview:
 
 Tokens
 ------
@@ -79,6 +83,7 @@ Read about the functionality of the users view in the following sections.
    manage_users
    user_attributes
 
+.. _machines:
 
 Machines
 --------
@@ -92,6 +97,7 @@ In most cases there is no need to manage machines and this view is empty.
 
    *The Machines view.*
 
+.. _config:
 
 Config
 ------
@@ -105,6 +111,8 @@ behavior of the system, manages the :ref:`eventhandler` and lets the user set up
 
    *The Config section is the heart of the privacyIDEA server.*
 
+.. _audit:
+
 Audit
 -----
 
@@ -114,6 +122,7 @@ In this tab, the :ref:`audit` log is displayed which lists all events the server
    :width: 500
 
    *Events can be displayed in the Audit log.*
+
 
 .. _components:
 

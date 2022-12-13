@@ -70,7 +70,8 @@ from ..lib.token import (init_token, get_tokens_paginate, assign_token,
                          copy_token_user, copy_token_pin, lost_token,
                          get_serial_by_otp, get_tokens,
                          set_validity_period_end, set_validity_period_start, add_tokeninfo,
-                         delete_tokeninfo, import_token)
+                         delete_tokeninfo, import_token,
+                         assign_tokengroup, unassign_tokengroup, set_tokengroups)
 from werkzeug.datastructures import FileStorage
 from cgi import FieldStorage
 from privacyidea.lib.error import (ParameterError, TokenAdminError)
@@ -85,7 +86,7 @@ from privacyidea.api.lib.prepolicy import (prepolicy, check_base_action,
                                            check_max_token_user,
                                            check_max_token_realm,
                                            init_tokenlabel, init_random_pin,
-                                           init_registrationcode_length_contents,
+                                           init_token_length_contents,
                                            set_random_pin,
                                            encrypt_pin, check_otp_pin,
                                            check_external, init_token_defaults,
@@ -96,10 +97,13 @@ from privacyidea.api.lib.prepolicy import (prepolicy, check_base_action,
                                            twostep_enrollment_parameters,
                                            sms_identifiers, pushtoken_add_config,
                                            check_admin_tokenlist,
+                                           verify_enrollment,
                                            indexedsecret_force_attribute,
                                            check_admin_tokenlist, webauthntoken_enroll, webauthntoken_allowed,
-                                           webauthntoken_request, required_piv_attestation)
-from privacyidea.api.lib.postpolicy import (save_pin_change,
+                                           webauthntoken_request, required_piv_attestation,
+                                           hide_tokeninfo, init_ca_connector, init_ca_template,
+                                           init_subject_components)
+from privacyidea.api.lib.postpolicy import (save_pin_change, check_verify_enrollment,
                                             postpolicy)
 from privacyidea.lib.event import event
 from privacyidea.api.auth import admin_required
@@ -126,6 +130,9 @@ To see how to authenticate read :ref:`rest_auth`.
 @prepolicy(check_max_token_user, request)
 @prepolicy(check_token_init, request)
 @prepolicy(init_tokenlabel, request)
+@prepolicy(init_ca_connector, request)
+@prepolicy(init_ca_template, request)
+@prepolicy(init_subject_components, request)
 @prepolicy(enroll_pin, request)
 @prepolicy(twostep_enrollment_activation, request)
 @prepolicy(twostep_enrollment_parameters, request)
@@ -134,7 +141,7 @@ To see how to authenticate read :ref:`rest_auth`.
 @prepolicy(check_otp_pin, request)
 @prepolicy(check_external, request, action="init")
 @prepolicy(init_token_defaults, request)
-@prepolicy(init_registrationcode_length_contents, request)
+@prepolicy(init_token_length_contents, request)
 @prepolicy(papertoken_count, request)
 @prepolicy(sms_identifiers, request)
 @prepolicy(tantoken_count, request)
@@ -146,9 +153,11 @@ To see how to authenticate read :ref:`rest_auth`.
 @prepolicy(webauthntoken_request, request)
 @prepolicy(webauthntoken_enroll, request)
 @prepolicy(required_piv_attestation, request)
+@prepolicy(verify_enrollment, request)
 @postpolicy(save_pin_change, request)
-@CheckSubscription(request)
 @event("token_init", request, g)
+@postpolicy(check_verify_enrollment, request)
+@CheckSubscription(request)
 @log_with(log, log_entry=False)
 def init():
     """
@@ -174,6 +183,8 @@ def init():
                     see :ref:`2step_enrollment`.
     :jsonparam otpkeyformat: used to supply the OTP key in alternate formats, currently
                             hex or base32check (see :ref:`2step_enrollment`)
+    :jsonparam rollover: Set this to 1 or true to indicate, that you want to rollover a token.
+                    This is mandatory to rollover tokens, that are in the clientwait state.
 
     :return: a json result with a boolean "result": true
 
@@ -251,6 +262,34 @@ def init():
     Base Tokenclass contains an extremely simple way by concatenating the 
     two parts. See
     :func:`~privacyidea.lib.tokenclass.TokenClass.generate_symmetric_key`
+
+    **verify enrollment**
+
+    Some tokens can be configured via enrollment policy so that the user
+    needs to provide some verification that e.g. a QR code was scanned correctly or
+    the token works correctly in general.
+    The specific way depends on the token class.
+    The necessary token class functions are
+
+    * :func:`~privacyidea.lib.tokenclass.TokenClass.verify_enrollment`
+    * :func:`~privacyidea.lib.tokenclass.TokenClass.prepare_verify_enrollment`
+
+    The first API call to /token/init returns responses in::
+
+        {"detail": {"verify": {"message": "Please provide a valid OTP value."},
+                    "rollout_state": "verify"}}
+
+    The second API call then needs to send the serial number and a response
+
+       .. sourcecode:: http
+
+           POST /token/init
+
+           serial=<serial from the previous response>
+           verify=<e.g. the OTP value>
+
+    As long as the token is in state "verify" it can not be used for
+    authentication.
     """
     response_details = {}
     tokenrealms = None
@@ -343,6 +382,7 @@ def get_challenges_api(serial=None):
 
 @token_blueprint.route('/', methods=['GET'])
 @prepolicy(check_admin_tokenlist, request)
+@prepolicy(hide_tokeninfo, request)
 @event("token_list", request, g)
 @log_with(log)
 def list_api():
@@ -365,9 +405,10 @@ def list_api():
     :query assigned: Only return assigned (True) or not assigned (False) tokens
     :query active: Only return active (True) or inactive (False) tokens
     :query pagesize: limit the number of returned tokens
-    :query user_fields: additional user fields from the userid resolver of
-        the owner (user)
     :query outform: if set to "csv", than the token list will be given in CSV
+    :query rollout_state: only list tokens with the given rollout_state
+    :query infokey: only list tokens, where the infokey has the given infovalue
+    :query infovalue: only list tokens, where the infokey has the given infovalue
 
     :return: a json result with the data being a list of token dictionaries::
 
@@ -387,12 +428,12 @@ def list_api():
     realm = getParam(param, "tokenrealm", optional)
     userid = getParam(param, "userid", optional)
     resolver = getParam(param, "resolver", optional)
-    ufields = getParam(param, "user_fields", optional)
     output_format = getParam(param, "outform", optional)
     assigned = getParam(param, "assigned", optional)
     active = getParam(param, "active", optional)
     tokeninfokey = getParam(param, "infokey", optional)
     tokeninfovalue = getParam(param, "infovalue", optional)
+    rollout_state = getParam(param, "rollout_state", optional)
     tokeninfo = None
     if tokeninfokey and tokeninfovalue:
         tokeninfo = {tokeninfokey: tokeninfovalue}
@@ -400,15 +441,14 @@ def list_api():
         assigned = assigned.lower() == "true"
     if active:
         active = active.lower() == "true"
-    
-    user_fields = []
-    if ufields:
-        user_fields = [u.strip() for u in ufields.split(",")]
 
     # allowed_realms determines, which realms the admin would be allowed to see
     # In certain cases like for users, we do not have allowed_realms
     allowed_realms = getattr(request, "pi_allowed_realms", None)
     g.audit_object.log({'info': "realm: {0!s}".format((allowed_realms))})
+
+    # get hide_tokeninfo setting from all_data
+    hidden_tokeninfo = getParam(request.all_data, 'hidden_tokeninfo', default=None)
 
     # get list of tokens as a dictionary
     tokens = get_tokens_paginate(serial=serial, realm=realm, page=page,
@@ -418,7 +458,9 @@ def list_api():
                                  resolver=resolver,
                                  description=description,
                                  userid=userid, allowed_realms=allowed_realms,
-                                 tokeninfo=tokeninfo)
+                                 tokeninfo=tokeninfo,
+                                 rollout_state=rollout_state,
+                                 hidden_tokeninfo=hidden_tokeninfo)
     g.audit_object.log({"success": True})
     if output_format == "csv":
         return send_csv_result(tokens)
@@ -1181,3 +1223,59 @@ def delete_tokeninfo_api(serial, key):
     success = count > 0
     g.audit_object.log({"success": success})
     return send_result(success)
+
+
+@token_blueprint.route('/group/<serial>/<groupname>', methods=['POST'])
+@token_blueprint.route('/group/<serial>', methods=['POST'])
+@admin_required
+@prepolicy(check_base_action, request, ACTION.TOKENGROUPS)
+@event("token_assign_group", request, g)
+@log_with(log)
+def assign_tokengroup_api(serial, groupname=None):
+    """
+    Assigns a token to a given tokengroup.
+
+    If no groupname is given, we expect a body data "groups", that
+    contains a list of tokengroups. tokengroups that are
+    not contained in this list, will be removed.
+
+    :jsonparam basestring serial: the serial number of the token
+    :jsonparam basestring groupname: The name of the tokengroup
+    :jsonparam list groups: A list of tokengroups
+    :return:
+    :rtype: json object
+    """
+    g.audit_object.log({"serial": serial})
+    if groupname:
+        g.audit_object.add_to_log({'action_detail': groupname})
+        assign_tokengroup(serial, tokengroup=groupname)
+    else:
+        groups = getParam(request.all_data, "groups", required)
+        if type(groups) == list:
+            group_list = groups
+        else:
+            group_list = [r.strip() for r in groups.split(",")]
+        g.audit_object.add_to_log({'action_detail': ",".join(group_list)})
+        set_tokengroups(serial, group_list)
+    g.audit_object.log({"success": True})
+    return send_result(1)
+
+
+@token_blueprint.route('/group/<serial>/<groupname>', methods=['DELETE'])
+@admin_required
+@prepolicy(check_base_action, request, ACTION.TOKENGROUPS)
+@event("token_unassign_group", request, g)
+@log_with(log)
+def unassign_tokengroup_api(serial, groupname):
+    """
+    Unassigned a token from a tokengroup.
+
+    :jsonparam basestring serial: the serial number of the token
+    :jsonparam basestring groupname: The name of the tokengroup
+    :return:
+    :rtype: json object
+    """
+    g.audit_object.add_to_log({'action_detail': groupname})
+    unassign_tokengroup(serial, tokengroup=groupname)
+    g.audit_object.add_to_log({'success': True})
+    return send_result(1)

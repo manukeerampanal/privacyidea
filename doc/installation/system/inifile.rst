@@ -25,6 +25,8 @@ The file should contain the following contents::
    SUPERUSER_REALM = ['super', 'administrators']
    # Your database
    SQLALCHEMY_DATABASE_URI = 'sqlite:////etc/privacyidea/data.sqlite'
+   # Set maximum identifier length to 128
+   # SQLALCHEMY_ENGINE_OPTIONS = {"max_identifier_length": 128}
    # This is used to encrypt the auth_token
    SECRET_KEY = 't0p s3cr3t'
    # This is used to encrypt the admin passwords
@@ -36,6 +38,8 @@ The file should contain the following contents::
    PI_AUDIT_KEY_PUBLIC = '/home/cornelius/src/privacyidea/public.pem'
    # PI_AUDIT_MODULE = <python audit module>
    # PI_AUDIT_SQL_URI = <special audit log DB uri>
+   # Options passed to the Audit DB engine (supersedes SQLALCHEMY_ENGINE_OPTIONS)
+   # PI_AUDIT_SQL_OPTIONS = {}
    # Truncate Audit entries to fit into DB columns
    PI_AUDIT_SQL_TRUNCATE = True
    # PI_LOGFILE = '....'
@@ -44,13 +48,21 @@ The file should contain the following contents::
    # PI_CSS = '/location/of/theme.css'
    # PI_UI_DEACTIVATED = True
 
-
 .. note:: The config file is parsed as python code, so you can use variables to
    set the path and you need to take care for indentations.
 
 ``SQLALCHEMY_DATABASE_URI`` defines the location of your database.
 You may want to use the MySQL database or Maria DB. There are two possible
 drivers, to connect to this database. Please read :ref:`mysqldb`.
+
+``SQLALCHEMY_ENGINE_OPTIONS`` is a dictionary of keyword args to send
+to `create_engine() <https://docs.sqlalchemy.org/en/14/core/engines.html#sqlalchemy
+.create_engine>`_. The ``max_identifier_length`` is the database’s
+configured maximum number of characters that may be used in a SQL identifier
+such as a table name, column name, or label name. For Oracle version 19 and above
+the `max_identifier_length <https://docs.sqlalchemy.org/en/14/core/engines
+.html#sqlalchemy.create_engine.params.max_identifier_length>`_ should be set to 128.
+
 
 The ``SUPERUSER_REALM`` is a list of realms, in which the users get the role
 of an administrator.
@@ -71,6 +83,34 @@ slower but more robust and can be necessary in large redundant setups.
    The database might respond with an error like "object has been deleted or its
    row is otherwise not present". In this case setting ``PI_DB_SAFE_STORE``  to *True*
    might help.
+
+``PI_HASH_ALGO_LIST`` is a user-defined list of hash algorithms which are used
+to verify passwords and pins. The first entry in ``PI_HASH_ALGO_LIST`` is used
+for hashing a new password/pin.
+If ``PI_HASH_ALGO_LIST`` is not defined, ``['argon2', 'pbkdf2_sha512']`` is the default.
+Further information can be found in the FAQ (:ref:`faq_crypto_pin_hashing`).
+
+.. note:: If you change the hash algorithm, take care that the previously used one is still
+   included in the ``PI_HASH_ALGO_LIST`` so already generated hashes can still be verified.
+
+
+``PI_HASH_ALGO_PARAMS`` is a user-defined dictionary where various parameters for the hash algorithm
+can be set, for example::
+
+   PI_HASH_ALGO_PARAMS = {'argon2__rounds': 5, 'argon2__memory_cost': 768'}
+
+Further information on possible parameters can be found in the
+`PassLib documentation <https://passlib.readthedocs.io/en/stable/lib/passlib.hash.html>`_.
+
+``PI_PREFERRED_LANGUAGE`` is a list in which the preferred languages can be defined.
+The browser's language settings are compared to this list and the "best match" wins.
+If none of the languages set in the browser match, the first language in the list
+will be used as the default language::
+
+    PI_PREFERRED_LANGUAGE = ["en", "de", "es", "fr"]
+
+.. note:: If ``PI_PREFERRED_LANGUAGE`` is not defined, the following list is used.
+   ['en', 'de', 'nl', 'zh_Hant', 'fr', 'es', 'tr']
 
 Logging
 -------
@@ -128,6 +168,9 @@ to the audit log using the variable ``PI_AUDIT_SERVERNAME``.
 
 You can run the database for the audit module on another database or even
 server. For this you can specify the database URI via ``PI_AUDIT_SQL_URI``.
+With ``PI_AUDIT_SQL_OPTIONS`` You can pass a dictionary of options to the
+database engine. If ``PI_AUDIT_SQL_OPTIONS`` is not set,
+``SQLALCHEMY_ENGINE_OPTIONS`` will be used.
 
 ``PI_AUDIT_SQL_TRUNCATE = True`` lets you truncate audit entries to the length
 of the database fields.

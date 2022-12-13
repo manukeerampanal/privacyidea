@@ -31,10 +31,6 @@ DICT_FILE = "tests/testdata/dictionary"
 FIREBASE_FILE = "tests/testdata/firebase-test.json"
 CLIENT_FILE = "tests/testdata/google-services.json"
 FB_CONFIG_VALS = {
-    FIREBASE_CONFIG.API_KEY: "1",
-    FIREBASE_CONFIG.APP_ID: "2",
-    FIREBASE_CONFIG.PROJECT_NUMBER: "3",
-    FIREBASE_CONFIG.PROJECT_ID: "test-123456",
     FIREBASE_CONFIG.JSON_CONFIG: FIREBASE_FILE}
 REGISTRATION_URL = "http://test/ttype/push"
 TTL = "10"
@@ -85,6 +81,17 @@ class TtypeAPITestCase(MyApiTestCase):
             self.assertTrue(len(auditdata) > 0)
             self.assertEqual(auditdata[0].get("token_type"), "u2f")
 
+    def test_03_wrong(self):
+        # Test the ttype endpoint for wrong ttype, here /ttype/wrong
+        init_token({"serial": "TIQR1",
+                    "type": "tiqr"}, User("cornelius", self.realm1))
+        with self.app.test_request_context('/ttype/wrong',
+                                           method='POST',
+                                           data={"action": "metadata",
+                                                 "serial": "TIQR1",
+                                                 "session": "12345"}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 400, res.status_code)
 
 class TtypePushAPITestCase(MyApiTestCase):
     """
@@ -173,9 +180,6 @@ class TtypePushAPITestCase(MyApiTestCase):
             self.assertTrue("pushurl" in detail)
             # check that the new URL contains the serial number
             self.assertTrue("&serial=PIPU" in detail.get("pushurl").get("value"))
-            self.assertTrue("appid=" in detail.get("pushurl").get("value"))
-            self.assertTrue("appidios=" in detail.get("pushurl").get("value"))
-            self.assertTrue("apikeyios=" in detail.get("pushurl").get("value"))
             self.assertFalse("otpkey" in detail)
             enrollment_credential = detail.get("enrollment_credential")
 
@@ -273,18 +277,21 @@ class TtypePushAPITestCase(MyApiTestCase):
 
             # Send the first authentication request to trigger the challenge.
             # No push notification is submitted to firebase, but a challenge is created anyway
-            with self.app.test_request_context('/validate/check',
-                                               method='POST',
-                                               data={"user": "cornelius",
-                                                     "realm": self.realm1,
-                                                     "pass": "pushpin"}):
-                res = self.app.full_dispatch_request()
-                self.assertTrue(res.status_code == 400, res)
-                jsonresp = res.json
-                self.assertFalse(jsonresp.get("result").get("status"))
-                self.assertEqual(jsonresp.get("result").get("error").get("code"), 401)
-                self.assertEqual(jsonresp.get("result").get("error").get("message"),
-                                 "ERR401: Failed to submit message to Firebase service.")
+            with mock.patch("logging.Logger.warning") as mock_log:
+                with self.app.test_request_context('/validate/check',
+                                                   method='POST',
+                                                   data={"user": "cornelius",
+                                                         "realm": self.realm1,
+                                                         "pass": "pushpin"}):
+                    res = self.app.full_dispatch_request()
+                    self.assertTrue(res.status_code == 200, res)
+                    result = res.json.get("result")
+                    self.assertTrue(result.get("status"))
+                    self.assertFalse(result.get("value"))
+                    self.assertEqual("CHALLENGE", result.get("authentication"))
+                    # Check that the warning was written to the log file.
+                    mock_log.assert_called_with("Failed to submit message to Firebase service for token {0!s}."
+                                                .format(serial))
 
         # first create a signature
         ts = datetime.utcnow().isoformat()

@@ -19,7 +19,8 @@
  *
  */
 angular.module("privacyideaAuth", ['privacyideaApp.errorMessage'])
-    .factory("AuthFactory", function (inform, gettextCatalog, $state) {
+    .factory("AuthFactory", ["inform", "gettextCatalog", "$state",
+                             function (inform, gettextCatalog, $state) {
         /*
         Each service - just like this service factory - is a singleton.
         Here we just store the username of the authenticated user and his
@@ -74,23 +75,27 @@ angular.module("privacyideaAuth", ['privacyideaApp.errorMessage'])
                 return user.role;
             },
             checkRight: function (action) {
-                // check if the action is contained in user.rights
-                var res = (user.rights.indexOf(action) >= 0);
-                ////debug: console.log("checking right: " + action + ": " + res);
-                return res;
+                if (user.rights) {
+                    // check if the action is contained in user.rights
+                    var res = (user.rights.indexOf(action) >= 0);
+                    ////debug: console.log("checking right: " + action + ": " + res);
+                    return res;
+                }
             },
-            getRightsValue: function (action) {
+            getRightsValue: function (action, defaultValue=false) {
                 // return the value of an action like otp_pin_minlength
-                var res = false;
-                user.rights.forEach(function(entry){
-                    if (entry.indexOf("=") >= 0) {
-                        // this is a value action
-                        var components = entry.split("=");
-                        if (components[0] === action) {
-                            res = components[1];
+                var res = defaultValue;
+                if (user.rights) {
+                    user.rights.forEach(function (entry) {
+                        if (entry.indexOf("=") >= 0) {
+                            // this is a value action
+                            var components = entry.split("=");
+                            if (components[0] === action) {
+                                res = components[1];
+                            }
                         }
-                    }
-                });
+                    });
+                }
                 return res;
             },
             checkMainMenu: function (menu) {
@@ -100,16 +105,18 @@ angular.module("privacyideaAuth", ['privacyideaApp.errorMessage'])
             checkEnroll: function() {
                 // Check if any enroll* action is contained in user.rights
                 var res = false;
-                user.rights.forEach(function(entry){
-                    // check if the action starts with "enroll"
-                    if (entry.indexOf("enroll") === 0) {
-                        res = true;
-                    }
-                });
+                if (user.rights) {
+                    user.rights.forEach(function(entry){
+                        // check if the action starts with "enroll"
+                        if (entry.indexOf("enroll") === 0) {
+                            res = true;
+                        }
+                    });
+                }
                 return res;
             }
         };
-    });
+    }]);
 
 //
 // Taken from

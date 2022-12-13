@@ -23,7 +23,6 @@ from privacyidea.lib.resolver import (save_resolver, get_resolver_list,
                                       delete_resolver)
 from privacyidea.lib.error import ParameterError
 from privacyidea.lib.user import User
-import datetime
 from .base import PWFILE as FILE_PASSWORDS
 from .base import PWFILE2 as FILE_PASSWD
 
@@ -1006,7 +1005,8 @@ class PolicyTestCase(MyTestCase):
         audit_data = {}
         r = P.get_action_values(action=ACTION.OTPPIN, scope=SCOPE.AUTH, unique=True, audit_data=audit_data)
 
-        self.assertEqual(r, {"userstore": ["act1", "act2"]})
+        self.assertIn('userstore', r, r)
+        self.assertEqual({'act1', 'act2'}, set(r['userstore']), r)
 
         # The audit_data contains act1 and act2
         self.assertTrue("act1" in audit_data.get("policies"))
@@ -1052,15 +1052,19 @@ class PolicyTestCase(MyTestCase):
         P = PolicyClass()
         self.assertEqual(set(p['name'] for p in P.match_policies(user_object=cornelius)),
                          {"act1", "act2", "act3"})
-        self.assertEqual(P.get_action_values(action=ACTION.OTPPIN, scope=SCOPE.AUTH,
-                                             user_object=cornelius),
-                         {"userstore": ["act1", "act2"], "none": ["act3"]})
+        r = P.get_action_values(action=ACTION.OTPPIN, scope=SCOPE.AUTH, user_object=cornelius)
+        self.assertIn('userstore', r, r)
+        self.assertIn('none', r, r)
+        self.assertEqual({'act1', 'act2'}, set(r['userstore']), r)
+        self.assertEqual(['act3'], r['none'], r)
 
         self.assertEqual(set(p['name'] for p in P.match_policies(user_object=nonascii)),
                          {"act1", "act2", "act3", "act4"})
-        self.assertEqual(P.get_action_values(action=ACTION.OTPPIN, scope=SCOPE.AUTH,
-                                             user_object=nonascii),
-                         {"userstore": ["act1", "act2"], "none": ["act3", "act4"]})
+        r = P.get_action_values(action=ACTION.OTPPIN, scope=SCOPE.AUTH, user_object=nonascii)
+        self.assertIn('userstore', r, r)
+        self.assertIn('none', r, r)
+        self.assertEqual({'act1', 'act2'}, set(r['userstore']), r)
+        self.assertEqual({'act3', 'act4'}, set(r['none']), r)
 
         self.assertEqual(set(p['name'] for p in P.match_policies(user_object=selfservice)),
                          {"act2", "act3"})
@@ -1076,9 +1080,11 @@ class PolicyTestCase(MyTestCase):
 
         self.assertEqual(set(p['name'] for p in P.match_policies(user_object=None)),
                          {"act1", "act2", "act3", "act4"})
-        self.assertEqual(P.get_action_values(action=ACTION.OTPPIN, scope=SCOPE.AUTH,
-                                             user_object=None),
-                         {"userstore": ["act1", "act2"], "none": ["act3", "act4"]})
+        r = P.get_action_values(action=ACTION.OTPPIN, scope=SCOPE.AUTH, user_object=None)
+        self.assertIn('userstore', r, r)
+        self.assertIn('none', r, r)
+        self.assertEqual({'act1', 'act2'}, set(r['userstore']), r)
+        self.assertEqual({'act3', 'act4'}, set(r['none']), r)
 
         self.assertEqual(set(p['name'] for p in P.match_policies(user_object=User())),
                          set())
@@ -1104,8 +1110,25 @@ class PolicyTestCase(MyTestCase):
         # If we pass None as the user object, all policies match
         self.assertEqual(set(p['name'] for p in P.match_policies(user_object=None)),
                          {"act1", "act2", "act3", "act4", "act5"})
-        self.assertEqual(P.get_action_values(action=ACTION.OTPPIN, scope=SCOPE.AUTH, user_object=None),
-                         {"userstore": ["act1", "act2"], "none": ["act3", "act4", "act5"]})
+        r = P.get_action_values(action=ACTION.OTPPIN, scope=SCOPE.AUTH, user_object=None)
+        self.assertIn('userstore', r, r)
+        self.assertIn('none', r, r)
+        self.assertEqual({'act1', 'act2'}, set(r['userstore']), r)
+        self.assertEqual({'act3', 'act4', 'act5'}, set(r['none']), r)
+
+        # if we pass user_obj ornelius, we only get 4 policies
+        self.assertEqual(set(p['name'] for p in P.match_policies(user_object=cornelius)),
+                         {"act1", "act2", "act3", "act5"})
+        # Provide a user object and parameters
+        self.assertEqual(set(p['name'] for p in P.match_policies(user_object=cornelius,
+                                                                 user="cornelius",
+                                                                 realm="realm1")),
+                         {"act1", "act2", "act3", "act5"})
+        # For some reason pass the same user_obj and parameters, but realm in upper case
+        self.assertEqual(set(p['name'] for p in P.match_policies(user_object=cornelius,
+                                                                 user="cornelius",
+                                                                 realm="REALM1")),
+                         {"act1", "act2", "act3", "act5"})
 
         delete_policy("act1")
         delete_policy("act2")
@@ -1488,6 +1511,29 @@ class PolicyTestCase(MyTestCase):
         self.assertEqual(sorted(d.get("set").get("*")), ["off", "on"])
         self.assertEqual(sorted(d.get("set").get("hello")), ["one", "three", "two"])
         self.assertEqual(sorted(d.get("set").get("hello2")), ["*"])
+
+    def test_40_disable_policy_client_remains(self):
+        pname = "client_must_not_vanish"
+        test_ip = "1.2.3.4"
+        set_policy(pname, scope=SCOPE.AUTH,
+                   action="otppin=none", client=test_ip)
+        p = PolicyClass()
+        plist = p.list_policies(name=pname)
+        self.assertIn(test_ip, plist[0].get("client"))
+        # Now disable the policy
+        enable_policy(pname, enable=False)
+        # client is still there
+        p = PolicyClass()
+        plist = p.list_policies(name=pname)
+        self.assertIn(test_ip, plist[0].get("client"))
+        # enable policy again
+        enable_policy(pname, enable=True)
+        # client is still there
+        p = PolicyClass()
+        plist = p.list_policies(name=pname)
+        self.assertIn(test_ip, plist[0].get("client"))
+        # clean up
+        delete_policy(pname)
 
 
 class PolicyMatchTestCase(MyTestCase):

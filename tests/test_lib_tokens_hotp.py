@@ -160,8 +160,7 @@ class HOTPTokenTestCase(MyTestCase):
                         token.token.so_pin)
         self.assertTrue(len(token.token.user_pin) == 32,
                         token.token.user_pin)
-        self.assertTrue(len(token.token.key_enc) == 192,
-                        token.token.key_enc)
+        self.assertEqual(len(token.token.key_enc), 96, token.token.key_enc)
         self.assertTrue(token.get_otplen() == 8)
         self.assertTrue(token.token.count == 1000,
                         token.token.count)
@@ -341,6 +340,9 @@ class HOTPTokenTestCase(MyTestCase):
         # OTP does exist
         res = token.check_otp_exist("969429")
         self.assertTrue(res == 3, res)
+        # check is_previous_otp
+        r = token.is_previous_otp("969429")
+        self.assertTrue(r)
 
     def test_14_split_pin_pass(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
@@ -652,7 +654,7 @@ class HOTPTokenTestCase(MyTestCase):
         token.check_otp("67062674")
 
     def test_26_is_previous_otp(self):
-        # check if the OTP was used prebiously
+        # check if the OTP was used previously
         serial = "previous"
         db_token = Token(serial, tokentype="hotp")
         db_token.save()
@@ -677,8 +679,13 @@ class HOTPTokenTestCase(MyTestCase):
         """
         r = token.check_otp("969429")
         self.assertEqual(r, 3)
+        # Too old
         r = token.is_previous_otp("755224")
+        self.assertEqual(r, False)
+        # The very previous OTP, that was just used in check_otp
+        r = token.is_previous_otp("969429")
         self.assertEqual(r, True)
+        # Future value
         r = token.is_previous_otp("254676")
         self.assertEqual(r, False)
         r = token.check_otp("254676")

@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-
-from .base import MyApiTestCase
+from .base import MyApiTestCase, PWFILE2
 import json
 import os
 import datetime
@@ -9,16 +8,124 @@ from mock import mock
 from privacyidea.lib.policy import (set_policy, delete_policy, SCOPE, ACTION,
                                     enable_policy,
                                     PolicyClass)
-from privacyidea.lib.token import (get_tokens, init_token, remove_token, get_tokens_from_serial_or_user, enable_token,
-                                   check_serial_pass, get_realms_of_token, assign_token)
+from privacyidea.lib.token import (get_tokens, init_token, remove_token,
+                                   get_tokens_from_serial_or_user, enable_token,
+                                   check_serial_pass, get_realms_of_token,
+                                   assign_token, token_exist, add_tokeninfo)
+from privacyidea.lib.resolver import save_resolver
+from privacyidea.lib.realm import set_realm
 from privacyidea.lib.user import User
 from privacyidea.lib.event import set_event, delete_event, EventConfiguration
 from privacyidea.lib.caconnector import save_caconnector
-from six.moves.urllib.parse import urlencode
+from six.moves.urllib.parse import urlencode, quote
 from privacyidea.lib.tokenclass import DATE_FORMAT
+from privacyidea.lib.tokenclass import ROLLOUTSTATE
+from privacyidea.lib.tokens.hotptoken import VERIFY_ENROLLMENT_MESSAGE
 from privacyidea.lib.config import set_privacyidea_config, delete_privacyidea_config
 from dateutil.tz import tzlocal
 from privacyidea.lib import _
+import os
+import unittest
+import mock
+from privacyidea.lib.caconnectors.baseca import AvailableCAConnectors
+from privacyidea.lib.caconnectors.msca import MSCAConnector
+from .mscamock import CAServiceMock
+from privacyidea.lib.caconnectors.msca import ATTR as MS_ATTR
+from privacyidea.lib.token import init_token
+
+# Mock for certificate from MSCA
+MY_CA_NAME = "192.168.47.11"
+
+MOCK_AVAILABLE_CAS = ['WIN-GG7JP259HMQ.nilsca.com\\nilsca-WIN-GG7JP259HMQ-CA',
+                      'CA03.nilsca.com\\nilsca-CA03-CA']
+MOCK_CA_TEMPLATES = ["User", "SmartcardLogon", "ApprovalRequired"]
+
+MOCK_USER_CERT = """-----BEGIN CERTIFICATE-----
+MIIGFTCCA/2gAwIBAgIBRjANBgkqhkiG9w0BAQsFADCBkTELMAkGA1UEBhMCREUx
+DzANBgNVBAgTBkhlc3NlbjEPMA0GA1UEBxMGS2Fzc2VsMRgwFgYDVQQKEw9OZXRL
+bmlnaHRzIEdtYkgxEDAOBgNVBAsTB2V4YW1wbGUxETAPBgNVBAMTCGxvY2FsIENB
+MSEwHwYJKoZIhvcNAQkBFhJpbmZvQG5ldGtuaWdodHMuaXQwHhcNMjIwNzE4MDkw
+OTMxWhcNMjQwNzA3MDkwOTMxWjBHMQswCQYDVQQGEwJERTEPMA0GA1UECAwGSGVz
+c2VuMRQwEgYDVQQKDAtwcml2YWN5aWRlYTERMA8GA1UEAwwIdXNlcmNlcnQwggEi
+MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDcL9FfKZfUfMNTyDC9S2dwLCRr
+uF7rIXpIElZ8gVxIdbZo6/bymE5QUdF/bHPzCqeuvkhe5dbh2Sp8Mm5O/Qj2WlRJ
+I3PDuQcY0e+zrPiK3JSWpJA6jnTf5g03G71btyUaVjnab5GqXhx08/l8FAGDEmV2
+x7v+NluV6XJlg+0+mDBx+ofdozZaMAMuJuBh0b8CP7YGH0qJKBxcov9OvpTmjODa
+gvGdKTJIMHO0BPZCHr734jIyJzydiS9wPoWab1zFCcCMMi9yIsnSlR+2rHJgcreC
+TWvOW+MA0NIvWMbgEOVRyk07LuZ+q4TWVvGTNaCTZCaBdS+RtRYGOAvbzC0HAgMB
+AAGjggG/MIIBuzALBgNVHQ8EBAMCBeAwCQYDVR0TBAIwADAdBgNVHQ4EFgQU/BTR
+8EuNAJDy9bhxnk6Xw5JUrQswgcYGA1UdIwSBvjCBu4AUgJJUh03rWtOETE9/aKgg
++S/Vy2WhgZekgZQwgZExCzAJBgNVBAYTAkRFMQ8wDQYDVQQIEwZIZXNzZW4xDzAN
+BgNVBAcTBkthc3NlbDEYMBYGA1UEChMPTmV0S25pZ2h0cyBHbWJIMRAwDgYDVQQL
+EwdleGFtcGxlMREwDwYDVQQDEwhsb2NhbCBDQTEhMB8GCSqGSIb3DQEJARYSaW5m
+b0BuZXRrbmlnaHRzLml0ggkArBZTyBi/ZtkwdAYDVR0fBG0wazAqoCigJoYkaHR0
+cHM6Ly9uZXRrbmlnaHRzLml0L25ldGtuaWdodHMuY3JsMD2gO6A5hjdodHRwczov
+L29wZW5wcm9qZWN0Lm9mZmljZS5uZXRrbmlnaHRzLml0L25ldGtuaWdodHMuY3Js
+MEMGCCsGAQUFBwEBBDcwNTAzBggrBgEFBQcwAoYnaHR0cHM6Ly9uZXRrbmlnaHRz
+Lml0L25ldGtuaWdodHMtY2EuY3J0MA0GCSqGSIb3DQEBCwUAA4ICAQCWsFBzwvIm
+ZWzmWZmCTNYc8c7O0wmNorfGp4c6yZjsffo8w+FLbsbkTb/U12mupKkMxTJmqUdb
+q3zeVsRUG1Lg9K2iM5f9FWxrxbyecGJ04lVN/FTBHdUw9dmnTlIgbUo3ZK6doS1F
+YcdDSYGkvUDMba0zvMy7A8MaGdtBWmvULLEw4pBcoxzjd7TtNGimVFH9mdS2YAj3
+P5fTX0ReBfUX4JJB7XJFl4vdPetZ/93zDM12YxtytDa1KrtwAFcCAgTuBsd014LK
+dMjsLOpiJzyKqol5OPsnkwhxqTEaPzCviMymMEwaZQLQDTbS62UBhMqv5oOOSy2l
+Awx0eVSlPOFEyeg0PEO3G3SQjajrpxUkGEdb+krEazNd00gz6SNbSliT/GQS4tO4
+VBC5Qos8/IabJpV5Bvqq4/7ZmVeAOXRQCVPomugzU1L6cs7GWCZpmuB7WG5VT+hL
++WGIKnWe8vmi+dWs1SRAjFEPKd5mjgeIiYh9D5n+0lBWYO7q6Hf+U4R0qlXHNS5p
++rNmCNAgo3LQGhxBZaCdpUNspZxGGCTba3P13zQupuXa7lKWHddwsZ4udnTgD6lI
+WYx05kOaYFFvb1u8ub+qSExyHGX9Lh6w32RCoM8kJP7F6YCepKJRboka1/BY3GbF
+17qsUVtb+0YLznMdHEFtWc51SpzA0h3a7w==
+-----END CERTIFICATE-----"""
+
+
+CERTIFICATE = """-----BEGIN CERTIFICATE-----
+MIIHdTCCBV2gAwIBAgITMAAAAHozruIlHyAQtAAAAAAAejANBgkqhkiG9w0BAQsF
+ADBGMRMwEQYKCZImiZPyLGQBGRYDY29tMRYwFAYKCZImiZPyLGQBGRYGbmlsc2Nh
+MRcwFQYDVQQDEw5uaWxzY2EtQ0EwMy1DQTAeFw0yMjA3MjQxNjQzNDlaFw0yMzA3
+MjQxNjQzNDlaMFUxEzARBgoJkiaJk/IsZAEZFgNjb20xFjAUBgoJkiaJk/IsZAEZ
+FgZuaWxzY2ExDjAMBgNVBAMTBVVzZXJzMRYwFAYDVQQDEw1BZG1pbmlzdHJhdG9y
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzb4UT/rOAT9CIhsdnK/d
+ktJ/22y3PjlDQ2sTA/EF9Ad0vHZpKAuvGY7X/OPNxljyyn8IbVP8BwJEJMa0NEyM
+BP4zDkDiILoCc1r39U9jbszGtt9UHTc5fVE2Jl+93D+oi2uirrad1iHn30G4eigq
+aEjKqC3t4elGXlpybbSEOIeR/ZQRCyiExsIvKvsB+TZ6CXXRM4g8c0FbyL+UiXCh
+8MC5LlBTHrEXZGn0LYHgqQ0OMum6VYqF8RtvSXm0f4jDDT5UiJs9HziMBPPuamMr
+9cbbtIOqxHhBOn1L4cg+ccobYVnqxsTKMl7J6b8SKebGw2P+oFXaevFgmE0m7fpw
+LQIDAQABo4IDSzCCA0cwHQYDVR0OBBYEFFM/7V0JB7Nle6tFySRbCXeACpbtMB8G
+A1UdIwQYMBaAFLgiq+2UnxagGJRx6MJQEOuboBfNMIHIBgNVHR8EgcAwgb0wgbqg
+gbeggbSGgbFsZGFwOi8vL0NOPW5pbHNjYS1DQTAzLUNBLENOPUNBMDMsQ049Q0RQ
+LENOPVB1YmxpYyUyMEtleSUyMFNlcnZpY2VzLENOPVNlcnZpY2VzLENOPUNvbmZp
+Z3VyYXRpb24sREM9bmlsc2NhLERDPWNvbT9jZXJ0aWZpY2F0ZVJldm9jYXRpb25M
+aXN0P2Jhc2U/b2JqZWN0Q2xhc3M9Y1JMRGlzdHJpYnV0aW9uUG9pbnQwgb8GCCsG
+AQUFBwEBBIGyMIGvMIGsBggrBgEFBQcwAoaBn2xkYXA6Ly8vQ049bmlsc2NhLUNB
+MDMtQ0EsQ049QUlBLENOPVB1YmxpYyUyMEtleSUyMFNlcnZpY2VzLENOPVNlcnZp
+Y2VzLENOPUNvbmZpZ3VyYXRpb24sREM9bmlsc2NhLERDPWNvbT9jQUNlcnRpZmlj
+YXRlP2Jhc2U/b2JqZWN0Q2xhc3M9Y2VydGlmaWNhdGlvbkF1dGhvcml0eTAOBgNV
+HQ8BAf8EBAMCBaAwPAYJKwYBBAGCNxUHBC8wLQYlKwYBBAGCNxUIhrbHcYa95yeB
+1Y8bh6WhcIGbvAqBfJStI5DMCgIBZAIBBTApBgNVHSUEIjAgBggrBgEFBQcDAgYI
+KwYBBQUHAwQGCisGAQQBgjcKAwQwNQYJKwYBBAGCNxUKBCgwJjAKBggrBgEFBQcD
+AjAKBggrBgEFBQcDBDAMBgorBgEEAYI3CgMEMDMGA1UdEQQsMCqgKAYKKwYBBAGC
+NxQCA6AaDBhBZG1pbmlzdHJhdG9yQG5pbHNjYS5jb20wTQYJKwYBBAGCNxkCBEAw
+PqA8BgorBgEEAYI3GQIBoC4ELFMtMS01LTIxLTYwNDM1NTA3OS0zNzE5MzIxMzQ2
+LTE4ODc1MjYzMzItNTAwMEQGCSqGSIb3DQEJDwQ3MDUwDgYIKoZIhvcNAwICAgCA
+MA4GCCqGSIb3DQMEAgIAgDAHBgUrDgMCBzAKBggqhkiG9w0DBzANBgkqhkiG9w0B
+AQsFAAOCAgEACiBnzQbxxS7cCTtvT6ODyXaJfl5F+WkeoazR7iQnMTIIuigGNeGY
+q7YS92YPGlw8CBcjQ2VHG8ez4v4RaN0xnRDPOoVddG6JPjY4z0Cq+SCHW1W+yBH6
+YNIoU22gx8qM4GWHEQvu33tU+gPHy0ZZceMoEWQVwpC9/Nq/bqEvbevrcXJDC20f
+3Ob3kVJTqrwULYqcuzNW194NXE+hC5+Wjg3mMy7YJU0bE1XeYQxCzHs2T3Sd2O+C
+9ZGvvykSS2MJsC0vW+sFpZ2Z6hDFduXzQqpzaORXe04p+dI88orjdu3yX898jOL0
+YCmxCy/Rvm5+E15MW6Dh3BfUh6Zaeij3z3/xmE3kVaLA9PeWxG5+akW1KtQwD0PB
+mH5q4AmzBj0ryhPfOvXKUSOBp+tLV9Fd4QW0rZgU6/ZTAC73mbh8sDBdXZYb+jzi
+7iM6kqIma6T3mgODYg2d1WTmNx3z+8m+sBoUiwY0yQc22oWkTVXKqzOrg7SOuiSy
+a3QX4OejnyxBSuNegL8EQhyxDCAdisRqgGLhtYh3RMegZn0WnJOlRPBHrniFkJBV
+ub8B4Q4BtcXwyX1IjkSRVGhpmBKc+cykTR1GGR0L0JihMK85qWF/8vyYiwBq3z08
+TdIfRtrzkM5Zw/U/p2/LWzbe/fCkqSC6SheI+/FDR7Bjz7xNxIZHonk=
+-----END CERTIFICATE-----"""
+
+
+CONF = {MS_ATTR.HOSTNAME: MY_CA_NAME,
+        MS_ATTR.PORT: 50061,
+        MS_ATTR.HTTP_PROXY: "0",
+        MS_ATTR.CA: "CA03.nilsca.com\\nilsca-CA03-CA"}
+
 
 IMPORTFILE = "tests/testdata/import.oath"
 IMPORTFILE_GPG = "tests/testdata/import.oath.asc"
@@ -56,8 +163,7 @@ class API000TokenAdminRealmList(MyApiTestCase):
 
     def test_000_setup_realms(self):
         self.setUp_user_realms()
-
-        self.setUp_user_realms()
+        self.setUp_user_realm2()
 
         # create tokens
         t = init_token({"otpkey": self.otpkey},
@@ -79,12 +185,12 @@ class API000TokenAdminRealmList(MyApiTestCase):
         # admin is allowed to see realm1
         set_policy(name="pol-realm1",
                    scope=SCOPE.ADMIN,
-                   action="tokenlist", user="testadmin", realm=self.realm1)
+                   action=ACTION.TOKENLIST, user=self.testadmin, realm=self.realm1)
 
         # admin is allowed to list all realms
         set_policy(name="pol-all-realms",
                    scope=SCOPE.ADMIN,
-                   action="tokenlist", user="testadmin")
+                   action=ACTION.TOKENLIST, user=self.testadmin)
 
         # admin is allowed to only init, not list
         set_policy(name="pol-only-init",
@@ -126,6 +232,168 @@ class API000TokenAdminRealmList(MyApiTestCase):
             # we have two tokens
             self.assertEqual(0, result.get("value").get("count"))
 
+    def test_02_two_resolver_in_realm_policy_condition(self):
+        self.setUp_user_realms()
+        # add a second resolver to the realm
+        save_resolver({"resolver": self.resolvername2,
+                       "type": "passwdresolver",
+                       "fileName": PWFILE2})
+        added, failed = set_realm(self.realm1,
+                                  [self.resolvername1, self.resolvername2])
+        self.assertEqual(len(failed), 0)
+        self.assertEqual(len(added), 2)
+
+        # create token delete policy for "testadmin" on resolver1
+        set_policy(name="pol-reso1",
+                   scope=SCOPE.ADMIN,
+                   action=','.join([ACTION.DELETE, ACTION.ASSIGN, ACTION.UNASSIGN,
+                                    ACTION.DISABLE, ACTION.ENABLE, ACTION.AUDIT]),
+                   adminuser=self.testadmin,
+                   realm=self.realm1,
+                   resolver=self.resolvername1)
+
+        # create tokens for users in resolver 1 and 2
+        t1 = init_token({'type': 'spass'}, user=User(login='franzi',
+                                                     resolver=self.resolvername2,
+                                                     realm=self.realm1))
+        t2 = init_token({'type': 'spass'})
+
+        # assigning a token to a user from resolver2 should fail
+        with self.app.test_request_context('/token/assign',
+                                           method='POST',
+                                           data={"serial": t2.token.serial,
+                                                 "user": "franzi",
+                                                 "realm": self.realm1},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(403, res.status_code, res.data)
+            result = res.json.get("result")
+            self.assertEqual(303, result.get('error').get('code'), result)
+            self.assertIsNone(t2.token.first_owner, t2.token.first_owner)
+        # check the audit log for a failed entry
+        entry = self.find_most_recent_audit_entry(action='*/token/assign')
+        self.assertFalse(entry['success'], entry)
+        self.assertIn('Admin actions are defined, but the action assign', entry['info'], entry)
+
+        # assigning the same token to a user from resolver1 should work
+        with self.app.test_request_context('/token/assign',
+                                           method='POST',
+                                           data={"serial": t2.token.serial,
+                                                 "user": "nönäscii",
+                                                 "realm": self.realm1},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res.data)
+            result = res.json.get("result")
+            self.assertTrue(result.get("value"), result)
+            self.assertIsNotNone(t2.token.first_owner)
+        # check the audit log for a  successful entry
+        entry = self.find_most_recent_audit_entry(action='*/token/assign')
+        self.assertTrue(entry['success'], entry)
+        self.assertIn('pol-reso1', entry['policies'], entry)
+
+        remove_token(t2.token.serial)
+
+        # unassign a token from a user in resolver2 should fail
+        with self.app.test_request_context('/token/unassign',
+                                           method='POST',
+                                           data={"serial": t1.token.serial},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 403, res)
+            result = res.json.get("result")
+            self.assertEqual(result.get('error').get('code'), 303, result)
+
+        t2 = init_token({'type': 'spass'}, user=User(login='nönäscii',
+                                                     resolver=self.resolvername1,
+                                                     realm=self.realm1))
+        # unassign a token from a user in resolver1 should work
+        with self.app.test_request_context('/token/unassign',
+                                           method='POST',
+                                           data={"serial": t2.token.serial},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("value"), result)
+            self.assertIsNone(t2.token.first_owner)
+
+        remove_token(t2.token.serial)
+
+        # disabling an active token from a user from resolver2 should fail
+        with self.app.test_request_context('/token/disable/{0!s}'.format(t1.token.serial),
+                                           method='POST',
+                                           data={},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 403, res)
+            result = res.json.get("result")
+            self.assertEqual(result.get('error').get('code'), 303, result)
+
+        # disableing an active token from a user from resolver1 should work
+        t2 = init_token({'type': 'spass'}, user=User(login='nönäscii',
+                                                     resolver=self.resolvername1,
+                                                     realm=self.realm1))
+        with self.app.test_request_context('/token/disable/{0!s}'.format(t2.token.serial),
+                                           method='POST',
+                                           data={},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get('value'), result)
+            self.assertFalse(t2.is_active())
+
+        remove_token(t2.token.serial)
+
+        # enable an inactive token from a user from resolver2 should fail
+        t1.enable(enable=False)
+        with self.app.test_request_context('/token/enable/{0!s}'.format(t1.token.serial),
+                                           method='POST',
+                                           data={},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 403, res)
+            result = res.json.get("result")
+            self.assertEqual(result.get('error').get('code'), 303, result)
+
+        # enable an inactive token from a user from resolver1 should work
+        t2 = init_token({'type': 'spass'}, user=User(login='nönäscii',
+                                                     resolver=self.resolvername1,
+                                                     realm=self.realm1))
+        t2.enable(enable=False)
+        with self.app.test_request_context('/token/enable/{0!s}'.format(t2.token.serial),
+                                           method='POST',
+                                           data={},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get('value'), result)
+            self.assertTrue(t2.is_active())
+
+        # token delete should fail for a token assigned to a user from resolver2
+        with self.app.test_request_context('/token/{0!s}'.format(t1.token.serial),
+                                           method='DELETE',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 403, res)
+            result = res.json.get("result")
+            self.assertEqual(result.get('error').get('code'), 303, result)
+
+        # token delete should work for a token assigned to a user from resolver1
+        with self.app.test_request_context('/token/{0!s}'.format(t2.token.serial),
+                                           method='DELETE',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get('value'), result)
+            self.assertFalse(token_exist(t2.token.serial))
+
+        # cleanup
+        remove_token(t1.token.serial)
+        delete_policy("pol-reso1")
 
 class APIAttestationTestCase(MyApiTestCase):
 
@@ -204,7 +472,12 @@ class APIAttestationTestCase(MyApiTestCase):
         delete_policy("pol2")
         delete_policy("pol_verify")
 
+
 class APITokenTestCase(MyApiTestCase):
+
+    def setUp(self):
+        super(APITokenTestCase, self).setUp()
+        self.setUp_user_realms()
 
     def _create_temp_token(self, serial):
         with self.app.test_request_context('/token/init',
@@ -214,9 +487,6 @@ class APITokenTestCase(MyApiTestCase):
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
-
-    def test_000_setup_realms(self):
-        self.setUp_user_realms()
 
     def test_00_init_token(self):
         # hmac is now hotp.
@@ -244,10 +514,12 @@ class APITokenTestCase(MyApiTestCase):
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
             detail = res.json.get("detail")
+            serial = detail.get("serial")
             self.assertTrue(result.get("status"), result)
             self.assertTrue(result.get("value"), result)
             self.assertTrue("value" in detail.get("googleurl"), detail)
-            self.assertTrue("OATH" in detail.get("serial"), detail)
+            self.assertTrue("OATH" in serial, detail)
+            remove_token(serial)
 
         with self.app.test_request_context('/token/init',
                                            method='POST',
@@ -255,17 +527,17 @@ class APITokenTestCase(MyApiTestCase):
                                                  "otpkey": self.otpkey,
                                                  "genkey": 0},
                                            headers={'Authorization': self.at}):
-                res = self.app.full_dispatch_request()
-                data = res.json
-                self.assertTrue(res.status_code == 200, res)
-                result = data.get("result")
-                detail = data.get("detail")
-                self.assertTrue(result.get("status"), result)
-                self.assertTrue(result.get("value"), result)
-                self.assertTrue("value" in detail.get("googleurl"), detail)
-                serial = detail.get("serial")
-                self.assertTrue("OATH" in serial, detail)
-        remove_token(serial)
+            res = self.app.full_dispatch_request()
+            data = res.json
+            self.assertTrue(res.status_code == 200, res)
+            result = data.get("result")
+            detail = data.get("detail")
+            self.assertTrue(result.get("status"), result)
+            self.assertTrue(result.get("value"), result)
+            self.assertTrue("value" in detail.get("googleurl"), detail)
+            serial = detail.get("serial")
+            self.assertTrue("OATH" in serial, detail)
+            remove_token(serial)
 
         with self.app.test_request_context('/token/init',
                                            method='POST',
@@ -275,19 +547,20 @@ class APITokenTestCase(MyApiTestCase):
                                                  "user": "cornelius",
                                                  "realm": self.realm1},
                                            headers={'Authorization': self.at}):
-                res = self.app.full_dispatch_request()
-                data = res.json
-                self.assertTrue(res.status_code == 200, res)
-                result = data.get("result")
-                detail = data.get("detail")
-                self.assertTrue(result.get("status"), result)
-                self.assertTrue(result.get("value"), result)
-                self.assertTrue("value" in detail.get("googleurl"), detail)
-                serial = detail.get("serial")
-                self.assertTrue("OATH" in serial, detail)
-        remove_token(serial)
+            res = self.app.full_dispatch_request()
+            data = res.json
+            self.assertTrue(res.status_code == 200, res)
+            result = data.get("result")
+            detail = data.get("detail")
+            self.assertTrue(result.get("status"), result)
+            self.assertTrue(result.get("value"), result)
+            self.assertTrue("value" in detail.get("googleurl"), detail)
+            serial = detail.get("serial")
+            self.assertTrue("OATH" in serial, detail)
+            remove_token(serial)
 
     def test_01_list_tokens(self):
+        init_token({"otpkey": self.otpkey}, tokenkind="hotp")
         with self.app.test_request_context('/token/',
                                            method='GET',
                                            headers={'Authorization': self.at}):
@@ -1404,18 +1677,18 @@ class APITokenTestCase(MyApiTestCase):
         # check password
         with self.app.test_request_context('/validate/check',
                                            data={"user": "cornelius",
-                                                 "pass": registrationcode},
+                                                 "pass": quote(registrationcode)},
                                            method="POST"):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            self.assertTrue(result.get("value"))
+            self.assertTrue(result.get("value"), (result, registrationcode))
 
         # check password again. THe second time it will fail, since the token
         # does not exist anymore.
         with self.app.test_request_context('/validate/check',
                                            data={"user": "cornelius",
-                                                 "pass": registrationcode},
+                                                 "pass": quote(registrationcode)},
                                            method="POST"):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
@@ -2191,7 +2464,6 @@ class APITokenTestCase(MyApiTestCase):
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
             detail = res.json.get("detail")
             self.assertEqual(9, len(detail.get("pin")))
 
@@ -2199,13 +2471,239 @@ class APITokenTestCase(MyApiTestCase):
         delete_policy("pinpolrandom")
         delete_policy("pinpolrandom2")
 
+    def test_33_hide_tokeninfo_user(self):
+        set_policy(name="hide_tokeninfo_user",
+                   scope=SCOPE.USER,
+                   action="{0!s}=tokenkind unknown".format(ACTION.HIDE_TOKENINFO))
+        t = init_token({"genkey": 1}, tokenkind='testing',
+                       user=User('cornelius', realm=self.realm1))
+        add_tokeninfo(t.token.serial, 'blabla', value='SomeValue')
+        for i in ['blabla', 'tokenkind']:
+            self.assertIn(i, t.get_tokeninfo(), t.get_tokeninfo())
+
+        # check that the admin user can see all tokeninfo
+        with self.app.test_request_context('/token/',
+                                           method='GET',
+                                           data={'serial': t.token.serial},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get('status'), result)
+            toks = result.get('value').get('tokens')
+            self.assertEqual(1, len(toks), toks)
+            tok = toks[0]
+            self.assertEqual('testing', tok.get('info').get('tokenkind'), tok)
+            self.assertEqual('SomeValue', tok.get('info').get('blabla'), tok)
+
+        # check that the "tokenkind" tokeninfo is hidden when calling as user
+        with self.app.test_request_context('/auth',
+                                           data={"username": 'cornelius',
+                                                 "password": 'test'},
+                                           method='POST'):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("status"), result)
+            user_token = result.get("value").get("token")
+        with self.app.test_request_context('/token/',
+                                           method='GET',
+                                           data={'serial': t.token.serial},
+                                           headers={'Authorization': user_token}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get('status'), result)
+            toks = result.get('value').get('tokens')
+            self.assertEqual(1, len(toks), toks)
+            tok = toks[0]
+            self.assertEqual('SomeValue', tok.get('info').get('blabla'), tok)
+            self.assertNotIn('tokenkind', tok.get('info'), tok)
+
+        delete_policy('hide_tokeninfo_user')
+
+    def test_34_hide_tokeninfo_admin(self):
+        set_policy(name="hide_tokeninfo_admin",
+                   scope=SCOPE.ADMIN,
+                   action="{0!s}=tokenkind unknown, {1!s}".format(ACTION.HIDE_TOKENINFO,
+                                                                  ACTION.TOKENLIST))
+        t = init_token({"genkey": 1}, tokenkind='testing')
+        add_tokeninfo(t.token.serial, 'blabla', value='SomeValue')
+        for i in ['blabla', 'tokenkind']:
+            self.assertIn(i, t.get_tokeninfo(), t.get_tokeninfo())
+
+        # check that the admin user can't see the tokenkind info
+        with self.app.test_request_context('/token/',
+                                           method='GET',
+                                           data={'serial': t.token.serial},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get('status'), result)
+            toks = result.get('value').get('tokens')
+            self.assertEqual(1, len(toks), toks)
+            tok = toks[0]
+            self.assertEqual('SomeValue', tok.get('info').get('blabla'), tok)
+            self.assertNotIn('tokenkind', tok.get('info'), tok)
+
+        delete_policy('hide_tokeninfo_admin')
+
+    def test_40_init_verify_hotp_token(self):
+        set_policy("verify_toks1", scope=SCOPE.ENROLL, action="{0!s}=hotp top".format(ACTION.VERIFY_ENROLLMENT))
+        set_policy("verify_toks2", scope=SCOPE.ENROLL, action="{0!s}=HOTP email".format(ACTION.VERIFY_ENROLLMENT))
+        # Enroll an HOTP token
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={"otpkey": self.otpkey},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            detail = res.json.get("detail")
+            result = res.json.get("result")
+            self.assertTrue(result.get("status"))
+            self.assertTrue(result.get("value"))
+            self.assertEqual(detail.get("rollout_state"), ROLLOUTSTATE.VERIFYPENDING)
+            self.assertEqual(detail.get("verify").get("message"), VERIFY_ENROLLMENT_MESSAGE)
+            serial = detail.get("serial")
+            tokenobj_list = get_tokens(serial=serial)
+            # Check the token rollout state
+            self.assertEqual(tokenobj_list[0].token.rollout_state, ROLLOUTSTATE.VERIFYPENDING)
+
+        # Try to authenticate with this not readily enrolled token and fail
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={'serial': serial,
+                                                 'pass': self.valid_otp_values[0]}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            # we fail to authenticate with a token, that in in state verify_pending
+            result = res.json.get("result")
+            detail = res.json.get("detail")
+            self.assertFalse(result.get("value"))
+            self.assertEqual(detail.get("message"), "matching 1 tokens, Token is not yet enrolled")
+
+        # Now run the second step: verify enrollment, but fail with a wrong OTP value
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={"serial": serial,
+                                                 "verify": "111111"},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 400)
+            result = res.json.get("result")
+            self.assertFalse(result.get("status"))
+            self.assertEqual(result.get("error").get("code"), 905)
+            self.assertEqual(result.get("error").get("message"), "ERR905: Verification of the new token failed.")
+
+        # Now run the second step: verify enrollment and test again
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={"serial": serial,
+                                                 "verify": self.valid_otp_values[1]},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            detail = res.json.get("detail")
+            self.assertTrue(result.get("status"))
+            self.assertTrue(result.get("value"))
+            tokenobj_list = get_tokens(serial=serial)
+            # Check the token rollout state, it is empty now.
+            self.assertEqual(ROLLOUTSTATE.ENROLLED, tokenobj_list[0].token.rollout_state)
+
+        delete_policy("verify_toks1")
+        delete_policy("verify_toks2")
+
+    def test_41_init_verify_email_token(self):
+        set_policy("verify_toks1", scope=SCOPE.ENROLL, action="{0!s}=email".format(ACTION.VERIFY_ENROLLMENT))
+        # Enroll an email token
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={"otpkey": self.otpkey,
+                                                 "type": "email",
+                                                 "email": "user@example.com"},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            detail = res.json.get("detail")
+            result = res.json.get("result")
+            self.assertTrue(result.get("status"))
+            self.assertTrue(result.get("value"))
+            self.assertEqual(detail.get("rollout_state"), ROLLOUTSTATE.VERIFYPENDING)
+            self.assertEqual(detail.get("verify").get("message"), VERIFY_ENROLLMENT_MESSAGE)
+            serial = detail.get("serial")
+            tokenobj_list = get_tokens(serial=serial)
+            # Check the token rollout state
+            self.assertEqual(tokenobj_list[0].token.rollout_state, ROLLOUTSTATE.VERIFYPENDING)
+
+        # Now run the second step: verify enrollment and test again
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={"serial": serial,
+                                                 "type": "email",
+                                                 "verify": self.valid_otp_values[1]},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            detail = res.json.get("detail")
+            self.assertTrue(result.get("status"))
+            self.assertTrue(result.get("value"))
+            tokenobj_list = get_tokens(serial=serial)
+            # Check the token rollout state, it is empty now.
+            self.assertEqual(ROLLOUTSTATE.ENROLLED, tokenobj_list[0].token.rollout_state)
+
+        delete_policy("verify_toks1")
+
+    def test_42_init_verify_sms_token(self):
+        set_policy("verify_toks1", scope=SCOPE.ENROLL, action="{0!s}=sms".format(ACTION.VERIFY_ENROLLMENT))
+        # Enroll an email token
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={"otpkey": self.otpkey,
+                                                 "type": "sms",
+                                                 "phone": "+123456"},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            detail = res.json.get("detail")
+            result = res.json.get("result")
+            self.assertTrue(result.get("status"))
+            self.assertTrue(result.get("value"))
+            self.assertEqual(detail.get("rollout_state"), ROLLOUTSTATE.VERIFYPENDING)
+            self.assertEqual(detail.get("verify").get("message"), VERIFY_ENROLLMENT_MESSAGE)
+            serial = detail.get("serial")
+            tokenobj_list = get_tokens(serial=serial)
+            # Check the token rollout state
+            self.assertEqual(tokenobj_list[0].token.rollout_state, ROLLOUTSTATE.VERIFYPENDING)
+
+        # Now run the second step: verify enrollment and test again
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={"serial": serial,
+                                                 "type": "sms",
+                                                 "verify": self.valid_otp_values[1]},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            detail = res.json.get("detail")
+            self.assertTrue(result.get("status"))
+            self.assertTrue(result.get("value"))
+            tokenobj_list = get_tokens(serial=serial)
+            # Check the token rollout state, it is empty now.
+            self.assertEqual(ROLLOUTSTATE.ENROLLED, tokenobj_list[0].token.rollout_state)
+
+        delete_policy("verify_toks1")
+
 
 class API00TokenPerformance(MyApiTestCase):
 
     token_count = 21
 
     def test_00_create_some_tokens(self):
-        for i in range(0,self.token_count):
+        for i in range(0, self.token_count):
             init_token({"genkey": 1, "serial": "perf{0!s:0>3}".format(i)})
         toks = get_tokens(serial_wildcard="perf*")
         self.assertEqual(len(toks), self.token_count)
@@ -2548,3 +3046,300 @@ class APIDetermine_User_from_Serial_for_Policies(MyApiTestCase):
 
         remove_token(serial)
         delete_policy(polname)
+
+
+class APIRolloutState(MyApiTestCase):
+
+    def setUp(self):
+        super(APIRolloutState, self).setUp()
+        self.setUp_user_realms()
+
+    def test_01_enroll_two_tokens(self):
+        r = init_token({"2stepinit": 1,
+                        "genkey": 1})
+        self.assertEqual(r.rollout_state, ROLLOUTSTATE.CLIENTWAIT)
+        serial1 = r.token.serial
+
+        r = init_token({"genkey": 1})
+        self.assertEqual(r.rollout_state, "")
+        serial2 = r.token.serial
+
+        # There are two tokens enrolled
+        with self.app.test_request_context('/token/',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            # we have two tokens
+            self.assertEqual(2, result.get("value").get("count"))
+
+        # Only one token in the rollout state client_wait
+        with self.app.test_request_context('/token/',
+                                           method='GET',
+                                           data={"rollout_state": ROLLOUTSTATE.CLIENTWAIT},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            # we have one token
+            self.assertEqual(1, result.get("value").get("count"))
+            tok = result.get("value").get("tokens")[0]
+            self.assertEqual(ROLLOUTSTATE.CLIENTWAIT, tok.get("rollout_state"))
+            self.assertEqual(serial1, tok.get("serial"))
+
+        # Test wildcard rollout_state filter
+        r = init_token({"genkey": 1})
+        self.assertEqual(r.rollout_state, "")
+        serial3 = r.token.serial
+        # Set a dummy rollout state
+        r.token.rollout_state = "special"
+        r.token.save()
+
+        # Find rollout state "cliEntwait" and "spEcial"
+        with self.app.test_request_context('/token/',
+                                           method='GET',
+                                           data={"rollout_state": "*e*"},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            # we have two tokens
+            self.assertEqual(2, result.get("value").get("count"))
+            # We are not sure about the ordering. But one is serial1 and the other is serial3.
+            tok = result.get("value").get("tokens")[0]
+            self.assertIn(tok.get("serial"), [serial1, serial3])
+            tok = result.get("value").get("tokens")[1]
+            self.assertIn(tok.get("serial"), [serial1, serial3])
+
+
+class APIMSCACertTestCase(MyApiTestCase):
+
+    @unittest.skipUnless("privacyidea.lib.caconnectors.msca.MSCAConnector" in AvailableCAConnectors,
+                         "Can not test MSCA. grpc module seems not available.")
+    def test_00_setup(self):
+        self.setUp_user_realms()
+        # setup ca connector
+        CONF["type"] = "microsoft"
+        CONF["caconnector"] = "billCA"
+        r = save_caconnector(CONF)
+        self.assertEqual(r, 1)
+
+    @unittest.skipUnless("privacyidea.lib.caconnectors.msca.MSCAConnector" in AvailableCAConnectors,
+                         "Can not test MSCA. grpc module seems not available.")
+    def test_01_msca_certificate_pending_and_enrolled(self):
+        with mock.patch.object(MSCAConnector, "_connect_to_worker") as mock_conncect_worker:
+            # Mock the CA to simulate a Pending Request - disposition 5
+            mock_conncect_worker.return_value = CAServiceMock(CONF,
+                                                              {"available_cas": MOCK_AVAILABLE_CAS,
+                                                               "ca_templates": MOCK_CA_TEMPLATES,
+                                                               "csr_disposition": 5,
+                                                               "certificate": CERTIFICATE})
+            # Issue a cert request to billCA for a ApprovalRequired Token.
+            cert_tok = init_token({"type": "certificate",
+                                   "ca": "billCA",
+                                   "template": "ApprovalRequired",
+                                   "genkey": 1,
+                                   "user": "cornelius",
+                                   "realm": self.realm1
+                                   }, User("cornelius", self.realm1))
+            self.assertEqual("certificate", cert_tok.type)
+            self.assertEqual(ROLLOUTSTATE.PENDING, cert_tok.rollout_state)
+
+            # Fetch the rolloutstate by fetching the token
+            with self.app.test_request_context('/token/?serial={0!s}'.format(cert_tok.token.serial),
+                                               method='GET',
+                                               headers={'Authorization': self.at}):
+                res = self.app.full_dispatch_request()
+                self.assertTrue(res.status_code == 200, res)
+                result = res.json.get("result")
+                token = result.get("value").get("tokens")[0]
+                # certificate is still pending
+                self.assertEqual(ROLLOUTSTATE.PENDING, token.get("rollout_state"))
+
+            # Enroll the certificated
+            mock_conncect_worker.return_value.disposition = 3
+
+            # Fetch the rolloutstate again, now the token is enrolled
+            with self.app.test_request_context('/token/?serial={0!s}'.format(cert_tok.token.serial),
+                                               method='GET',
+                                               headers={'Authorization': self.at}):
+                res = self.app.full_dispatch_request()
+                self.assertTrue(res.status_code == 200, res)
+                result = res.json.get("result")
+                token = result.get("value").get("tokens")[0]
+                # certificate is still pending
+                self.assertEqual(ROLLOUTSTATE.ENROLLED, token.get("rollout_state"))
+
+    @unittest.skipUnless("privacyidea.lib.caconnectors.msca.MSCAConnector" in AvailableCAConnectors,
+                         "Can not test MSCA. grpc module seems not available.")
+    def test_02_msca_certificate_pending_and_denied(self):
+        with mock.patch.object(MSCAConnector, "_connect_to_worker") as mock_conncect_worker:
+            # Mock the CA to simulate a Pending Request - disposition 5
+            mock_conncect_worker.return_value = CAServiceMock(CONF,
+                                                              {"available_cas": MOCK_AVAILABLE_CAS,
+                                                               "ca_templates": MOCK_CA_TEMPLATES,
+                                                               "csr_disposition": 5,
+                                                               "certificate": CERTIFICATE})
+            # Issue a cert request to billCA for a ApprovalRequired Token.
+            cert_tok = init_token({"type": "certificate",
+                                   "ca": "billCA",
+                                   "template": "ApprovalRequired",
+                                   "genkey": 1,
+                                   "user": "cornelius",
+                                   "realm": self.realm1
+                                   }, User("cornelius", self.realm1))
+            self.assertEqual("certificate", cert_tok.type)
+            self.assertEqual(ROLLOUTSTATE.PENDING, cert_tok.rollout_state)
+
+            # Fetch the rolloutstate by fetching the token
+            with self.app.test_request_context('/token/?serial={0!s}'.format(cert_tok.token.serial),
+                                               method='GET',
+                                               headers={'Authorization': self.at}):
+                res = self.app.full_dispatch_request()
+                self.assertTrue(res.status_code == 200, res)
+                result = res.json.get("result")
+                token = result.get("value").get("tokens")[0]
+                # certificate is still pending
+                self.assertEqual(ROLLOUTSTATE.PENDING, token.get("rollout_state"))
+
+            # Enroll the certificated
+            mock_conncect_worker.return_value.disposition = 2
+
+            # Fetch the rolloutstate again, now the token is enrolled
+            with self.app.test_request_context('/token/?serial={0!s}'.format(cert_tok.token.serial),
+                                               method='GET',
+                                               headers={'Authorization': self.at}):
+                res = self.app.full_dispatch_request()
+                self.assertTrue(res.status_code == 200, res)
+                result = res.json.get("result")
+                token = result.get("value").get("tokens")[0]
+                # certificate is still pending
+                self.assertEqual(ROLLOUTSTATE.DENIED, token.get("rollout_state"))
+
+
+class APITokengroupTestCase(MyApiTestCase):
+
+    def setUp(self):
+        super(APITokengroupTestCase, self).setUp()
+        self.setUp_user_realms()
+
+    def test_01_add_tokengroups(self):
+        serial = "testtok1"
+        with self.app.test_request_context('/tokengroup/gruppe1',
+                                           data={"description": "My Cool first group"},
+                                           method='POST',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            value = res.json['result']['value']
+            self.assertGreaterEqual(value, 1)
+
+        # Add a 2nd group
+        with self.app.test_request_context('/tokengroup/gruppe2',
+                                           data={"description": "My Cool first group"},
+                                           method='POST',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            value = res.json['result']['value']
+            self.assertGreaterEqual(value, 1)
+
+        init_token({"serial": serial, "type": "spass"})
+
+        # Assign token to tokengroup
+        with self.app.test_request_context('/token/group/{0!s}/gruppe1'.format(serial),
+                                           method='POST',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            value = res.json['result']['value']
+            self.assertGreaterEqual(value, 1)
+
+        # Check token, there is the tokengroup "gruppe1"
+        with self.app.test_request_context('/token/?serial={0!s}'.format(serial),
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            value = res.json['result']['value']
+            tok = value["tokens"][0]
+            self.assertEqual(tok.get("tokengroup"), ["gruppe1"])
+
+        # Delete the tokengroup from the token
+        with self.app.test_request_context('/token/group/{0!s}/gruppe1'.format(serial),
+                                           method='DELETE',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            value = res.json['result']['value']
+            self.assertEqual(value, 1)
+
+        # Check token, there is no tokengroup
+        with self.app.test_request_context('/token/?serial={0!s}'.format(serial),
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            value = res.json['result']['value']
+            tok = value["tokens"][0]
+            self.assertEqual(tok.get("tokengroup"), [])
+
+        # Now assign the tokengroup grupp1 again.
+        with self.app.test_request_context('/token/group/{0!s}/gruppe1'.format(serial),
+                                           method='POST',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            value = res.json['result']['value']
+            self.assertGreaterEqual(value, 1)
+
+        # Now use the generic endpoint to SET tokengroups. We set "gruppe2", this will also remove "gruppe1"
+        with self.app.test_request_context('/token/group/{0!s}'.format(serial),
+                                           method='POST',
+                                           data={"groups": ["gruppe2"]},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            value = res.json['result']['value']
+            self.assertGreaterEqual(value, 1)
+        # Check that the token has gruppe2 assigned and not gruppe1
+        with self.app.test_request_context('/token/?serial={0!s}'.format(serial),
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            value = res.json['result']['value']
+            tok = value["tokens"][0]
+            self.assertEqual(tok.get("tokengroup"), ["gruppe2"])
+
+        remove_token(serial)
+
+    def test_02_non_existing_groups(self):
+        serial = "testtok2"
+        init_token({"serial": serial, "type": "spass"})
+
+        # Assign token to non-existing tokengroup
+        with self.app.test_request_context('/token/group/{0!s}/gaga'.format(serial),
+                                           method='POST',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 404, res)
+            result = res.json['result']
+            self.assertFalse(result.get("status"))
+            self.assertEqual(result.get("error").get("code"), 601)
+            self.assertEqual(result.get("error").get("message"), "The tokengroup does not exist.")
+
+        # Delete a non-existing tokengroup from the token
+        with self.app.test_request_context('/token/group/{0!s}/gaga'.format(serial),
+                                           method='DELETE',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 404, res)
+            result = res.json['result']
+            self.assertFalse(result.get("status"))
+            self.assertEqual(result.get("error").get("code"), 601)
+            self.assertEqual(result.get("error").get("message"), "The tokengroup does not exist.")
+
+        remove_token(serial)
+

@@ -16,7 +16,8 @@ from privacyidea.lib.user import (User, create_user,
                                   get_username,
                                   get_user_list,
                                   split_user,
-                                  get_user_from_param)
+                                  get_user_from_param,
+                                  UserError)
 from . import ldap3mock
 from .test_lib_resolver import LDAPDirectory_small
 
@@ -93,14 +94,25 @@ class UserTestCase(MyTestCase):
         self.assertFalse(self.resolvername2 in resolvers, resolvers)
         
     def test_02_get_user_identifiers(self):
+        # create user by login
         user = User(login="root",
                     realm=self.realm1)
         (uid, rtype, resolvername) = user.get_user_identifiers()
-        self.assertTrue(uid == "0", uid)
-        self.assertTrue(rtype == "passwdresolver", rtype)
-        self.assertTrue(resolvername == self.resolvername1, resolvername)
+        self.assertEqual("0", uid)
+        self.assertEqual("passwdresolver", rtype)
+        self.assertEqual(self.resolvername1, resolvername)
         self.assertEqual(user.realm_id, 1)
-        
+
+        # create user by uid. fail, since the resolver is missing
+        self.assertRaises(UserError, User, realm=self.realm1, uid="0")
+        # create user by uid.
+        user2 = User(realm=self.realm1, resolver=self.resolvername1, uid="0")
+        (uid, rtype, resolvername) = user2.get_user_identifiers()
+        self.assertEqual("root", user2.login)
+        self.assertEqual("passwdresolver", rtype)
+        self.assertEqual(self.resolvername1, resolvername)
+        self.assertEqual(user.realm_id, 1)
+
     def test_03_get_username(self):
         username = get_username("0", self.resolvername1)
         self.assertTrue(username == "root", username)
@@ -461,6 +473,46 @@ class UserTestCase(MyTestCase):
         r = u.get_user_phone("mobile", index=2)
         self.assertEqual(r, "")
 
+        delete_realm("ldap")
+        delete_resolver("ldapresolver")
+
+    @ldap3mock.activate
+    def test_19_compare_user_object(self):
+        ldap3mock.setLDAPDirectory(LDAPDirectory_small)
+        params = ({'LDAPURI': 'ldap://localhost',
+                   'LDAPBASE': 'o=test',
+                   'BINDDN': 'cn=manager,ou=example,o=test',
+                   'BINDPW': 'ldaptest',
+                   'LOGINNAMEATTRIBUTE': 'cn',
+                   'LDAPSEARCHFILTER': '(|(cn=*))',  # we use this weird search filter to get a unique resolver ID
+                   'USERINFO': '{ "username": "cn",'
+                               '"phone" : "telephoneNumber", '
+                               '"mobile" : "mobile"'
+                               ', "email" : "mail", '
+                               '"surname" : "sn", '
+                               '"givenname" : "givenName" }',
+                   'UIDTYPE': 'objectGUID',
+                   'NOREFERRALS': True,
+                   'CACHE_TIMEOUT': 0
+                   })
+        params["resolver"] = "ldapresolver"
+        params["type"] = "ldapresolver"
+        rid = save_resolver(params)
+        self.assertTrue(rid > 0)
+        (added, failed) = set_realm("ldap", ["ldapresolver"])
+        self.assertEqual(len(added), 1)
+        self.assertEqual(len(failed), 0)
+
+        # Comparing different objects fails
+        self.assertFalse(User("salesman", "ldap") == None)
+        # comparing different realm or resolver fails
+        self.assertFalse(User("cornelius", self.realm1) == User("salesman", "ldap"))
+        # comparing different users fails
+        self.assertFalse(User("manager", "ldap") == User("salesman", "ldap"))
+        # comparing case insensitive successful
+        self.assertTrue(User("salesman", "ldap") == User("salesman", "ldap"))
+        self.assertTrue(User(resolver='ldapresolver', realm="ldap",
+                             uid="039b36ef-e7c0-42f3-9bf9-ca6a6c0d4d54") == User("salesman", "ldap"))
         delete_realm("ldap")
         delete_resolver("ldapresolver")
 

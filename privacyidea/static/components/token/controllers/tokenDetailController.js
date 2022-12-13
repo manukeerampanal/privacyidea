@@ -45,20 +45,25 @@ function string_to_date_object(s) {
     return date_obj;
 }
 
-myApp.controller("tokenDetailController", function ($scope,
-                                                    TokenFactory, UserFactory,
-                                                    $stateParams,
-                                                    $state, $rootScope,
-                                                    ValidateFactory,
-                                                    AuthFactory,
-                                                    ConfigFactory,
-                                                    MachineFactory, inform,
-                                                    gettextCatalog) {
+myApp.controller("tokenDetailController", ['$scope', 'TokenFactory',
+                                           'UserFactory', '$stateParams',
+                                           '$state', '$rootScope',
+                                           'ValidateFactory', 'AuthFactory',
+                                           'ConfigFactory', 'MachineFactory',
+                                           'inform', 'gettextCatalog',
+                                           function ($scope, TokenFactory,
+                                                     UserFactory, $stateParams,
+                                                     $state, $rootScope,
+                                                     ValidateFactory,
+                                                     AuthFactory, ConfigFactory,
+                                                     MachineFactory, inform,
+                                                     gettextCatalog) {
     $scope.tokenSerial = $stateParams.tokenSerial;
     // This is the parents object
     $scope.selectedToken.serial = $scope.tokenSerial;
     $scope.editCountWindow = false;
     $scope.selectedRealms = {};
+    $scope.selectedTokenGroups = {};
     $scope.newUser = {user: "", realm: $scope.defaultRealm};
     $scope.loggedInUser = AuthFactory.getUser();
     $scope.machinesPerPage = 15;
@@ -147,6 +152,15 @@ myApp.controller("tokenDetailController", function ($scope,
         TokenFactory.reset($scope.tokenSerial, $scope.get);
     };
 
+    $scope.startEditTokenGroups = function() {
+        // fill the selectedTokenGroups with the groups of the token
+        $scope.selectedTokenGroups = {};
+        $scope.editTokenGroups = true;
+        angular.forEach($scope.token.tokengroup, function (groupname, _index) {
+            $scope.selectedTokenGroups[groupname] = true;
+        });
+    };
+
     $scope.startEditRealm = function () {
         // fill the selectedRealms with the realms of the token
         $scope.selectedRealms = {};
@@ -156,9 +170,25 @@ myApp.controller("tokenDetailController", function ($scope,
         });
     };
 
+    $scope.cancelEditTokenGroups = function () {
+        $scope.editTokenGroups = false;
+        $scope.selectedTokenGroups = {};
+    }
+
     $scope.cancelEditRealm = function () {
         $scope.editTokenRealm = false;
         $scope.selectedRealms = {};
+    };
+
+    $scope.saveTokenGroups = function () {
+        var tokengroups = [];
+        for (var tokengroup in $scope.selectedTokenGroups) {
+            if ($scope.selectedTokenGroups[tokengroup] === true) {
+                tokengroups.push(tokengroup);
+            }
+        }
+        TokenFactory.settokengroups($scope.tokenSerial, tokengroups, $scope.get);
+        $scope.cancelEditTokenGroups();
     };
 
     $scope.saveRealm = function () {
@@ -266,6 +296,27 @@ myApp.controller("tokenDetailController", function ($scope,
         });
     };
 
+    $scope.sendVerifyResponse = function () {
+        var params = {
+            "serial": $scope.token.serial,
+            "verify": $scope.token.verifyResponse,
+            "type": $scope.token.tokentype
+        };
+        TokenFactory.enroll($scope.newUser, params, function (data) {
+            $scope.token.verifyResponse = "";
+            if (data.result.value === true) {
+                inform.add(gettextCatalog.getString("Enrollment successfully verified."),
+                                {type: "info", ttl: 10000});
+            } else {
+                inform.add(gettextCatalog.getString("Enrollment verification failed."),
+                                {type: "danger", ttl: 10000});
+            }
+            $scope.get();
+        });
+    };
+
+
+
     $scope.testOtp = function (otponly) {
         var params = {
             serial: $scope.tokenSerial,
@@ -298,7 +349,11 @@ myApp.controller("tokenDetailController", function ($scope,
         // If the loggedInUser is only a user, we do not need the realm list,
         // as we do not assign a token
         ConfigFactory.getRealms(function (data) {
-                $scope.realms = data.result.value;
+            $scope.realms = data.result.value;
+        });
+
+        ConfigFactory.getTokengroup("", function (data) {
+            $scope.tokengroups = data.result.value;
         });
 
         $scope.attachMachine = function () {
@@ -309,8 +364,14 @@ myApp.controller("tokenDetailController", function ($scope,
             var machineObject = fixMachine($scope.newMachine);
             params["serial"] = $scope.tokenSerial;
             params["application"] = $scope.form.application;
-            params["machineid"] = machineObject.id;
-            params["resolver"] = machineObject.resolver;
+            if ($scope.form.application === "offline") {
+                // We force to be not attached to a machine
+                params["machineid"] = 0;
+                params["resolver"] = "";
+            } else {
+                params["machineid"] = machineObject.id;
+                params["resolver"] = machineObject.resolver;
+            }
             MachineFactory.attachTokenMachine(params, function (data) {
                 // clear form
                 $scope.form.application = null;
@@ -397,4 +458,4 @@ myApp.controller("tokenDetailController", function ($scope,
     };
 
 
-});
+}]);

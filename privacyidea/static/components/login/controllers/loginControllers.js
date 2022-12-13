@@ -20,23 +20,29 @@
  */
 
 //Return an empty array if string is empty.
-//Otherwise return the result of the ordinary split.
+//Otherwise, return the result of the ordinary split.
 String.prototype.mysplit = function(separator) {
     return this == "" ? [] : this.split(separator);
 };
 
 
 angular.module("privacyideaApp")
-    .controller("mainController",
-                            function (Idle,
-                                      $scope, $http, $location,
-                                      authUrl, AuthFactory, $rootScope,
-                                      $state, ConfigFactory, inform,
-                                      PolicyTemplateFactory, gettextCatalog,
-                                      hotkeys, RegisterFactory,
-                                      U2fFactory, webAuthnToken, instanceUrl,
-                                      PollingAuthFactory, $transitions,
-                                      resourceNamePatterns) {
+    .controller("mainController", ["Idle", "$scope", "$sce", "$http", "$location",
+                                   "authUrl", "validateUrl", "AuthFactory", "$rootScope",
+                                   "$state", "ConfigFactory", "inform",
+                                   "PolicyTemplateFactory", "gettextCatalog",
+                                   "hotkeys", "RegisterFactory",
+                                   "U2fFactory", "webAuthnToken", "instanceUrl",
+                                   "PollingAuthFactory", "$transitions",
+                                   "resourceNamePatterns", "$window",
+                                   function (Idle, $scope, $sce, $http, $location,
+                                             authUrl, validateUrl, AuthFactory, $rootScope,
+                                             $state, ConfigFactory, inform,
+                                             PolicyTemplateFactory, gettextCatalog,
+                                             hotkeys, RegisterFactory,
+                                             U2fFactory, webAuthnToken, instanceUrl,
+                                             PollingAuthFactory, $transitions,
+                                             resourceNamePatterns, $window) {
 
     $scope.instanceUrl = instanceUrl;
     $scope.checkRight = AuthFactory.checkRight;
@@ -66,13 +72,14 @@ angular.module("privacyideaApp")
     obj = angular.element(document.querySelector('#LOGO'));
     $scope.piLogo = obj.val();
     obj = angular.element(document.querySelector('#HAS_JOB_QUEUE'));
-    $scope.hasJobQueue = obj.val() == "True";
+    $scope.hasJobQueue = obj.val() === "True";
     obj = angular.element(document.querySelector('#LOGIN_TEXT'));
     $scope.piLoginText = obj.val();
     obj = angular.element(document.querySelector('#SHOW_NODE'));
     $scope.show_node = obj.val();
     obj = angular.element(document.querySelector('#GDPR_LINK'));
-    $scope.piGDPRLink = obj.val();
+    // we need to trust the GDPR URI explicitly since an admin can change this via policy.
+    $scope.piGDPRLink = $sce.trustAsUrl(obj.val());
     obj = angular.element(document.querySelector('#PI_TRANSLATION_WARNING'));
     $scope.piTranslationWarning = obj.val() !== "False";
     $scope.piTranslationPrefix = obj.val();
@@ -149,7 +156,7 @@ angular.module("privacyideaApp")
     });
 
     $scope.$on('IdleTimeout', function () {
-        if ($scope.timeout_action == "logout") {
+        if ($scope.timeout_action === "logout") {
             //debug: console.log("Logout!");
             $scope.logout();
         } else {
@@ -251,26 +258,28 @@ angular.module("privacyideaApp")
                     if (multi_challenge.length > 1) {
                         $scope.challenge_message = $scope.challenge_message + ' ' + multi_challenge[i].serial;
                     }
-                    var attributes = multi_challenge[i].attributes;
-                    if (attributes === null || attributes.hideResponseInput !== true) {
-                        $scope.hideResponseInput = false;
-                    }
-                    if (attributes !== null) {
-                        if (attributes.u2fSignRequest) {
-                           $scope.u2fSignRequests.push(attributes.u2fSignRequest);
+                    let challenge = multi_challenge[i];
+                    if (challenge !== null) {
+                        if (challenge.client_mode === 'interactive') {
+                            // if we have at least one interactive token, we need to show the input field
+                            $scope.hideResponseInput = false;
                         }
-                        if (attributes.webAuthnSignRequest) {
+                        let attributes = challenge.attributes ? challenge.attributes : null;
+                        if (attributes && attributes.u2fSignRequest) {
+                            $scope.u2fSignRequests.push(attributes.u2fSignRequest);
+                        }
+                        if (attributes && attributes.webAuthnSignRequest) {
                             $scope.webAuthnSignRequests.push(attributes.webAuthnSignRequest);
                         }
-                        if (attributes.img) {
-                            $scope.image = attributes.img;
+                        if (challenge.image) {
+                            $scope.image = challenge.image;
                             if ($scope.image.indexOf("data:image") === -1) {
                                 // In case of an Image link, we prepend the instanceUrl
                                 $scope.image = $scope.instanceUrl + "/" + $scope.image;
                             }
                         }
-                        if (attributes.poll) {
-                            $scope.polling = attributes.poll;
+                        if (challenge.client_mode && challenge.client_mode === 'poll') {
+                            $scope.polling = true;
                         }
                     }
                 }
@@ -344,15 +353,29 @@ angular.module("privacyideaApp")
         // authentication was performed successfully in the background
         // This is used for the TiQR token.
         //debug: console.log("calling check_authentication.");
-        $http.post(authUrl, {
-            username: $scope.login.username,
-            password: "",
-            transaction_id: $scope.transactionid
-        }, {
-            withCredentials: true
+        $http.get(validateUrl + "/polltransaction", {
+            params: {
+                'transaction_id': $scope.transactionid
+            }
         }).then(function (response) {
-            $scope.do_login_stuff(response.data);
-            PollingAuthFactory.stop();
+            if (response.data.result.value === true) {
+                $http.post(authUrl, {
+                    username: $scope.login.username,
+                    password: "",
+                    transaction_id: $scope.transactionid
+                }).then(function (response) {
+                    $scope.do_login_stuff(response.data);
+                }, function (response) {
+                    console.log('Authentication failed after polling!');
+                    console.log(response.data);
+                });
+                PollingAuthFactory.stop();
+            }
+            // if result.value is false, the challenge hasn't been answered yet.
+            // Continue polling
+        }, function(response) {
+            // the /validate/polltransaction endpoint returned an error
+            console.warn("Polling for transactions returned an error: " + response.data);
         });
     };
 
@@ -409,6 +432,7 @@ angular.module("privacyideaApp")
             if ($scope.qr_images.length > 0) {
                 $scope.qr_col_md = "col-md-" + parseInt(12 / $scope.qr_images.length);
             }
+            $scope.audit_page_size = data.result.value.audit_page_size;
             $scope.token_page_size = data.result.value.token_page_size;
             $scope.user_page_size = data.result.value.user_page_size;
             $scope.user_details_in_tokenlist = data.result.value.user_details;
@@ -420,12 +444,14 @@ angular.module("privacyideaApp")
             } else {
                 $scope.startRoute = "/token";
             }
+            $scope.logout_redirect_url = data.result.value.logout_redirect_url;
             $scope.hide_welcome = data.result.value.hide_welcome;
             $scope.hide_buttons = data.result.value.hide_buttons;
             $scope.show_seed = data.result.value.show_seed;
             $scope.show_node = data.result.value.show_node;
             $scope.token_rollover = data.result.value.token_rollover;
             $scope.subscription_state = data.result.value.subscription_status;
+            $scope.subscription_state_push = data.result.value.subscription_status_push;
             $rootScope.search_on_enter = data.result.value.search_on_enter;
             // Token specific settings
             $scope.tokensettings = {indexedsecret:
@@ -474,6 +500,20 @@ angular.module("privacyideaApp")
                 }
                 var $random_number = Math.floor(Math.random() * (9999 + 1000 + 1)) + 1000;
                 $scope.class_subscription_expired = "subscriptionExpired" + $random_number;
+                // Show info about privacyIDEA Authenticator App and push
+                if ($scope.subscription_state_push === 1 && !$scope.hide_welcome) {
+                    // no subscription at all
+                     inform.add(gettextCatalog.getString("You are using a certain amount of Push tokens. " +
+                         "Note, that you need a valid subscription, to use Push tokens in push mode. Otherwise" +
+                         " Push tokens will only work in poll only mode. "),
+                            {type: "danger", ttl: 30000});
+                }
+                if ($scope.subscription_state_push === 2) {
+                    // Subscription expired
+                    inform.add(gettextCatalog.getString("Your subscription for the privacyIDEA Authenticator" +
+                        " has expired."),
+                        {type: "danger", ttl: 20000});
+                }
             }
             if ( $scope.unlocking ) {
                 $('#dialogLock').modal('hide');
@@ -501,12 +541,17 @@ angular.module("privacyideaApp")
         Idle.unwatch();
         // Jump to top when the policy is saved
         $('html,body').scrollTop(0);
+        // Optional redirect on logout
+        if ($scope.logout_redirect_url !== "") {
+            console.log("Redirecting to "+$scope.logout_redirect_url)
+            $window.location.href = $scope.logout_redirect_url;
+        }
     };
 
     $scope.nextWelcome = function() {
         $scope.welcomeStep += 1;
-        if (($scope.subscription_state == 0 && $scope.welcomeStep === 4) ||
-            ($scope.subscription_state == 1 && $scope.welcomeStep === 5)) {
+        if (($scope.subscription_state === 0 && $scope.welcomeStep === 4) ||
+            ($scope.subscription_state === 1 && $scope.welcomeStep === 5)) {
             $('#dialogWelcome').modal("hide");
         }
     };
@@ -579,18 +624,23 @@ angular.module("privacyideaApp")
         $scope.$broadcast("piReload");
     };
 
-});
+}]);
 
 angular.module("privacyideaApp")
-    .controller("pinChangeController",
-                            function (Idle,
-                                      $scope, $http, $location,
-                                      authUrl, AuthFactory, $rootScope,
-                                      $state, ConfigFactory, inform,
-                                      PolicyTemplateFactory, gettextCatalog,
-                                      hotkeys, RegisterFactory,
-                                      U2fFactory, instanceUrl,
-                                      PollingAuthFactory, TokenFactory)
+    .controller("pinChangeController", ["Idle", "$scope", "$http", "$location",
+                                        "authUrl", "AuthFactory", "$rootScope",
+                                        "$state", "ConfigFactory", "inform",
+                                        "PolicyTemplateFactory", "gettextCatalog",
+                                        "hotkeys", "RegisterFactory",
+                                        "U2fFactory", "instanceUrl",
+                                        "PollingAuthFactory", "TokenFactory",
+                                        function (Idle, $scope, $http, $location,
+                                                  authUrl, AuthFactory, $rootScope,
+                                                  $state, ConfigFactory, inform,
+                                                  PolicyTemplateFactory, gettextCatalog,
+                                                  hotkeys, RegisterFactory,
+                                                  U2fFactory, instanceUrl,
+                                                  PollingAuthFactory, TokenFactory)
 {
 
     $scope.newpin = "";
@@ -610,4 +660,4 @@ angular.module("privacyideaApp")
         $scope.logout();
     }
 
-});
+}]);

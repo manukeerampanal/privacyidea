@@ -239,7 +239,7 @@ def delete_user(resolvername=None, username=None):
        Accept: application/json
 
     """
-    user_obj = User(login=username, resolver=resolvername)
+    user_obj = request.User
     res = user_obj.delete()
     g.audit_object.log({"success": res,
                         "info": u"{0!s}".format(user_obj)})
@@ -327,7 +327,12 @@ def update_user():
     attributes = _get_attributes_from_param(request.all_data)
     username = getParam(request.all_data, "user", optional=False)
     resolvername = getParam(request.all_data, "resolver", optional=False)
-    user_obj = User(login=username, resolver=resolvername)
+    userid = getParam(request.all_data, "userid")
+    if userid is not None:
+        # Create the user object by uid
+        user_obj = User(resolver=resolvername, uid=userid)
+    else:
+        user_obj = User(login=username, resolver=resolvername)
     # Remove the password from the attributes, so that we can hide it in the
     # logs
     password = attributes.get("password")

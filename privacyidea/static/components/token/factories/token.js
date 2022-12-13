@@ -75,8 +75,10 @@ function fixMachine(machinestr) {
 }
 
 angular.module("TokenModule", ["privacyideaAuth"])
-    .factory("TokenFactory", function (AuthFactory, $http, $state, $rootScope,
-                                       tokenUrl, authUrl, inform, $q) {
+    .factory("TokenFactory", ['AuthFactory', '$http', '$state', '$rootScope',
+                              'tokenUrl', 'authUrl', 'inform', '$q',
+                              function (AuthFactory, $http, $state, $rootScope,
+                                        tokenUrl, authUrl, inform, $q) {
         /**
          Each service - just like this service factory - is a singleton.
          */
@@ -195,6 +197,12 @@ angular.module("TokenModule", ["privacyideaAuth"])
                         headers: {'PI-Authorization': AuthFactory.getAuthToken()}
                     }).then(function (response) { callback(response.data) }, function(error) { AuthFactory.authError(error.data) });
             },
+            settokengroups: function (serial, tokengroups, callback) {
+                $http.post(tokenUrl + "/group/" + serial, {groups: tokengroups},
+                    {
+                        headers: {'PI-Authorization': AuthFactory.getAuthToken()}
+                    }).then(function (response) { callback(response.data) }, function(error) { AuthFactory.authError(error.data) });
+            },
             assign: function (params, callback) {
                 /* if the user is in the select format
                  [ID] loginname (Givenname)
@@ -250,5 +258,4 @@ angular.module("TokenModule", ["privacyideaAuth"])
                 }).then(function (response) { callback(response.data) }, function(error) { AuthFactory.authError(error.data) });
             }
         };
-    });
-
+    }]);

@@ -17,6 +17,7 @@ from privacyidea.models import (Token,
 from privacyidea.lib.config import (set_privacyidea_config, set_prepend_pin)
 import datetime
 import binascii
+import time
 
 
 class TOTPTokenTestCase(MyTestCase):
@@ -158,8 +159,7 @@ class TOTPTokenTestCase(MyTestCase):
                         token.token.so_pin)
         self.assertTrue(len(token.token.user_pin) == 32,
                         token.token.user_pin)
-        self.assertTrue(len(token.token.key_enc) == 192,
-                        token.token.key_enc)
+        self.assertEqual(len(token.token.key_enc), 96, token.token.key_enc)
         self.assertTrue(token.get_otplen() == 8)
         self.assertTrue(token.token.count == 1000,
                         token.token.count)
@@ -294,7 +294,7 @@ class TOTPTokenTestCase(MyTestCase):
                                                                    30})
         # Found the counter 47251647
         self.assertTrue(res == 47251647, res)
-        
+
     def test_14_split_pin_pass(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = TotpTokenClass(db_token)
@@ -571,6 +571,23 @@ class TOTPTokenTestCase(MyTestCase):
                             options={"initTime": 47251645 * 30 })
         self.assertTrue(r == 47251650, r)
 
+        # counter = 47251640 => otp = 166325 is an old OTP value
+        # counter = 47251641 => otp = 432730 is an old OTP value
+        # Autoresync with two times the same old OTP value must not work out!
+        r = token.check_otp(anOtpVal="166325", window=30,
+                            options={"initTime": 47251644 * 30})
+        self.assertTrue(r == -1, r)
+        r = token.check_otp(anOtpVal="166325", window=30,
+                            options={"initTime": 47251645 * 30})
+        self.assertTrue(r == -1, r)
+        # Autoresync with two consecutive old OTP values must not work out!
+        r = token.check_otp(anOtpVal="166325", window=30,
+                            options={"initTime": 47251644 * 30})
+        self.assertTrue(r == -1, r)
+        r = token.check_otp(anOtpVal="432730", window=30,
+                            options={"initTime": 47251645 * 30})
+        self.assertTrue(r == -1, r)
+
         # Autosync with a gap in the next otp value will fail
         token.token.count = 47251640
         # Just try some bullshit config value
@@ -709,6 +726,39 @@ class TOTPTokenTestCase(MyTestCase):
         self.assertEqual(r, "public")
         r = TotpTokenClass.get_setting_type("totp.blabla")
         self.assertEqual(r, "")
+
+    def test_26_is_previous_otp(self):
+        # check if the OTP was used previously
+        serial = "previous"
+        db_token = Token(serial, tokentype="totp")
+        db_token.save()
+        token = TotpTokenClass(db_token)
+        token.set_otpkey(self.otpkey)
+        token.set_hashlib("sha1")
+        token.set_otplen(6)
+        # Authenticate with the current OTP value
+        counter = token._time2counter(time.time(), timeStepping=30)
+        otp_now = token._calc_otp(counter)
+        r = token.check_otp(otp_now, window=180)
+        self.assertEqual(r, counter)
+        # Now we try several is_previous_otp and the timeShift must stay the same!
+        ts0 = float(token.get_tokeninfo("timeShift"))
+        self.assertTrue(-181 < ts0 < 181)
+        # Too old
+        r = token.is_previous_otp(token._calc_otp(counter - 3))
+        self.assertEqual(r, False)
+        ts = float(token.get_tokeninfo("timeShift"))
+        self.assertEqual(ts, ts0)
+        # The same OTP value
+        r = token.is_previous_otp(otp_now)
+        self.assertEqual(r, True)
+        ts = float(token.get_tokeninfo("timeShift"))
+        self.assertEqual(ts, ts0)
+        # Future value
+        r = token.is_previous_otp(token._calc_otp(counter + 8))
+        self.assertEqual(r, False)
+        ts = float(token.get_tokeninfo("timeShift"))
+        self.assertEqual(ts, ts0)
 
     def test_27_get_default_settings(self):
         params = {}

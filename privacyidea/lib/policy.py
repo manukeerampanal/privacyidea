@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 #
+#  2021-09-06 Cornelius Kölbel <cornelius.koelbel@netknights.it>
+#             Add extended condition for HTTP environment
 #  2021-02-01 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Add custom user attributes
 #  2020-06-05 Cornelius Kölbel <cornelius.koelbel@netknights.it>
@@ -173,7 +175,8 @@ import six
 import logging
 from ..models import (Policy, db, save_config_timestamp, Token)
 from privacyidea.lib.config import (get_token_classes, get_token_types,
-                                    get_config_object, get_privacyidea_node)
+                                    get_config_object, get_privacyidea_node,
+                                    get_multichallenge_enrollable_tokentypes)
 from privacyidea.lib.error import ParameterError, PolicyError, ResourceNotFoundError, ServerError
 from privacyidea.lib.realm import get_realms
 from privacyidea.lib.resolver import get_resolver_list
@@ -183,8 +186,11 @@ from privacyidea.lib.utils import (check_time_in_range, check_pin_contents,
                                    fetch_one_resource, is_true, check_ip_in_policy,
                                    determine_logged_in_userparams, parse_string_to_dict)
 from privacyidea.lib.utils.compare import compare_values, COMPARATOR_DESCRIPTIONS
+from privacyidea.lib.utils.export import (register_import, register_export)
 from privacyidea.lib.user import User
 from privacyidea.lib import _
+from netaddr import AddrFormatError
+from privacyidea.lib.error import privacyIDEAError
 import datetime
 import re
 import ast
@@ -198,6 +204,7 @@ required = False
 
 DEFAULT_ANDROID_APP_URL = "https://play.google.com/store/apps/details?id=it.netknights.piauthenticator"
 DEFAULT_IOS_APP_URL = "https://apps.apple.com/us/app/privacyidea-authenticator/id1445401301"
+DEFAULT_PREFERRED_CLIENT_MODE = ['interactive', 'webauthn', 'poll', 'u2f']
 
 
 class SCOPE(object):
@@ -223,6 +230,7 @@ class ACTION(object):
     AUDIT = "auditlog"
     AUDIT_AGE = "auditlog_age"
     AUDIT_DOWNLOAD = "auditlog_download"
+    AUDITPAGESIZE = "audit_page_size"
     AUTHITEMS = "fetch_authentication_items"
     AUTHMAXSUCCESS = "auth_max_success"
     AUTHMAXFAIL = "auth_max_fail"
@@ -250,6 +258,7 @@ class ACTION(object):
     IMPORT = "importtokens"
     LASTAUTH = "last_auth"
     LOGINMODE = "login_mode"
+    LOGOUT_REDIRECT = "logout_redirect"
     LOGOUTTIME = "logout_time"
     LOSTTOKEN = 'losttoken'
     LOSTTOKENPWLEN = "losttoken_PW_length"
@@ -287,6 +296,8 @@ class ACTION(object):
     REALM = "realm"
     REGISTRATIONCODE_LENGTH = "registration.length"
     REGISTRATIONCODE_CONTENTS = "registration.contents"
+    PASSWORD_LENGTH = "pw.length"
+    PASSWORD_CONTENTS = "pw.contents"
     REMOTE_USER = "remote_user"
     REQUIREDEMAIL = "requiredemail"
     RESET = "reset"
@@ -314,6 +325,7 @@ class ACTION(object):
     TOKENREALMS = "tokenrealms"
     TOKENTYPE = "tokentype"
     TOKENINFO = "tokeninfo"
+    HIDE_TOKENINFO = "hide_tokeninfo"
     TOKENWIZARD = "tokenwizard"
     TOKENWIZARD2ND = "tokenwizard_2nd_token"
     TOKENROLLOVER = "token_rollover"
@@ -344,9 +356,11 @@ class ACTION(object):
     CHANGE_PIN_EVERY = "change_pin_every"
     CHANGE_PIN_VIA_VALIDATE = "change_pin_via_validate"
     RESYNC_VIA_MULTICHALLENGE = "resync_via_multichallenge"
+    ENROLL_VIA_MULTICHALLENGE = "enroll_via_multichallenge"
     CLIENTTYPE = "clienttype"
     REGISTERBODY = "registration_body"
     RESETALLTOKENS = "reset_all_user_tokens"
+    INCREASE_FAILCOUNTER_ON_CHALLENGE = "increase_failcounter_on_challenge"
     ENROLLPIN = "enrollpin"
     MANAGESUBSCRIPTION = "managesubscription"
     SEARCH_ON_ENTER = "search_on_enter"
@@ -369,6 +383,12 @@ class ACTION(object):
     SHOW_NODE = "show_node"
     SET_USER_ATTRIBUTES = "set_custom_user_attributes"
     DELETE_USER_ATTRIBUTES = "delete_custom_user_attributes"
+    VERIFY_ENROLLMENT = "verify_enrollment"
+    TOKENGROUPS = "tokengroups"
+    TOKENGROUP_LIST = "tokengroup_list"
+    TOKENGROUP_ADD = "tokengroup_add"
+    TOKENGROUP_DELETE = "tokengroup_delete"
+    PREFERREDCLIENTMODE = "preferred_client_mode"
 
 
 class TYPE(object):
@@ -396,6 +416,8 @@ class GROUP(object):
     MODIFYING_RESPONSE = "modifying response"
     CONDITIONS = "conditions"
     SETTING_ACTIONS = "setting actions"
+    TOKENGROUP= "tokengroup"
+
 
 class MAIN_MENU(object):
     __doc__ = """These are the allowed top level menu items. These are used
@@ -450,6 +472,7 @@ class CONDITION_SECTION(object):
     TOKENINFO = "tokeninfo"
     TOKEN = "token"
     HTTP_REQUEST_HEADER = "HTTP Request header"
+    HTTP_ENVIRONMENT = "HTTP Environment"
 
 
 class CONDITION_CHECK(object):
@@ -563,8 +586,8 @@ class PolicyClass(object):
             if searchvalue is not None:
                 reduced_policies = [policy for policy in reduced_policies if
                                     policy.get(searchkey) == searchvalue]
-                log.debug("Policies after matching {1!s}: {0!s}".format(
-                    reduced_policies, searchkey))
+                log.debug("Policies after matching {1!s}={2!s}: {0!s}".format(
+                    reduced_policies, searchkey, searchvalue))
 
         p = [("action", action), ("user", user), ("realm", realm)]
         # If this is an admin-policy, we also do check the adminrealm
@@ -588,8 +611,8 @@ class PolicyClass(object):
                         if value_found and not value_excluded:
                             new_policies.append(policy)
                 reduced_policies = new_policies
-                log.debug("Policies after matching {1!s}: {0!s}".format(
-                    reduced_policies, searchkey))
+                log.debug(u"Policies after matching {1!s}={2!s}: {0!s}".format(
+                    reduced_policies, searchkey, searchvalue))
 
         # We need to act individually on the resolver key word
         # We either match the resolver exactly or we match another resolver (
@@ -623,8 +646,8 @@ class PolicyClass(object):
                         new_policies.append(policy)
 
             reduced_policies = new_policies
-            log.debug("Policies after matching resolver: {0!s}".format(
-                reduced_policies))
+            log.debug("Policies after matching resolver={1!s}: {0!s}".format(
+                reduced_policies, resolver))
 
         # Match the privacyIDEA node
         if pinode is not None:
@@ -635,7 +658,7 @@ class PolicyClass(object):
                     new_policies.append(policy)
 
             reduced_policies = new_policies
-            log.debug("Policies after matching pinode: {0!s}".format(reduced_policies))
+            log.debug("Policies after matching pinode={1!s}: {0!s}".format(reduced_policies, pinode))
 
         # Match the client IP.
         # Client IPs may be direct match, may be located in subnets or may
@@ -665,8 +688,8 @@ class PolicyClass(object):
                 if not policy.get("client"):
                     new_policies.append(policy)
             reduced_policies = new_policies
-            log.debug("Policies after matching client: {0!s}".format(
-                reduced_policies))
+            log.debug("Policies after matching client={1!s}: {0!s}".format(
+                reduced_policies, client))
 
         if sort_by_priority:
             reduced_policies = sorted(reduced_policies, key=itemgetter("priority"))
@@ -716,9 +739,9 @@ class PolicyClass(object):
         """
         if user_object is not None:
             # if a user_object is passed, we check, if it differs from potentially passed user, resolver, realm:
-            if (user and user.lower() != user_object.login.lower()) \
+            if (user and user.lower() not in {user_object.login.lower(), user_object.used_login.lower()}) \
                     or (resolver and resolver.lower() != user_object.resolver.lower()) \
-                    or (realm and realm != user_object.realm):
+                    or (realm and realm.lower() != user_object.realm):
                 tb_str = ''.join(traceback.format_stack())
                 log.warning("Cannot pass user_object as well as user, resolver, realm "
                             "in policy {0!s}. "
@@ -805,6 +828,11 @@ class PolicyClass(object):
                                                                                  request_headers):
                                 include_policy = False
                                 break
+                        elif section == CONDITION_SECTION.HTTP_ENVIRONMENT:
+                            if not self._policy_matches_request_environ_condition(policy, key, comparator, value,
+                                                                                 request_headers):
+                                include_policy = False
+                                break
                         else:
                             log.warning(u"Policy {!r} has condition with unknown section: {!r}".format(
                                 policy['name'], section
@@ -813,6 +841,38 @@ class PolicyClass(object):
             if include_policy:
                 reduced_policies.append(policy)
         return reduced_policies
+
+    @staticmethod
+    def _policy_matches_request_environ_condition(policy, key, comparator, value, request_headers):
+        """
+        :param request_headers: Request Header object
+        :type request_headers: Can be accessed using .get()
+        """
+        # Now we check the HTTP request headers
+        if request_headers is not None:
+            request_environ = request_headers.environ
+            if request_environ.get(key):
+                try:
+                    environ_value = request_environ.get(key)
+                    return compare_values(environ_value, comparator, value)
+                except Exception as exx:
+                    log.warning(u"Error during handling the condition on HTTP environment {!r} "
+                                u"of policy {!r}: {!r}".format(key, policy['name'], exx))
+                    raise PolicyError(
+                        u"Invalid comparison in the HTTP environment conditions of policy {!r}".format(policy['name']))
+            else:
+                log.warning(u"Unknown HTTP environment key referenced in condition of policy "
+                            u"{!r}: {!r}".format(policy["name"], key))
+                log.warning(u"Available HTTP environment: {!r}".format(request_environ))
+                raise PolicyError(u"Unknown HTTP environment key referenced in condition of policy "
+                                  u"{!r}: {!r}".format(policy["name"], key))
+        else:  # pragma: no cover
+            log.error(u"Policy {!r} has conditions on HTTP environment, but HTTP environment"
+                      u" is not available. This should not happen - possible "
+                      u"programming error {!s}.".format(policy["name"],
+                                                        ''.join(traceback.format_stack())))
+            raise PolicyError(u"Policy {!r} has conditions on environment {!r}, but HTTP environment"
+                              u" is not available".format(policy["name"], key))
 
     @staticmethod
     def _policy_matches_request_header_condition(policy, key, comparator, value, request_headers):
@@ -835,6 +895,7 @@ class PolicyClass(object):
             else:
                 log.warning(u"Unknown HTTP header key referenced in condition of policy "
                             u"{!r}: {!r}".format(policy["name"], key))
+                log.warning(u"Available HTTP headers: {!r}".format(request_headers))
                 raise PolicyError(u"Unknown HTTP header key referenced in condition of policy "
                                   u"{!r}: {!r}".format(policy["name"], key))
         else:  # pragma: no cover
@@ -1295,6 +1356,11 @@ def set_policy(name=None, scope=None, action=None, realm=None, resolver=None,
         resolver = ", ".join(resolver)
     if type(client) == list:
         client = ", ".join(client)
+    if client is not None:
+        try:
+            check_ip_in_policy("127.0.0.1", [c.strip() for c in client.split(",")])
+        except AddrFormatError:
+            raise privacyIDEAError(_("Invalid client definition!"), id=302)
     if type(pinode) == list:
         pinode = ", ".join(pinode)
     # validate conditions parameter
@@ -1552,8 +1618,7 @@ def get_static_policy_definitions(scope=None):
             ACTION.UNASSIGN: {'type': 'bool',
                               'desc': _(
                                   'Admin is allowed to remove the token from '
-                                  'a user, '
-                                  'i.e. unassign a token.'),
+                                  'a user, i.e. unassign a token.'),
                               'mainmenu': [MAIN_MENU.TOKENS],
                               'group': GROUP.TOKEN},
             ACTION.IMPORT: {'type': 'bool',
@@ -1611,14 +1676,12 @@ def get_static_policy_definitions(scope=None):
             ACTION.COPYTOKENPIN: {'type': 'bool',
                                   'desc': _(
                                       'Admin is allowed to copy the PIN of '
-                                      'one token '
-                                      'to another token.'),
+                                      'one token to another token.'),
                                   "group": GROUP.TOOLS},
             ACTION.COPYTOKENUSER: {'type': 'bool',
                                    'desc': _(
                                        'Admin is allowed to copy the assigned '
-                                       'user to another'
-                                       ' token, i.e. assign a user ot '
+                                       'user to another token, i.e. assign a user to '
                                        'another token.'),
                                    "group": GROUP.TOOLS},
             ACTION.LOSTTOKEN: {'type': 'bool',
@@ -1887,7 +1950,31 @@ def get_static_policy_definitions(scope=None):
                           "attribute, set this to '*'. For more details, check "
                           "the documentation."),
                 'mainmenu': [],
-                'group': GROUP.USER}
+                'group': GROUP.USER},
+            ACTION.HIDE_TOKENINFO: {
+                'type': TYPE.STRING,
+                'desc': _('A whitespace-separated list of tokeninfo fields '
+                          'which are not displayed to the admin.'),
+                'group': GROUP.TOKEN},
+            ACTION.TOKENGROUP_LIST: {
+                'type': 'bool',
+                'desc': _("The Admin is allowed list the available tokengroups."),
+                'mainmenu': [MAIN_MENU.CONFIG],
+                'group': GROUP.TOKENGROUP},
+            ACTION.TOKENGROUP_ADD: {
+                'type': 'bool',
+                'desc': _("The Admin is allowed to add a new tokengroup."),
+                'mainmenu': [MAIN_MENU.CONFIG],
+                'group': GROUP.TOKENGROUP},
+            ACTION.TOKENGROUP_DELETE: {
+                'type': 'bool',
+                'desc': _("The Admin is allowed delete a tokengroup."),
+                'mainmenu': [MAIN_MENU.CONFIG],
+                'group': GROUP.TOKENGROUP},
+            ACTION.TOKENGROUPS: {
+                'type': 'bool',
+                'desc': _("The Admin is allowed to manage the tokengroups of a token."),
+                'group': GROUP.TOKEN},
         },
 
         SCOPE.USER: {
@@ -2017,8 +2104,13 @@ def get_static_policy_definitions(scope=None):
                           "attribute, set this to '*'. Use '*' with CAUTION! "
                           "For more details, check the documentation."),
                 'mainmenu': [],
-                'group': GROUP.USER}
-
+                'group': GROUP.USER},
+            ACTION.HIDE_TOKENINFO: {
+                'type': TYPE.STRING,
+                'desc': _('A whitespace-separated list of tokeninfo fields '
+                          'which are not displayed to the user.'),
+                'group': GROUP.TOKEN
+            }
         },
         SCOPE.ENROLL: {
             ACTION.MAXTOKENREALM: {
@@ -2067,8 +2159,8 @@ def get_static_policy_definitions(scope=None):
             ACTION.TOKENLABEL: {
                 'type': 'str',
                 'desc': _("Set label for a new enrolled Google Authenticator. "
-                          "Possible tags are <u> (user), <r> ("
-                          "realm), <s> (serial)."),
+                          "Possible tags are &lt;u&gt; (user), &lt;r&gt; ("
+                          "realm), &lt;s&gt; (serial)."),
                 'group': GROUP.TOKEN},
             ACTION.TOKENISSUER: {
                 'type': 'str',
@@ -2078,8 +2170,8 @@ def get_static_policy_definitions(scope=None):
             },
             ACTION.APPIMAGEURL: {
                 'type': 'str',
-                'desc': _("This is the URL to the token image for smartphone apps "
-                          "like FreeOTP."),
+                'desc': _("This is the URL to the token image for the privacyIDEA Authenticator "
+                          "and some other apps like FreeOTP (supported file formats: PNG, JPG and GIF)."),
                 'group': GROUP.TOKEN
             },
             ACTION.AUTOASSIGN: {
@@ -2114,8 +2206,25 @@ def get_static_policy_definitions(scope=None):
                           "(c)haracters, (n)umeric, "
                           "(s)pecial. Use modifiers +/- or a list "
                           "of allowed characters [1234567890]"),
-                'group': GROUP.TOKEN
-            }
+                'group': GROUP.TOKEN},
+            ACTION.PASSWORD_LENGTH: {
+                'type': 'int',
+                'value': list(range(1, 32)),
+                "desc": _("Set the length of the password of generated password tokens."),
+                'group': GROUP.TOKEN},
+            ACTION.PASSWORD_CONTENTS: {
+                'type': 'str',
+                "desc": _("Specify the required "
+                          "contents of the password of a password token. "
+                          "(c)haracters, (n)umeric, "
+                          "(s)pecial. Use modifiers +/- or a list "
+                          "of allowed characters [1234567890]"),
+                'group': GROUP.TOKEN},
+            ACTION.VERIFY_ENROLLMENT: {
+                'type': 'str',
+                'desc': _("Specify a white space separated list of token types, "
+                          "that should be verified during enrollment."),
+                'group': GROUP.TOKEN}
         },
         SCOPE.AUTH: {
             ACTION.OTPPIN: {
@@ -2155,6 +2264,12 @@ def get_static_policy_definitions(scope=None):
                 'desc': _("The autoresync of a token can be done via a challenge response message."
                           "You need to activate 'Automatic resync' in the general settings!"),
             },
+            ACTION.ENROLL_VIA_MULTICHALLENGE: {
+                'type': 'str',
+                'desc': _("In case of a successful authentication the following tokentype is enrolled. The "
+                          "maximum number of tokens for a user is checked."),
+                'value': [t.upper() for t in get_multichallenge_enrollable_tokentypes()]
+            },
             ACTION.PASSTHRU: {
                 'type': 'str',
                 'value': radiusconfigs,
@@ -2192,12 +2307,22 @@ def get_static_policy_definitions(scope=None):
                 'desc': _('If a user authenticates successfully reset the '
                           'failcounter of all of his tokens.')
             },
+            ACTION.INCREASE_FAILCOUNTER_ON_CHALLENGE: {
+                'type': 'bool',
+                'desc': _('Increase the failcounter for all the tokens, for which a challenge has been triggered.')
+            },
             ACTION.AUTH_CACHE: {
                 'type': 'str',
                 'desc': _('Cache the password used for authentication and '
                           'allow authentication with the same credentials for a '
                           'certain amount of time. '
                           'Specify timeout like 4h or 4h/5m.')
+            },
+            ACTION.PREFERREDCLIENTMODE: {
+                'type': 'str',
+                'desc': _('You can set the client modes in the order that you prefer. '
+                          'For example: "interactive webauthn poll u2f". Accepted'
+                          ' values are:"interactive, webauthn, poll, u2f"')
             }
         },
         SCOPE.AUTHZ: {
@@ -2255,7 +2380,7 @@ def get_static_policy_definitions(scope=None):
             ACTION.TOKENINFO: {
                 'type': 'str',
                 'desc': _("The user will only be authenticated if the tokeninfo "
-                          "field matches the regexp. key/<regexp>/"),
+                          "field matches the regexp. key/&lt;regexp&gt;/"),
                 'group': GROUP.CONDITIONS,
             },
             ACTION.SETREALM: {
@@ -2354,6 +2479,11 @@ def get_static_policy_definitions(scope=None):
                 'desc': _("Set how many users should be displayed in the user "
                           "view on one page.")
             },
+            ACTION.AUDITPAGESIZE: {
+                'type': 'int',
+                'desc': _("Set how many audit entries should be displayed in the audit "
+                          "view on one page.")
+            },
             ACTION.CUSTOM_MENU: {
                 'type': 'str',
                 'desc': _("Use your own html template for the web UI menu.")
@@ -2377,6 +2507,11 @@ def get_static_policy_definitions(scope=None):
                           "templates can be found.  (Default "
                           "https: //raw.githubusercontent.com/ privacyidea/"
                           "policy-templates /master/templates/)")
+            },
+            ACTION.LOGOUT_REDIRECT: {
+              'type': 'str',
+              'desc': _("The URL of an SSO provider for redirect at logout."
+                        "(The URL must start with http:// or https://)")
             },
             ACTION.TOKENWIZARD: {
                 'type': 'bool',
@@ -2502,6 +2637,9 @@ def get_policy_condition_sections():
         },
         CONDITION_SECTION.HTTP_REQUEST_HEADER: {
             "description": _("The policy only matches if certain conditions on the HTTP Request header are fulfilled.")
+        },
+        CONDITION_SECTION.HTTP_ENVIRONMENT: {
+            "description": _("The policy only matches if certain conditions on the HTTP Environment are fulfilled.")
         }
     }
 
@@ -2892,3 +3030,26 @@ def check_pin(g, pin, tokentype, user_obj):
         r, comment = check_pin_contents(pin, list(pol_contents)[0])
         if r is False:
             raise PolicyError(comment)
+
+
+@register_export('policy')
+def export_policy(name=None):
+    """ Export given or all policy configuration """
+    pol_cls = PolicyClass()
+    return pol_cls.list_policies(name=name)
+
+
+@register_import('policy')
+def import_policy(data, name=None):
+    """Import policy configuration"""
+    log.debug('Import policy config: {0!s}'.format(data))
+    for res_data in data:
+        if name and name != res_data.get('name'):
+            continue
+        rid = set_policy(**res_data)
+        # TODO: we have no information if a new policy was created or an
+        #  existing policy updated. We would need to enhance "set_policy()"
+        #  to either force overwriting or not and also return if the policy
+        #  existed before.
+        log.info('Import of policy "{0!s}" finished,'
+                 ' id: {1!s}'.format(res_data['name'], rid))

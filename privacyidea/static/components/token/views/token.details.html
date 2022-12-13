@@ -71,7 +71,14 @@
         <tr ng-if="token.rollout_state">
             <td translate>Rollout State</td>
             <td>{{ token.rollout_state }}</td>
-            <td></td>
+            <td>
+                <div ng-show="token.rollout_state === 'verify'">
+                    <input type="text" ng-model="token.verifyResponse" class="form-control"
+                           placeholder="{{ 'Enter code to verify enrollment' | translate }}">
+                    <button type="button" ng-click="sendVerifyResponse()"
+                            class="btn btn-primary" translate>Verify Token</button>
+                </div>
+            </td>
         </tr>
         <tr token-data-edit text="{{'Maxfail' | translate }}"
             button-text="{{ 'Set max fail'|translate}}"
@@ -324,6 +331,51 @@
                             id="trCancelButton"
                             ng-show="editTokenRealm"
                             ng-click="cancelEditRealm();"
+                            translate>Cancel
+                    </button>
+                </div>
+            </td>
+        </tr>
+
+        <tr>
+            <td>Token groups</td>
+            <td>
+                <span ng-hide="editTokenGroups">
+            <ul ng-click="!token.locked ? editTokenGroups = true : null">
+                <li ng-repeat="group in token.tokengroup">{{ group }}</li>
+            </ul>
+            </span>
+            <span ng-show="editTokenGroups">
+                <span ng-repeat="(groupname, tokengroup) in tokengroups">
+                    <label for="{{ groupname }}">
+                        <input type="checkbox"
+                               ng-model="selectedTokenGroups[groupname]"
+                               name="group"
+                               id="{{ groupname }}"
+                               ng-checked="selectedTokenGroups[groupname]">
+                        {{ groupname }} ({{ tokengroup.description }})
+                    </label><br>
+                </span></span>
+            </td>
+            <td>
+                <div ng-show="loggedInUser.role == 'admin' && !token.locked">
+                    <button class="btn btn-primary"
+                            id="tgEditButton"
+                            ng-hide="editTokenGroups || (!checkRight('tokengroups') && hide_buttons)"
+                            ng-disable="!checkRight('tokengroups')"
+                            ng-click="startEditTokenGroups()"
+                            translate>Edit
+                    </button>
+                    <button class="btn btn-primary"
+                            id="tgSaveButton"
+                            ng-show="editTokenGroups"
+                            ng-click="saveTokenGroups()"
+                            translate>Save Token Groups
+                    </button>
+                    <button class="btn btn-danger"
+                            id="tgCancelButton"
+                            ng-show="editTokenGroups"
+                            ng-click="cancelEditTokenGroups();"
                             translate>Cancel
                     </button>
                 </div>
@@ -612,7 +664,6 @@
     <form name="formAttachMachine" role="form"
           ng-hide="token.locked"
           validate>
-        <div attach-machine new-machine="newMachine"></div>
 
         <div class="form-group">
             <label for="application" translate>Application</label>
@@ -624,6 +675,9 @@
                     >
             </select>
         </div>
+
+        <div ng-hide="form.application=='offline'"
+             attach-machine new-machine="newMachine"></div>
 
         <!-- Options for a new MachineToken -->
         <div class="form-group"

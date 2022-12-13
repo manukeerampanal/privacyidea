@@ -1,9 +1,9 @@
 .. _policy_conditions:
 
-Policy conditions
------------------
+Extended Policy Conditions
+--------------------------
 
-Since privacyIDEA 3.1, *policy conditions* allow to define more advanced rules
+Since privacyIDEA 3.1, *extended policy conditions* allow to define more advanced rules
 for policy matching, i.e. for determining which policies are valid for a
 specific request.
 
@@ -30,7 +30,8 @@ consists of five parts:
 Sections
 ~~~~~~~~
 
-privacyIDEA implements three sections ``userinfo``, ``token``, ``tokeninfo`` and ``HTTP Request Headers``.
+privacyIDEA implements the sections ``userinfo``, ``token``, ``tokeninfo``, ``HTTP Request Headers``
+and ``HTTP Environment``.
 
 ``userinfo``
 ^^^^^^^^^^^^
@@ -122,7 +123,7 @@ The token condition works on the database columns of the token. This would be
 ``description``, ``otplen``, ``count``, ``serial``, ``active`` but most importantly
 also ``failcount`` and ``tokentype``.
 
-.. note:: A policy with an active tokeninfo condition will
+.. note:: A policy with an active token condition will
    throw an exception whenever the token object cannot be determined.
    It will also throw an error, if the request ``Key`` does not exist
    as a database column.
@@ -153,6 +154,20 @@ of the required value.
    in addition restrict the policy e.g. to client IPs, to assure, that a request from
    this certain IP address will always contain the header, that is to be checked.
 
+``HTTP Environment``
+^^^^^^^^^^^^^^^^^^^^
+
+The section ``HTTP Environment`` can be used to define conditions that are checked against
+the HTTP environment key-value pairs.
+
+The ``Key`` is case sensitive.
+
+The environment contains information like the ``PATH_INFO`` which contains the name of the
+endpoint like ``/validate/check`` or ``/auth``.
+
+.. note:: privacyIDEA raises an error if ``Key`` refers to an unknown environment key.
+   The log file then contains information about the available keys.
+   The behaviour is similar to the extended conditions of HTTP Request Header.
 
 Comparators
 ~~~~~~~~~~~

@@ -175,7 +175,12 @@ class YubikeyTokenClass(TokenClass):
                            'desc': _(
                                "The user may only have this maximum number of active Yubikey tokens assigned."),
                            'group': GROUP.TOKEN
-                       }
+                       },
+                       'yubikey_access_code': {
+                           'type': 'str',
+                           'desc': _("The Yubikey access code can be read by an enrollment client to "
+                                     "initialize Yubikeys.")
+                       },
                    }
                }
         }
@@ -293,7 +298,7 @@ class YubikeyTokenClass(TokenClass):
 
         uid = msg_hex[0:12]
         log.debug("uid: {0!r}".format(uid))
-        log.debug("prefix: {0!r}".format(binascii.hexlify(modhex_decode(yubi_prefix))))
+        log.debug("prefix: {0!r}".format(yubi_prefix))
         # usage_counter can go from 1 – 0x7fff
         usage_counter = msg_hex[12:16]
         timestamp = msg_hex[16:22]

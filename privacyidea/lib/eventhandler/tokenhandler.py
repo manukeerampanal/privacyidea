@@ -47,12 +47,14 @@ from privacyidea.lib.token import (set_realms, remove_token, enable_token,
                                    unassign_token, init_token, set_description,
                                    set_count_window, add_tokeninfo,
                                    set_failcounter, delete_tokeninfo,
-                                   get_one_token, set_max_failcount)
+                                   get_one_token, set_max_failcount,
+                                   assign_tokengroup, unassign_tokengroup)
 from privacyidea.lib.utils import (parse_date, is_true,
                                    parse_time_offset_from_now)
 from privacyidea.lib.tokenclass import DATE_FORMAT, AUTH_DATE_FORMAT
 from privacyidea.lib.smtpserver import get_smtpservers
 from privacyidea.lib.smsprovider.SMSProvider import get_smsgateway
+from privacyidea.lib.tokengroup import get_tokengroups
 from privacyidea.lib import _
 import logging
 import datetime
@@ -82,6 +84,8 @@ class ACTION_TYPE(object):
     CHANGE_FAILCOUNTER = "change failcounter"
     DELETE_TOKENINFO = "delete tokeninfo"
     SET_RANDOM_PIN = "set random pin"
+    ADD_TOKENGROUP = "add tokengroup"
+    REMOVE_TOKENGROUP = "remove tokengroup"
 
 
 class VALIDITY(object):
@@ -290,7 +294,25 @@ class TokenEventHandler(BaseEventHandler):
                                 "required": True,
                                 "description": _("Delete this tokeninfo key.")
                             }
-                       }
+                       },
+                   ACTION_TYPE.ADD_TOKENGROUP:
+                       {"tokengroup":
+                            {
+                                "type": "string",
+                                "required": True,
+                                "description": _("Add a tokengroup to the token."),
+                                "value": [tg.name for tg in get_tokengroups()]
+                            }
+                       },
+                   ACTION_TYPE.REMOVE_TOKENGROUP:
+                       {"tokengroup":
+                            {
+                                "type": "string",
+                                "required": True,
+                                "description": _("Remote a tokengroup from the token."),
+                                "value": [tg.name for tg in get_tokengroups()]
+                            }
+                        }
                    }
         return actions
 
@@ -327,7 +349,9 @@ class TokenEventHandler(BaseEventHandler):
                               ACTION_TYPE.SET_MAXFAIL,
                               ACTION_TYPE.CHANGE_FAILCOUNTER,
                               ACTION_TYPE.SET_RANDOM_PIN,
-                              ACTION_TYPE.DELETE_TOKENINFO]:
+                              ACTION_TYPE.DELETE_TOKENINFO,
+                              ACTION_TYPE.ADD_TOKENGROUP,
+                              ACTION_TYPE.REMOVE_TOKENGROUP]:
             if serial:
                 if ',' in serial:
                     serials = [t.strip() for t in serial.split(',')]
@@ -428,9 +452,22 @@ class TokenEventHandler(BaseEventHandler):
                         except Exception as exx:
                             log.warning("Misconfiguration: Failed to increase or decrease fail "
                                         "counter!")
+                    elif action.lower() == ACTION_TYPE.ADD_TOKENGROUP:
+                        try:
+                            assign_tokengroup(serial, handler_options.get("tokengroup"))
+                        except Exception as exx:
+                            log.warning("Misconfiguration: Failed to add tokengroup "
+                                        "to token {0!s}!".format(serial))
+                    elif action.lower() == ACTION_TYPE.REMOVE_TOKENGROUP:
+                        try:
+                            unassign_tokengroup(serial, handler_options.get("tokengroup"))
+                        except Exception as exx:
+                            log.warning("Misconfiguration: Failed to remove tokengroup "
+                                        "from token {0!s}!".format(serial))
+
                 else:
                     log.info("Action {0!s} requires serial number. But no serial "
-                             "number could be found in request.")
+                             "number could be found in request {1!s}.".format(action, request))
 
         if action.lower() == ACTION_TYPE.INIT:
             log.info("Initializing new token")
@@ -448,7 +485,7 @@ class TokenEventHandler(BaseEventHandler):
                         init_param.update(add_params)
 
                 if tokentype == "sms":
-                    if handler_options.get("dynamic_phone"):
+                    if is_true(handler_options.get("dynamic_phone")):
                         init_param["dynamic_phone"] = 1
                     else:
                         init_param['phone'] = user.get_user_phone(
@@ -459,7 +496,7 @@ class TokenEventHandler(BaseEventHandler):
                     if handler_options.get("sms_identifier"):
                         init_param["sms.identifier"] = handler_options.get("sms_identifier")
                 elif tokentype == "email":
-                    if handler_options.get("dynamic_email"):
+                    if is_true(handler_options.get("dynamic_email")):
                         init_param["dynamic_email"] = 1
                     else:
                         init_param['email'] = user.info.get("email", "")

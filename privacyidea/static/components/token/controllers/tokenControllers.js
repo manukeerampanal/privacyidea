@@ -18,11 +18,12 @@
  * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *
  */
-myApp.controller("tokenController", function (TokenFactory, ConfigFactory,
-                                              $scope, $location, AuthFactory,
-                                              instanceUrl,
-                                              $rootScope, gettextCatalog,
-                                              hotkeys) {
+myApp.controller("tokenController", ['TokenFactory', 'ConfigFactory', '$scope',
+                                     '$location', 'AuthFactory', 'instanceUrl',
+                                     '$rootScope',
+                                     function (TokenFactory, ConfigFactory,
+                                               $scope, $location, AuthFactory,
+                                               instanceUrl, $rootScope) {
     $scope.tokensPerPage = $scope.token_page_size;
     $scope.params = {page: 1, sortdir: "asc"};
     $scope.reverse = false;
@@ -43,6 +44,7 @@ myApp.controller("tokenController", function (TokenFactory, ConfigFactory,
             $scope.params.tokenrealm = "*" + ($scope.tokenrealmFilter || "") + "*";
             $scope.params.type = "*" + ($scope.typeFilter || "") + "*";
             $scope.params.description = "*" + ($scope.descriptionFilter || "") + "*";
+            $scope.params.rollout_state = "*" + ($scope.rolloutStateFilter || "") + "*";
             $scope.params.userid = "*" + ($scope.userIdFilter || "") + "*";
             $scope.params.resolver = "*" + ($scope.resolverFilter || "") + "*";
             $scope.params.pagesize = $scope.token_page_size;
@@ -99,7 +101,7 @@ myApp.controller("tokenController", function (TokenFactory, ConfigFactory,
         $scope.get();
     });
 
-});
+}]);
 
 
 myApp.controller("tokenAssignController", ['$scope', 'TokenFactory',
@@ -149,6 +151,9 @@ myApp.controller("tokenEnrollController", ["$scope", "TokenFactory", "$timeout",
     });
 
     $scope.qrCodeWidth = 250;
+
+    // Available SMS gateways. We do this here to avoid javascript loops
+    $scope.smsGateways = $scope.getRightsValue('sms_gateways', '').split(' ');
 
     if ($state.includes('token.wizard') && !$scope.show_seed) {
         $scope.qrCodeWidth = 300;
@@ -420,7 +425,6 @@ myApp.controller("tokenEnrollController", ["$scope", "TokenFactory", "$timeout",
     $scope.CATemplates = {};
     $scope.radioCSR = 'csrgenerate';
 
-
     // default enrollment callback
     $scope.callback = function (data) {
         $scope.U2FToken = {};
@@ -505,6 +509,19 @@ myApp.controller("tokenEnrollController", ["$scope", "TokenFactory", "$timeout",
         };
         TokenFactory.enroll($scope.newUser, params, function (data) {
             $scope.clientpart = "";
+            $scope.callback(data);
+        });
+    };
+
+    $scope.sendVerifyResponse = function () {
+        var params = {
+            "serial": $scope.enrolledToken.serial,
+            "verify": $scope.verifyResponse,
+            "type": $scope.form.type
+
+        };
+        TokenFactory.enroll($scope.newUser, params, function (data) {
+            $scope.verifyResponse = "";
             $scope.callback(data);
         });
     };
@@ -648,12 +665,23 @@ myApp.controller("tokenEnrollController", ["$scope", "TokenFactory", "$timeout",
 }]);
 
 
-myApp.controller("tokenImportController", function ($scope, Upload,
-                                                    AuthFactory, tokenUrl,
-                                                    ConfigFactory, inform) {
+myApp.controller("tokenImportController", ['$scope', 'Upload', 'AuthFactory',
+                                           'tokenUrl', 'ConfigFactory', 'inform',
+                                           'gettextCatalog',
+                                           function ($scope, Upload,
+                                                     AuthFactory, tokenUrl,
+                                                     ConfigFactory, inform,
+                                                     gettextCatalog) {
     $scope.formInit = {
         fileTypes: ["aladdin-xml", "OATH CSV", "Yubikey CSV", "pskc"]
     };
+
+    $scope.verify_pskc_opts = {
+        no_check: gettextCatalog.getString('Do not verify the authenticity'),
+        check_fail_soft: gettextCatalog.getString('Skip tokens that can not be verified'),
+        check_fail_hard: gettextCatalog.getString('Abort operation on unverifiable token'),
+    }
+
     // These are values that are also sent to the backend!
     $scope.form = {
         type: "OATH CSV",
@@ -702,4 +730,4 @@ myApp.controller("tokenImportController", function ($scope, Upload,
                 $scope.uploadProgress = parseInt(100.0 * evt.loaded / evt.total)});
         }
     };
-});
+}]);

@@ -71,6 +71,10 @@ APPLICATIONS = {"demo_application": 0,
                 "privacyidea-ldap-proxy": 50,
                 "privacyidea-cp": 50,
                 "privacyidea-adfs": 50,
+                "privacyidea-keycloak": 10000,
+                "simplesamlphp": 10000,
+                "privacyidea-simplesamlphp": 10000,
+                "privacyidea authenticator": 10,
                 "privacyidea": 50}
 
 log = logging.getLogger(__name__)
@@ -89,7 +93,7 @@ def get_users_with_active_tokens():
     return sql_query.count()
 
 
-def subscription_status():
+def subscription_status(component="privacyidea", tokentype=None):
     """
     Return the status of the subscription
 
@@ -100,16 +104,16 @@ def subscription_status():
 
     :return: subscription state
     """
-    token_count = get_tokens(assigned=True, active=True, count=True)
-    if token_count <= APPLICATIONS.get("privacyidea", 50):
+    token_count = get_tokens(assigned=True, active=True, count=True, tokentype=tokentype)
+    if token_count <= APPLICATIONS.get(component, 50):
         return 0
 
-    subscriptions = get_subscription("privacyidea")
+    subscriptions = get_subscription(component)
     if len(subscriptions) == 0:
         return 1
 
     try:
-        check_subscription("privacyidea")
+        check_subscription(component)
     except SubscriptionError as exx:
         log.warning(u"{0}".format(exx))
         return 2
@@ -201,8 +205,8 @@ def delete_subscription(application):
 
 def raise_exception_probability(subscription=None):
     """
-    Depending on the subscription this will return True, so that an exception
-    can be raised
+    Depending on the subscription expiration data this will return True,
+    so that an exception can be raised
 
     :param subscription: Subscription dictionary
     :return: Bool
@@ -225,6 +229,26 @@ def raise_exception_probability(subscription=None):
     return False
 
 
+def subscription_exceeded_probability(active_tokens, allowed_tokens):
+    """
+    Depending on the subscription token numbers, this will return True,
+    so that an exception can be raised.
+
+    Returns true if a Subscription Exception is to be raised.
+
+    :param active_tokens: The number of the active tokens
+    :param allowed_tokens: The number of the allowed tokens
+    :return:
+    """
+    # old, hard behaviour
+    # return active_tokens > allowed_tokens
+    if active_tokens > allowed_tokens:
+        prob_check = random.randrange(active_tokens +1)
+        return prob_check > allowed_tokens
+    else:
+        return False
+
+
 def check_subscription(application, max_free_subscriptions=None):
     """
     This checks if the subscription for the given application is valid.
@@ -242,7 +266,7 @@ def check_subscription(application, max_free_subscriptions=None):
         token_users = get_users_with_active_tokens()
         free_subscriptions = max_free_subscriptions or APPLICATIONS.get(application.lower())
         if len(subscriptions) == 0:
-            if token_users > free_subscriptions:
+            if subscription_exceeded_probability(token_users, free_subscriptions):
                 raise SubscriptionError(description="No subscription for your client.",
                                         application=application)
         else:
@@ -257,12 +281,13 @@ def check_subscription(application, max_free_subscriptions=None):
             else:
                 # subscription is still valid, so check the signature.
                 check_signature(subscription)
-                if token_users > subscription.get("num_tokens"):
+                allowed_tokennums = subscription.get("num_tokens")
+                if subscription_exceeded_probability(token_users, allowed_tokennums):
                     # subscription is exceeded
                     raise SubscriptionError(description="Too many users "
                                                         "with assigned tokens. "
                                                         "Subscription exceeded.",
-                                            application="privacyIDEA")
+                                            application=application)
 
     return True
 

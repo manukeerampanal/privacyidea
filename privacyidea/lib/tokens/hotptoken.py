@@ -5,6 +5,8 @@
 #  License: AGPLv3
 #  contact: http://www.privacyidea.org
 #
+#  2022-02-03 Cornelius Kölbel <cornelius.koelbel@netknights.it>
+#             Add verified enrollment
 #  2018-06-06 Michael Becker <michael.becker@hs-niederrhein.de>
 #             Add get_setting_type to make hotp.hashlib public and
 #             therefore recognised in token enrollment with role user.
@@ -53,7 +55,7 @@ from privacyidea.lib.config import get_from_config
 from privacyidea.lib.tokenclass import (TokenClass,
                                         TWOSTEP_DEFAULT_DIFFICULTY,
                                         TWOSTEP_DEFAULT_CLIENTSIZE,
-                                        TOKENKIND)
+                                        TOKENKIND, ROLLOUTSTATE)
 from privacyidea.lib.log import log_with
 from privacyidea.lib.apps import create_google_authenticator_url as cr_google
 from privacyidea.lib.error import ParameterError
@@ -62,6 +64,8 @@ from privacyidea.lib.utils import (create_img, is_true, b32encode_and_unicode,
                                    hexlify_and_unicode, determine_logged_in_userparams)
 from privacyidea.lib.decorators import check_token_locked
 from privacyidea.lib.policy import SCOPE, ACTION, GROUP, Match
+from privacyidea.lib.token import init_token
+from privacyidea.lib.tokenclass import CLIENTMODE
 from privacyidea.lib import _
 import traceback
 import logging
@@ -77,11 +81,29 @@ keylen = {'sha1': 20,
           'sha512': 64
           }
 
+VERIFY_ENROLLMENT_MESSAGE = _("Please enter a valid OTP value of the new token.")
+
 
 class HotpTokenClass(TokenClass):
     """
     hotp token class implementation
     """
+
+    previous_otp_offset = 1
+
+    # The HOTP token provides means to verify the enrollment
+    can_verify_enrollment = True
+    # If the token is enrollable via multichallenge
+    is_multichallenge_enrollable = True
+
+    desc_hash_func = _('Specify the hashing function to be used. '
+                       'Can be SHA1, SHA256 or SHA512.')
+    desc_otp_len = _('Specify the OTP length to be used. Can be 6 or 8 digits.')
+    desc_key_gen = _("Force the key to be generated on the server.")
+    desc_two_step_user = _('Specify whether users are allowed or forced to use '
+                           'two-step enrollment.')
+    desc_two_step_admin = _('Specify whether admins are allowed or forced to '
+                            'use two-step enrollment.')
 
     @staticmethod
     def get_class_type():
@@ -115,13 +137,6 @@ class HotpTokenClass(TokenClass):
         :return: subsection if key exists or user defined
         :rtype: dict
         """
-        desc_self1 = _('Specify the hashlib to be used. '
-                       'Can be sha1 (1) or sha2-256 (2).')
-        desc_self2 = _('Specify the otplen to be used. Can be 6 or 8 digits.')
-        desc_two_step_user = _('Specify whether users are allowed or forced to use '
-                               'two-step enrollment.')
-        desc_two_step_admin = _('Specify whether admins are allowed or forced to use '
-                                'two-step enrollment.')
         res = {'type': 'hotp',
                'title': 'HOTP Event Token',
                'description': _('HOTP: Event based One Time Passwords.'),
@@ -139,11 +154,6 @@ class HotpTokenClass(TokenClass):
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of active HOTP tokens assigned."),
                            'group': GROUP.TOKEN
-                       },
-                       'yubikey_access_code': {
-                           'type': 'str',
-                           'desc': _("The Yubikey access code used to "
-                                     "initialize Yubikeys.")
                        },
                        'hotp_2step_clientsize': {
                            'type': 'int',
@@ -171,29 +181,29 @@ class HotpTokenClass(TokenClass):
                                         'value': ["sha1",
                                                   "sha256",
                                                   "sha512"],
-                                        'desc': desc_self1},
+                                        'desc': HotpTokenClass.desc_hash_func},
                        'hotp_otplen': {'type': 'int',
                                        'value': [6, 8],
-                                       'desc': desc_self2},
+                                       'desc': HotpTokenClass.desc_otp_len},
                        'hotp_force_server_generate': {
                            'type': 'bool',
-                           'desc': _("Force the key to be generated on the server.")},
+                           'desc': HotpTokenClass.desc_key_gen},
                        'hotp_2step': {'type': 'str',
                                       'value': ['allow', 'force'],
-                                      'desc': desc_two_step_user}
+                                      'desc': HotpTokenClass.desc_two_step_user}
                    },
                    SCOPE.ADMIN: {
                        'hotp_hashlib': {'type': 'str',
                                         'value': ["sha1",
                                                   "sha256",
                                                   "sha512"],
-                                        'desc': desc_self1},
+                                        'desc': HotpTokenClass.desc_hash_func},
                        'hotp_otplen': {'type': 'int',
                                        'value': [6, 8],
-                                       'desc': desc_self2},
+                                       'desc': HotpTokenClass.desc_otp_len},
                        'hotp_2step': {'type': 'str',
                                       'value': ['allow', 'force'],
-                                      'desc': desc_two_step_admin}
+                                      'desc': HotpTokenClass.desc_two_step_admin}
                    }
                }
                }
@@ -216,6 +226,7 @@ class HotpTokenClass(TokenClass):
         TokenClass.__init__(self, db_token)
         self.set_type(u"hotp")
         self.hKeyRequired = True
+        self.currently_in_challenge = False
 
     @log_with(log)
     def get_init_detail(self, params=None, user=None):
@@ -243,7 +254,7 @@ class HotpTokenClass(TokenClass):
         imageurl = params.get("appimageurl")
         if imageurl:
             extra_data.update({"image": imageurl})
-        force_app_pin = params.get('force_app_pin')
+        force_app_pin = params.get(ACTION.FORCE_APP_PIN)
         if force_app_pin:
             extra_data.update({'pin': True})
         if otpkey:
@@ -270,8 +281,7 @@ class HotpTokenClass(TokenClass):
                                                     _("URL for google "
                                                       "Authenticator"),
                                                     "value": goo_url,
-                                                    "img": create_img(goo_url,
-                                                                      width=250)
+                                                    "img": create_img(goo_url)
                                                     }
 
                     oath_url = cr_oath(otpkey=otpkey,
@@ -285,8 +295,7 @@ class HotpTokenClass(TokenClass):
                                                                    " OATH "
                                                                    "token"),
                                                   "value": oath_url,
-                                                  "img": create_img(oath_url,
-                                                                    width=250)
+                                                  "img": create_img(oath_url)
                                                   }
                 except Exception as ex:  # pragma: no cover
                     log.error("{0!s}".format((traceback.format_exc())))
@@ -368,6 +377,23 @@ class HotpTokenClass(TokenClass):
                      get_from_config("hotp.hashlib", u'sha1')
         return hashlibStr
 
+    def _calc_otp(self, counter):
+        """
+        Helper function to calculate the OTP value for the given counter
+        :param counter: The OTP counter
+        :return: OTP value as string
+        """
+        otplen = int(self.token.otplen)
+        secretHOtp = self.token.get_otpkey()
+        hmac2Otp = HmacOtp(secretHOtp,
+                           self.get_otp_count(),
+                           otplen,
+                           self.get_hashlib(self.hashlib))
+
+        otpval = hmac2Otp.generate(counter=counter,
+                                   inc_counter=False,
+                                   do_truncation=True)
+        return otpval
 
     @log_with(log)
     @check_token_locked
@@ -446,7 +472,7 @@ class HotpTokenClass(TokenClass):
         return res
 
     @log_with(log)
-    def is_previous_otp(self, otp, window=10):
+    def is_previous_otp(self, otp):
         """
         Check if the OTP values was previously used.
 
@@ -454,12 +480,17 @@ class HotpTokenClass(TokenClass):
         :param window:
         :return:
         """
-        res = False
-        r = self.check_otp_exist(otp, window=window, symetric=True,
-                                 inc_counter=False)
-        if 0 <= r < self.token.count:
-            res = True
-        return res
+        counter = int(self.get_otp_count())
+        if counter > 0:
+            previous_otp = self._calc_otp(counter - self.previous_otp_offset)
+            res = previous_otp == otp
+            if res:
+                log.info("Previous OTP used again. "
+                         "Serial {0!s} with counter {1!s}.".format(self.token.serial, counter))
+            return res
+        else:
+            # The internal counter is 0, the token was not used, yet.
+            return False
 
     @log_with(log)
     def _autosync(self, hmac2Otp, anOtpVal):
@@ -753,3 +784,73 @@ class HotpTokenClass(TokenClass):
         if len(l) >= 5:
             params["counter"] = int(l[4].strip())
         return params
+
+    def prepare_verify_enrollment(self):
+        """
+        This is called, if the token should be enrolled in a way, that the user
+        needs to provide a proof, that the server can verify, that the token
+        was successfully enrolled. E.g. with HOTP tokens the user might need to provide
+        a correct OTP value.
+
+        The returned dictionary is added to the response in "detail" -> "verify".
+
+        :return: A dictionary with information that is needed to trigger the verification.
+        """
+        return {"message": VERIFY_ENROLLMENT_MESSAGE}
+
+    def verify_enrollment(self, verify):
+        """
+        This is called during the 2nd step of the verified enrollment.
+        This method verifies the actual response from the user.
+        Returns true, if the verification was successful.
+
+        :param verify: The response given by the user
+        :return: True
+        """
+        r = self.check_otp(verify)
+        log.debug("Enrollment verified: {0!s}".format(r))
+        return r >= 0
+
+    @classmethod
+    def enroll_via_validate(cls, g, content, user_obj):
+        """
+        This class method is used in the policy ENROLL_VIA_MULTICHALLENGE.
+        It enrolls a new token of this type and returns the necessary information
+        to the client by modifying the content.
+
+        :param g: context object
+        :param content: The content of a response
+        :param user_obj: A user object
+        :return: None, the content is modified
+        """
+        token_obj = init_token({"type": cls.get_class_type(),
+                                "genkey": 1}, user=user_obj)
+        content.get("result")["value"] = False
+        content.get("result")["authentication"] = "CHALLENGE"
+
+        detail = content.setdefault("detail", {})
+        # Create a challenge!
+        c = token_obj.create_challenge()
+        # get details of token
+        init_details = token_obj.get_init_detail()
+        detail["transaction_ids"] = [c[2]]
+        chal = {"transaction_id": c[2],
+                "image": init_details.get("otpkey").get("img"),
+                "client_mode": CLIENTMODE.INTERACTIVE,
+                "serial": token_obj.token.serial,
+                "type": token_obj.type,
+                "message": _("Please scan the QR code!")}
+        detail["multi_challenge"] = [chal]
+        detail.update(chal)
+
+    def has_further_challenge(self, options=None):
+        """
+
+        :param options:
+        :return:
+        """
+        try:
+            return self.currently_in_challenge
+        except AttributeError:
+            # Certain from HOTP inherited tokenclasses might not set currently_in_challenge
+            return False

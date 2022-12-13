@@ -37,7 +37,6 @@ TOTP is defined in https://tools.ietf.org/html/rfc6238
 from __future__ import division
 import logging
 import time
-import math
 import datetime
 from privacyidea.lib.tokens.HMAC import HmacOtp
 from privacyidea.lib.config import get_from_config
@@ -57,8 +56,11 @@ log = logging.getLogger(__name__)
 
 class TotpTokenClass(HotpTokenClass):
 
-    # When resyncing we need to do two directly consecutive values.
-    resyncDiffLimit = 1
+    # In contrast to the HOTP the counter does not contain the next OTP value,
+    # but the last used OTP value, so we need to set this to 0.
+    previous_otp_offset = 0
+
+    desc_timestep = _('Specify the time step of the time-based OTP token.')
 
     @log_with(log)
     def __init__(self, db_token):
@@ -113,47 +115,36 @@ class TotpTokenClass(HotpTokenClass):
                    SCOPE.USER: {
                        'totp_timestep': {'type': 'int',
                                          'value': [30, 60],
-                                         'desc': 'Specify the time step of '
-                                                 'the timebased OTP token.'},
+                                         'desc': TotpTokenClass.desc_timestep},
                        'totp_hashlib': {'type': 'str',
                                         'value': ["sha1",
                                                   "sha256",
                                                   "sha512"],
-                                        'desc': 'Specify the hashlib to be used. '
-                                                'Can be SHA1, SHA256 or SHA512.'},
+                                        'desc': TotpTokenClass.desc_hash_func},
                        'totp_otplen': {'type': 'int',
                                        'value': [6, 8],
-                                       'desc': "Specify the OTP length to be "
-                                               "used."},
+                                       'desc': TotpTokenClass.desc_otp_len},
                        'totp_force_server_generate': {'type': 'bool',
-                                                      'desc': _("Force the key to "
-                                                                "be generated on "
-                                                                "the server.")},
+                                                      'desc': TotpTokenClass.desc_key_gen},
                        '2step': {'type': 'str',
                                  'value': ['allow', 'force'],
-                                 'desc': _('Specify whether users are allowed or '
-                                           'forced to use two-step enrollment.')}
+                                 'desc': TotpTokenClass.desc_two_step_user}
                    },
                    SCOPE.ADMIN: {
                        'totp_timestep': {'type': 'int',
                                          'value': [30, 60],
-                                         'desc': 'Specify the time step of '
-                                                 'the timebased OTP token.'},
+                                         'desc': TotpTokenClass.desc_timestep},
                        'totp_hashlib': {'type': 'str',
                                         'value': ["sha1",
                                                   "sha256",
                                                   "sha512"],
-                                        'desc': 'Specify the hashlib to be used. '
-                                                'Can be SHA1, SHA256 or SHA512.'},
+                                        'desc': TotpTokenClass.desc_hash_func},
                        'totp_otplen': {'type': 'int',
                                        'value': [6, 8],
-                                       'desc': "Specify the OTP length to be "
-                                               "used."},
+                                       'desc': TotpTokenClass.desc_otp_len},
                        '2step': {'type': 'str',
                                  'value': ['allow', 'force'],
-                                 'desc': _('Specify whether admins are allowed or '
-                                           'forced to use two-step enrollment.')
-                                 }
+                                 'desc': TotpTokenClass.desc_two_step_admin}
                    },
                    SCOPE.ENROLL: {
                        '2step_clientsize': {'type': 'int',
@@ -434,10 +425,15 @@ class TotpTokenClass(HotpTokenClass):
                 otp1c = int(info.get("otp1c"))
                 otp2c = res
                 log.debug("otp1c: {0!r}, otp2c: {1!r}".format(otp1c, otp2c))
-                diff = math.fabs(otp2c - otp1c)
-                if diff > self.resyncDiffLimit:
+                if (otp1c + 1) != otp2c:
+                    log.debug("Autoresync failed for token {0!s}. OTP values too far apart.".format(self.token.serial))
+                    res = -1
+                elif otp2c <= self.token.count:
+                    # The resync was done with previous (old) OTP values
+                    log.debug("Autoresync failed for token {0!s}. Previous OTP values used.".format(self.token.serial))
                     res = -1
                 else:
+                    log.info("Autoresync successful for token {0!s}.".format(self.token.serial))
                     server_time = time.time()
                     counter = int((server_time / self.timestep) + 0.5)
 
