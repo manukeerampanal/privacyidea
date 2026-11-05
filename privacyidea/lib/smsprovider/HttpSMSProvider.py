@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #    E-mail: info@privacyidea.org
 #    Contact: www.privacyidea.org
 #
@@ -44,45 +42,61 @@ It can handle HTTP/HTTPS POST and GET requests also with Proxy support
 The code is tested in tests/test_lib_smsprovider
 """
 
-from privacyidea.lib.smsprovider.SMSProvider import (ISMSProvider, SMSError)
+from privacyidea.lib.smsprovider.SMSProvider import ALLOW_PUSH, ISMSProvider, SMSError
 from privacyidea.lib import _
+from privacyidea.lib.error import ConfigAdminError
 import requests
-from six.moves.urllib.parse import urlparse
-import re
-import logging
 import json
+from urllib.parse import urlparse
+import logging
+
 log = logging.getLogger(__name__)
 
 
 class HttpSMSProvider(ISMSProvider):
 
-    @staticmethod
-    def _mangle_phone(phone, config):
-        regexp = config.get("REGEXP")
-        if regexp:
-            try:
-                m = re.match("^/(.*)/(.*)/$", regexp)
-                if m:
-                    phone = re.sub(m.group(1), m.group(2), phone)
-            except re.error:
-                log.warning(u"Can not mangle phone number. "
-                            u"Please check your REGEXP: {0!s}".format(regexp))
+    supports_push_messages = True
 
-        return phone
+    @staticmethod
+    def _render_option_value(value, phone, message):
+        if isinstance(message, dict):
+            # A structured push payload has to reach the gateway with its fields unchanged,
+            # so an option that is nothing but a placeholder keeps the object itself.
+            if value == "{phone}":
+                return phone
+            if value in ["{message}", "{otp}"]:
+                return message
+            serialized_message = json.dumps(message)
+            value = value.replace("{message}", serialized_message)
+            value = value.replace("{otp}", serialized_message)
+            return value.replace("{phone}", phone)
+
+        # {message} is not substituted for an SMS, so a gateway can pass the placeholder
+        # on to the remote provider for expansion there.
+        value = value.replace("{otp}", message)
+        value = value.replace("{phone}", phone)
+        try:
+            return json.loads(value)
+        except json.decoder.JSONDecodeError:
+            return value
 
     def submit_message(self, phone, message):
         """
         send a message to a phone via an http sms gateway
 
+        Additional options of an SMS may use ``{phone}`` and ``{otp}``. A structured push
+        payload additionally expands ``{message}``, and an option consisting only of
+        ``{message}`` or ``{otp}`` preserves the payload as an object.
+
         :param phone: the phone number
         :param message: the message to submit to the phone
         :return:
         """
-        log.debug("submitting message {0!r} to {1!s}".format(message, phone))
         parameter = {}
         headers = {}
         if self.smsgateway:
-            phone = self._mangle_phone(phone, self.smsgateway.option_dict)
+            if not isinstance(message, dict):
+                phone = self._mangle_phone(phone, self.smsgateway.option_dict)
             url = self.smsgateway.option_dict.get("URL")
             method = self.smsgateway.option_dict.get("HTTP_METHOD", "GET")
             username = self.smsgateway.option_dict.get("USERNAME")
@@ -99,10 +113,11 @@ class HttpSMSProvider(ISMSProvider):
             for k, v in self.smsgateway.option_dict.items():
                 if k not in self.parameters().get("parameters"):
                     # This is an additional option
-                    parameter[k] = v.format(otp=message, phone=phone)
+                    parameter[k] = self._render_option_value(v, phone, message)
             headers = self.smsgateway.header_dict
         else:
-            phone = self._mangle_phone(phone, self.config)
+            if not isinstance(message, dict):
+                phone = self._mangle_phone(phone, self.config)
             url = self.config.get('URL')
             method = self.config.get('HTTP_Method', 'GET')
             username = self.config.get('USERNAME')
@@ -115,6 +130,11 @@ class HttpSMSProvider(ISMSProvider):
             https_proxy = self.config.get('HTTPS_PROXY')
             parameter = self._get_parameters(message, phone)
             timeout = self.config.get("TIMEOUT") or 3
+
+        if isinstance(message, dict) and (method != "POST" or not json_data):
+            raise SMSError(-1, "Structured messages require HTTP_METHOD=POST and SEND_DATA_AS_JSON=yes.")
+
+        log.debug(f"submitting message {message!r} to {phone!s}")
 
         if url is None:
             log.warning("can not submit message. URL is missing.")
@@ -152,17 +172,17 @@ class HttpSMSProvider(ISMSProvider):
             params = None
             if json_data:
                 json_param = parameter
-                log.debug("passing JSON data: {0!s}".format(json_param))
+                log.debug("passing JSON data (content hidden for security)")
             else:
                 data = parameter
 
         log_dict = {'params': params,
                     'headers': headers,
                     'method': method,
-                    'basic_auth': basic_auth,
+                    'basic_auth': bool(basic_auth),
                     'url': url,
                     'data': data,
-                    'json_param': json_param}
+                    'json_param': bool(json_param)}
         log.debug("issuing request with parameters {params} (data: {data}, "
                   "json: {json_param}), headers {headers}, method {method} and"
                   "authentication {basic_auth} "
@@ -174,14 +194,13 @@ class HttpSMSProvider(ISMSProvider):
                       auth=basic_auth,
                       timeout=float(timeout),
                       proxies=proxies)
-        log.debug("queued SMS on the HTTP gateway. status code returned: {0!s}".format(
-                  r.status_code))
+        log.debug(f"queued SMS on the HTTP gateway. status code returned: {r.status_code!s}")
 
         # We assume, that all gateways return with HTTP Status Code 200,
         # 201 or 202
         if r.status_code not in [200, 201, 202]:
             raise SMSError(r.status_code, "SMS could not be "
-                                          "sent: %s" % r.status_code)
+                                          f"sent: {r.status_code}")
         success = self._check_success(r)
         return success
 
@@ -196,7 +215,7 @@ class HttpSMSProvider(ISMSProvider):
         urldata[messageKey] = message
         params = self.config.get('PARAMETER', {})
         urldata.update(params)
-        log.debug("[getParameters] urldata: {0!s}".format(urldata))
+        log.debug(f"[getParameters] urldata: {urldata!s}")
         return urldata
 
     def _check_success(self, response):
@@ -220,17 +239,16 @@ class HttpSMSProvider(ISMSProvider):
                 log.debug("sending sms success")
                 ret = True
             else:
-                log.warning("failed to send sms. Reply %s does not match "
-                            "the RETURN_SUCCESS definition" % reply)
+                log.warning(f"failed to send sms. Reply {reply} does not match "
+                            "the RETURN_SUCCESS definition")
                 raise SMSError(response.status_code,
                                "We received a none success reply from the "
-                               "SMS Gateway: {0!s} ({1!s})".format(reply,
-                                                                   return_success))
+                               f"SMS Gateway: {reply!s} ({return_success!s})")
 
         elif return_fail:
             if return_fail in reply:
-                log.warning("sending sms failed. %s was not found "
-                            "in %s" % (return_fail, reply))
+                log.warning(f"sending sms failed. {return_fail} was not found "
+                            f"in {reply}")
                 raise SMSError(response.status_code,
                                "We received the predefined error from the "
                                "SMS Gateway.")
@@ -240,6 +258,14 @@ class HttpSMSProvider(ISMSProvider):
         else:
             ret = True
         return ret
+
+    def check_configuration(self):
+        if self.smsgateway and self.allows_push_messages(self.smsgateway):
+            options = self.smsgateway.option_dict
+            if options.get("HTTP_METHOD") != "POST" or options.get("SEND_DATA_AS_JSON") != "yes":
+                raise ConfigAdminError(
+                    "PUSH delivery requires HTTP_METHOD=POST and SEND_DATA_AS_JSON=yes."
+                )
 
     @classmethod
     def parameters(cls):
@@ -276,7 +302,8 @@ class HttpSMSProvider(ISMSProvider):
                       },
                       "PASSWORD": {
                           "description": _("Password in case of basic "
-                                           "authentication.")
+                                           "authentication."),
+                          "secret": True
                       },
                       "CHECK_SSL": {
                           "required": True,
@@ -290,11 +317,9 @@ class HttpSMSProvider(ISMSProvider):
                                            "as JSON."),
                           "values": ["yes", "no"]
                       },
+                      ALLOW_PUSH: cls.allow_push_parameter(),
                       "REGEXP": {
-                          "description": _("Regular expression to modify the phone number "                 
-                                           "to make it compatible with provider. "
-                                           "Enter something like '/[\\+/]//' to remove "
-                                           "pluses and slashes.")
+                          "description": cls.regexp_description
                       },
                       "PROXY": {"description": _("An optional proxy string. DEPRECATED. Do not use "
                                                  "this anymore. Rather use HTTP_PROXY for http "

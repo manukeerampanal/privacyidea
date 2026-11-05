@@ -1,0 +1,104 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { Component, computed, inject } from "@angular/core";
+
+import { MatButtonModule } from "@angular/material/button";
+import { MatCardModule } from "@angular/material/card";
+import { MatDividerModule } from "@angular/material/divider";
+import { MatExpansionModule } from "@angular/material/expansion";
+import { MatIconModule } from "@angular/material/icon";
+import { MatTooltipModule } from "@angular/material/tooltip";
+import { SimpleConfirmationDialogComponent } from "@components/shared/dialog/confirmation-dialog/confirmation-dialog.component";
+import { ScrollToTopDirective } from "@components/shared/directives/app-scroll-to-top.directive";
+import { TableStateComponent } from "@components/shared/table-state/table-state.component";
+import { TableState } from "@core/models/table_state/table-state";
+import { AuthService } from "@services/auth/auth.service";
+import { DialogService } from "@services/dialog/dialog.service";
+import { NotificationService } from "@services/notification/notification.service";
+import { SubscriptionService } from "@services/subscription/subscription.service";
+
+@Component({
+  selector: "app-subscription",
+  standalone: true,
+  imports: [
+    MatButtonModule,
+    MatExpansionModule,
+    MatIconModule,
+    MatDividerModule,
+    MatCardModule,
+    MatTooltipModule,
+    ScrollToTopDirective,
+    TableStateComponent
+  ],
+  templateUrl: "./subscription.component.html",
+  styleUrl: "./subscription.component.scss"
+})
+export class SubscriptionComponent {
+  private subscriptionService = inject(SubscriptionService);
+  private notificationService = inject(NotificationService);
+  private dialogService = inject(DialogService);
+  subscriptionsResource = this.subscriptionService.subscriptionsResource;
+  subscriptions = computed(() => {
+    if (!this.subscriptionsResource.hasValue()) return [];
+    const value = this.subscriptionsResource.value()?.result?.value;
+    return value ? Object.values(value) : [];
+  });
+  protected authService = inject(AuthService);
+  readonly tableState = new TableState({
+    resource: this.subscriptionsResource,
+    count: () => this.subscriptions().length
+  });
+
+  upload(event: Event): void {
+    const element = event.currentTarget as HTMLInputElement;
+    const fileList: FileList | null = element.files;
+    if (fileList && fileList.length > 0) {
+      this.subscriptionService.uploadSubscriptionFile(fileList[0]).subscribe(() => {
+        this.notificationService.success(
+          $localize`:@@subscription.fileUploadedSuccessfully:File uploaded successfully.`
+        );
+        this.subscriptionService.reload();
+      });
+    }
+  }
+
+  deleteSubscription(application: string): void {
+    this.dialogService
+      .openDialog({
+        component: SimpleConfirmationDialogComponent,
+        data: {
+          title: $localize`:@@subscription.deleteSubscription:Delete Subscription`,
+          items: [application],
+          itemType: $localize`:@@subscription.subscription:subscription`,
+          confirmAction: { label: $localize`:@@common.delete:Delete`, value: true, type: "destruct" }
+        }
+      })
+      .afterClosed()
+      .subscribe((result) => {
+        if (result) {
+          this.subscriptionService.deleteSubscription(application).subscribe(() => {
+            this.notificationService.success(
+              $localize`:@@subscription.subscriptionDeleted:Subscription deleted successfully.`
+            );
+            this.subscriptionService.reload();
+          });
+        }
+      });
+  }
+}

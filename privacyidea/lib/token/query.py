@@ -1,0 +1,1175 @@
+# SPDX-FileCopyrightText: 2026 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Token lookup and retrieval helpers (read-only queries)."""
+
+import logging
+import traceback
+from collections.abc import Callable, Iterator
+from typing import Any, NamedTuple
+
+from flask_sqlalchemy.session import Session
+from sqlalchemy import and_, false, func, or_, select
+from sqlalchemy.sql import Select
+
+from privacyidea.lib import _
+from privacyidea.lib.config import (get_token_class)
+from privacyidea.lib.error import (TokenAdminError,
+                                   ParameterError,
+                                   PrivacyIDEAError, ResourceNotFoundError, UserError)
+from privacyidea.lib.framework import get_app_config_value
+from privacyidea.lib.log import log_with
+from privacyidea.lib.realm import get_realms
+from privacyidea.lib.resolver import get_resolver_object
+from privacyidea.lib.tokenclass import TokenClass
+from privacyidea.lib.utils import SQL_LIKE_ESCAPE, convert_wildcard_to_sql_like, escape_sql_like
+from privacyidea.models.token import TOKENINFO_TYPE_SUFFIX
+from privacyidea.lib.user import User
+from privacyidea.models import (db, Token, Realm, TokenRealm, TokenInfo, TokenOwner, TokenContainer,
+                                TokenContainerToken)
+
+log = logging.getLogger(__name__)
+
+# The number of token IDs that go into one ``IN`` clause when the owners and containers of a page
+# are looked up. Databases cap the number of bind parameters a statement may carry, so a page that
+# is larger than this is looked up in several queries.
+PAGE_QUERY_CHUNK_SIZE = 500
+
+
+@log_with(log)
+def create_tokenclass_object(db_token: Token) -> TokenClass | None:
+    """
+    (was createTokenClassObject)
+    create a token class object from a given type
+    If a tokenclass for this type does not exist,
+    the function returns None.
+
+    :param db_token: the database referenced token
+    :type db_token: database token object
+    :return: instance of the token class object
+    :rtype: tokenclass object
+    """
+    # We use the tokentype from the database
+    tokentype = db_token.tokentype.lower()
+    token_object = None
+    token_class = get_token_class(tokentype)
+    if token_class:
+        try:
+            token_object = token_class(db_token)
+        except Exception as e:  # pragma: no cover
+            raise TokenAdminError(_("create_tokenclass_object failed: {0!r}").format(e),
+                                  id=1609)
+    else:
+        log.error(f'type {tokentype!r} not found in tokenclasses')
+
+    return token_object
+
+
+def _create_token_query(tokentype: str | None = None, token_type_list: list[str] | None = None,
+                        realm: str | None = None,
+                        assigned: bool | None = None, user: User | None = None,
+                        serial_exact: str | None = None, serial_wildcard: str | None = None,
+                        serial_list: list[str] | None = None, active: bool | None = None,
+                        resolver: str | None = None, rollout_state: str | None = None,
+                        description: str | None = None, revoked: bool | None = None,
+                        locked: bool | None = None, userid: str | None = None, tokeninfo: dict | None = None,
+                        maxfail: bool | None = None, allowed_realms: list[str] | None = None,
+                        container_serial: str | None = None, all_nodes: bool = False) -> Select:
+    session = db.session
+    session.expire_all()
+
+    sql_query = select(Token)
+
+    # Conditional Joins at the top to avoid re-joining
+    should_join_token_owner = (bool(userid and userid.strip("*")) or
+                               bool(resolver and resolver.strip("*")) or
+                               bool(user) or
+                               assigned is not None or
+                               not all_nodes)
+
+    if should_join_token_owner:
+        sql_query = sql_query.outerjoin(TokenOwner, Token.id == TokenOwner.token_id)
+
+    # Filtering by realm and allowed_realms.
+    # A token can belong to several realms, so each filter is an independent
+    # "is the token a member of one of these realms" test expressed as a
+    # Token.id IN (...) subquery. Keeping the checks orthogonal ensures a token
+    # that is in an allowed realm and in the queried realm is returned even when
+    # those are different realms, and avoids duplicate rows that would otherwise
+    # inflate the paginated count.
+    # The realm parameter accepts a single realm name, a wildcard pattern, or a
+    # comma-separated list of realm names (each entry may contain wildcards).
+    # Entries that are only wildcards (e.g. "**" or "*") would match every realm
+    # name but would still exclude tokens with NO realm (due to the subquery
+    # join). To preserve the "no filter" semantic of such catch-all patterns,
+    # we strip them out; if nothing remains, no realm filter is applied.
+    realm_list = [r.strip() for r in realm.split(",") if r.strip()] if realm else None
+    if realm_list:
+        realm_list = [r for r in realm_list if r.strip("*")]
+
+    if realm_list:
+        # Separate wildcard entries from exact entries
+        exact_realms = [r.lower() for r in realm_list if "*" not in r]
+        wildcard_realms = [r for r in realm_list if "*" in r]
+
+        realm_conditions = []
+        if exact_realms:
+            realm_conditions.append(
+                func.lower(Realm.name).in_(exact_realms)
+            )
+        for wr in wildcard_realms:
+            realm_conditions.append(
+                func.lower(Realm.name).like(
+                    convert_wildcard_to_sql_like(wr.lower()),
+                    escape=SQL_LIKE_ESCAPE)
+            )
+
+        realm_ids = select(Realm.id).where(or_(*realm_conditions))
+        sql_query = sql_query.where(
+            Token.id.in_(select(TokenRealm.token_id).where(TokenRealm.realm_id.in_(realm_ids))))
+
+    if allowed_realms is not None:
+        allowed_realm_ids = select(Realm.id).where(
+            func.lower(Realm.name).in_([r.lower() for r in allowed_realms]))
+        sql_query = sql_query.where(
+            Token.id.in_(select(TokenRealm.token_id).where(TokenRealm.realm_id.in_(allowed_realm_ids))))
+
+    # Filtering by tokentype
+    if tokentype and tokentype.strip("*"):
+        if "*" in tokentype:
+            sql_query = sql_query.where(
+                Token.tokentype.like(convert_wildcard_to_sql_like(tokentype.lower()), escape=SQL_LIKE_ESCAPE)
+            )
+        else:
+            sql_query = sql_query.where(
+                func.lower(Token.tokentype) == tokentype.lower()
+            )
+
+    # Filtering by token_type_list
+    if token_type_list:
+        sql_query = sql_query.where(
+            Token.tokentype.in_([t.lower() for t in token_type_list])
+        )
+
+    # Filtering by description
+    if description and description.strip("*"):
+        if "*" in description:
+            sql_query = sql_query.where(
+                func.lower(Token.description).like(
+                    convert_wildcard_to_sql_like(description.lower()), escape=SQL_LIKE_ESCAPE
+                )
+            )
+        else:
+            sql_query = sql_query.where(
+                func.lower(Token.description) == description.lower()
+            )
+
+    # Filtering by assigned status
+    if assigned is not None:
+        if assigned:
+            sql_query = sql_query.where(TokenOwner.id.is_not(None))
+        else:
+            sql_query = sql_query.where(TokenOwner.id.is_(None))
+
+    # Filtering by serial
+    if serial_wildcard and serial_wildcard.strip("*"):
+        sql_query = sql_query.where(
+            Token.serial.like(convert_wildcard_to_sql_like(serial_wildcard), escape=SQL_LIKE_ESCAPE)
+        )
+
+    if serial_exact:
+        sql_query = sql_query.where(Token.serial == serial_exact)
+
+    if serial_list:
+        sql_query = sql_query.where(Token.serial.in_(serial_list))
+
+    # Filtering by user object
+    if user and not user.is_empty():
+        realm_db_result = None
+        if user.realm:
+            realm_db = select(Realm).where(func.lower(Realm.name) == user.realm.lower())
+            # Execute the subquery using the provided session
+            realm_db_result = session.execute(realm_db).scalars().first()
+        if user.login and not user.uid:
+            # A username was requested, but it can not be resolved to a user id: neither the realm nor
+            # the resolver of the user may be used as a fallback filter, because the query would then
+            # return the tokens of all users of that realm or resolver.
+            raise UserError("The user can not be found in any resolver in this realm!")
+        elif user.realm and not realm_db_result:
+            # No user can be in a realm that does not exist: like every other filter, an unknown value
+            # matches nothing.
+            sql_query = sql_query.where(false())
+        else:
+            # The realm, the resolver and the user id are applied independently, so that the tokens of
+            # all users of a realm can be listed without specifying a username.
+            if realm_db_result:
+                sql_query = sql_query.where(TokenOwner.realm_id == realm_db_result.id)
+            if user.resolver:
+                sql_query = sql_query.where(func.lower(TokenOwner.resolver) == user.resolver.lower())
+            if user.uid:
+                uid_str = str(user.uid) if isinstance(user.uid, int) else user.uid
+                sql_query = sql_query.where(TokenOwner.user_id == uid_str)
+
+    # Filtering by the resolver of the token owner, independent of a user object
+    if resolver and resolver.strip("*"):
+        if "*" in resolver:
+            sql_query = sql_query.where(
+                TokenOwner.resolver.ilike(convert_wildcard_to_sql_like(resolver), escape=SQL_LIKE_ESCAPE)
+            )
+        else:
+            sql_query = sql_query.where(func.lower(TokenOwner.resolver) == resolver.lower())
+
+    # Filtering by the user id of the token owner, independent of a user object
+    if userid and userid.strip("*"):
+        if "*" in userid:
+            sql_query = sql_query.where(
+                TokenOwner.user_id.like(convert_wildcard_to_sql_like(userid), escape=SQL_LIKE_ESCAPE)
+            )
+        else:
+            sql_query = sql_query.where(TokenOwner.user_id == userid)
+
+    # Filtering by token status flags
+    if active is not None:
+        sql_query = sql_query.where(Token.active == active)
+    if revoked is not None:
+        sql_query = sql_query.where(Token.revoked == revoked)
+    if locked is not None:
+        sql_query = sql_query.where(Token.locked == locked)
+    if maxfail is not None:
+        if maxfail:
+            sql_query = sql_query.where(Token.failcount >= Token.maxfail)
+        else:
+            sql_query = sql_query.where(Token.failcount < Token.maxfail)
+
+    # Filtering by rollout state
+    if rollout_state and rollout_state.strip("*"):
+        if "*" in rollout_state:
+            sql_query = sql_query.where(
+                func.lower(Token.rollout_state).like(
+                    convert_wildcard_to_sql_like(rollout_state.lower()), escape=SQL_LIKE_ESCAPE
+                )
+            )
+        else:
+            sql_query = sql_query.where(
+                func.lower(Token.rollout_state) == rollout_state.lower()
+            )
+
+    # Filtering by tokeninfo
+    if tokeninfo is not None:
+        if len(tokeninfo) != 1:
+            raise PrivacyIDEAError(_("I can only create SQL filters from tokeninfo of length 1."))
+        key, value = list(tokeninfo.items())[0]
+        sql_query = sql_query.join(TokenInfo, TokenInfo.token_id == Token.id)
+        sql_query = sql_query.where(TokenInfo.Key == key)
+        # TokenInfo.Value is a CLOB on Oracle, where it can be neither compared with "="
+        # (ORA-00932) nor converted to a string beyond 4000 bytes (ORA-22835, and token info
+        # holds certificates). LIKE has neither limit and matches exactly once the value's
+        # own metacharacters are escaped.
+        sql_query = sql_query.where(TokenInfo.Value.like(escape_sql_like(value), escape=SQL_LIKE_ESCAPE))
+
+    # Filtering by container_serial
+    if container_serial is not None:
+        if not container_serial:
+            sql_query = sql_query.outerjoin(
+                TokenContainerToken,
+                TokenContainerToken.token_id == Token.id
+            ).where(TokenContainerToken.container_id.is_(None))
+        else:
+            subquery = select(TokenContainerToken.token_id).join(
+                TokenContainer,
+                TokenContainer.id == TokenContainerToken.container_id
+            ).where(
+                func.upper(TokenContainer.serial) == container_serial.upper()
+            )
+            sql_query = sql_query.where(Token.id.in_(subquery))
+
+    # Node-specific resolver and realm configuration: the tokens of owners that another node serves are left out.
+    # A token belongs to no node if the resolver of its owner is in no realm at all, e.g. because the resolver was
+    # deleted, or if the realm of its owner has no resolver. Such a token is shown on every node, as it could
+    # otherwise neither be found nor deleted anywhere.
+    if not all_nodes:
+        local_node_uuid = get_app_config_value("PI_NODE_UUID")
+        realms = get_realms()
+        resolvers = []
+        resolvers_of_any_node = set()
+        realms_to_filter = []
+
+        for realm_name, realm_data in realms.items():
+            realm_resolvers = [res for res in realm_data.get("resolver", []) if res.get("name")]
+            resolvers_on_this_node = [res["name"] for res in realm_resolvers
+                                      if not res.get("node") or res["node"] == local_node_uuid]
+            resolvers.extend(resolvers_on_this_node)
+            resolvers_of_any_node.update(res["name"] for res in realm_resolvers)
+            if realm_resolvers and not resolvers_on_this_node:
+                # Only other nodes serve this realm
+                realms_to_filter.append(realm_name)
+
+        # Build the resolver filter condition
+        resolver_filter = or_(
+            TokenOwner.id.is_(None),
+            TokenOwner.resolver.in_(resolvers),
+            TokenOwner.resolver.not_in(sorted(resolvers_of_any_node)),
+        )
+
+        # Re-join realm and explicitly include the join conditions in the filter to handle unassigned tokens
+        # The realm join is now correctly placed within the `if not all_nodes` block.
+        sql_query = sql_query.outerjoin(Realm, TokenOwner.realm_id == Realm.id)
+        realm_filter = or_(
+            TokenOwner.realm_id.is_(None),
+            and_(
+                func.lower(Realm.name).not_in([r.lower() for r in realms_to_filter]),
+                TokenOwner.realm_id == Realm.id,
+                TokenOwner.token_id == Token.id,
+            )
+        )
+
+        # Combine all filters with the existing query using and_()
+        sql_query = sql_query.where(and_(resolver_filter, realm_filter))
+
+    # print(f"----------------------------- CREATE TOKEN QUERY -----------------------------")
+    # from sqlalchemy.dialects import postgresql
+    # print(sql_query.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+    # print("-------------------------------------------------------------------------------")
+    return sql_query
+
+
+def get_tokens_paginated_generator(tokentype: str | None = None, realm: str | None = None,
+                                   assigned: bool | None = None, user: User | None = None,
+                                   serial_wildcard: str | None = None, active: bool | None = None,
+                                   resolver: str | None = None, rollout_state: str | None = None,
+                                   revoked: bool | None = None, locked: bool | None = None,
+                                   tokeninfo: dict | None = None, maxfail: bool | None = None,
+                                   psize: int = 1000) -> Iterator[list[TokenClass]]:
+    """
+    Fetch chunks of ``psize`` tokens that match the filter criteria from the database and generate
+    lists of token objects.
+    See ``get_tokens`` for information on the arguments.
+
+    Note that individual lists may contain less than ``psize`` elements if
+    a token entry has an invalid type.
+
+    :param psize: Maximum size of chunks that are fetched from the database
+    :param assigned: Whether the token is assigned to a user
+    :type assigned: bool or None
+    :return: This is a generator that generates non-empty lists of token objects.
+    """
+    session = db.session
+    main_sql_query = _create_token_query(
+        tokentype=tokentype, realm=realm, assigned=assigned, user=user,
+        serial_wildcard=serial_wildcard, active=active, resolver=resolver,
+        rollout_state=rollout_state, revoked=revoked, locked=locked,
+        tokeninfo=tokeninfo, maxfail=maxfail
+    ).order_by(Token.id)
+
+    last_id = None
+    while True:
+        sql_query = main_sql_query
+        if last_id is not None:
+            sql_query = sql_query.where(Token.id > last_id)
+        sql_query = sql_query.limit(psize)
+        tokens = session.scalars(sql_query).unique().all()
+        if tokens:
+            token_objects = []
+            for token in tokens:
+                token_obj = create_tokenclass_object(token)
+                if isinstance(token_obj, TokenClass):
+                    token_objects.append(token_obj)
+            yield token_objects
+            if len(tokens) < psize:
+                break
+            last_id = tokens[-1].id
+        else:
+            break
+
+
+def _chunked(items: list, size: int = PAGE_QUERY_CHUNK_SIZE) -> Iterator[list]:
+    """
+    Split a list of values that go into an ``IN`` clause into chunks a database accepts.
+    """
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def _select_owners(token_ids: list[int]) -> list[TokenOwner]:
+    return db.session.scalars(
+        select(TokenOwner).where(TokenOwner.token_id.in_(token_ids)).order_by(TokenOwner.id)
+    ).unique().all()
+
+
+def _select_container_serials(token_ids: list[int]) -> list:
+    return db.session.execute(
+        select(TokenContainerToken.token_id, TokenContainer.serial)
+        .join(TokenContainer, TokenContainer.id == TokenContainerToken.container_id)
+        .where(TokenContainerToken.token_id.in_(token_ids))
+        .order_by(TokenContainerToken.container_id)
+    ).all()
+
+
+def _read_page_rows(token_ids: list[int], select_rows: Callable[[list[int]], list], what: str) -> list:
+    """
+    Read rows for a whole page of tokens, with one query per chunk of token IDs.
+
+    A chunk whose query fails (a transient DB error, e.g. a lock-wait timeout) is retried
+    once after a rollback, since most such failures clear on retry. A chunk that fails
+    twice falls back to querying its tokens one by one, so that a failure which does not
+    clear costs only the tokens it actually affects instead of the whole page -- mirroring
+    how ``_resolve_owner_logins`` recovers from a failed resolver batch lookup.
+
+    :param token_ids: The database IDs of the tokens
+    :param select_rows: Returns the rows for the given token IDs, or raises
+    :param what: What is being read, for the log messages ("owners", ...)
+    :return: the rows of every chunk, in order. The rows of a token that could not be read
+             even on its own are missing.
+    """
+    rows = []
+    for chunk in _chunked(token_ids):
+        try:
+            chunk_rows = select_rows(chunk)
+        except Exception as chunk_error:
+            log.error(f"Could not read the {what} of a page of tokens in one query: {chunk_error!s}")
+            log.debug(traceback.format_exc())
+            db.session.rollback()
+            try:
+                chunk_rows = select_rows(chunk)
+            except Exception as retry_error:
+                log.error(f"Retrying the {what} of the page in one query failed again: {retry_error!s}")
+                log.debug(traceback.format_exc())
+                db.session.rollback()
+                chunk_rows = []
+                for token_id in chunk:
+                    try:
+                        chunk_rows.extend(select_rows([token_id]))
+                    except Exception as token_error:
+                        log.error(f"Could not read the {what} of token {token_id}: {token_error!s}")
+                        db.session.rollback()
+        rows.extend(chunk_rows)
+    return rows
+
+
+def _get_owner_by_token_id(token_ids: list[int]) -> dict[int, TokenOwner]:
+    """
+    Return the owner of each of the given tokens, with one query for the whole page.
+
+    A token can have several owners, in which case the first one is returned, just like
+    ``Token.first_owner`` does for a single token.
+
+    :param token_ids: The database IDs of the tokens
+    :return: dictionary mapping a token ID to its owner. Tokens without an owner (or whose
+             owner could not be read even one by one) are not contained.
+    """
+    owner_by_token_id = {}
+    for owner in _read_page_rows(token_ids, _select_owners, "owners"):
+        owner_by_token_id.setdefault(owner.token_id, owner)
+    return owner_by_token_id
+
+
+def _get_container_serial_by_token_id(token_ids: list[int]) -> dict[int, str]:
+    """
+    Return the serial of the container each of the given tokens is in, with one query for the whole
+    page.
+
+    The association table allows a token in several containers. The one with the lowest ID is
+    returned in that case, so that the same page does not show a different container every time.
+
+    :param token_ids: The database IDs of the tokens
+    :return: dictionary mapping a token ID to a container serial. Tokens that are in no container
+             (or whose container could not be read even one by one) are not contained.
+    """
+    container_serial_by_token_id = {}
+    for token_id, container_serial in _read_page_rows(token_ids, _select_container_serials, "container serials"):
+        container_serial_by_token_id.setdefault(token_id, container_serial)
+    return container_serial_by_token_id
+
+
+class ResolvedOwnerLogins(NamedTuple):
+    """The result of resolving the login names of a page of token owners."""
+    #: login name keyed by (resolver name, user ID)
+    login_by_owner: dict[tuple[str, str], str]
+    #: whether the resolver is editable, keyed by resolver name
+    editable_by_resolver: dict[str, bool]
+    #: (resolver name, user ID) keys whose login name could not be resolved
+    unresolvable_owners: set[tuple[str, str]]
+
+
+def _resolve_owner_logins(owners: list[TokenOwner]) -> ResolvedOwnerLogins:
+    """
+    Resolve the login names of the given token owners with one batch lookup per resolver, instead
+    of one user store lookup per owner.
+
+    An owner whose login name can not be looked up is reported as unresolvable, so that the caller
+    can mark that single token while the rest of the page still renders.
+
+    :param owners: The token owners of the page
+    :return: the resolved logins, editable flags and unresolvable owners of the page
+    """
+    user_ids_by_resolver = {}
+    login_by_owner = {}
+    editable_by_resolver = {}
+    unresolvable_owners = set()
+    for owner in owners:
+        if owner.resolver:
+            user_ids_by_resolver.setdefault(owner.resolver, []).append(owner.user_id)
+        else:
+            # An owner without a resolver is a broken assignment, its login name is not knowable
+            unresolvable_owners.add((owner.resolver, owner.user_id))
+
+    for resolver_name, owned_user_ids in user_ids_by_resolver.items():
+        # Several tokens of one user are the normal case, and a resolver without a batch lookup of
+        # its own pays for every repetition. dict.fromkeys drops the duplicates but keeps the order.
+        user_ids = list(dict.fromkeys(owned_user_ids))
+        resolver = None
+        try:
+            # Building a resolver reads and applies its configuration, which raises on a broken one
+            resolver = get_resolver_object(resolver_name)
+        except Exception as resolver_error:
+            log.error(f"The resolver {resolver_name!r} can not be loaded: {resolver_error!s}")
+            log.debug(traceback.format_exc())
+        if resolver is None:
+            log.error(f"No user information can be retrieved from the resolver {resolver_name!r}!")
+            unresolvable_owners.update((resolver_name, user_id) for user_id in user_ids)
+            continue
+        editable_by_resolver[resolver_name] = resolver.editable
+
+        # In certain cases the LDAP or SQL server might not be reachable. Then an exception is raised
+        try:
+            login_map = resolver.get_usernames_batch(user_ids)
+        except Exception as batch_error:
+            # A failing batch must not cost the whole page. Fall back to looking the users of this
+            # resolver up one by one, so that only the ones that keep failing are marked.
+            log.error(f"User information can not be retrieved in one batch: {batch_error!s}")
+            log.debug(traceback.format_exc())
+            login_map = {}
+            for user_id in user_ids:
+                try:
+                    login_map[user_id] = resolver.getUsername(user_id)
+                except Exception as user_error:
+                    log.error(f"User information can not be retrieved: {user_error!s}")
+                    log.debug(traceback.format_exc())
+                    unresolvable_owners.add((resolver_name, user_id))
+
+        for user_id in user_ids:
+            login_by_owner[(resolver_name, user_id)] = login_map.get(user_id) or ""
+
+    return ResolvedOwnerLogins(login_by_owner, editable_by_resolver, unresolvable_owners)
+
+
+def _build_token_dicts(tokens: list[TokenClass], hidden_token_info: list[str] | None = None) -> list[dict]:
+    """
+    Build the dictionaries the token list is rendered from, including the owner and the container of
+    each token.
+
+    The owners of the page are resolved with one batch lookup per resolver and the containers with
+    one query for the whole page, so that a page costs a constant number of user store round trips
+    instead of one per token.
+
+    :param tokens: A list of token objects
+    :param hidden_token_info: List of token-info keys to remove from the results
+    :return: A list of dictionaries
+    """
+    token_objects = [token for token in tokens if isinstance(token, TokenClass)]
+    token_ids = [token.token.id for token in token_objects]
+    owner_by_token_id = _get_owner_by_token_id(token_ids)
+    login_by_owner, editable_by_resolver, unresolvable_owners = _resolve_owner_logins(
+        list(owner_by_token_id.values()))
+    container_serial_by_token_id = _get_container_serial_by_token_id(token_ids)
+
+    token_dict_list = []
+    for token in token_objects:
+        token_dict = token.get_as_dict()
+        # add user information
+        token_dict["username"] = ""
+        token_dict["user_realm"] = ""
+        owner = owner_by_token_id.get(token.token.id)
+        if owner:
+            owner_key = (owner.resolver, owner.user_id)
+            if owner_key in unresolvable_owners:
+                token_dict["username"] = "**resolver error**"
+            else:
+                token_dict["username"] = login_by_owner.get(owner_key, "")
+                token_dict["user_realm"] = owner.realm.name.lower() if owner.realm else ""
+                token_dict["user_editable"] = editable_by_resolver.get(owner.resolver, False)
+
+        if hidden_token_info:
+            for key in list(token_dict['info']):
+                if key in hidden_token_info:
+                    token_dict['info'].pop(key)
+
+        # Tell the caller which of the returned token info entries it may not change or remove, so a client does
+        # not offer an edit or a delete that the token info endpoints would refuse. The value of an entry is
+        # readable either way, only writing it is restricted. A "<key>.type" entry is synthesized from the value
+        # type of "<key>" and is not a stored entry of its own, so it can be neither changed nor removed.
+        # An entry the token maintains can still have its own endpoint, POST /token/set, which is what
+        # settable_info_keys names, so a client can offer an edit for those after all.
+        readonly_info_keys = []
+        undeletable_info_keys = []
+        settable_info_keys = []
+        for key in token_dict["info"]:
+            if key.endswith(TOKENINFO_TYPE_SUFFIX):
+                readonly_info_keys.append(key)
+                undeletable_info_keys.append(key)
+                continue
+            if token.is_owned_tokeninfo_key(key):
+                readonly_info_keys.append(key)
+                if not token.is_deletable_tokeninfo_key(key):
+                    undeletable_info_keys.append(key)
+                if token.is_settable_tokeninfo_key(key):
+                    settable_info_keys.append(key)
+        token_dict["readonly_info_keys"] = readonly_info_keys
+        token_dict["undeletable_info_keys"] = undeletable_info_keys
+        token_dict["settable_info_keys"] = settable_info_keys
+
+        token_dict["container_serial"] = container_serial_by_token_id.get(token.token.id, "")
+
+        token_dict_list.append(token_dict)
+
+    return token_dict_list
+
+
+def convert_token_objects_to_dicts(tokens: list[TokenClass], user: User | None, user_role: str = "user",
+                                   allowed_realms: list[str] | None = None,
+                                   hidden_token_info: list[str] | None = None) -> list[dict]:
+    """
+    Convert a list of token objects to a list of dictionaries.
+    Additionally, checks whether the requesting user is allowed to see the token information.
+    If not it is reduced to the tokens serial.
+
+    :param tokens: A list of token objects
+    :type tokens: list
+    :param user: The user object performing the request
+    :type user: User object
+    :param user_role: The role of the logged-in user
+    :type user_role: str
+    :param allowed_realms: A list of the realms the admin is allowed to see, None if the admin is allowed to see all
+                           realms
+    :param hidden_token_info: List of token-info keys to remove from the results
+    :return: A list of dictionaries
+    :rtype: list
+    """
+    token_dict_list = []
+    for token_dict in _build_token_dicts(tokens, hidden_token_info=hidden_token_info):
+        # Reduce token info if the user is not the owner
+        if user_role != "admin":
+            if not user or user.login != token_dict["username"] or user.realm != token_dict["user_realm"]:
+                token_dict = {"serial": token_dict["serial"]}
+        elif user_role == "admin" and allowed_realms is not None:
+            same_realms = list(set(token_dict["realms"]).intersection(allowed_realms))
+            if len(same_realms) == 0:
+                # The token is in no realm the admin is allowed to see
+                token_dict = {"serial": token_dict["serial"]}
+
+        token_dict_list.append(token_dict)
+
+    return token_dict_list
+
+
+@log_with(log)
+# @cache.memoize(10)
+def get_tokens(tokentype: str | None = None, token_type_list: list[str] | None = None, realm: str | None = None,
+               assigned: bool | None = None, user: User | None = None,
+               serial: str | None = None, serial_wildcard: str | None = None, active: bool | None = None,
+               resolver: str | None = None, userid: str | None = None, rollout_state: str | None = None,
+               count: bool = False, revoked: bool | None = None, locked: bool | None = None,
+               tokeninfo: dict | None = None,
+               maxfail: bool | None = None, all_nodes: bool = False) -> list[TokenClass] | int:
+    """
+    (was getTokensOfType)
+    This function returns a list of token objects of a
+    * given type,
+    * of a realm
+    * or tokens with assignment or not
+    * for a certain serial number or
+    * for a User
+
+    E.g. thus you can get all assigned tokens of type totp.
+
+    :param tokentype: The type of the token. If None, all tokens are returned.
+    :type tokentype: basestring
+    :param token_type_list: A list of token types. If None or empty, all token types are returned.
+    :type token_type_list: list
+    :param realm: get tokens of a realm. If None, all tokens are returned.
+        Accepts a single realm name, a wildcard pattern (e.g. ``realm*``),
+        or a comma-separated list of realm names where each entry may
+        contain ``*`` wildcards (e.g. ``realm1,realm2`` or ``staff*,students*``).
+        If allowed_realms is not None, the queried realms must overlap with
+        allowed_realms, otherwise no matching tokens will be found.
+    :type realm: basestring
+    :param assigned: Get either assigned (True) or unassigned (False) tokens. If None, gets all tokens.
+    :type assigned: bool
+    :param user: Filter for the Owner of the token. The realm, the resolver and the user id of the user
+        are applied independently, hence a user object carrying only a realm lists the tokens of all
+        users of that realm. Note that a user object with only a resolver is empty (User.is_empty
+        ignores the resolver) and therefore does not filter at all. A realm that does not exist matches
+        nothing, and a login name that can not be resolved to a user id raises a UserError.
+    :type user: User Object
+    :param serial: The exact serial number of a token
+    :type serial: basestring
+    :param serial_wildcard: A wildcard to match token serials
+    :type serial_wildcard: basestring
+    :param active: Whether only active (True) or inactive (False) tokens
+        should be returned
+    :type active: bool
+    :param resolver: filter for the resolver of the token owner (case-insensitive and allows "*" as
+        wildcard)
+    :type resolver: basestring
+    :param userid: filter for the user id of the token owner, i.e. the identifier the resolver reports
+        for the user (case-sensitive and allows "*" as wildcard)
+    :type userid: basestring
+    :param rollout_state: returns a list of the tokens in the certain rollout
+        state. Some tokens are not enrolled in a single step but in multiple
+        steps. These tokens are then identified by the DB-column rollout_state.
+    :param count: If set to True, only the number of the result and not the
+        list is returned.
+    :type count: bool
+    :param revoked: Only search for revoked tokens or only for not revoked
+        tokens
+    :type revoked: bool
+    :param locked: Only search for locked tokens or only for not locked tokens
+    :type locked: bool
+    :param tokeninfo: Return tokens with the given tokeninfo. The tokeninfo
+        is a key/value dictionary
+    :type tokeninfo: dict
+    :param maxfail: If only tokens should be returned, which failcounter
+        reached maxfail
+    :param all_nodes: If True, ignore node specific realm configurations (default: False)
+    :type all_nodes: bool
+    :return: A list of lib.tokenclass objects.
+    :rtype: list or int
+    """
+    serial_list = None
+    if serial and "*" not in serial and "," in serial:
+        serial_list = serial.replace(" ", "").split(",")
+        serial = None
+
+    sql_query = _create_token_query(tokentype=tokentype, token_type_list=token_type_list,
+                                    realm=realm,
+                                    assigned=assigned, user=user,
+                                    serial_exact=serial, serial_wildcard=serial_wildcard, serial_list=serial_list,
+                                    active=active, resolver=resolver, userid=userid,
+                                    rollout_state=rollout_state,
+                                    revoked=revoked, locked=locked,
+                                    tokeninfo=tokeninfo, maxfail=maxfail, all_nodes=all_nodes)
+
+    # Warning for unintentional exact serial matches
+    if serial is not None and "*" in serial:
+        log.info(f"Exact match on a serial containing a wildcard: {serial!r}")
+    # Warning for unintentional wildcard serial matches
+    if serial_wildcard is not None and "*" not in serial_wildcard:
+        log.info(f"Wildcard match on serial without a wildcard: {serial_wildcard!r}")
+
+    session: Session = db.session
+
+    if count:
+        # Use count(distinct Token.id) to avoid over-counting when outer joins
+        # (e.g. TokenOwner) produce multiple rows per token.
+        ret = session.execute(
+            sql_query.order_by(None).with_only_columns(
+                func.count(func.distinct(Token.id)), maintain_column_froms=True
+            )
+        ).scalar_one()
+    else:
+        tokens = session.execute(sql_query).unique().scalars().all()
+        token_list = []
+        for token in tokens:
+            token = create_tokenclass_object(token)
+            if isinstance(token, TokenClass):
+                token_list.append(token)
+        ret = token_list
+    return ret
+
+
+@log_with(log)
+def get_tokens_paginate(tokentype: str | None = None, token_type_list: list[str] | None = None,
+                        realm: str | None = None, assigned: bool | None = None, user: User | None = None,
+                        serial: str | None = None, active: bool | None = None, resolver: str | None = None,
+                        rollout_state: str | None = None,
+                        sortby: Any = Token.serial, sortdir: str = "asc", psize: int = 15,
+                        page: int = 1, description: str | None = None, userid: str | None = None,
+                        allowed_realms: list[str] | None = None,
+                        tokeninfo: dict | None = None, hidden_tokeninfo: list[str] | None = None,
+                        container_serial: str | None = None) -> dict:
+    """
+    This function is used to retrieve a token list, that can be displayed in
+    the Web UI. It supports pagination.
+    Each retrieved page will also contain a "next" and a "prev", indicating
+    the next or previous page. If either does not exist, it is None.
+
+    :param tokentype:
+    :param token_type_list: A list of token types
+    :param realm: A realm the token is assigned to, a wildcard pattern, or a comma-separated list of realm names
+        (each entry may contain ``*`` wildcards). If allowed_realms is not None, it must contain this realm,
+        otherwise no matching tokens will be found.
+    :param assigned: Returns assigned (True) or not assigned (False) tokens
+    :type assigned: bool
+    :param user: The user, whose token should be displayed
+    :type user: User object
+    :param serial: a pattern for matching the serial or a comma separated list of exact serials
+    :param active: Returns active (True) or inactive (False) tokens
+    :param resolver: A resolver name, which may contain "*" for filtering.
+    :type resolver: basestring
+    :param userid: A userid, which may contain "*" for filtering.
+    :type userid: basestring
+    :param rollout_state:
+    :param sortby: Sort by a certain Token DB field. The default is
+        Token.serial. If a string like "serial" is provided, we try to convert
+        it to the DB column.
+    :type sortby: A Token column or a string.
+    :param sortdir: Can be "asc" (default) or "desc"
+    :type sortdir: basestring
+    :param psize: The size of the page
+    :type psize: int
+    :param page: The number of the page to view. Starts with 1 ;-)
+    :type page: int
+    :param allowed_realms: A list of realms, that the admin is allowed to see
+    :type allowed_realms: list
+    :param tokeninfo: Return tokens with the given tokeninfo. The tokeninfo
+        is a key/value dictionary
+    :param description: Take the description of the token into the query
+    :type description: str
+    :param hidden_tokeninfo: List of token-info keys to remove from the results
+    :type hidden_tokeninfo: list
+    :param container_serial: The serial number of a container
+    :type container_serial: basestring
+    :return: dict with tokens, prev, next and count
+    :rtype: dict
+    """
+    serial_list = None
+    if serial and "*" not in serial and "," in serial:
+        serial_list = serial.replace(" ", "").split(",")
+        serial = None
+    session: Session = db.session
+    session.commit()
+    sql_query: Select = _create_token_query(tokentype=tokentype, token_type_list=token_type_list,
+                                            realm=realm, assigned=assigned, user=user,
+                                            serial_wildcard=serial, serial_list=serial_list, active=active,
+                                            resolver=resolver, tokeninfo=tokeninfo,
+                                            rollout_state=rollout_state,
+                                            description=description, userid=userid,
+                                            allowed_realms=allowed_realms, container_serial=container_serial)
+
+    if isinstance(sortby, str):
+        cols = Token.__table__.columns
+        if sortby in cols:
+            sortby = cols.get(sortby)
+        else:
+            log.warning(f'Unknown sort column "{sortby}". Using "serial" instead.')
+            sortby = Token.serial
+
+    if sortdir == "desc":
+        sql_query = sql_query.order_by(sortby.desc())
+    else:
+        sql_query = sql_query.order_by(sortby.asc())
+
+    session: Session = db.session
+
+    # Get the total count from a query without limit/offset.
+    # Use count(distinct Token.id) to avoid over-counting when outer joins
+    # (e.g. TokenOwner) produce multiple rows per token.
+    total_count = session.execute(
+        sql_query.order_by(None).with_only_columns(
+            func.count(func.distinct(Token.id)), maintain_column_froms=True
+        )
+    ).scalar_one()
+
+    # Now apply the limit and offset for the current page
+    offset = (page - 1) * psize
+    tokens = session.scalars(sql_query.limit(psize).offset(offset)).unique().all()
+
+    # TODO first creating the objects and then converting them to dicts, probably not efficient
+    token_objects = [create_tokenclass_object(token) for token in tokens]
+    token_list = _build_token_dicts(token_objects, hidden_token_info=hidden_tokeninfo)
+
+    previous_page = page - 1 if page > 1 else None
+    next_page = page + 1 if offset + psize < total_count else None
+
+    ret = {
+        "tokens": token_list,
+        "prev": previous_page,
+        "next": next_page,
+        "count": total_count
+    }
+    return ret
+
+
+def get_one_token(*args: Any, silent_fail: bool = False, **kwargs: Any) -> TokenClass | None:
+    """
+    Fetch exactly one token according to the given filter arguments, which are passed to
+    ``get_tokens``. Raise ``ResourceNotFoundError`` if no token was found. Raise
+    ``ParameterError`` if more than one token was found.
+
+    :param silent_fail: Instead of raising an exception we return None silently
+    :returns: Token object
+    :rtype: privacyidea.lib.tokenclass.TokenClass
+    """
+    result = get_tokens(*args, **kwargs)
+    if not result:
+        if silent_fail:
+            return None
+        raise ResourceNotFoundError(_("The requested token could not be found."))
+    elif len(result) > 1:
+        if silent_fail:
+            log.warning("More than one matching token was found.")
+            return None
+        raise ParameterError(_("More than one matching token was found."))
+    else:
+        return result[0]
+
+
+def get_tokens_from_serial_or_user(serial: str | None, user: User | None, **kwargs: Any) -> list[TokenClass]:
+    """
+    Fetch tokens, either by (exact) serial, or all tokens of a single user.
+    In case a serial number is given, check that exactly one token is returned
+    and raise a ResourceNotFoundError if that is not the case.
+    In case a user is given, the result can also be empty.
+
+    :param serial: exact serial number or None
+    :param user: a user object or None
+    :param kwargs: additional arguments to ``get_tokens``
+    :return: a (possibly empty) list of tokens
+    :rtype: list
+    """
+    if serial:
+        return [get_one_token(serial=serial, user=user, **kwargs)]
+    else:
+        return get_tokens(serial=serial, user=user, **kwargs)
+
+
+@log_with(log)
+def get_token_type(serial: str) -> str:
+    """
+    Returns the tokentype of a given serial number. If the token does
+    not exist or can not be determined, an empty string is returned.
+
+    :param serial: the serial number of the to be searched token
+    :type serial: string
+    :return: tokentype
+    :rtype: string
+    """
+    if serial and "*" in serial:
+        return ""
+    try:
+        return get_one_token(serial=serial).type
+    except ResourceNotFoundError:
+        return ""
+
+
+@log_with(log)
+def check_serial(serial: str) -> tuple[bool, str]:
+    """
+    This checks, if the given serial number can be used for a new token.
+    it returns a tuple (result, new_serial)
+    result being True if the serial does not exist, yet.
+    new_serial is a suggestion for a new serial number, that does not
+    exist, yet.
+
+    :param serial: Serial number to check if it can be used for
+        a new token.
+    :type serial: str
+    :result: result of check and (new) serial number
+    :rtype: tuple(bool, str)
+    """
+    # serial does not exist, yet
+    result = True
+    new_serial = serial
+
+    i = 0
+    while get_tokens(serial=new_serial):
+        # as long as we find a token, modify the serial:
+        i += 1
+        result = False
+        new_serial = f"{serial!s}_{i:02d}"
+
+    return result, new_serial
+
+
+@log_with(log)
+def get_num_tokens_in_realm(realm: str, active: bool = True) -> int:
+    """
+    This returns the number of tokens in one realm.
+
+    :param realm: The name of the realm
+    :type realm: basestring
+    :param active: If only active tokens should be taken into account
+    :type active: bool
+    :return: The number of tokens in the realm
+    :rtype: int
+    """
+    return get_tokens(realm=realm, active=active, count=True)
+
+
+@log_with(log)
+def get_token_owner_keys(resolvers: list[str] | None = None,
+                         user_ids: list[str] | None = None) -> set[tuple[str, str, str]]:
+    """
+    Return the (realm, resolver, user id) triples that own at least one token.
+
+    A user of a resolver shared by several realms only owns a token in the realm it was assigned in,
+    so a caller holding the user records of one realm can tell which of them own a token there.
+    Tokens that are not assigned do not contribute, and neither do revoked ones, which can never be
+    used again. A disabled token does, as it can be enabled again, and so does every token type. An
+    assignment without a realm - a token given to a user that has none - yields the empty realm and
+    therefore matches no user of any realm.
+
+    A failing query is not caught as in :func:`_read_page_rows`: a set missing the triples of one
+    chunk would silently report their users as owning no token.
+
+    :param resolvers: Only return the triples of these resolvers. None returns the triples of every
+        resolver, an empty list returns nothing.
+    :param user_ids: Only return the triples of these user ids, however many. None returns the
+        triples of every user, an empty list returns nothing.
+    :return: A set of (lowercase realm name, resolver name, user id) triples
+    """
+    # Compared with false() rather than negated, so that it also reads on Oracle, which has no boolean type.
+    # The column is nullable, and a token that was never revoked may hold NULL.
+    owners = (select(Realm.name, TokenOwner.resolver, TokenOwner.user_id).select_from(TokenOwner)
+              .join(Token, Token.id == TokenOwner.token_id)
+              .outerjoin(Realm, Realm.id == TokenOwner.realm_id)
+              .where(or_(Token.revoked == false(), Token.revoked.is_(None)))
+              .distinct())
+    if resolvers is not None:
+        owners = owners.where(TokenOwner.resolver.in_(resolvers))
+    queries = [owners] if user_ids is None else [owners.where(TokenOwner.user_id.in_(chunk))
+                                                 for chunk in _chunked(user_ids)]
+    return {((realm or "").lower(), resolver or "", user_id or "")
+            for query in queries for realm, resolver, user_id in db.session.execute(query)}
+
+
+@log_with(log)
+def get_realms_of_token(serial: str, only_first_realm: bool = False) -> list[str] | str | None:
+    """
+    This function returns a list of the realms of a token
+
+    :param serial: the exact serial number of the token
+    :type serial: basestring
+
+    :param only_first_realm: Whether we should only return the first realm
+    :type only_first_realm: bool
+
+    :return: list of the realm names
+    :rtype: list
+    """
+    if serial and "*" in serial:
+        return []
+
+    try:
+        token = get_one_token(serial=serial)
+        realms = token.get_realms()
+    except ResourceNotFoundError:
+        realms = []
+
+    if len(realms) > 1:
+        log.debug(f"Token {serial} in more than one realm: {realms}")
+
+    if only_first_realm:
+        if realms:
+            realms = realms[0]
+        else:
+            realms = None
+
+    return realms
+
+
+@log_with(log)
+def token_exist(serial: str) -> bool:
+    """
+    returns true if the token with the exact given serial number exists
+
+    :param serial: the serial number of the token
+    """
+    if serial:
+        return get_tokens(serial=serial, count=True) > 0
+    else:
+        # If we have no serial we return false anyway!
+        return False
+
+
+@log_with(log)
+def get_token_owner(serial: str) -> User | None:
+    """
+    returns the user object, to which the token is assigned.
+    the token is identified and retrieved by its serial number
+
+    If the token has no owner, None is returned
+
+    Wildcards in the serial number are ignored. This raises
+    ``ResourceNotFoundError`` if the token could not be found.
+
+    :param serial: serial number of the token
+    :type serial: basestring
+
+    :return: The owner of the token
+    :rtype: User object or None
+    """
+    token = get_one_token(serial=serial)
+    return token.user
+
+
+def get_token_owner_without_lookup(serial: str) -> User:
+    """
+    The owner of a token as far as the database knows it, without asking the user store: a user object with the
+    realm and the resolver of the owner, but without a login name or user ID. For an owner that can not be looked
+    up, e.g. because the resolver of the owner was deleted, while the realm of the owner is still what the policies
+    are matched against. An empty user object if the token has no owner.
+
+    :param serial: serial number of the token
+    :return: the owner without the information of the user store
+    """
+    owner = get_one_token(serial=serial).token.first_owner
+    if not owner:
+        return User()
+    return User(realm=owner.realm.name if owner.realm else "", resolver=owner.resolver)
+
+
+@log_with(log)
+def is_token_owner(serial: str, user: User) -> bool:
+    """
+    Check if the given user is the owner of the token with the given serial
+    number
+
+    :param serial: The serial number of the token
+    :type serial: str
+    :param user: The user that needs to be checked
+    :type user: User object
+    :return: Return True or False
+    :rtype: bool
+    """
+    ret = False
+    token_owner = get_token_owner(serial)
+    if token_owner is not None:
+        ret = token_owner == user
+    return ret
+
+
+@log_with(log)
+def get_tokens_in_resolver(resolver: str) -> list[TokenClass]:
+    """
+    Return a list of the token objects, that contain this very resolver
+
+    :param resolver: The resolver, the tokens should be in
+    :type resolver: basestring
+
+    :return: list of tokens with this resolver
+    :rtype: list of token objects
+    """
+    ret = get_tokens(resolver=resolver)
+    return ret
+
+
+@log_with(log)
+def get_tokenclass_info(tokentype: str, section: str | None = None) -> dict:
+    """
+    return the config definition of a dynamic token
+
+    :param tokentype: the tokentype of the token like "totp" or "hotp"
+    :type tokentype: basestring
+    :param section: subsection of the token definition - optional
+    :type section: basestring
+
+    :return: dictionary with the configuration definition of the token.
+      If the token type is not found, an empty dictionary is returned
+    :rtype: dict
+    """
+    res = {}
+    tokenclass = get_token_class(tokentype)
+    if tokenclass:
+        res = tokenclass.get_class_info(section)
+
+    return res

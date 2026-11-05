@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2015-06-30 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Initial writup
 #
@@ -31,8 +29,13 @@ tests/test_api_lib_policy.py
 import logging
 log = logging.getLogger(__name__)
 
+# The pin handler classes that ship with privacyIDEA. Writing an own one is a supported thing
+# to do, see the pinhandling policy - such a class is declared in PI_PIN_HANDLER_MODULES
+# rather than added here.
+PIN_HANDLERS = ["privacyidea.lib.pinhandling.base.PinHandler"]
 
-class PinHandler(object):
+
+class PinHandler:
     """
     A PinHandler Class is responsible for handling the OTP PIN during
     enrollment.
@@ -71,7 +74,7 @@ class PinHandler(object):
         :rtype: bool
         """
         # The most simple way of handling a random PIN! ;-)
-        log.info("handling pin {0!r} for token {1!s} of user {2!r}".format(pin, serial,
-                                                              user))
-        log.info("The token was enrolled by {0!r}@{1!s}".format(logged_in_user.get("username"), logged_in_user.get("realm")))
+        log.info(f"handling pin {pin!r} for token {serial!s} of user {user!r}")
+        log.info("The token was enrolled by {!r}@{!s}".format(logged_in_user.get("username"),
+                                                               logged_in_user.get("realm")))
         return True

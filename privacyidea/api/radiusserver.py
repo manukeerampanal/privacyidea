@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 # http://www.privacyidea.org
 # (c) Cornelius Kölbel
 #
@@ -20,18 +18,23 @@
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-__doc__ = """This endpoint is used to create, update, list and delete RADIUS
-server definitions. RADIUS server definitions can be used for several purposes
-like RADIUS-Token or RADIUS-passthru policies.
+__doc__ = """
+The RADIUS-server REST API manages definitions of remote RADIUS servers.
+These definitions are referenced by the :ref:`radius_token` token type
+and by the :ref:`passthru_policy` to forward authentication to a RADIUS
+backend. See :ref:`radiusserver_config` for the conceptual chapter.
 
-The code of this module is tested in tests/test_api_radiusserver.py
+All endpoints require admin authentication. Read access is gated by the
+admin policy action :ref:`policy_radiusserver_read`; create, update,
+delete and the test request are gated by :ref:`policy_radiusserver_write`.
 """
 from flask import (Blueprint, request)
-from .lib.utils import (getParam,
-                        required,
-                        send_result)
+
+from privacyidea.lib.crypto import CENSORED
+from .lib.utils import (send_result)
+from ..lib.params import get_optional, get_required
 from ..lib.log import log_with
-from ..lib.policy import ACTION
+from ..lib.policies.actions import PolicyAction
 from ..api.lib.prepolicy import prepolicy, check_base_action
 from flask import g
 import logging
@@ -45,32 +48,43 @@ radiusserver_blueprint = Blueprint('radiusserver_blueprint', __name__)
 
 
 @radiusserver_blueprint.route('/<identifier>', methods=['POST'])
-@prepolicy(check_base_action, request, ACTION.RADIUSSERVERWRITE)
+@prepolicy(check_base_action, request, PolicyAction.RADIUSSERVERWRITE)
 @log_with(log)
 def create(identifier=None):
     """
-    This call creates or updates a RADIUS server definition.
+    Create or update a RADIUS server definition. If a definition with the
+    given ``identifier`` already exists it is updated; otherwise it is
+    created. Spaces in ``identifier`` are replaced with underscores.
 
-    :param identifier: The unique name of the RADIUS server definition
-    :param server: The FQDN or IP of the RADIUS server
-    :param port: The port of the RADIUS server
-    :param secret: The RADIUS secret of the RADIUS server
-    :param description: A description for the definition
+    Requires admin authentication and the policy action
+    :ref:`policy_radiusserver_write`.
+
+    :param identifier: path component, the unique name of the definition.
+    :jsonparam server: hostname or IP of the RADIUS server (required).
+    :jsonparam port: UDP port of the RADIUS server, default ``1812``.
+    :jsonparam secret: shared RADIUS secret (required).
+    :jsonparam retries: number of retries on timeout, default ``3``.
+    :jsonparam timeout: per-attempt timeout in seconds, default ``5``.
+    :jsonparam dictionary: server-side filesystem path to the FreeRADIUS
+        dictionary file, default ``/etc/privacyidea/dictionary``.
+    :jsonparam description: free-form description.
+    :jsonparam options: optional dictionary of additional connection options.
+    :status 200: ``True`` on success.
     """
     param = request.all_data
     identifier = identifier.replace(" ", "_")
-    server = getParam(param, "server", required)
-    port = int(getParam(param, "port", default=1812))
-    secret = getParam(param, "secret", required)
-    retries = int(getParam(param, "retries", default=3))
-    timeout = int(getParam(param, "timeout", default=5))
-    description = getParam(param, "description", default="")
-    dictionary = getParam(param, "dictionary",
-                          default="/etc/privacyidea/dictionary")
+    server = get_required(param, "server")
+    port = int(get_optional(param, "port", default=1812))
+    secret = get_required(param, "secret")
+    retries = int(get_optional(param, "retries", default=3))
+    timeout = int(get_optional(param, "timeout", default=5))
+    description = get_optional(param, "description", default="")
+    dictionary = get_optional(param, "dictionary", default="/etc/privacyidea/dictionary")
+    options = get_optional(param, "options", default=None)
 
     r = add_radius(identifier, server, secret, port=port,
                    description=description, dictionary=dictionary,
-                   retries=retries, timeout=timeout)
+                   retries=retries, timeout=timeout, options=options)
 
     g.audit_object.log({'success': r > 0,
                         'info':  r})
@@ -79,27 +93,41 @@ def create(identifier=None):
 
 @radiusserver_blueprint.route('/', methods=['GET'])
 @log_with(log)
-@prepolicy(check_base_action, request, ACTION.RADIUSSERVERREAD)
+@prepolicy(check_base_action, request, PolicyAction.RADIUSSERVERREAD)
 def list_radius():
     """
-    This call gets the list of RADIUS server definitions
+    Return all RADIUS server definitions known to this server. The shared
+    secret of each definition is redacted in the response.
+
+    The result is a dictionary keyed by ``identifier``; each value contains
+    ``id``, ``server``, ``port``, ``secret`` (always ``"__CENSORED__"``),
+    ``retries``, ``timeout``, ``dictionary``, ``description``.
+
+    Requires admin authentication and the policy action
+    :ref:`policy_radiusserver_read`.
+
+    :status 200: dict of definitions in ``result.value``.
     """
     res = list_radiusservers()
     # We do not add the secret!
     for identifier, data in res.items():
-        data.pop("password")
+        data["secret"] = CENSORED
     g.audit_object.log({'success': True})
     return send_result(res)
 
 
 @radiusserver_blueprint.route('/<identifier>', methods=['DELETE'])
-@prepolicy(check_base_action, request, ACTION.RADIUSSERVERWRITE)
+@prepolicy(check_base_action, request, PolicyAction.RADIUSSERVERWRITE)
 @log_with(log)
 def delete_server(identifier=None):
     """
-    This call deletes the specified RADIUS server configuration
+    Delete the RADIUS server definition with the given identifier.
 
-    :param identifier: The unique name of the RADIUS server definition
+    Requires admin authentication and the policy action
+    :ref:`policy_radiusserver_write`.
+
+    :param identifier: path component, the name of the definition.
+    :status 200: ``True`` if a definition was deleted, ``False`` otherwise.
     """
     r = delete_radius(identifier)
 
@@ -109,27 +137,46 @@ def delete_server(identifier=None):
 
 
 @radiusserver_blueprint.route('/test_request', methods=['POST'])
-@prepolicy(check_base_action, request, ACTION.RADIUSSERVERWRITE)
+@prepolicy(check_base_action, request, PolicyAction.RADIUSSERVERWRITE)
 @log_with(log)
 def test():
     """
-    Test the RADIUS definition
-    :return:
+    Test a RADIUS server definition by performing an Access-Request against
+    it with the supplied credentials. The definition does not need to be
+    saved first — all parameters are taken from the request body.
+
+    Requires admin authentication and the policy action
+    :ref:`policy_radiusserver_write`.
+
+    :jsonparam identifier: identifier under which the definition would be
+        saved (used for logging/audit only).
+    :jsonparam server: hostname or IP of the RADIUS server (required).
+    :jsonparam port: UDP port, default ``1812``.
+    :jsonparam secret: shared RADIUS secret (required).
+    :jsonparam retries: number of retries on timeout, default ``3``.
+    :jsonparam timeout: per-attempt timeout in seconds, default ``5``.
+    :jsonparam dictionary: server-side filesystem path to the FreeRADIUS
+        dictionary file, default ``/etc/privacyidea/dictionary``.
+    :jsonparam options: optional dictionary of additional connection options.
+    :jsonparam username: user name to test (required).
+    :jsonparam password: password / OTP to test (required).
+    :status 200: ``True`` if the RADIUS server accepted the credentials,
+        ``False`` otherwise.
     """
     param = request.all_data
-    identifier = getParam(param, "identifier", required)
-    server = getParam(param, "server", required)
-    port = int(getParam(param, "port", default=1812))
-    secret = getParam(param, "secret", required)
-    retries = int(getParam(param, "retries", default=3))
-    timeout = int(getParam(param, "timeout", default=5))
-    user = getParam(param, "username", required)
-    password = getParam(param, "password", required)
-    dictionary = getParam(param, "dictionary",
-                          default="/etc/privacyidea/dictionary")
+    identifier = get_required(param, "identifier")
+    server = get_required(param, "server")
+    port = int(get_optional(param, "port", default=1812))
+    secret = get_required(param, "secret")
+    retries = int(get_optional(param, "retries", default=3))
+    timeout = int(get_optional(param, "timeout", default=5))
+    user = get_required(param, "username")
+    password = get_required(param, "password")
+    dictionary = get_optional(param, "dictionary", default="/etc/privacyidea/dictionary")
+    options = get_optional(param, "options", default=None)
 
     r = test_radius(identifier, server, secret, user, password, port=port,
-                    dictionary=dictionary, retries=retries, timeout=timeout)
+                    dictionary=dictionary, retries=retries, timeout=timeout, options=options)
     g.audit_object.log({'success': r > 0,
                         'info':  r})
     return send_result(r > 0)

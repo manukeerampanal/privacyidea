@@ -1,0 +1,212 @@
+.table-transparent > thead > tr > th,
+.table-transparent > tbody > tr > th,
+.table-transparent > tfoot > tr > th,
+.table-transparent > thead > tr > td,
+.table-transparent > tbody > tr > td,
+.table-transparent > tfoot > tr > td {
+    padding: 0px 5px 0px 0px;
+}
+
+/* Dashboard panel flow: on large screens let the top panels wrap and fill the
+   space beside the (narrow) compact Subscriptions panel; when it expands, the
+   neighbouring panels reflow to the next line. Below lg, Bootstrap stacks the
+   columns full width as usual, so we only switch to flex at the lg breakpoint.
+   flex-start keeps each panel at its natural height instead of stretching. */
+@media (min-width: 1200px) {
+    .dashboard-flow {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-start;
+    }
+    /* Bootstrap's .row clearfix pseudo-elements would become stray flex items. */
+    .dashboard-flow::before,
+    .dashboard-flow::after {
+        content: none;
+    }
+}
+
+/* Usage / Subscription status dots. The compact view shows only the dot, so
+   it is enlarged there; the detailed view shows the dot next to its label. */
+.subscription-table .status-dot {
+    font-size: 1.2em;
+    line-height: 1;
+}
+.subscription-table.subscription-compact .status-dot {
+    font-size: 1.7em;
+}
+/* Bootstrap's .text-warning is a muted brown; use a bright yellow for the
+   traffic-light dots (expiring / exceeded). Scoped to the dots only. */
+.subscription-table .status-dot.text-warning {
+    color: #f5b800;
+}
+.subscription-table .status-text {
+    margin-left: 6px;
+}
+
+/* Keep the Versions cell from stretching the column: cap its width and wrap a
+   long list of versions onto multiple lines inside the cell. */
+.subscription-table .subscription-versions {
+    max-width: 130px;
+    white-space: normal;
+}
+
+.table-capitalize-header > thead > tr > th {
+    text-transform: capitalize;
+}
+
+.table-capitalize {
+    text-transform: capitalize;
+}
+
+.nav-capitalize {
+    text-transform: capitalize;
+}
+
+.btn-capitalize {
+    text-transform: capitalize;
+}
+
+.btn-transparent {
+    color: #000000;
+    background-color: transparent;
+    border-color: #ddd;
+}
+
+.btn-outline-primary {
+    color: #337ab7;
+    background-color: transparent;
+    border-color: #337ab7;
+}
+
+.btn-outline-primary:hover,
+.btn-outline-primary:focus {
+    color: #ffffff;
+    background-color: #337ab7;
+    border-color: #337ab7;
+}
+
+.btn-transparent.disabled:hover,
+.btn-transparent[disabled]:hover,
+fieldset[disabled] .btn-transparent:hover,
+.btn-transparent.disabled:focus,
+.btn-transparent[disabled]:focus,
+fieldset[disabled] .btn-transparent:focus,
+.btn-transparent.disabled.focus,
+.btn-transparent[disabled].focus,
+fieldset[disabled] .btn-transparent.focus {
+    color: #000000;
+    background-color: transparent;
+    border-color: #ddd;
+}
+
+.btn-header {
+    font-weight: bold;
+}
+
+.btn-margin-small {
+    margin: 2px;
+}
+
+.horizontal-line {
+    width: 95%;
+    height: 5px;
+    line-height: 80%;
+    border-top: 1px #ddd solid;
+    margin: 5px;
+}
+
+.horizontal-line-invisible {
+    width: 95%;
+    height: 5px;
+    line-height: 80%;
+    border-top: 1px rgba(72, 112, 150, 0) solid;
+    margin: 12px;
+}
+
+tr.table-remove {
+    background-color: #ffe9e9;
+}
+
+tr.table-add {
+    background-color: #efffdf;
+}
+
+td.width-25 {
+    width: 25%;
+}
+
+/* AngularJS CSP Support - Required when using no-inline-style */
+[ng\:cloak], [ng-cloak], [data-ng-cloak], [x-ng-cloak], .ng-cloak, .x-ng-cloak, .ng-hide:not(.ng-hide-animate) {
+    display: none !important;
+}
+
+ng\:form {
+    display: block;
+}
+
+.ng-animate-shim {
+    visibility: hidden;
+}
+
+.ng-anchor {
+    position: absolute;
+}
+
+.clear-button {
+    vertical-align: middle;
+    text-align: center;
+    padding: 0;
+    background: none;
+    border: none;
+    box-shadow: none;
+    outline: none;
+    cursor: pointer;
+    font-size: 1.5em;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 32px;
+    width: 32px;
+    position: absolute;
+    right: 25px;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 2;
+    color: #555;
+}
+
+.realm-row {
+    position: relative;
+}
+
+.realm-selection {
+    position: relative;
+    width: 100%;
+}
+
+
+.realm-selection select {
+    padding-right: 45px;
+}
+
+[uib-typeahead-popup].dropdown-menu,
+.uib-typeahead-popup.dropdown-menu {
+  display: block;
+}
+
+pi-client-ip-input [uib-typeahead-popup].dropdown-menu,
+pi-client-ip-input .uib-typeahead-popup.dropdown-menu {
+  max-height: 250px;
+  overflow-y: auto;
+}
+
+.assign-user-search-dropdown {
+    display: block;
+    position: static;
+    width: 100%;
+    margin-top: 2px;
+    max-height: 250px;
+    overflow-y: auto;
+}
+

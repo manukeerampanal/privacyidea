@@ -1,9 +1,9 @@
-# -*- coding: utf-8 -*-
 from .base import MyApiTestCase
-import json
 from . import radiusmock
 from privacyidea.lib.config import set_privacyidea_config
 from privacyidea.lib.radiusserver import delete_radius
+from privacyidea.lib.crypto import CENSORED
+
 DICT_FILE = "tests/testdata/dictionary"
 
 
@@ -49,7 +49,7 @@ class RADIUSServerTestCase(MyApiTestCase):
             server1 = server_list.get("server1")
             self.assertEqual(server1.get("server"), "1.2.3.4")
             self.assertEqual(server1.get("description"), "myServer")
-            self.assertTrue("secret" not in server1)
+            self.assertEqual(server1.get("secret"), CENSORED)
 
         # delete server
         with self.app.test_request_context('/radiusserver/server1',

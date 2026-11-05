@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 #  2018-10-02 Friedrich Weber <friedrich.weber@netknights.it>
 #             Add chunked deletions
 #
@@ -17,9 +16,9 @@
 #
 #
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.sql import ClauseElement, Delete
+from sqlalchemy.sql.expression import ClauseElement, Delete
 
 
 class DeleteLimit(Delete, ClauseElement):
@@ -36,6 +35,8 @@ class DeleteLimit(Delete, ClauseElement):
     A dedicated clause element is needed because different
     databases use different notation for limits on DELETE statements.
     """
+    inherit_cache = False
+
     def __init__(self, table, filter, limit=1000):
         Delete.__init__(self, table)
         self.table = table
@@ -45,22 +46,26 @@ class DeleteLimit(Delete, ClauseElement):
         if limit <= 0:
             raise RuntimeError('limit must be positive')
         self.limit = limit
+        primary_key_columns = list(table.primary_key.columns)
+        if len(primary_key_columns) != 1:
+            raise RuntimeError(f'table {table.name} must have a primary key of one column')
+        self.primary_key_column = primary_key_columns[0]
 
 
 @compiles(DeleteLimit)
 def visit_delete_limit(element, compiler, **kw):
     """
     Default compiler for the DeleteLimit clause element.
-    This compiles to a DELETE statement with a SELECT subquery which
-    has a limit set::
+    This compiles to a DELETE statement with a SELECT subquery on the
+    primary key which has a limit set::
 
         DELETE FROM ... WHERE id IN
         (SELECT id FROM ... WHERE ... LIMIT ...)
 
     However, this syntax is not supported by MySQL.
     """
-    select_stmt = select([element.table.c.id]).where(element.filter).limit(element.limit)
-    delete_stmt = element.table.delete().where(element.table.c.id.in_(select_stmt))
+    select_stmt = select(element.primary_key_column).where(element.filter).limit(element.limit)
+    delete_stmt = element.table.delete().where(element.primary_key_column.in_(select_stmt))
     return compiler.process(delete_stmt)
 
 
@@ -73,9 +78,9 @@ def visit_delete_limit_mysql(element, compiler, **kw):
 
         DELETE FROM pidea_audit WHERE ... LIMIT ...
     """
-    return 'DELETE FROM {} WHERE {} LIMIT {:d}'.format(
-        compiler.process(element.table, asfrom=True),
-        compiler.process(element.filter), element.limit)
+    table = compiler.process(element.table, asfrom=True, **kw)
+    where = compiler.process(element.filter)
+    return f'DELETE FROM {table} WHERE {where} LIMIT {element.limit:d}'  # nosec B608 # no user input used in query construction  # noqa: E501
 
 
 def delete_chunked(session, table, filter, limit=1000):

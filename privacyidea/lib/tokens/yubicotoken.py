@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  privacyIDEA is a fork of LinOTP
 #  May 08, 2014 Cornelius Kölbel
 #  License:  AGPLv3
@@ -41,42 +39,45 @@ Authentication requests are forwarded to the Yubico Cloud service YubiCloud.
 
 The code is tested in tests/test_lib_tokens_yubico
 """
+
 import logging
-from privacyidea.lib.decorators import check_token_locked
 import traceback
+from urllib.parse import urlencode
+
 import requests
-from privacyidea.api.lib.utils import getParam
-from privacyidea.lib.crypto import geturandom
+
+from privacyidea.lib.params import get_required
+from privacyidea.lib import _
 from privacyidea.lib.config import get_from_config
+from privacyidea.lib.crypto import geturandom
+from privacyidea.lib.decorators import check_token_locked
 from privacyidea.lib.log import log_with
-from privacyidea.lib.tokenclass import TokenClass, TOKENKIND
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.policy import SCOPE, GROUP
+from privacyidea.lib.tokenclass import TokenClass, Tokenkind
 from privacyidea.lib.tokens.yubikeytoken import (yubico_check_api_signature,
                                                  yubico_api_signature)
-from six.moves.urllib.parse import urlencode
-from privacyidea.lib import _
-from privacyidea.lib.policy import SCOPE, ACTION, GROUP
 
 YUBICO_LEN_ID = 12
 YUBICO_LEN_OTP = 44
 YUBICO_URL = "https://api.yubico.com/wsapi/2.0/verify"
-# The Yubico API requires GET requests. See: https://developers.yubico.com/yubikey-val/Validation_Protocol_V2.0.html
-# Previously we used POST requests.
-# If you want to have the old behaviour, you can set this to True
+# The Yubico API requires GET requests. See:
+# https://developers.yubico.com/OTP/Specifications/OTP_validation_protocol.html
+# Previously we used POST requests. If you want to have the old behaviour, you can set this to True
 DO_YUBICO_POST = False
 DEFAULT_CLIENT_ID = 20771
 DEFAULT_API_KEY = "9iE9DRkPHQDJbAFFC31/dum5I54="
 
-optional = True
-required = False
 
 log = logging.getLogger(__name__)
 
 
 class YubicoTokenClass(TokenClass):
+    owned_tokeninfo_prefixes = frozenset({"yubico."})
 
     def __init__(self, db_token):
         TokenClass.__init__(self, db_token)
-        self.set_type(u"yubico")
+        self.set_type("yubico")
         self.tokenid = ""
 
     @staticmethod
@@ -102,17 +103,17 @@ class YubicoTokenClass(TokenClass):
                'title': 'Yubico Token',
                'description': _('Yubikey Cloud mode: Forward authentication '
                                 'request to YubiCloud.'),
-               'user':  ['enroll'],
+               'user': ['enroll'],
                # This tokentype is enrollable in the UI for...
                'ui_enroll': ["admin", "user"],
                'policy': {
                    SCOPE.ENROLL: {
-                       ACTION.MAXTOKENUSER: {
+                       PolicyAction.MAXTOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of Yubico tokens assigned."),
                            'group': GROUP.TOKEN
                        },
-                       ACTION.MAXACTIVETOKENUSER: {
+                       PolicyAction.MAXACTIVETOKENUSER: {
                            'type': 'int',
                            'desc': _(
                                "The user may only have this maximum number of active Yubico tokens assigned."),
@@ -130,10 +131,10 @@ class YubicoTokenClass(TokenClass):
         return ret
 
     def update(self, param):
-        tokenid = getParam(param, "yubico.tokenid", required)
+        tokenid = get_required(param, "yubico.tokenid")
         if len(tokenid) < YUBICO_LEN_ID:
-            log.error("The tokenid needs to be {0:d} characters long!".format(YUBICO_LEN_ID))
-            raise Exception("The Yubikey token ID needs to be {0:d} characters long!".format(YUBICO_LEN_ID))
+            log.error(f"The tokenid needs to be {YUBICO_LEN_ID:d} characters long!")
+            raise Exception(f"The Yubikey token ID needs to be {YUBICO_LEN_ID:d} characters long!")
 
         if len(tokenid) > YUBICO_LEN_ID:
             tokenid = tokenid[:YUBICO_LEN_ID]
@@ -141,8 +142,8 @@ class YubicoTokenClass(TokenClass):
         # overwrite the maybe wrong length given at the command line
         param['otplen'] = 44
         TokenClass.update(self, param)
-        self.add_tokeninfo("yubico.tokenid", self.tokenid)
-        self.add_tokeninfo("tokenkind", TOKENKIND.HARDWARE)
+        self.write_tokeninfo("yubico.tokenid", self.tokenid)
+        self.write_tokeninfo("tokenkind", Tokenkind.HARDWARE)
 
     @log_with(log)
     @check_token_locked
@@ -166,7 +167,7 @@ class YubicoTokenClass(TokenClass):
 
         tokenid = self.get_tokeninfo("yubico.tokenid")
         if len(anOtpVal) < 12:
-            log.warning("The otpval is too short: {0!r}".format(anOtpVal))
+            log.warning(f"The otpval is too short: length {len(anOtpVal)}")
         elif anOtpVal[:12] != tokenid:
             log.warning("The tokenid in the OTP value does not match "
                         "the assigned token!")
@@ -181,10 +182,12 @@ class YubicoTokenClass(TokenClass):
             try:
                 if do_yubico_post:
                     r = requests.post(yubico_url,
-                                      data=p)
+                                      data=p,
+                                      timeout=60)
                 else:
                     r = requests.get(yubico_url,
-                                     params=urlencode(p))
+                                     params=urlencode(p),
+                                     timeout=60)
 
                 if r.status_code == requests.codes.ok:
                     response = r.text
@@ -200,8 +203,8 @@ class YubicoTokenClass(TokenClass):
 
                     if not signature_valid:
                         log.error("The hash of the return from the yubico "
-                                  "authentication server ({0!s}) "
-                                  "does not match the data!".format(yubico_url))
+                                  f"authentication server ({yubico_url!s}) "
+                                  "does not match the data!")
 
                     if nonce != return_nonce:
                         log.error("The returned nonce does not match "
@@ -214,12 +217,26 @@ class YubicoTokenClass(TokenClass):
                             res = -2
                     else:
                         # possible results are listed here:
-                        # https://github.com/Yubico/yubikey-val/wiki/ValidationProtocolV20
-                        log.warning("failed with {0!r}".format(result))
+                        # https://developers.yubico.com/OTP/Specifications/OTP_validation_protocol.html
+                        log.warning(f"failed with {result!r}")
 
             except Exception as ex:
                 log.error("Error getting response from Yubico Cloud Server"
-                          " (%r): %r" % (yubico_url, ex))
-                log.debug("{0!s}".format(traceback.format_exc()))
+                          f" ({yubico_url!r}): {ex!r}")
+                log.debug(f"{traceback.format_exc()!s}")
 
         return res
+
+    def export_token(self, export_user: bool = False) -> dict:
+        """
+        Export for this token is not supported.
+        """
+        raise NotImplementedError("Export for Yubico token is not supported.")
+
+    def import_token(self, token_information: dict):
+        """
+        Import for this token is not supported.
+
+        Concern that the database token must be deleted manually.
+        """
+        raise NotImplementedError("Import for Yubico token is not supported.")

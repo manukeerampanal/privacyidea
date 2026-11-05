@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: (C) 2025 NetKnights GmbH <https://netknights.it>
+# SPDX-FileCopyrightText: (C) 2025 Paul Lettich <paul.lettich@netknights.it>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# This code is free software; you can redistribute it and/or
+# modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+# as published by the Free Software Foundation; either
+# version 3 of the License, or any later version.
+#
+# This code is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+#
+# You should have received a copy of the GNU Affero General Public
+# License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+import logging
+from datetime import datetime
+
+from sqlalchemy import Sequence, Unicode, Integer, DateTime, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column
+
+from privacyidea.models import db
+from privacyidea.models.utils import MethodsMixin
+
+log = logging.getLogger(__name__)
+
+
+class ClientApplication(MethodsMixin, db.Model):
+    """
+    This table stores the clients, which sent an authentication request to privacyIDEA.
+    This table is filled automatically by authentication requests.
+    """
+    __tablename__ = 'clientapplication'
+    id: Mapped[int] = mapped_column(Integer, Sequence("clientapp_seq"), primary_key=True)
+    ip: Mapped[str] = mapped_column(Unicode(255), nullable=False, index=True)
+    hostname: Mapped[str | None] = mapped_column(Unicode(255))
+    clienttype: Mapped[str] = mapped_column(Unicode(255), nullable=False, index=True)
+    lastseen: Mapped[datetime | None] = mapped_column(DateTime, index=True, default=datetime.now)
+    node: Mapped[str] = mapped_column(Unicode(255), nullable=False)
+    __table_args__ = (UniqueConstraint('ip', 'clienttype', 'node', name='caix'),)
+
+    def __repr__(self):
+        return f"<ClientApplication [{self.id}][{self.ip}:{self.clienttype}] on {self.node}>"
+
+
+class Subscription(MethodsMixin, db.Model):
+    """
+    This table stores the imported subscription files.
+    """
+    __tablename__ = 'subscription'
+    id: Mapped[int] = mapped_column(Integer, Sequence("subscription_seq"), primary_key=True)
+    application: Mapped[str | None] = mapped_column(Unicode(80), index=True)
+    for_name: Mapped[str] = mapped_column(Unicode(80), nullable=False)
+    for_address: Mapped[str | None] = mapped_column(Unicode(128))
+    for_email: Mapped[str] = mapped_column(Unicode(128), nullable=False)
+    for_phone: Mapped[str] = mapped_column(Unicode(50), nullable=False)
+    for_url: Mapped[str | None] = mapped_column(Unicode(80))
+    for_comment: Mapped[str | None] = mapped_column(Unicode(255))
+    by_name: Mapped[str] = mapped_column(Unicode(50), nullable=False)
+    by_email: Mapped[str] = mapped_column(Unicode(128), nullable=False)
+    by_address: Mapped[str | None] = mapped_column(Unicode(128))
+    by_phone: Mapped[str | None] = mapped_column(Unicode(50))
+    by_url: Mapped[str | None] = mapped_column(Unicode(80))
+    date_from: Mapped[datetime | None] = mapped_column(DateTime)
+    date_till: Mapped[datetime | None] = mapped_column(DateTime)
+    num_users: Mapped[int | None] = mapped_column(Integer)
+    num_tokens: Mapped[int | None] = mapped_column(Integer)
+    num_clients: Mapped[int | None] = mapped_column(Integer)
+    level: Mapped[str | None] = mapped_column(Unicode(80))
+    signature: Mapped[str | None] = mapped_column(Unicode(640))
+
+    def __repr__(self):
+        return f"<Subscription [{self.id}][{self.application}:{self.for_name}:{self.by_name}]>"
+
+    def get(self):
+        return {attr: getattr(self, attr) for attr in self.__table__.columns.keys() if getattr(self, attr) is not None}

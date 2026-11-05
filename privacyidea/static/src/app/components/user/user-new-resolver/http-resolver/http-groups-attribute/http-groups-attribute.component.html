@@ -1,0 +1,113 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<h4 i18n="@@resolver.userGroups">User Groups</h4>
+<div class="flex-column margin-top-16">
+  <div class="flex-row gap-16 margin-bottom-32">
+    <div class="flex just-center ali-center toggle-width">
+      <span i18n="@@resolver.enable">Enable:</span>
+      <mat-slide-toggle
+        (change)="model.update(m => ({ ...m, active: $event.checked }))"
+        [checked]="model().active"
+        [matTooltip]="slideToggleTooltipSignal()"
+        class="margin-left-8" />
+    </div>
+
+    <mat-form-field class="input-width-l">
+      <mat-label i18n="@@resolver.privacyideaUser">privacyIDEA User Groups Key</mat-label>
+      <input
+        (input)="model.update(m => ({ ...m, pi_user_groups_key: $any($event.target).value }))"
+        [disabled]="!model().active"
+        [value]="model().pi_user_groups_key"
+        matInput />
+      <mat-hint i18n="@@resolver.keyStoreGroups">Key to store the groups of the user in privacyIDEA.</mat-hint>
+    </mat-form-field>
+
+    <mat-form-field class="input-width-l">
+      @if (resolverType() === "entraidresolver") {
+        <mat-label i18n="@@resolver.groupIdentifier">Group Identifier</mat-label>
+      } @else {
+        <mat-label i18n="@@resolver.userStoreAttribute">User Store Attribute</mat-label>
+      }
+      <input
+        (input)="model.update(m => ({ ...m, user_groups_attribute: $any($event.target).value }))"
+        [disabled]="!model().active"
+        [value]="model().user_groups_attribute"
+        matInput />
+      @if (resolverType() === "entraidresolver") {
+        <mat-hint i18n="@@resolver.groupIdentifierFrom"
+          >Group identifier from EntraID mapped to the users group list.</mat-hint
+        >
+      } @else {
+        <mat-hint i18n="@@resolver.keyGroupSName">Key of the group's name in the user store response.</mat-hint>
+      }
+    </mat-form-field>
+  </div>
+
+  @if (resolverType() !== "entraidresolver") {
+    <div class="flex-row gap-16 margin-bottom-16">
+      <mat-form-field class="input-width-s">
+        <mat-label i18n="@@resolver.method">Method</mat-label>
+        <mat-select
+          (selectionChange)="model.update(m => ({ ...m, method: $event.value }))"
+          [disabled]="!model().active"
+          [value]="model().method">
+          <mat-option value="POST">POST</mat-option>
+          <mat-option value="GET">GET</mat-option>
+          <mat-option value="PUT">PUT</mat-option>
+          <mat-option value="PATCH">PATCH</mat-option>
+          <mat-option value="DELETE">DELETE</mat-option>
+        </mat-select>
+        <mat-hint i18n="@@resolver.httpMethodGroups">HTTP method for the groups request.</mat-hint>
+      </mat-form-field>
+
+      <mat-form-field class="input-width-xl">
+        <mat-label i18n="@@resolver.endpoint">Endpoint</mat-label>
+        <input
+          (input)="model.update(m => ({ ...m, endpoint: $any($event.target).value }))"
+          [disabled]="!model().active"
+          [value]="model().endpoint"
+          matInput />
+        <mat-hint>
+          <span i18n="@@resolver.endpointReceive"
+            >Endpoint to receive the groups of a specific user. Possible tags:</span
+          >
+          <code>&#123;userid&#125;</code>
+          @if (resolverType() === "keycloakresolver") {
+            <code>&#123;realm&#125;</code>
+          }
+        </mat-hint>
+      </mat-form-field>
+    </div>
+  }
+</div>
+
+@if (resolverType() === "entraidresolver") {
+  <div
+    class="hint margin-top-16 margin-bottom-16"
+    i18n="@@resolver.receiveUsersGroups"
+    >Receive the users groups via the <code>memberOf</code> attribute.</div
+  >
+} @else {
+  <div
+    class="hint margin-top-16 margin-bottom-16"
+    i18n="@@resolver.userGroupsReceived"
+    >User groups are received in a separate request and stored under the privacyIDEA attribute
+    <code>groups</code> .</div
+  >
+}

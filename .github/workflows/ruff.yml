@@ -1,0 +1,33 @@
+# Ruff is a fast Python linter that catches real bugs beyond style issues.
+# https://github.com/astral-sh/ruff
+# https://pypi.org/project/ruff/ is MIT licensed, by Astral
+
+name: Ruff
+on:
+  pull_request:
+    paths:
+      # Keep in sync with the paths linted by the "Run Ruff" step below.
+      - 'privacyidea/**.py'
+      - 'tests/**.py'
+      # Re-run when the Ruff config (rules, excludes) changes.
+      - 'pyproject.toml'
+      - '.github/workflows/ruff.yml'
+permissions: {}
+
+jobs:
+  ruff:
+    name: Run Ruff linter
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Ruff
+        # Pin the version so a new Ruff release that adds or tightens a lint
+        # rule can't turn unrelated PRs red without an intentional bump here.
+        run: python -m pip install "ruff==0.15.10"
+      - name: Run Ruff
+        run: ruff check privacyidea tests

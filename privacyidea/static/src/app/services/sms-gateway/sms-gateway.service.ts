@@ -1,0 +1,159 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { HttpClient, httpResource, HttpResourceRef } from "@angular/common/http";
+import { computed, inject, Injectable, Signal } from "@angular/core";
+import { PiResponse } from "@app/app.component";
+import { environment } from "@env/environment";
+import { AuthService, AuthServiceInterface } from "@services/auth/auth.service";
+import { ContentService, ContentServiceInterface } from "@services/content/content.service";
+import { NotificationService, NotificationServiceInterface } from "@services/notification/notification.service";
+import { lastValueFrom, Observable } from "rxjs";
+
+export interface SmsProviderParameter {
+  values?: string[];
+  required?: boolean;
+  type?: string;
+  secret?: boolean;
+  description: string;
+}
+
+export interface SmsProvider {
+  parameters: Record<string, SmsProviderParameter>;
+  options_allowed?: boolean;
+  headers_allowed?: boolean;
+}
+
+export type SmsProviders = Record<string, SmsProvider>;
+
+export interface SmsGateway {
+  id?: number;
+  name: string;
+  description?: string;
+  providermodule: string;
+  options: Record<string, string>;
+  headers: Record<string, string>;
+  secret_options?: string[];
+  secret_headers?: string[];
+}
+
+export interface SmsGatewayPayload {
+  name: string;
+  module: string;
+  description?: string;
+  id?: number;
+
+  [key: string]: string | number | undefined;
+}
+
+export interface SmsGatewayServiceInterface {
+  smsGatewayResource: HttpResourceRef<PiResponse<SmsGateway[]> | undefined>;
+  smsProvidersResource: HttpResourceRef<PiResponse<SmsProviders> | undefined>;
+  readonly smsGateways: Signal<SmsGateway[]>;
+  readonly canListSmsGateways: Signal<boolean>;
+
+  postSmsGateway(gateway: SmsGatewayPayload): Promise<void>;
+
+  deleteSmsGateway(name: string): Promise<void>;
+
+  listSmsGateways(): Observable<PiResponse<SmsGateway[]>>;
+}
+
+@Injectable()
+export class SmsGatewayService implements SmsGatewayServiceInterface {
+  private readonly authService: AuthServiceInterface = inject(AuthService);
+  private readonly contentService: ContentServiceInterface = inject(ContentService);
+  private readonly notificationService: NotificationServiceInterface = inject(NotificationService);
+  private readonly http = inject(HttpClient);
+
+  private readonly baseUrl = environment.proxyUrl + "/smsgateway";
+
+  readonly canListSmsGateways = computed<boolean>(() => this.authService.actionAllowed("smsgateway_read"));
+
+  readonly smsGatewayResource = httpResource<PiResponse<SmsGateway[]>>(() => {
+    const onPageUsingTheList = this.contentService.onExternalSms() || this.contentService.onConfigurationTokenTypes();
+    if (!onPageUsingTheList || !this.canListSmsGateways()) {
+      return undefined;
+    }
+    return {
+      url: this.baseUrl + "/",
+      method: "GET",
+      headers: this.authService.getHeaders()
+    };
+  });
+
+  readonly smsProvidersResource = httpResource<PiResponse<SmsProviders>>(() => {
+    if (!this.contentService.onExternalSms() || !this.canListSmsGateways()) {
+      return undefined;
+    }
+    return {
+      url: this.baseUrl + "/providers",
+      method: "GET",
+      headers: this.authService.getHeaders()
+    };
+  });
+
+  readonly smsGateways = computed<SmsGateway[]>(() => {
+    if (!this.smsGatewayResource.hasValue()) return [];
+    return this.smsGatewayResource.value()?.result?.value ?? [];
+  });
+
+  async postSmsGateway(gateway: SmsGatewayPayload): Promise<void> {
+    const request = this.http.post<PiResponse<number>>(this.baseUrl, gateway, {
+      headers: this.authService.getHeaders()
+    });
+    return lastValueFrom(request)
+      .then(() => {
+        this.notificationService.success($localize`:@@smsGateway.successfullySaved:Successfully saved SMS gateway.`);
+        this.smsGatewayResource.reload();
+      })
+      .catch((error) => {
+        const message = error.error?.result?.error?.message || "";
+        this.notificationService.error(
+          $localize`:@@smsGateway.failedSaveSms:Failed to save SMS gateway. ${message}:MESSAGE:`
+        );
+        throw new Error("post-failed");
+      });
+  }
+
+  async deleteSmsGateway(name: string): Promise<void> {
+    const request = this.http.delete<PiResponse<number>>(`${this.baseUrl}/${encodeURIComponent(name)}`, {
+      headers: this.authService.getHeaders()
+    });
+    return lastValueFrom(request)
+      .then(() => {
+        this.notificationService.success(
+          $localize`:@@smsGateway.successfullyDeleted:Successfully deleted SMS gateway: ${name}:NAME:.`
+        );
+        this.smsGatewayResource.reload();
+      })
+      .catch((error) => {
+        const message = error.error?.result?.error?.message || "";
+        this.notificationService.error(
+          $localize`:@@smsGateway.failedDeleteSms:Failed to delete SMS gateway. ${message}:MESSAGE:`
+        );
+        throw new Error("delete-failed");
+      });
+  }
+
+  listSmsGateways(): Observable<PiResponse<SmsGateway[]>> {
+    return this.http.get<PiResponse<SmsGateway[]>>(this.baseUrl + "/", {
+      headers: this.authService.getHeaders()
+    });
+  }
+}

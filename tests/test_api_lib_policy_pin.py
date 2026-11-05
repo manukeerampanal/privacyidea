@@ -1,0 +1,547 @@
+# SPDX-FileCopyrightText: 2024 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Tests for PIN-related prepolicies (privacyidea.api.lib.prepolicy)."""
+import logging
+
+from flask import Request, g
+from testfixtures import log_capture
+from werkzeug.test import EnvironBuilder
+
+from privacyidea.api.lib.prepolicy import (init_random_pin, encrypt_pin, check_otp_pin,
+                                           enroll_pin)
+from privacyidea.lib.error import PolicyError
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.policy import (set_policy, delete_policy, PolicyClass, SCOPE)
+from privacyidea.lib.realm import delete_realm
+from privacyidea.lib.realm import set_realm as create_realm
+from privacyidea.lib.token import (init_token, remove_token)
+from privacyidea.lib.user import User
+from .api_lib_policy_common import PrePolicyHelperMixin
+from .base import (MyApiTestCase)
+
+HOSTSFILE = "tests/testdata/hosts"
+SSHKEY = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDO1rx366cmSSs/89j" \
+         "/0u5aEiXa7bYArHn7zFNCBaVnDUiK9JDNkpWBj2ucbmOpDKWzH0Vl3in21E" \
+         "8BaRlq9AobASG0qlEqlnwrYwlH+vcYp6td4QBoh3sOelzhyrJFug9dnfe8o7" \
+         "0r3IL4HIbdQOdh1b8Ogi7aL01V/eVE9RgGfTNHUzuYRMUL3si4dtqbCsSjFZ" \
+         "6dN1nnVhos9cSphPr7pQEbq8xW0uxzOGrFDY9g1NSOleA8bOjsCT9k+3X4R7" \
+         "00iVGvpzWkKopcWrzXJDIa3yxylAMOM0c3uO9U3NLfRsucvcQ5Cs8S6ctM30" \
+         "8cua3t5WaBOsr3RyoXs+cHIPIkXnJHg03HsnWONaGxl8VPymC9s3P0zVwm2jMFx" \
+         "JD9WbBqep7Dwc5unxLOSKidKrnNflQiMyiIv+5dY5lhc0YTJdktC2Scse64ac2E" \
+         "7ldjG3bJuKSIWAz8Sd1km4ZJWWIx8NlpC9AfbHcgMyFUDniV1EtFIaSQLPspIk" \
+         "thzIMqPTpKblzdRZP37mPu/FpwfYG4S+F34dCmJ4BipslsVcqgCFJQHoAYAJc4N" \
+         "Dq5IRDQqXH2KybHpSLATnbSY7zjVD+evJeU994yTaXTFi5hBmd0aWTC+ph79mmE" \
+         "tu3dokA2YbLa7uWkAIXvX/HHauGLMTyCOpYi1BxN47c/kccxyNg" \
+         "jPw== corny@schnuck"
+
+YUBIKEY_CSR = """-----BEGIN CERTIFICATE REQUEST-----
+MIICbTCCAVUCAQAwFzEVMBMGA1UEAwwMY249Y29ybmVsaXVzMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzqQ5MCVz5J3mNzuFWYPvo275g7n3SLAL1egF
+QGHNxVq8ES9bTtBPuNDofwWrrSQLkNQ/YOwVtk6+jtkmq/IvfzXCpqG8UjrZiPuz
++nEguVEO+K8NFr69XbmrMNWsazy87ihKT2/UCRX3mK932zYVLh7uD9DZYK3bucQ/
+xiUy+ePpULjshKDE0pz9ziWAhX46rUynQBsKWBifwl424dFE6Ua23LQoouztAvcl
+eeGGjmlnUu6CIbeELcznqDlXfaMe6VBjdymr5KX/3O5MS14IK2IILXW4JmyT6/VF
+6s2DWFMVRuZrQ8Ev2YhLPdX9DP9RUu1U+yctWe9MUM5xzetamQIDAQABoBEwDwYJ
+KoZIhvcNAQkOMQIwADANBgkqhkiG9w0BAQsFAAOCAQEArLWY74prQRtKojwMEOsw
+4efmzCwOvLoO/WXDwzrr7kgSOawQanhFzD+Z4kCwapf1ZMmobBnyWREpL4EC9PzC
+YH+mgSDCI0jDj/4OSfklb31IzRhuWcCVOpV9xuiDW875WM792t09ILCpx4rayw2a
+8t92zv49IcWHtJNqpo2Q8064p2fzYf1J1r4OEBKUUxEIcw2/nifIiHHTb7DqDF4+
+XjcD3ygUfTVbCzPYBmLPwvt+80AxgT2Nd6E612L/fbI9clv5DsvMwnVeSvlP1wXo
+5BampVY4p5CQRFLlCQa9fGWZrT+ArC9Djo0mHf32x6pEsSz0zMOlmjHrh+ChVkAs
+tA==
+-----END CERTIFICATE REQUEST-----"""
+
+
+class PrePolicyPinTestCase(PrePolicyHelperMixin, MyApiTestCase):
+
+    def setUp(self):
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+        self.setUp_user_realm3()
+
+    def test_08_encrypt_pin(self):
+        g.logged_in_user = {"username": "admin1",
+                            "realm": "",
+                            "role": "admin"}
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "OATH123456"},
+                                 headers={})
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+
+        # Set a policy that defines the PIN to be encrypted
+        set_policy(name="pol1",
+                   scope=SCOPE.ENROLL,
+                   action=PolicyAction.ENCRYPTPIN)
+        g.policy_object = PolicyClass()
+
+        # request, that matches the policy
+        req.all_data = {
+            "user": "cornelius",
+            "realm": "home"
+        }
+        encrypt_pin(req)
+
+        # Check, if the tokenlabel was added
+        self.assertEqual(req.all_data.get("encryptpin"), "True")
+        # finally delete policy
+        delete_policy("pol1")
+
+    def test_08a_enroll_pin_admin(self):
+        g.logged_in_user = {"username": "admin1",
+                            "realm": "",
+                            "role": "admin"}
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "OATH123456"},
+                                 headers={})
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.User = User("cornelius", self.realm1)
+
+        # Set a policy that defines the PIN to be encrypted
+        set_policy(name="pol1",
+                   scope=SCOPE.ADMIN,
+                   action="enrollHOTP")
+        g.policy_object = PolicyClass()
+
+        # Trying to enroll a token with a pin but without enrollpin right will result in a policy error.
+        # checked by enroll_pin
+        req.all_data = {"pin": "test",
+                        "user": "cornelius",
+                        "realm": self.realm1}
+
+        with self.assertRaises(PolicyError):
+            enroll_pin(req)
+
+        # finally delete policy
+        delete_policy("pol1")
+
+    def test_08b_enroll_pin_user(self):
+        g.logged_in_user = {"username": "cornelius",
+                            "realm": self.realm1,
+                            "role": "user"}
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "OATH123456"},
+                                 headers={})
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+
+        # Set a policy that defines the PIN to be encrypted
+        set_policy(name="pol1",
+                   scope=SCOPE.USER,
+                   action="enrollHOTP, enrollpin")
+        g.policy_object = PolicyClass()
+
+        # request, that matches the policy
+        req.all_data = {"pin": "test",
+                        "user": "cornelius",
+                        "realm": self.realm1}
+        req.User = User("cornelius", self.realm1)
+        enroll_pin(req)
+
+        # Check, if the PIN was removed
+        self.assertEqual(req.all_data.get("pin"), "test")
+        # finally delete policy
+        delete_policy("pol1")
+
+    @log_capture(level=logging.DEBUG)
+    def test_09_pin_policies(self, capture):
+        create_realm("home", [{'name': self.resolvername1}])
+        g.logged_in_user = {"username": "user1",
+                            "realm": "",
+                            "role": "user"}
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "OATH123456"},
+                                 headers={})
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+
+        # Set a policy that defines PIN policy
+        set_policy(name="pol1",
+                   scope=SCOPE.USER,
+                   action=f"{PolicyAction.OTPPINMAXLEN}=10,{PolicyAction.OTPPINMINLEN}=4,"
+                          f"{PolicyAction.OTPPINCONTENTS}=cn")
+        g.policy_object = PolicyClass()
+
+        req.all_data = {
+            "user": "cornelius",
+            "realm": "home"
+        }
+        req.User = User("cornelius", "home")
+        # The minimum OTP length is 4
+        self.assertRaises(PolicyError, check_otp_pin, req)
+
+        req.all_data = {
+            "user": "cornelius",
+            "realm": "home",
+            "pin": "12345566890012"
+        }
+        # Fail maximum OTP length
+        self.assertRaises(PolicyError, check_otp_pin, req)
+
+        req.all_data = {
+            "user": "cornelius",
+            "realm": "home",
+            "pin": "123456"
+        }
+        # Good OTP length, but missing character A-Z
+        self.assertRaises(PolicyError, check_otp_pin, req)
+
+        req.all_data = {
+            "user": "cornelius",
+            "realm": "home",
+            "pin": "abc123"
+        }
+        # Good length and good contents
+        self.assertTrue(check_otp_pin(req))
+
+        # A token that does not use pins is ignored.
+        init_token({"type": "certificate",
+                    "serial": "certificate"})
+        req.all_data = {"serial": "certificate",
+                        "realm": "somerealm",
+                        "user": "cornelius",
+                        "pin": ""}
+        self.assertTrue(check_otp_pin(req))
+
+        init_token({"type": "sshkey",
+                    "serial": "sshkey",
+                    "sshkey": SSHKEY})
+        req.all_data = {"serial": "sshkey",
+                        "realm": "somerealm",
+                        "user": "cornelius",
+                        "pin": ""}
+        self.assertTrue(check_otp_pin(req))
+
+        # The same types are exempt at /token/init, where no serial exists yet and only the
+        # requested type is known.
+        for token_type in ["certificate", "sshkey"]:
+            req.all_data = {"type": token_type,
+                            "realm": "home",
+                            "user": "cornelius"}
+            self.assertTrue(check_otp_pin(req))
+
+        # The exemption only covers the absent PIN. The certificate token encrypts the PKCS#12
+        # container with the PIN, so a PIN that is sent has to satisfy the policies.
+        req.all_data = {"type": "certificate",
+                        "realm": "home",
+                        "user": "cornelius",
+                        "pin": "1"}
+        self.assertRaises(PolicyError, check_otp_pin, req)
+        req.all_data = {"type": "certificate",
+                        "realm": "home",
+                        "user": "cornelius",
+                        "pin": "abc123"}
+        self.assertTrue(check_otp_pin(req))
+
+        # A type that does use a PIN is still checked, and so is a type we do not know.
+        for token_type in ["hotp", "an-unknown-type"]:
+            req.all_data = {"type": token_type,
+                            "realm": "home",
+                            "user": "cornelius"}
+            self.assertRaises(PolicyError, check_otp_pin, req)
+
+        # check that no pin is checked during rollover or verify
+        logging.getLogger('privacyidea').setLevel(logging.DEBUG)
+        req.all_data = {
+            "user": "cornelius",
+            "realm": "home",
+            "rollover": True
+        }
+        self.assertTrue(check_otp_pin(req))
+        capture.check_present(("privacyidea.api.lib.prepolicy", "DEBUG",
+                               "Disable PIN checking due to rollover (True) or verify (None)"))
+        req.all_data = {
+            "user": "cornelius",
+            "realm": "home",
+            "verify": 123456
+        }
+        self.assertTrue(check_otp_pin(req))
+        capture.check_present(("privacyidea.api.lib.prepolicy", "DEBUG",
+                               "Disable PIN checking due to rollover (None) or verify (123456)"))
+        logging.getLogger('privacyidea').setLevel(logging.INFO)
+
+        # finally delete policy
+        delete_policy("pol1")
+        delete_realm("home")
+
+    @log_capture(level=logging.DEBUG)
+    def test_09_pin_policies_admin(self, capture):
+        create_realm("home", [{'name': self.resolvername1}])
+        g.logged_in_user = {"username": "super",
+                            "realm": "",
+                            "role": "admin"}
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "OATH123456"},
+                                 headers={})
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+
+        # Set a policy that defines PIN policy
+        set_policy(name="pol1",
+                   scope=SCOPE.ADMIN,
+                   action=f"{PolicyAction.OTPPINMAXLEN}=10,{PolicyAction.OTPPINMINLEN}=4,"
+                          f"{PolicyAction.OTPPINCONTENTS}=cn",
+                   realm="home")
+        g.policy_object = PolicyClass()
+
+        req.all_data = {"user": "cornelius",
+                        "realm": "home"}
+        req.User = User("cornelius", "home")
+        # The minimum OTP length is 4
+        self.assertRaises(PolicyError, check_otp_pin, req)
+
+        req.all_data = {"user": "cornelius",
+                        "realm": "home",
+                        "pin": "12345566890012"}
+        # Fail maximum OTP length
+        self.assertRaises(PolicyError, check_otp_pin, req)
+
+        req.all_data = {"user": "cornelius",
+                        "realm": "home",
+                        "pin": "123456"}
+        # Good OTP length, but missing character A-Z
+        self.assertRaises(PolicyError, check_otp_pin, req)
+
+        req.all_data = {
+            "user": "cornelius",
+            "realm": "home",
+            "pin": "abc123"
+        }
+        # Good length and good contents
+        self.assertTrue(check_otp_pin(req))
+
+        # A token that does not use pins is ignored.
+        init_token({"type": "certificate",
+                    "serial": "certificate"})
+        req.all_data = {"serial": "certificate",
+                        "realm": "somerealm",
+                        "user": "cornelius",
+                        "pin": ""}
+        self.assertTrue(check_otp_pin(req))
+
+        init_token({"type": "sshkey",
+                    "serial": "sshkey",
+                    "sshkey": SSHKEY})
+        req.all_data = {"serial": "sshkey",
+                        "realm": "somerealm",
+                        "user": "cornelius",
+                        "pin": ""}
+        self.assertTrue(check_otp_pin(req))
+
+        # The same types are exempt at /token/init, where no serial exists yet and only the
+        # requested type is known.
+        for token_type in ["certificate", "sshkey"]:
+            req.all_data = {"type": token_type,
+                            "realm": "home",
+                            "user": "cornelius"}
+            self.assertTrue(check_otp_pin(req))
+
+        # The exemption only covers the absent PIN. The certificate token encrypts the PKCS#12
+        # container with the PIN, so a PIN that is sent has to satisfy the policies.
+        req.all_data = {"type": "certificate",
+                        "realm": "home",
+                        "user": "cornelius",
+                        "pin": "1"}
+        self.assertRaises(PolicyError, check_otp_pin, req)
+        req.all_data = {"type": "certificate",
+                        "realm": "home",
+                        "user": "cornelius",
+                        "pin": "abc123"}
+        self.assertTrue(check_otp_pin(req))
+
+        # A type that does use a PIN is still checked, and so is a type we do not know.
+        for token_type in ["hotp", "an-unknown-type"]:
+            req.all_data = {"type": token_type,
+                            "realm": "home",
+                            "user": "cornelius"}
+            self.assertRaises(PolicyError, check_otp_pin, req)
+
+        # check that no pin is checked during rollover or verify
+        logging.getLogger('privacyidea').setLevel(logging.DEBUG)
+        req.all_data = {
+            "user": "cornelius",
+            "realm": "home",
+            "rollover": True
+        }
+        self.assertTrue(check_otp_pin(req))
+        capture.check_present(("privacyidea.api.lib.prepolicy", "DEBUG",
+                               "Disable PIN checking due to rollover (True) or verify (None)"))
+        req.all_data = {
+            "user": "cornelius",
+            "realm": "home",
+            "verify": 123456
+        }
+        self.assertTrue(check_otp_pin(req))
+        capture.check_present(("privacyidea.api.lib.prepolicy", "DEBUG",
+                               "Disable PIN checking due to rollover (None) or verify (123456)"))
+        logging.getLogger('privacyidea').setLevel(logging.INFO)
+
+        # finally delete policy
+        delete_policy("pol1")
+        delete_realm("home")
+
+    def test_09b_pin_policies_admin_by_serial(self):
+        # An admin acting on an existing token by serial without a user parameter must still have
+        # the realm-scoped PIN policy of the token owner enforced. The owner is derived from the
+        # serial, so the empty request.User does not silently skip the realm-scoped policy.
+        create_realm("home", [{'name': self.resolvername1}])
+        g.logged_in_user = {"username": "super",
+                            "realm": "",
+                            "role": "admin"}
+        builder = EnvironBuilder(method='POST', headers={})
+        env = builder.get_environ()
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+
+        # A token owned by cornelius in realm "home"
+        init_token({"type": "hotp", "serial": "PINBYSERIAL"}, user=User("cornelius", "home"))
+
+        # Realm-scoped admin PIN policy that requires a complex PIN
+        set_policy(name="pol1",
+                   scope=SCOPE.ADMIN,
+                   action=f"{PolicyAction.OTPPINMINLEN}=4,{PolicyAction.OTPPINCONTENTS}=cn",
+                   realm="home")
+        g.policy_object = PolicyClass()
+
+        # Admin sends only the serial and a weak PIN, with no user parameter -> empty request.User
+        req.all_data = {"serial": "PINBYSERIAL", "pin": "12"}
+        req.User = User()
+        # The realm-scoped policy is matched against the token owner -> weak PIN is rejected
+        self.assertRaises(PolicyError, check_otp_pin, req)
+
+        # A PIN that complies with the owner's realm policy is accepted
+        req.all_data = {"serial": "PINBYSERIAL", "pin": "abc123"}
+        req.User = User()
+        self.assertTrue(check_otp_pin(req))
+
+        # An explicitly supplied user is honored over the token owner: naming a
+        # user in a realm without a strict PIN policy uses that user's policies,
+        # so the weak PIN is accepted. The owner's home-realm policy is only used
+        # as a fallback when no user is supplied (empty request.User).
+        req.all_data = {"serial": "PINBYSERIAL", "pin": "12",
+                        "user": "cornelius", "realm": self.realm1}
+        req.User = User("cornelius", self.realm1)
+        self.assertTrue(check_otp_pin(req))
+
+        delete_policy("pol1")
+        remove_token("PINBYSERIAL")
+        delete_realm("home")
+
+    def test_09c_random_pin_contents_uses_param_user(self):
+        # init_random_pin must resolve the OTPPINCONTENTS policy with the same
+        # user as the OTPPINRANDOM lookup (the enrollment user from the request
+        # params), not request.User. When request.User is empty but the params
+        # carry the user (e.g. a realm injected by realmadmin), the user-scoped
+        # contents policy must still apply to the generated PIN.
+        create_realm("home", [{'name': self.resolvername1}])
+        g.logged_in_user = {"username": "super",
+                            "realm": "",
+                            "role": "admin"}
+        builder = EnvironBuilder(method='POST', headers={})
+        env = builder.get_environ()
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+
+        # Enrollment generates a random PIN of length 12 (SCOPE.ENROLL) whose
+        # contents must include a special character (OTPPINCONTENTS "s",
+        # SCOPE.ADMIN, realm-scoped). "s" is a deterministic discriminator: the
+        # fallback generate_password() charset is alphanumeric only, so a special
+        # character can only appear when the contents policy was actually applied.
+        set_policy(name="pol_rand", scope=SCOPE.ENROLL,
+                   action=f"{PolicyAction.OTPPINRANDOM}=12",
+                   realm="home")
+        set_policy(name="pol_contents", scope=SCOPE.ADMIN,
+                   action=f"{PolicyAction.OTPPINCONTENTS}=s",
+                   realm="home")
+        g.policy_object = PolicyClass()
+
+        # Admin enrolls for cornelius@home: the user is in the params, but
+        # request.User is empty.
+        req.all_data = {"type": "hotp", "user": "cornelius", "realm": "home"}
+        req.User = User()
+        self.assertTrue(init_random_pin(req))
+
+        # The realm-scoped contents policy was resolved via the param user (not
+        # the empty request.User), so the generated PIN has the configured length
+        # and contains a special character.
+        pin = req.all_data["pin"]
+        self.assertEqual(12, len(pin), pin)
+        self.assertTrue(any(not c.isalnum() for c in pin), pin)
+
+        delete_policy("pol_rand")
+        delete_policy("pol_contents")
+        delete_realm("home")
+
+    def test_01b_token_specific_pin_policy(self):
+        create_realm("home", [{'name': self.resolvername1}])
+        g.logged_in_user = {"username": "super",
+                            "realm": "",
+                            "role": "admin"}
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "OATH123456"},
+                                 headers={})
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+
+        # Set a policy that defines a default PIN policy
+        set_policy(name="pol1",
+                   scope=SCOPE.ADMIN,
+                   action=f"{PolicyAction.OTPPINMAXLEN}=10,{PolicyAction.OTPPINMINLEN}=4,"
+                          f"{PolicyAction.OTPPINCONTENTS}=cn",
+                   realm="home")
+
+        # Set a policy that defines a SPASS PIN policy
+        set_policy(name="pol2",
+                   scope=SCOPE.ADMIN,
+                   action="spass_otp_pin_maxlength=11,spass_otp_pin_minlength=8,"
+                          "spass_otp_pin_contents=n",
+                   realm="home")
+        g.policy_object = PolicyClass()
+
+        req.all_data = {"user": "cornelius",
+                        "realm": "home",
+                        "pin": "123456",
+                        "type": "spass"}
+        req.User = User("cornelius", "home")
+        # The minimum OTP length is 8
+        self.assertRaises(PolicyError, check_otp_pin, req)
+
+        req.all_data = {"user": "cornelius",
+                        "realm": "home",
+                        "type": "spass",
+                        "pin": "12345678901"}
+        # The maximum PIN length of 11 is ok.
+        r = check_otp_pin(req)
+        self.assertTrue(r)
+
+        req.all_data = {"user": "cornelius",
+                        "realm": "home",
+                        "type": "spass",
+                        "pin": "abcdefghij"}
+        # Good OTP length, but missing numbers
+        self.assertRaises(PolicyError, check_otp_pin, req)
+
+        # finally delete policy
+        delete_policy("pol1")
+        delete_realm("home")

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  http://www.privacyidea.org
 #  2018-04-16 Friedrich Weber <friedrich.weber@netknights.it>
 #             Fix validation of challenge responses
@@ -30,7 +28,7 @@ detailed enrollment information.
 For a description of the TiQR protocol see
 
 * https://www.usenix.org/legacy/events/lisa11/tech/full_papers/Rijswijk.pdf
-* https://github.com/SURFnet/tiqr/wiki/Protocol-documentation.
+* https://github.com/Tiqr/tiqr/wiki/Protocol-documentation.
 * https://tiqr.org
 
 The TiQR token is based on the OCRA algorithm. It lets you authenticate
@@ -38,7 +36,7 @@ with your smartphone by scanning a QR code.
 
 The TiQR token is enrolled via /token/init, but it requires no otpkey, since
 the otpkey is generated on the smartphone and pushed to the privacyIDEA
-server in a seconds step.
+server in a second step.
 
 Enrollment
 ----------
@@ -80,36 +78,32 @@ the token in challenge response.
 This code is tested in tests/test_lib_tokens_tiqr.
 """
 
-from six.moves.urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus
 
-from privacyidea.api.lib.utils import getParam
+from privacyidea.lib.params import get_optional, get_required
 from privacyidea.lib.config import get_from_config
-from privacyidea.lib.tokenclass import TokenClass, AUTHENTICATIONMODE, CLIENTMODE
+from privacyidea.lib.tokenclass import TokenClass, AuthenticationMode, ClientMode
 from privacyidea.lib.log import log_with
 from privacyidea.lib.crypto import generate_otpkey
 from privacyidea.lib.utils import create_img
 import logging
-from privacyidea.lib.token import get_one_token
+from privacyidea.lib.token import get_one_token, create_challenge
 from privacyidea.lib.error import ParameterError
-from privacyidea.models import Challenge
-from privacyidea.lib.user import get_user_from_param
-from privacyidea.lib.tokens.ocra import OCRASuite, OCRA
+from privacyidea.lib.tokens.ocra import OCRASuite
 from privacyidea.lib.challenge import get_challenges
-from privacyidea.models import cleanup_challenges
 from privacyidea.lib import _
 from privacyidea.lib.decorators import check_token_locked
 from privacyidea.lib.tokens.ocratoken import OcraTokenClass
-from privacyidea.lib.policy import SCOPE, ACTION, GROUP
+from privacyidea.lib.policy import SCOPE, GROUP
+from privacyidea.lib.policies.actions import PolicyAction
 
 log = logging.getLogger(__name__)
-optional = True
-required = False
 
 
 OCRA_DEFAULT_SUITE = "OCRA-1:HOTP-SHA1-6:QN10"
 
 
-class API_ACTIONS(object):
+class API_ACTIONS:
     METADATA = "metadata"
     ENROLLMENT = "enrollment"
     AUTHENTICATION = "authentication"
@@ -120,8 +114,10 @@ class TiqrTokenClass(OcraTokenClass):
     """
     The TiQR Token implementation.
     """
-    mode = [AUTHENTICATIONMODE.AUTHENTICATE, AUTHENTICATIONMODE.CHALLENGE, AUTHENTICATIONMODE.OUTOFBAND]
-    client_mode = CLIENTMODE.POLL
+    mode = [AuthenticationMode.AUTHENTICATE, AuthenticationMode.CHALLENGE, AuthenticationMode.OUTOFBAND]
+    client_mode = ClientMode.POLL
+
+    owned_tokeninfo_keys = frozenset({"session"})
 
     @staticmethod
     def get_class_type():
@@ -164,12 +160,12 @@ class TiqrTokenClass(OcraTokenClass):
                'ui_enroll': ["admin", "user"],
                'policy': {
                    SCOPE.ENROLL: {
-                       ACTION.MAXTOKENUSER: {
+                       PolicyAction.MAXTOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of TiQR tokens assigned."),
                            'group': GROUP.TOKEN
                        },
-                       ACTION.MAXACTIVETOKENUSER: {
+                       PolicyAction.MAXACTIVETOKENUSER: {
                            'type': 'int',
                            'desc': _(
                                "The user may only have this maximum number of active TiQR tokens assigned."),
@@ -195,7 +191,7 @@ class TiqrTokenClass(OcraTokenClass):
         :type db_token: DB object
         """
         TokenClass.__init__(self, db_token)
-        self.set_type(u"tiqr")
+        self.set_type("tiqr")
         self.hKeyRequired = False
 
     def update(self, param):
@@ -211,11 +207,11 @@ class TiqrTokenClass(OcraTokenClass):
         # smartphone needs to contain a userId.
         if not self.user:
             # The user and realms should have already been set in init_token()
-            raise ParameterError("Missing parameter: {0!r}".format("user"), id=905)
+            raise ParameterError("Missing parameter: {!r}".format("user"), id=905)
 
         ocrasuite = get_from_config("tiqr.ocrasuite") or OCRA_DEFAULT_SUITE
         OCRASuite(ocrasuite)
-        self.add_tokeninfo("ocrasuite", ocrasuite)
+        self.write_tokeninfo("ocrasuite", ocrasuite)
         TokenClass.update(self, param)
 
     @log_with(log)
@@ -226,14 +222,12 @@ class TiqrTokenClass(OcraTokenClass):
         response_detail = TokenClass.get_init_detail(self, params, user)
         params = params or {}
         enroll_url = get_from_config("tiqr.regServer")
-        log.info("using tiqr.regServer for enrollment: {0!s}".format(enroll_url))
+        log.info(f"using tiqr.regServer for enrollment: {enroll_url!s}")
         serial = self.token.serial
         session = generate_otpkey()
         # save the session in the token
-        self.add_tokeninfo("session", session)
-        tiqrenroll = "tiqrenroll://{0!s}?action={1!s}&session={2!s}&serial={3!s}".format(
-            enroll_url, API_ACTIONS.METADATA,
-            session, serial)
+        self.write_tokeninfo("session", session)
+        tiqrenroll = f"tiqrenroll://{enroll_url!s}?action={API_ACTIONS.METADATA!s}&session={session!s}&serial={serial!s}"
 
         response_detail["tiqrenroll"] = {"description":
                                                     _("URL for TiQR "
@@ -255,15 +249,14 @@ class TiqrTokenClass(OcraTokenClass):
         :return: Flask Response or text
         """
         params = request.all_data
-        action = getParam(params, "action", optional) or \
+        action = get_optional(params, "action") or \
                  API_ACTIONS.AUTHENTICATION
         if action not in API_ACTIONS.ALLOWED_ACTIONS:
-            raise ParameterError("Allowed actions are {0!s}".format(
-                                 API_ACTIONS.ALLOWED_ACTIONS))
+            raise ParameterError(f"Allowed actions are {API_ACTIONS.ALLOWED_ACTIONS!s}")
 
         if action == API_ACTIONS.METADATA:
-            session = getParam(params, "session", required)
-            serial = getParam(params, "serial", required)
+            session = get_required(params, "session")
+            serial = get_required(params, "serial")
             # The user identifier is displayed in the App
             # We need to set the user ID
             token = get_one_token(serial=serial, tokentype="tiqr")
@@ -285,13 +278,10 @@ class TiqrTokenClass(OcraTokenClass):
                        "logoUrl": logo_url,
                        "infoUrl": info_url,
                        "authenticationUrl":
-                           "{0!s}".format(auth_server),
+                           f"{auth_server!s}",
                        "ocraSuite": ocrasuite,
                        "enrollmentUrl":
-                           "{0!s}?action={1!s}&session={2!s}&serial={3!s}".format(
-                               reg_server,
-                               API_ACTIONS.ENROLLMENT,
-                               session, serial)
+                           f"{reg_server!s}?action={API_ACTIONS.ENROLLMENT!s}&session={session!s}&serial={serial!s}"
                        }
             identity = {"identifier": user_identifier,
                         "displayName": user_displayname
@@ -314,9 +304,9 @@ class TiqrTokenClass(OcraTokenClass):
             serial:
             """
             res = "Fail"
-            serial = getParam(params, "serial", required)
-            session = getParam(params, "session", required)
-            secret = getParam(params, "secret", required)
+            serial = get_required(params, "serial")
+            session = get_required(params, "session")
+            secret = get_required(params, "secret")
             # The secret needs to be stored in the token object.
             # We take the token "serial" and check, if it contains the "session"
             # in the tokeninfo.
@@ -326,7 +316,7 @@ class TiqrTokenClass(OcraTokenClass):
                 # save the secret
                 enroll_token.set_otpkey(secret)
                 # delete the session
-                enroll_token.del_tokeninfo("session")
+                enroll_token.remove_tokeninfo("session")
                 res = "OK"
             else:
                 raise ParameterError("Invalid Session")
@@ -334,10 +324,10 @@ class TiqrTokenClass(OcraTokenClass):
             return "plain", res
         elif action == API_ACTIONS.AUTHENTICATION:
             res = "FAIL"
-            userId = getParam(params, "userId", required)
-            session = getParam(params, "sessionKey", required)
-            passw = getParam(params, "response", required)
-            operation = getParam(params, "operation", required)
+            get_required(params, "userId")
+            session = get_required(params, "sessionKey")
+            passw = get_required(params, "response")
+            get_required(params, "operation")
             res = "INVALID_CHALLENGE"
             # The sessionKey is stored in the db_challenge.transaction_id
             # We need to get the token serial for this sessionKey
@@ -365,10 +355,11 @@ class TiqrTokenClass(OcraTokenClass):
                             token.inc_failcount()
                             fail = token.get_failcount()
                             maxfail = token.get_max_failcount()
-                            res = "INVALID_RESPONSE:{0!s}".format(maxfail - fail)
+                            res = f"INVALID_RESPONSE:{maxfail - fail!s}"
                             break
-
-            cleanup_challenges()
+                if not challenge.is_valid():
+                    # The challenge is not valid anymore. We delete the challenge.
+                    challenge.delete()
 
             return "plain", res
 
@@ -416,27 +407,20 @@ class TiqrTokenClass(OcraTokenClass):
         challenge = os.create_challenge()
 
         # Create the challenge in the database
-        db_challenge = Challenge(self.token.serial,
-                                 transaction_id=transactionid,
-                                 challenge=challenge,
-                                 data=None,
-                                 session=options.get("session"),
-                                 validitytime=validity)
-        db_challenge.save()
+        db_challenge = create_challenge(self.token.serial,
+                                        transaction_id=transactionid,
+                                        challenge=challenge,
+                                        session=options.get("session"),
+                                        validitytime=validity)
 
         # Encode the user to UTF-8 and quote the result
         encoded_user_identifier = quote_plus(user_identifier.encode('utf-8'))
-        authurl = u"tiqrauth://{0!s}@{1!s}/{2!s}/{3!s}/{4!s}".format(
-                                              encoded_user_identifier,
-                                              service_identifier,
-                                              db_challenge.transaction_id,
-                                              challenge,
-                                              quote(service_displayname))
+        authurl = f"tiqrauth://{encoded_user_identifier!s}@{service_identifier!s}/{db_challenge.transaction_id!s}/{challenge!s}/{quote(service_displayname)!s}"
         image = create_img(authurl)
         attributes = {"img": image,
                       "value": authurl,
-                      "poll": self.client_mode == CLIENTMODE.POLL,
-                      "hideResponseInput": self.client_mode != CLIENTMODE.INTERACTIVE}
+                      "poll": self.client_mode == ClientMode.POLL,
+                      "hideResponseInput": self.client_mode != ClientMode.INTERACTIVE}
         reply_dict = {"attributes": attributes,
                       "image": image}
 

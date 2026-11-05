@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 # http://www.privacyidea.org
 # (c) cornelius kölbel, privacyidea.org
 #
@@ -39,15 +37,33 @@
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-__doc__ = """This module contains the REST API for doing authentication.
-The methods are tested in the file tests/test_api_validate.py
+__doc__ = """
+The validate REST API verifies one-time passwords, drives challenge-
+response flows, and supports out-of-band token polling. It is the
+endpoint group that consumers (RADIUS plugins, SAML adapters, PAM
+modules, web applications) call to actually authenticate a user.
 
-Authentication is either done by providing a username and a password or a
-serial number and a password.
+This is distinct from :ref:`rest_auth`, which issues the JWT-based
+admin/user session tokens for the management API.
+
+The endpoints fall in five groups:
+
+* :http:post:`/validate/check` — verify a user/serial + password and,
+  for challenge-response tokens, trigger or complete the challenge.
+  The ``/validate/radiuscheck`` URL alias shapes the response into
+  RADIUS-friendly status codes (204 / 400) for protocol adapters.
+* :http:post:`/validate/triggerchallenge` — admin-only, requires the
+  ``triggerchallenge`` policy. Forces a challenge for every matching
+  challenge-response token of a user.
+* :http:get:`/validate/polltransaction` — anonymous. Out-of-band
+  tokens (push, container) poll this to see whether a challenge has
+  been answered.
+* :http:post:`/validate/initialize` — anonymous. Bootstraps a
+  FIDO2/passkey challenge before login.
+* :http:post:`/validate/offlinerefill` — refills the OTP buffer of a
+  token attached to a machine for offline use.
 
 **Authentication workflow**
-
-Authentication workflow is like this:
 
 In case of authenticating a user:
 
@@ -57,7 +73,7 @@ In case of authenticating a user:
  * :func:`privacyidea.lib.tokenclass.TokenClass.check_pin`
  * :func:`privacyidea.lib.tokenclass.TokenClass.check_otp`
 
-In case if authenticating a serial number:
+In case of authenticating a serial number:
 
  * :func:`privacyidea.lib.token.check_serial_pass`
  * :func:`privacyidea.lib.token.check_token_list`
@@ -65,52 +81,87 @@ In case if authenticating a serial number:
  * :func:`privacyidea.lib.tokenclass.TokenClass.check_pin`
  * :func:`privacyidea.lib.tokenclass.TokenClass.check_otp`
 
+See :ref:`client_modes` for the per-token-type interaction model that
+clients consume from challenge responses.
 """
-from flask import (Blueprint, request, g, current_app)
-from privacyidea.lib.user import get_user_from_param, log_used_user
-from .lib.utils import send_result, getParam
-from ..lib.decorators import (check_user_or_serial_in_request)
-from .lib.utils import required
-from privacyidea.lib.error import ParameterError
-from privacyidea.lib.token import (check_user_pass, check_serial_pass,
-                                   check_otp, create_challenges_from_tokens, get_one_token)
-from privacyidea.lib.utils import is_true
-from privacyidea.api.lib.utils import get_all_params
-from privacyidea.lib.config import (return_saml_attributes, get_from_config,
-                                    return_saml_attributes_on_fail,
-                                    SYSCONF, ensure_no_config_object)
-from privacyidea.lib.audit import getAudit
+
+import copy
+import json
+import logging
+import threading
+
+from flask import (Blueprint, request, g, Response)
+from flask_babel import _
+
+from privacyidea.api.auth import admin_required
 from privacyidea.api.lib.decorators import add_serial_from_response_to_g
-from privacyidea.api.lib.prepolicy import (prepolicy, set_realm,
-                                           api_key_required, mangle,
-                                           save_client_application_type,
-                                           check_base_action, pushtoken_wait, webauthntoken_auth, webauthntoken_authz,
-                                           webauthntoken_request, check_application_tokentype,
-                                           increase_failcounter_on_challenge)
 from privacyidea.api.lib.postpolicy import (postpolicy,
                                             check_tokentype, check_serial,
                                             check_tokeninfo,
                                             no_detail_on_fail,
                                             no_detail_on_success, autoassign,
                                             offline_info,
-                                            add_user_detail_to_response, construct_radius_response,
+                                            add_user_detail_to_response,
                                             mangle_challenge_response, is_authorized,
                                             multichallenge_enroll_via_validate, preferred_client_mode)
-from privacyidea.lib.policy import PolicyClass
-from privacyidea.lib.event import EventConfiguration
-import logging
-from privacyidea.api.register import register_blueprint
+from privacyidea.api.lib.prepolicy import (prepolicy, set_realm,
+                                           api_key_required, mangle,
+                                           save_client_application_type,
+                                           check_base_action, pushtoken_validate, fido2_auth,
+                                           webauthntoken_authz,
+                                           webauthntoken_request, check_application_tokentype,
+                                           increase_failcounter_on_challenge, get_first_policy_value, fido2_enroll,
+                                           disabled_token_types, load_challenge_text)
+from privacyidea.api.lib.conditional_access import (conditional_access_gate, conditional_access_precheck,
+                                                    REMEMBER_DEVICE_REJECTION)
+from privacyidea.api.lib.utils import (get_all_params, get_before_request_config, get_optional_one_of, get_optional,
+                                       INTERNAL_OPTION_KEYS)
 from privacyidea.api.recover import recover_blueprint
-from privacyidea.lib.utils import get_client_ip
-from privacyidea.lib.event import event
-from privacyidea.lib.challenge import get_challenges, extract_answered_challenges
-from privacyidea.lib.subscriptions import CheckSubscription
-from privacyidea.api.auth import admin_required
-from privacyidea.lib.policy import ACTION
-from privacyidea.lib.token import get_tokens
-from privacyidea.lib.machine import list_machine_tokens
+from privacyidea.lib.remembered_device import (create_remembered_device, consume_remember_device_cookie,
+                                               user_identity, count_user_devices, apply_cookie_action,
+                                               CookieAction, PERSISTENT_COOKIE_NAME, RememberStatus,
+                                               handle_device_theft)
+from privacyidea.api.register import register_blueprint
 from privacyidea.lib.applications.offline import MachineApplication
-import json
+from privacyidea.lib.challenge import get_challenges, extract_answered_challenges, cancel_enrollment_via_multichallenge
+from privacyidea.lib.config import ensure_no_config_object, get_privacyidea_node
+from privacyidea.lib.container import find_container_for_token, find_container_by_serial, check_container_challenge
+from privacyidea.lib.error import (ParameterError, PolicyError, ResourceNotFoundError, Error, AuthError, UserError,
+                                   TokenAdminError, EnrollmentError)
+from privacyidea.lib.event import event
+from privacyidea.lib.machine import list_machine_tokens, get_auth_items, attach_token
+from privacyidea.lib.policy import Match
+from privacyidea.lib.policy import SCOPE
+from privacyidea.lib.policydecorators import reset_all_user_tokens_active, reset_token_failcounters
+from privacyidea.lib.subscriptions import CheckSubscription
+from privacyidea.lib.token import (check_user_pass, check_serial_pass,
+                                   check_otp, create_challenges_from_tokens, get_one_token)
+from privacyidea.lib.token import get_tokens
+from privacyidea.lib.tokenclass import CHALLENGE_REFUSAL_STATUS
+from privacyidea.lib.tokenrolloutstate import RolloutState
+from privacyidea.lib.tokens.passkeytoken import PasskeyTokenClass
+from privacyidea.lib.tokens.webauthntoken import WebAuthnTokenClass
+from privacyidea.lib.user import log_used_user, User, split_user
+from privacyidea.lib.utils import get_plugin_info_from_useragent, AUTH_RESPONSE
+from privacyidea.lib.utils import is_true, get_computer_name_from_user_agent
+from .lib.policyhelper import check_last_auth_policy, get_realm_for_authentication
+from .lib.utils import (get_required, get_auth_error_status_code, send_error, send_result,
+                        log_authentication, pop_auth_event_reason, pop_auth_event_serials)
+from ..lib.conditional_access.authentication_event_types import (AuthEventType, AuthEventReason,
+                                                                AUTH_EVENT_TYPE_KEY, AUTH_EVENT_REASON_KEY,
+                                                                AUTH_EVENT_REASON_DETAIL_KEY,
+                                                                AUTH_EVENT_SERIALS_KEY, build_reason_detail,
+                                                                LOG_TRANSACTION_ID_KEY)
+from ..lib.conditional_access.request_context import continue_attempt, confirm_attempt
+from ..lib.decorators import (check_user_serial_or_cred_id_in_request)
+from ..lib.fido2.challenge import create_fido2_challenge, verify_fido2_challenge
+from ..lib.fido2.policy_action import FIDO2PolicyAction
+from ..lib.fido2.util import (get_fido2_token_by_credential_id, get_fido2_token_by_transaction_id,
+                              token_belongs_to_user)
+from ..lib.framework import get_app_config_value
+from ..lib.policies.actions import PolicyAction
+from ..lib.realm import get_default_realm
+from ..lib.users.internal_user_attributes import InternalUserAttributes
 
 log = logging.getLogger(__name__)
 
@@ -125,84 +176,210 @@ def before_request():
     This is executed before the request
     """
     ensure_no_config_object()
-    request.all_data = get_all_params(request)
-    request.User = get_user_from_param(request.all_data)
-    privacyidea_server = current_app.config.get("PI_AUDIT_SERVERNAME") or \
-                         request.host
-    # Create a policy_object, that reads the database audit settings
-    # and contains the complete policy definition during the request.
-    # This audit_object can be used in the postpolicy and prepolicy and it
-    # can be passed to the innerpolicies.
+    # Save the request data
+    g.request_data = get_all_params(request)
+    request.all_data = copy.deepcopy(g.request_data)
 
-    g.policy_object = PolicyClass()
+    # Join the attempt here because the attempt id lives in the challenge, which the token logic deletes once
+    # answered, leaving nothing to read it from later. ``state`` is the RADIUS alias of ``transaction_id``.
+    continue_attempt(get_optional_one_of(request.all_data, ["transaction_id", "state"]))
 
-    g.audit_object = getAudit(current_app.config, g.startdate)
-    g.event_config = EventConfiguration()
-    # access_route contains the ip addresses of all clients, hops and proxies.
-    g.client_ip = get_client_ip(request, get_from_config(SYSCONF.OVERRIDECLIENT))
-    # Save the HTTP header in the localproxy object
-    g.request_headers = request.headers
-    g.serial = getParam(request.all_data, "serial", default=None)
+    privacyidea_server = get_app_config_value("PI_AUDIT_SERVERNAME", get_privacyidea_node(request.host))
+    get_before_request_config()
+    g.serial = get_optional(request.all_data, "serial", default=None)
+    ua_name, ua_version, _ua_comment = get_plugin_info_from_useragent(request.user_agent.string)
+    g.user_agent = ua_name
+
+    # Log the request before the user is resolved. Resolving raises if the requested realm
+    # or resolver does not exist, and such a request has to appear in the audit log as
+    # well. The user is logged the way it was requested and is replaced by the resolved
+    # user further down.
     g.audit_object.log({"success": False,
                         "action_detail": "",
                         "client": g.client_ip,
-                        "client_user_agent": request.user_agent.browser,
+                        "user_agent": ua_name,
+                        "user_agent_version": ua_version,
                         "privacyidea_server": privacyidea_server,
-                        "action": "{0!s} {1!s}".format(request.method, request.url_rule),
-                        "info": ""})
+                        "action": f"{request.method!s} {request.url_rule!s}",
+                        "thread_id": f"{threading.current_thread().ident!s}",
+                        "info": "",
+                        "user": request.all_data.get("user") or "",
+                        "realm": request.all_data.get("realm") or "",
+                        "resolver": request.all_data.get("resolver") or ""})
+
+    # Get user
+    username = request.all_data.get("user", "")
+    username, realm = split_user(username)
+    realm = request.all_data.get("realm", realm)
+    if username and not realm:
+        realm = get_default_realm()
+    # Check if a policy defines the realm
+    realm = get_realm_for_authentication(g, username, realm)
+    resolver = request.all_data.get("resolver")
+    request.User = User(username, realm, resolver)
+    request.all_data["realm"] = realm
+
+    # Replace the requested user with the user it was resolved to
+    g.audit_object.log({
+        "user": request.User.login,
+        "resolver": request.User.resolver,
+        "realm": request.User.realm})
 
 
 @validate_blueprint.route('/offlinerefill', methods=['POST'])
-@check_user_or_serial_in_request(request)
+@check_user_serial_or_cred_id_in_request(request)
 @event("validate_offlinerefill", request, g)
 def offlinerefill():
     """
-    This endpoint allows to fetch new offline OTP values for a token,
-    that is already offline.
-    According to the definition it will send the missing OTP values, so that
-    the client will have as much otp values as defined.
+    Replenish the OTP buffer of a token that is attached to a machine
+    for offline use. Each successful refill rotates the
+    ``refilltoken`` so that the previous one cannot be reused.
 
-    :param serial: The serial number of the token, that should be refilled.
-    :param refilltoken: The authorization token, that allows refilling.
-    :param pass: the last password (maybe password+OTP) entered by the user
-    :return:
+    For HOTP tokens, the response carries enough fresh OTP values to
+    bring the offline buffer back up to the configured count. The
+    caller must supply the last password (PIN+OTP) the end user
+    entered so the server can advance the counter to the right
+    position. For WebAuthn / Passkey tokens, the response carries
+    only the new ``refilltoken`` and the WebAuthn/Passkey machine
+    name is read from the user agent string; ``pass`` should be an
+    empty string in that case.
+
+    The response carries the new ``refilltoken``, the token serial,
+    and the OTP material under
+    ``response.auth_items.offline``. Failures may be masked into a
+    generic error by the
+    ``hide_specific_error_message_for_offline_refill`` token-scope
+    policy.
+
+    :jsonparam serial: token serial number (required).
+    :jsonparam refilltoken: the refill authorization token issued on
+        the previous refill (or, for HOTP tokens, by the first online
+        ``/validate/check`` that returned the offline bag) (required).
+    :jsonparam pass: the last PIN+OTP the user entered (required;
+        empty string for WebAuthn / Passkey).
+    :status 200: refill payload in the response body, with the new
+        ``refilltoken`` and OTP material under
+        ``auth_items.offline``.
+    :status 400: the token does not exist, is not marked for offline
+        use, the refilltoken is wrong, or the calling machine cannot
+        be identified from the user agent (WebAuthn/Passkey).
     """
-    serial = getParam(request.all_data, "serial", required)
-    refilltoken = getParam(request.all_data, "refilltoken", required)
-    password = getParam(request.all_data, "pass", required)
-    tokenobj_list = get_tokens(serial=serial)
-    if len(tokenobj_list) != 1:
-        raise ParameterError("The token does not exist")
-    else:
-        tokenobj = tokenobj_list[0]
-        tokenattachments = list_machine_tokens(serial=serial, application="offline")
-        if tokenattachments:
+    serial = get_required(request.all_data, "serial")
+    refilltoken_request = get_required(request.all_data, "refilltoken")
+    password = get_required(request.all_data, "pass", allow_empty=True)
+    try:
+        tokens = get_tokens(serial=serial)
+        if len(tokens) != 1:
+            raise ParameterError(_("The token does not exist"))
+
+        token = tokens[0]
+        # check if token is disabled or otherwise not fit for auth
+        message_list = []
+        if not token.check_all(message_list):
+            log.info(f"Failed to offline refill: {message_list}")
+            raise ParameterError(_("The token is not valid."))
+        token_attachments = list_machine_tokens(serial=serial, application="offline")
+        if token_attachments:
             # TODO: Currently we do not distinguish, if a token had more than one offline attachment
-            # We need the options to pass the count and the rounds for the next offline OTP values,
-            # which could have changed in the meantime.
-            options = tokenattachments[0].get("options")
-            # check refill token:
-            if tokenobj.get_tokeninfo("refilltoken") == refilltoken:
-                # refill
-                otps = MachineApplication.get_refill(tokenobj, password, options)
-                refilltoken = MachineApplication.generate_new_refilltoken(tokenobj)
+            # check refill token depending on token type
+            refilltoken_stored = None
+            if token.type.lower() == "hotp":
+                refilltoken_stored = token.get_tokeninfo("refilltoken")
+            elif token.type.lower() in ["webauthn", "passkey"]:
+                computer_name = get_computer_name_from_user_agent(request.user_agent.string)
+                if not computer_name:
+                    log.warning(f"Unable to refill because user agent does not contain a valid machine name: "
+                                f"{request.user_agent.string}")
+                    raise ParameterError(_("Machine can not be identified by user agent!"))
+                refilltoken_stored = token.get_tokeninfo("refilltoken_" + computer_name)
+
+            if refilltoken_stored and refilltoken_stored == refilltoken_request:
+                # We need the options to pass the count and the rounds for the next offline OTP values,
+                # which could have changed in the meantime.
+                options = token_attachments[0].get("options")
+                otps = MachineApplication.get_refill(token, password, options)
+                refilltoken_new = MachineApplication.generate_new_refilltoken(token, request.user_agent.string)
                 response = send_result(True)
                 content = response.json
-                content["auth_items"] = {"offline": [{"refilltoken": refilltoken,
+                content["auth_items"] = {"offline": [{"refilltoken": refilltoken_new,
                                                       "response": otps,
                                                       "serial": serial}]}
                 response.set_data(json.dumps(content))
                 return response
-        raise ParameterError("Token is not an offline token or refill token is incorrect")
+        raise ParameterError(_("Token is not an offline token or refill token is incorrect"))
+
+    except Exception as e:
+        if Match.user(
+                g,
+                scope=SCOPE.TOKEN,
+                action=PolicyAction.HIDE_SPECIFIC_ERROR_MESSAGE_FOR_OFFLINE_REFILL,
+                user_object=request.User if hasattr(request, "User") else None).any():
+            return send_error("Failed offline token refill", error_code=Error.VALIDATE), get_auth_error_status_code(e)
+        raise
+
+
+def _conditional_access_identity():
+    """
+    Resolve the identity the conditional-access pre-check must gate on, for the endpoints that accept a token
+    instead of a user: ``/validate/check`` and ``/validate/triggerchallenge``.
+
+    ``before_request`` builds ``request.User`` from the ``user`` parameter only, so a username-less passkey request
+    (identified by ``credential_id``) or a serial-only request arrives without a login name, at most with a realm —
+    and the user-lock / DENY checks would be silently skipped, letting a locked user authenticate by credential id or
+    serial, or an admin trigger a challenge that pushes a prompt to a locked user's phone. Resolve the token owner in
+    that case so the lock is enforced before any token work runs.
+
+    Both endpoints require a ``user``, a ``serial`` or a ``credential_id``
+    (:class:`~privacyidea.lib.decorators.check_user_serial_or_cred_id_in_request`), so between them these three
+    cover every request that can reach the gate. Falls back to the (empty) request user when no owner can be
+    resolved, so the IP-block check still applies. That costs a user-scoped check only on a request that cannot
+    authenticate anyway: the authenticating path repeats this lookup without ``silent_fail``
+    (:func:`~privacyidea.lib.token.check_serial_pass`), so a serial that does not resolve to exactly one token
+    raises there instead of authenticating - and the authentication-log row resolves the owner from the serial
+    itself, so an attempt that does reach a token is still counted.
+    """
+    if request.User and request.User.login:
+        return request.User
+    credential_id = get_optional_one_of(request.all_data, ["credential_id", "credentialid"])
+    serial = get_optional(request.all_data, "serial")
+    token = None
+    try:
+        if serial:
+            token = get_one_token(serial=serial, silent_fail=True)
+        elif credential_id:
+            # Only the credential-id lookup, while _handle_fido2_auth also falls back to the transaction id: a
+            # webauthn token predating the credential-id hash is invisible here but resolvable there. Unreachable in
+            # practice - a passkey is hashed at enrollment, the webauthn second leg carries the user - and not worth
+            # a challenge lookup plus otpkey decrypt on every request.
+            token = get_fido2_token_by_credential_id(credential_id)
+    except Exception as ex:
+        log.debug(f"Conditional-access pre-check could not resolve a token owner: {ex!r}")
+    return token.user if (token and token.user) else request.User
+
+
+def _challenge_owner(challenge) -> User:
+    """
+    Resolve the owner (a token owner or the first container user) of a single
+    challenge. Returns an empty :class:`User` when no owner can be resolved.
+    """
+    challenge_type = challenge.get_data().get("type", "token")
+    try:
+        if challenge_type == "container":
+            users = find_container_by_serial(challenge.serial).get_users()
+            return users[0] if users else User()
+        token = get_one_token(serial=challenge.serial, silent_fail=True)
+        return token.user if (token and token.user) else User()
+    except Exception as ex:
+        log.debug(f"Could not resolve the owner of challenge {challenge.serial}: {ex!r}")
+        return User()
 
 
 @validate_blueprint.route('/check', methods=['POST', 'GET'])
 @validate_blueprint.route('/radiuscheck', methods=['POST', 'GET'])
-@validate_blueprint.route('/samlcheck', methods=['POST', 'GET'])
 @postpolicy(is_authorized, request=request)
-@postpolicy(mangle_challenge_response, request=request)
-@postpolicy(construct_radius_response, request=request)
 @postpolicy(multichallenge_enroll_via_validate, request=request)
+@postpolicy(mangle_challenge_response, request=request)
+@postpolicy(preferred_client_mode, request=request)
 @postpolicy(no_detail_on_fail, request=request)
 @postpolicy(no_detail_on_success, request=request)
 @postpolicy(add_user_detail_to_response, request=request)
@@ -211,53 +388,83 @@ def offlinerefill():
 @postpolicy(check_tokentype, request=request)
 @postpolicy(check_serial, request=request)
 @postpolicy(autoassign, request=request)
-@postpolicy(preferred_client_mode, request=request)
 @add_serial_from_response_to_g
 @prepolicy(check_application_tokentype, request=request)
-@prepolicy(pushtoken_wait, request=request)
+@prepolicy(pushtoken_validate, request=request)
 @prepolicy(set_realm, request=request)
 @prepolicy(mangle, request=request)
+# Below set_realm and mangle in particular, because both *rewrite the identity*
+# Besides of them, CA gate should the first step to run before any other authentication step starts
+@conditional_access_gate(_conditional_access_identity)
 @prepolicy(increase_failcounter_on_challenge, request=request)
 @prepolicy(save_client_application_type, request=request)
 @prepolicy(webauthntoken_request, request=request)
 @prepolicy(webauthntoken_authz, request=request)
-@prepolicy(webauthntoken_auth, request=request)
-@check_user_or_serial_in_request(request)
+@prepolicy(disabled_token_types, request=request)
+@prepolicy(load_challenge_text, request=request)
+@prepolicy(fido2_auth, request=request)
+@check_user_serial_or_cred_id_in_request(request)
 @CheckSubscription(request)
 @prepolicy(api_key_required, request=request)
 @event("validate_check", request, g)
 def check():
     """
-    check the authentication for a user or a serial number.
-    Either a ``serial`` or a ``user`` is required to authenticate.
-    The PIN and OTP value is sent in the parameter ``pass``.
-    In case of successful authentication it returns ``result->value: true``.
+    Verify an authentication attempt.
 
-    In case of a challenge response authentication a parameter ``exception=1``
-    can be passed. This would result in a HTTP 500 Server Error response if
-    an error occurred during sending of SMS or Email.
+    The endpoint is bound to two URL paths that share the same
+    request shape but produce different response shapes for protocol
+    adapters:
 
-    In case ``/validate/radiuscheck`` is requested, the responses are
-    modified as follows: A successful authentication returns an empty ``HTTP
-    204`` response. An unsuccessful authentication returns an empty ``HTTP
-    400`` response. Error responses are the same responses as for the
-    ``/validate/check`` endpoint.
+    * ``/validate/check`` — standard JSON response, ``result.value``
+      is ``true`` / ``false``.
+    * ``/validate/radiuscheck`` — RADIUS adapter shape: the body is
+      always empty. A successful authentication returns ``204``; any
+      other outcome returns ``400``. Unlike ``/validate/check``, this
+      includes server-side faults (e.g. an unknown serial or an
+      internal error): they are collapsed into the same empty ``400``
+      rather than surfacing the JSON error body and its status code,
+      because a RADIUS adapter only consumes the status code. Inspect
+      the audit log or use ``/validate/check`` to diagnose failures.
 
-    :param serial: The serial number of the token, that tries to authenticate.
-    :param user: The loginname/username of the user, who tries to authenticate.
-    :param realm: The realm of the user, who tries to authenticate. If the
-        realm is omitted, the user is looked up in the default realm.
-    :param type: The tokentype of the tokens, that are taken into account during
-        authentication. Requires the *authz* policy :ref:`application_tokentype_policy`.
-        It is ignored when a distinct serial is given.
-    :param pass: The password, that consists of the OTP PIN and the OTP value.
-    :param otponly: If set to 1, only the OTP value is verified. This is used
-        in the management UI. Only used with the parameter serial.
-    :param transaction_id: The transaction ID for a response to a challenge
-        request
-    :param state: The state ID for a response to a challenge request
+    To return user attributes alongside the authentication result
+    (the former ``/validate/samlcheck`` use case), enable the AUTHZ
+    policies :ref:`policy_add_user_in_response` and/or
+    :ref:`policy_add_resolver_in_response` on ``/validate/check``;
+    the user info is then included under ``detail.user``.
 
-    :return: a json result with a boolean "result": true
+    Either ``user`` (with optional ``realm``) or ``serial`` is
+    required. The PIN+OTP is sent in ``pass``. Subsequent legs of a
+    challenge-response flow carry ``transaction_id`` (and any
+    additional fields the token type needs). The authorization
+    decision can be vetoed by the AUTHZ-scope ``authorized=deny_access``
+    policy (see :ref:`authorization_policies`).
+
+    :jsonparam serial: token serial. Either ``serial`` or ``user`` is
+        required.
+    :jsonparam user: login name of the user. Either ``serial`` or
+        ``user`` is required.
+    :jsonparam realm: realm of the user; defaults to the default
+        realm if omitted.
+    :jsonparam pass: PIN concatenated with OTP. For WebAuthn/Passkey
+        endpoints it may be empty.
+    :jsonparam type: restrict the authentication to tokens of this
+        type. Requires the AUTHZ policy
+        :ref:`application_tokentype_policy`. Ignored when a serial
+        is supplied.
+    :jsonparam otponly: ``1`` to skip the PIN check and only verify
+        the OTP value. Used by the management UI; only meaningful
+        with ``serial``.
+    :jsonparam transaction_id: transaction id for the second leg of
+        a challenge-response flow.
+    :jsonparam state: alias of ``transaction_id`` for legacy callers.
+    :jsonparam exception: ``1`` to surface delivery failures (SMS,
+        email, push) as HTTP 500 instead of returning a generic
+        challenge-creation error.
+    :jsonparam credential_id: FIDO2 credential id for passkey /
+        WebAuthn authentication.
+    :jsonparam cancel_enrollment: ``1`` together with
+        ``transaction_id`` cancels an in-progress
+        ``enroll_via_multichallenge`` flow without authenticating.
 
     **Example Validation Request**:
 
@@ -337,99 +544,822 @@ def check():
        this case.
 
 
-    **Example response** for a successful authentication with ``/samlcheck``:
-
-       .. sourcecode:: http
-
-           HTTP/1.1 200 OK
-           Content-Type: application/json
-
-            {
-              "detail": {
-                "message": "matching 1 tokens",
-                "serial": "PISP0000AB00",
-                "type": "spass"
-              },
-              "id": 1,
-              "jsonrpc": "2.0",
-              "result": {
-                "status": true,
-                "value": {"attributes": {
-                            "username": "koelbel",
-                            "realm": "themis",
-                            "mobile": null,
-                            "phone": null,
-                            "myOwn": "/data/file/home/koelbel",
-                            "resolver": "themis",
-                            "surname": "Kölbel",
-                            "givenname": "Cornelius",
-                            "email": null},
-                          "auth": true}
-              },
-              "version": "privacyIDEA unknown"
-            }
-
-    The response in ``value->attributes`` can contain additional attributes
-    (like "myOwn") which you can define in the LDAP resolver in the attribute
-    mapping.
     """
-    user = request.User
-    serial = getParam(request.all_data, "serial")
-    password = getParam(request.all_data, "pass", required)
-    otp_only = getParam(request.all_data, "otponly")
-    token_type = getParam(request.all_data, "type")
-    options = {"g": g,
-               "clientip": g.client_ip,
-               "user": user}
-    # Add all params to the options
-    for key, value in request.all_data.items():
-        if value and key not in ["g", "clientip", "user"]:
-            options[key] = value
+    # Handle Enrollment Cancellation (Immediate Return)
+    if is_true(request.all_data.get("cancel_enrollment")):
+        return _handle_enrollment_cancellation(request.all_data)
 
-    g.audit_object.log({"user": user.login,
-                        "resolver": user.resolver,
-                        "realm": user.realm})
+    # This dictionary carries state across the extracted helper functions
+    # to avoid changing the functional signatures of the underlying libraries yet.
+    context = {
+        "user": request.User,
+        "result": False,
+        "details": {},
+        "response_params": {},
+        "serial_list": [],
+        "is_container_challenge": False,
+        AUTH_EVENT_TYPE_KEY: None,
+        AUTH_EVENT_REASON_KEY: [],
+        AUTH_EVENT_REASON_DETAIL_KEY: None,
+        # Kept apart from ``serial_list``, which also feeds the audit entry (see _finalize_auth_response): the tokens
+        # a failure was made against belong on the authentication-log row alone.
+        AUTH_EVENT_SERIALS_KEY: [],
+        # Build the token options from the request, but strip the internal keys
+        "options": {k: v for k, v in request.all_data.items() if k not in INTERNAL_OPTION_KEYS}
+    }
+    # Add standard context to options and the user object again, because options is passed down to every function
+    context["options"].update({"g": g, "clientip": g.client_ip})
+    context["options"]["user"] = context["user"]
 
-    if serial:
-        if user:
-            # check if the given token belongs to the user
-            if not get_tokens(user=user, serial=serial, count=True):
-                raise ParameterError('Given serial does not belong to given user!')
-        if not otp_only:
-            success, details = check_serial_pass(serial, password, options=options)
+    # Dispatch to Logic Handlers
+    credential_id = get_optional_one_of(request.all_data, ["credential_id", "credentialid"])
+    serial = get_optional(request.all_data, "serial")
+
+    try:
+        if credential_id:
+            _handle_fido2_auth(context, credential_id)
+        elif serial:
+            _handle_serial_auth(context, serial)
         else:
-            success, details = check_otp(serial, password)
-        result = success
+            _handle_standard_auth(context)
+        response = _finalize_auth_response(context)
+    except TokenAdminError as error:
+        # A locked token raises before the lib can classify it, so classify it here instead.
+        if error.id == Error.TOKEN_LOCKED:
+            context[AUTH_EVENT_TYPE_KEY] = AuthEventType.NO_USABLE_TOKEN
+            # TOKEN_LOCKED is raised only for a revoked token: check_token_list drops those before any other check.
+            _record_context_reason(context, AuthEventReason.TOKEN_REVOKED)
+        raise
+    finally:
+        # Stage the single authentication-log row for this request; it is written at teardown, which then lets the
+        # conditional-access engine react to the classified outcome.
+        _log_authentication_event(context)
+    return response
 
+
+def _record_context_reason(context: dict, reason: AuthEventReason, serial: str | None = None,
+                           policies: list[str] | None = None) -> None:
+    """
+    Record *reason* on the request context, for a handler that classifies an event itself instead of taking it off a
+    lib call's details.
+
+    Those handlers know exactly why they turned the request away, and a row with no reason there would answer "no
+    cause recorded" for a cause the code had in hand - so filtering by reason would silently miss the endpoint. Such a
+    handler knows exactly one reason, so it *replaces* the list. *serial* also puts the reason in the per-serial
+    detail, matching what the token layer records. *policies* does the same for a policy-decided reason, matching
+    how :func:`~privacyidea.lib.policydecorators.auth_lastauth` attributes the same LASTAUTH check.
+    """
+    context[AUTH_EVENT_REASON_KEY] = [reason]
+    if serial:
+        context[AUTH_EVENT_REASON_DETAIL_KEY] = build_reason_detail(reasons={serial: reason})
+    elif policies:
+        context[AUTH_EVENT_REASON_DETAIL_KEY] = build_reason_detail(policies=policies)
+
+
+def _handle_enrollment_cancellation(data: dict) -> Response:
+    """
+    Handles the specific case where a user cancels enroll_via_multichallenge (possible if policy is enabled).
+    Returns the Flask response object directly.
+    """
+    transaction_id = get_required(data, "transaction_id")
+
+    # The enrollment challenge belongs to the user it was created for. Resolve that owner from the challenge, so
+    # the cancellation, its response and its log entry are tied to that user rather than to a user named in the
+    # request.
+    challenge_user = None
+    challenges = get_challenges(transaction_id=transaction_id)
+    if challenges:
+        serial = challenges[0].serial
+        token = get_one_token(serial=serial, silent_fail=True)
+        if token and token.user:
+            challenge_user = token.user
+        else:
+            try:
+                owners = find_container_by_serial(serial).get_users()
+                if owners:
+                    challenge_user = owners[0]
+            except Exception as ex:
+                log.debug(f"Could not resolve the container owner for the cancellation: {ex!r}")
+
+    # A request that names a different user than the one the enrollment was created for does not act on this
+    # enrollment.
+    if request.User and request.User.login and challenge_user and request.User != challenge_user:
+        log_authentication(AuthEventType.ENROLLMENT_CANCELED_FAIL, request, user=request.User,
+                           transaction_id=transaction_id)
+        raise PolicyError(_("The user does not match the enrollment."))
+
+    user = challenge_user or request.User
+
+    # Cancelling the enrollment step of a chain is a step of that chain: the request acts on this very
+    # transaction, so it settles the attempt claimed for it rather than starting one of its own.
+    confirm_attempt(transaction_id)
+
+    success = cancel_enrollment_via_multichallenge(transaction_id)
+
+    details = {}
+    if success:
+        details["message"] = _("Cancelled enrollment via multichallenge")
+        message = _("Cancelled enrollment via multichallenge for transaction_id ") + f"{transaction_id}"
     else:
-        options["token_type"] = token_type
-        success, details = check_user_pass(user, password, options=options)
-        result = success
-        if request.path.endswith("samlcheck"):
-            ui = user.info
-            result = {"auth": success,
-                      "attributes": {}}
-            if return_saml_attributes():
-                if success or return_saml_attributes_on_fail():
-                    # privacyIDEA's own attribute map
-                    result["attributes"] = {"username": ui.get("username"),
-                                                "realm": user.realm,
-                                                "resolver": user.resolver,
-                                                "email": ui.get("email"),
-                                                "surname": ui.get("surname"),
-                                                "givenname": ui.get("givenname"),
-                                                "mobile": ui.get("mobile"),
-                                                "phone": ui.get("phone")}
-                    # additional attributes
-                    for k, v in ui.items():
-                        result["attributes"][k] = v
-    serials = ",".join([challenge_info["serial"] for challenge_info in details["multi_challenge"]]) \
-        if 'multi_challenge' in details else details.get('serial')
-    g.audit_object.log({"info": log_used_user(user, details.get("message")),
-                        "success": success,
-                        "serial": serials,
-                        "token_type": details.get("type")})
-    return send_result(result, rid=2, details=details)
+        details["message"] = _("Failed to cancel enrollment via multichallenge")
+        message = _("Failed to cancel enrollment via multichallenge for transaction_id ") + f"{transaction_id}"
+
+    ret = send_result(success, rid=2, details=details)
+
+    g.audit_object.log({
+        "success": success,
+        "authentication": ret.json.get("result", {}).get("authentication", ""),
+        "action_detail": message,
+    })
+
+    log_authentication(
+        AuthEventType.LOGIN_SUCCESS if success else AuthEventType.ENROLLMENT_CANCELED_FAIL,
+        request,
+        user=user,
+        transaction_id=transaction_id,
+    )
+    return ret
+
+
+def _handle_fido2_auth(context: dict, credential_id: str):
+    """
+    Handles FIDO2/Passkey authentication and enroll_via_multichallenge of passkeys.
+    Updates the context with the result.
+    """
+    # A request without its transaction_id is malformed, not an authentication attempt, so it is rejected before
+    # anything classifies it and leaves no authentication event.
+    transaction_id = get_required(request.all_data, "transaction_id")
+    # A passkey answer is verified against this very transaction, so it continues that attempt. The token layer's
+    # own settling does not apply here: this path resolves and checks the token itself.
+    confirm_attempt(transaction_id)
+    serial = get_optional(request.all_data, "serial")
+
+    # Resolve Token
+    if serial:
+        try:
+            token = get_one_token(serial=serial)
+        except ResourceNotFoundError:
+            context[AUTH_EVENT_TYPE_KEY] = AuthEventType.NO_TOKEN
+            context[AUTH_EVENT_SERIALS_KEY] = [serial]
+            raise
+    else:
+        token = get_fido2_token_by_credential_id(credential_id)
+
+    if not token:
+        log.debug(f"No token found for credential id {credential_id}. Checking transaction id...")
+        token = get_fido2_token_by_transaction_id(transaction_id, credential_id)
+        if not token:
+            log.debug(f"No token found for transaction id {transaction_id}.")
+            context["details"]["message"] = "No token found for the given credential ID or transaction ID!"
+            context[AUTH_EVENT_TYPE_KEY] = AuthEventType.NO_TOKEN
+            return  # Result remains False
+
+    if not token.user:
+        context["details"]["message"] = "No user found for the token with the given credential ID!"
+        context[AUTH_EVENT_TYPE_KEY] = AuthEventType.USER_UNKNOWN
+        return  # Result remains False
+
+    # A request that names a user authenticates that user, so the token has to be one of theirs. A request without a
+    # user is a usernameless login, which authenticates the token owner.
+    if request.User and request.User.login:
+        if not token_belongs_to_user(token, request.User):
+            log.warning(f"The token {token.get_serial()} does not belong to the user {request.User} named in the "
+                        "request.")
+            context["details"]["message"] = _("Authentication failed.")
+            context[AUTH_EVENT_TYPE_KEY] = AuthEventType.NO_TOKEN
+            context[AUTH_EVENT_SERIALS_KEY] = [token.get_serial()]
+            return  # Result remains False
+        user = request.User
+    else:
+        user = token.user
+
+    # Update User in Context
+    request.User = user
+    context["user"] = user
+    context["options"]["user"] = user
+
+    # Policy Checks
+    # disabled_token_types already ran once before the token (and therefore the user) could be
+    # resolved from the credential_id, so a user/realm/resolver-scoped SCOPE.AUTH restriction was
+    # evaluated without a user and only matched unscoped policies. Re-run it now that request.User
+    # is set, same reasoning as fido2_auth/fido2_enroll below.
+    disabled_token_types(request, None)
+    if (PolicyAction.DISABLED_TOKEN_TYPES in request.all_data and
+            token.get_type() in request.all_data[PolicyAction.DISABLED_TOKEN_TYPES]):
+        context[AUTH_EVENT_TYPE_KEY] = AuthEventType.NO_USABLE_TOKEN
+        _record_context_reason(context, AuthEventReason.TOKEN_TYPE_DISABLED, token.get_serial())
+        raise PolicyError(_("The authentication method is not available."))
+
+    # Handle Enrollment vs Authentication
+    attestation_object = get_optional_one_of(request.all_data, ["attestationObject", "attestationobject"])
+
+    if attestation_object:
+        # The registration has to answer the enroll_via_multichallenge challenge of a token that waits for it. An
+        # enrollment started at /token/init is completed there.
+        enrollment_challenges = [challenge for challenge in
+                                 get_challenges(serial=token.get_serial(), transaction_id=transaction_id)
+                                 if challenge.is_valid()
+                                 and challenge.get_data().get(PolicyAction.ENROLL_VIA_MULTICHALLENGE)]
+        if (token.get_type() != PasskeyTokenClass.get_class_type()
+                or token.rollout_state != RolloutState.CLIENTWAIT or not enrollment_challenges):
+            log.warning(f"Registration data for token {token.get_serial()} does not answer a pending enrollment.")
+            context["details"]["message"] = _("Authentication failed.")
+            context[AUTH_EVENT_TYPE_KEY] = AuthEventType.MFA_FAIL
+            context["serial_list"].append(token.get_serial())
+            return  # Result remains False
+
+        # Enrollment
+        context[AUTH_EVENT_TYPE_KEY] = AuthEventType.ENROLLMENT_FAIL
+        context[AUTH_EVENT_SERIALS_KEY] = [token.get_serial()]
+        request.all_data.update({"type": "passkey"})
+        fido2_enroll(request, None)
+        try:
+            registration_details = token.update(request.all_data)
+            # Double-check the enrollment was successful
+            if token.rollout_state != RolloutState.ENROLLED:
+                raise EnrollmentError(f"The registration data did not enroll the token {token.get_serial()}.")
+            evm = registration_details.pop(PolicyAction.ENROLL_VIA_MULTICHALLENGE, None)
+
+            # Check if offline data should be appended here already (policy)
+            if evm and Match.user(g, scope=SCOPE.AUTH,
+                                  action=PolicyAction.ENROLL_VIA_MULTICHALLENGE_PASSKEY_OFFLINE,
+                                  user_object=user).any():
+                __ = attach_token(token.get_serial(), "offline")
+                offline_data = get_auth_items(serial=token.get_serial(), application="offline",
+                                              user_agent=request.user_agent.string)
+                if offline_data:
+                    context["response_params"]["auth_items"] = offline_data
+
+            context["result"] = True
+        except Exception as ex:
+            log.error(f"Error updating token: {ex}")
+            context["result"] = False
+    else:
+        # Actual Authentication
+        # The fido2_auth prepolicy already ran before the token (and therefore the user) could be
+        # resolved from the credential_id, so any user/realm/resolver-scoped SCOPE.AUTH policy for
+        # AllowedAuthenticatorDeviceTypes or EnforceUserHandle was evaluated without a user and only
+        # matched unscoped policies. Re-run it now that request.User is set, mirroring fido2_enroll
+        # above for the enrollment branch.
+        fido2_auth(request, None)
+        # The same applies to the authorization restrictions of WebAuthn tokens
+        if token.get_type() == WebAuthnTokenClass.get_class_type():
+            webauthntoken_request(request, None)
+            webauthntoken_authz(request, None)
+
+        last_auth_ok, last_auth_policies = check_last_auth_policy(g, token)
+        if not last_auth_ok:
+            log.debug(f"Last authentication policy check failed for token {token.get_serial()}.")
+            context["details"]["message"] = _(
+                "Last authentication policy check failed for token {serial}").format(
+                serial=token.get_serial())
+            context[AUTH_EVENT_TYPE_KEY] = AuthEventType.NOT_AUTHORIZED
+            _record_context_reason(context, AuthEventReason.LAST_AUTH_TOO_OLD, policies=last_auth_policies)
+            return
+
+        if not token.is_active():
+            log.debug(f"Authentication attempted with disabled token {token.get_serial()}")
+            context["details"]["message"] = "Token is disabled"
+            # Explicit audit for disabled token
+            g.audit_object.log({
+                "info": log_used_user(user, "Token is disabled"),
+                "success": False,
+                "authentication": AUTH_RESPONSE.REJECT,
+                "serial": token.get_serial(),
+                "token_type": context["details"].get("type")
+            })
+            # Owned-but-unusable token (disabled) -> NO_USABLE_TOKEN
+            context[AUTH_EVENT_TYPE_KEY] = AuthEventType.NO_USABLE_TOKEN
+            _record_context_reason(context, AuthEventReason.TOKEN_DISABLED, token.get_serial())
+            return
+
+        try:
+            fido_verification_result = verify_fido2_challenge(transaction_id, token, request.all_data)
+        except (ResourceNotFoundError, AuthError):
+            # A challenge that fails to verify (wrong serial, expired) propagates as a failure; record it on the
+            # context since check() logs it once in its finally.
+            context[AUTH_EVENT_TYPE_KEY] = AuthEventType.MFA_FAIL
+            context["serial_list"].append(token.get_serial())
+            raise
+        except PolicyError:
+            # An authorization policy does not allow this authenticator. The refusal counts as a failed login.
+            g.audit_object.log({"authentication": AUTH_RESPONSE.REJECT, "serial": token.get_serial(),
+                                "token_type": token.get_type()})
+            context[AUTH_EVENT_TYPE_KEY] = AuthEventType.NOT_AUTHORIZED
+            context[AUTH_EVENT_SERIALS_KEY] = [token.get_serial()]
+            raise
+        context["result"] = fido_verification_result.success > 0
+
+    # Success Handling
+    if context["result"]:
+        context["details"].update({
+            "username": user.login,
+            "message": _("Found matching challenge"),
+            "serial": token.get_serial()
+        })
+        context["serial_list"].append(token.get_serial())
+
+        # FIDO2/passkey authentication does not pass through check_token_list,
+        # so the reset_all_user_tokens policy is applied here explicitly. This
+        # must only happen for actual authentication, not for enrollment via
+        # multichallenge (attestation_object present), which also ends up here.
+        if not attestation_object and reset_all_user_tokens_active(g, user):
+            reset_token_failcounters(get_tokens(user=user))
+    else:
+        context["details"]["message"] = _("Authentication failed.")
+
+    if context["result"]:
+        context[AUTH_EVENT_TYPE_KEY] = AuthEventType.LOGIN_SUCCESS
+    elif not attestation_object:
+        context[AUTH_EVENT_TYPE_KEY] = AuthEventType.MFA_FAIL
+
+
+def _handle_serial_auth(context: dict, serial: str):
+    """
+    Handles authentication with serial provided
+    """
+    user = context["user"]
+    password = get_optional(request.all_data, "pass")
+    otp_only = get_optional(request.all_data, "otponly")
+
+    # Validate ownership if user is present
+    if user:
+        try:
+            tokens = get_tokens(user=user, serial=serial, count=True)
+            if not tokens:
+                raise ParameterError(_("Given serial does not belong to given user!"))
+        except ResourceNotFoundError:
+            raise ParameterError(_("Given serial does not belong to given user!"))
+
+    # Resolve the token owner so the auth log, audit log and per-user policies see the authenticating user even
+    # when the request only carries a serial.
+    if not user or not user.exist():
+        token = get_one_token(serial=serial, silent_fail=True)
+        if token and token.user:
+            user = token.user
+            request.User = user
+            context["user"] = user
+            context["options"]["user"] = user
+
+    # Perform Check
+    if not otp_only:
+        success, details = check_serial_pass(serial, password, options=context["options"])
+        context[AUTH_EVENT_TYPE_KEY] = details.pop(AUTH_EVENT_TYPE_KEY, None)
+        context[AUTH_EVENT_REASON_KEY], context[AUTH_EVENT_REASON_DETAIL_KEY] = pop_auth_event_reason(details)
+        context[AUTH_EVENT_SERIALS_KEY] = pop_auth_event_serials(details)
+        context[LOG_TRANSACTION_ID_KEY] = details.pop(LOG_TRANSACTION_ID_KEY, None)
+    else:
+        success, details = check_otp(serial, password)
+        # otponly verifies only the token (no PIN/password as first factor): a wrong value is a token-only failure.
+        context[AUTH_EVENT_TYPE_KEY] = AuthEventType.LOGIN_SUCCESS if success else AuthEventType.TOKEN_ONLY_FAIL
+        # The one token the request named and check_otp verified. Recorded here because check_otp reports back only
+        # a message, so without this the row would name no token although the request named exactly one.
+        context[AUTH_EVENT_SERIALS_KEY] = [serial]
+
+    context["result"] = success
+    context["details"] = details
+
+    if "serial" in details:
+        context["serial_list"].append(details["serial"])
+
+
+def _handle_standard_auth(context: dict):
+    """
+    Handles username+otp/password authentication, or container challenges.
+    """
+    transaction_id = request.all_data.get("transaction_id")
+    container_result = check_container_challenge(transaction_id, context["user"])
+
+    success = container_result.get("success", False)
+    details = container_result.get("details", {})
+    context["is_container_challenge"] = success
+
+    if not success:
+        # Fallback to standard user check
+        token_type = get_optional(request.all_data, "type")
+        context["options"]["token_type"] = token_type
+
+        try:
+            success, details = check_user_pass(context["user"], get_optional(request.all_data, "pass"),
+                                               options=context["options"])
+        except (UserError, AuthError):
+            # The auth_user_does_not_exist policy decorator rejects an unknown user before check_user_pass can
+            # classify it, so classify it here; check() logs it once in its finally.
+            if not context["user"] or not context["user"].exist():
+                context[AUTH_EVENT_TYPE_KEY] = AuthEventType.USER_UNKNOWN
+            raise
+
+    if AUTH_EVENT_TYPE_KEY not in details:
+        # An absent key means nothing classified this request; a token suppressing its own terminal event (push_wait
+        # timeout) leaves it present but None, which must survive so nothing overwrites the logged CHALLENGE_TRIGGERED.
+        if success:
+            # A successful container challenge or a policy decorator (passthru, passonnouser, authcache,
+            # accept-no-token) can accept a login the token layer never classified, defaulting to LOGIN_SUCCESS.
+            details[AUTH_EVENT_TYPE_KEY] = AuthEventType.LOGIN_SUCCESS
+        else:
+            details[AUTH_EVENT_TYPE_KEY] = AuthEventType.UNKNOWN_FAIL_REASON
+
+    context["result"] = success
+    context["details"] = details
+
+    event_type = details.pop(AUTH_EVENT_TYPE_KEY, None)
+    context[AUTH_EVENT_TYPE_KEY] = event_type
+    # Why it came out that way, classified by the token layer alongside the event itself.
+    context[AUTH_EVENT_REASON_KEY], context[AUTH_EVENT_REASON_DETAIL_KEY] = pop_auth_event_reason(details)
+    # The tokens a failure was made against, which the response names at most one of (see AUTH_EVENT_SERIALS_KEY).
+    context[AUTH_EVENT_SERIALS_KEY] = pop_auth_event_serials(details)
+    # Log-only transaction_id (push_wait): correlate the terminal row without exposing it in the response.
+    context[LOG_TRANSACTION_ID_KEY] = details.pop(LOG_TRANSACTION_ID_KEY, None)
+
+    # Extract serials for logging
+    if 'multi_challenge' in details:
+        context["serial_list"].extend([c["serial"] for c in details["multi_challenge"]])
+    elif "serial" in details:
+        context["serial_list"].append(details["serial"])
+    elif transaction_id:
+        # A response that does not match the challenges of more than one token names no
+        # token at all, since there is no single token the response could be attributed
+        # to. Take the tokens that were challenged from the transaction instead, so that
+        # the failed attempt is logged against the tokens it was made against.
+        context["serial_list"].extend(_challenged_token_serials(transaction_id, context["user"]))
+
+
+def _challenged_token_serials(transaction_id: str, user: User) -> list[str]:
+    """
+    Return the serials of the tokens of the given user that were challenged in the given
+    transaction.
+
+    Only tokens of that user are returned: a request can name the transaction id of
+    somebody else, and the audit entry of this request must not name their tokens.
+    Challenges of a container carry the container serial instead of a token serial and are
+    left out, because the audit log keeps the two in separate columns.
+
+    :param transaction_id: the transaction id of the challenges
+    :param user: the user the request authenticates
+    :return: a sorted list of unique token serials
+    """
+    if not user or not user.login:
+        return []
+    try:
+        challenged = {challenge.serial for challenge in get_challenges(transaction_id=transaction_id)
+                      if challenge.get_data().get("type", "token") != "container"}
+        if not challenged:
+            return []
+        owned = {token.get_serial() for token in get_tokens(user=user)}
+    except Exception as exx:  # noqa: BLE001 - naming the tokens must not fail the request
+        # The authentication result is already decided at this point, only the audit entry
+        # is still being filled in. A challenge or token store that can not be read must
+        # therefore cost the entry its serials, never turn the response into an error.
+        log.debug(f"Could not read the challenged tokens of {user!r} for the audit log: {exx!r}")
+        return []
+    return sorted(challenged & owned)
+
+
+def _finalize_auth_response(context):
+    """
+    Handles final state updates (last_auth), audit logging, and response construction.
+    """
+    user = context["user"]
+    details = context["details"]
+    success = context["result"]
+
+    # Update Last Authentication
+    # FIDO2 tokens update this internally during verify, so we skip them here mostly,
+    # but check if we have serials from standard flows.
+    if success:
+        for serial in context["serial_list"]:
+            if not context["is_container_challenge"]:
+                try:
+                    container = find_container_for_token(serial)
+                    if container:
+                        container.update_last_authentication()
+                except Exception as e:
+                    log.debug(f"Could not find container for token {serial}: {e}")
+
+            # Client Mode Per User Policy
+            if Match.user(g, scope=SCOPE.AUTH, action=PolicyAction.CLIENT_MODE_PER_USER,
+                          user_object=user).allowed():
+                token = get_one_token(serial=serial, silent_fail=True)
+                if token:
+                    user_agent, __, __ = get_plugin_info_from_useragent(request.user_agent.string)
+                    if user.exist():
+                        # Read-modify-write on a per-user dict. Concurrent auths from
+                        # different user-agents can race here and lose one update.
+                        # Accepted: the value is a UX hint (preferred client mode) —
+                        # at worst the user sees their second-most-recent choice.
+                        last_used = dict(user.internal_attributes.get(
+                            InternalUserAttributes.LAST_USED_TOKEN) or {})
+                        last_used[user_agent] = token.get_tokentype()
+                        user.set_internal_attribute(InternalUserAttributes.LAST_USED_TOKEN, last_used)
+
+    # Audit Logging
+    # Ensure user is logged even if we switched users (e.g. FIDO2)
+    g.audit_object.log({"user": user.login, "resolver": user.resolver, "realm": user.realm})
+
+    serials_str = ",".join(context["serial_list"])
+
+    # Decide whether to issue a persistent "remember device" cookie. This is an
+    # optional enhancement on an already-successful auth, so a failure here (e.g.
+    # a transient DB error while creating the device) must never turn that success
+    # into a 500 - fall back to issuing no cookie.
+    try:
+        cookie_action = _resolve_persistent_cookie(user, success)
+    except Exception as exc:  # noqa: BLE001 - issuance is best-effort, never fatal
+        log.warning(f"Could not issue a remember-device cookie: {exc}")
+        cookie_action = None
+
+    ret = send_result(context["result"], rid=2, details=details, **context["response_params"])
+    apply_cookie_action(ret, cookie_action)
+
+    audit_entry = {
+        "info": log_used_user(user, details.get("message")),
+        "success": success,
+        "authentication": ret.json.get("result", {}).get("authentication", "")
+    }
+    # Keep the token a handler logged on its own. A request that is rejected before any
+    # token is used (e.g. a disabled token, which is not part of the serial list) names
+    # its token there, and the empty serial list must not overwrite it.
+    if serials_str:
+        audit_entry["serial"] = serials_str
+    if details.get("type"):
+        audit_entry["token_type"] = details.get("type")
+    g.audit_object.log(audit_entry)
+
+    return ret
+
+
+def _log_authentication_event(context):
+    """
+    Stage the single authentication-log row for this /validate/check request.
+
+    Called from check()'s finally, so it runs exactly once whether the request succeeded or a handler raised. The
+    classified outcome is read from the explicit *context* dict (no framework global), and log_authentication is a
+    no-op if nothing classified the request. The row itself is written at request teardown, so a post-policy that
+    runs after this - enroll_via_multichallenge, is_authorized - can still correct the staged event.
+    """
+    request_txn = request.all_data.get("transaction_id") or request.all_data.get("state")
+    # The log-only transaction id (push_wait success) stands in for the challenge transaction id, which the
+    # response never carries.
+    details_txn = context["details"].get("transaction_id") or context.get(LOG_TRANSACTION_ID_KEY)
+    # The newly-created challenge's transaction id is preferred over the answered challenge's; both share the same
+    # attempt_id, so the answered challenge remains correlated regardless.
+    logged_txn = details_txn or request_txn
+    log_authentication(
+        context[AUTH_EVENT_TYPE_KEY],
+        request,
+        user=context["user"],
+        # The tokens the failure was made against where the token layer named any, else what the response named.
+        # Only this row gets them: ``serial_list`` also feeds the audit entry, whose serial integrations parse.
+        serial=",".join(context[AUTH_EVENT_SERIALS_KEY] or context["serial_list"]) or None,
+        transaction_id=logged_txn,
+        reasons=context.get(AUTH_EVENT_REASON_KEY),
+        reason_detail=context.get(AUTH_EVENT_REASON_DETAIL_KEY),
+    )
+
+
+def _resolve_persistent_cookie(user: User, success: bool) -> CookieAction | None:
+    """
+    Decide whether to *issue* a new persistent ("remember device") cookie on a
+    successful authentication, returning a ``"set"`` :class:`CookieAction` or
+    ``None``.
+
+    ``/validate/check`` only issues cookies. A presented cookie is consumed and
+    rotated by the dedicated recognition endpoint (``/validate/remember_device``),
+    never here, so this endpoint carries no cookie theft/rotation logic. A cookie
+    is issued when the request is made by an identified API client, opts in
+    (``request_persistent_cookie``) and the ``remember_device`` policy (scope
+    auth, matched on user/realm) allows it.
+    """
+    if not success or not g.get("client_id"):
+        return None
+    if not is_true(get_optional(request.all_data, "request_persistent_cookie")):
+        return None
+    identity = user_identity(user)
+    if not identity:
+        # The recognition endpoint binds and matches on the resolver-stable user
+        # identity, so a remembered device for a userless (serial-only) auth could
+        # never be recognised. Do not issue a cookie that can never be redeemed.
+        return None
+    if not Match.user(g, scope=SCOPE.AUTH, action=PolicyAction.REMEMBER_DEVICE, user_object=user).any():
+        return None
+    # Optional per-user device cap (remember_device_max_devices, off by default):
+    # once the user has this many live devices for this client, opt-in issues no
+    # new cookie - the existing devices keep working. Unset / invalid / <=0 =
+    # unlimited. Each opt-in otherwise mints a new series (a client cannot be
+    # deduped reliably, and multiple devices per user are legitimate), so this is
+    # the knob for admins who want to bound that growth.
+    # Best-effort: count-then-create is not atomic, so two concurrent logins can
+    # both pass the check and overshoot the cap by the concurrency. That is an
+    # accepted trade-off - the cap bounds accumulation, it is not a security
+    # control, and serialising issuance per user is not worth the contention.
+    max_pols = Match.user(g, scope=SCOPE.AUTH, action=PolicyAction.REMEMBER_DEVICE_MAX_DEVICES,
+                          user_object=user).action_values(unique=True)
+    if max_pols:
+        try:
+            max_devices = int(list(max_pols)[0])
+        except (ValueError, TypeError):
+            max_devices = 0
+        if max_devices > 0 and count_user_devices(g.client_id, identity.resolver, identity.user_id,
+                                                  identity.realm_id) >= max_devices:
+            return None
+    # The cookie lifetime is a policy value so it can differ per realm/user/client
+    # (e.g. a shorter lifetime for admins). Unset / invalid -> the model default.
+    validity_days = None
+    validity_pols = Match.user(g, scope=SCOPE.AUTH, action=PolicyAction.REMEMBER_DEVICE_VALIDITY,
+                               user_object=user).action_values(unique=True)
+    if validity_pols:
+        try:
+            validity_days = int(list(validity_pols)[0])
+        except (ValueError, TypeError):
+            validity_days = None
+    device, cookie_value = create_remembered_device(identity,
+                                                    client_id=g.client_id,
+                                                    ip_address=g.client_ip,
+                                                    user_agent=g.get("user_agent"),
+                                                    validity_days=validity_days)
+    return CookieAction("set", cookie_value, device.expires_at)
+
+
+@validate_blueprint.route('/capabilities', methods=['GET'])
+def get_capabilities():
+    """
+    Discovery endpoint for API clients.
+
+    Requires an identified API client (the ``X-API-Key`` header, resolved into
+    ``g.client_id`` by the API-key middleware). Returns the capabilities this
+    server offers to the client.
+
+    .. important::
+
+       This is **client-level** discovery only. ``remember_device: true`` means
+       a ``remember_device`` policy exists for this server; it is **not** a
+       per-user guarantee. A ``remember_device`` policy scoped to specific
+       users/realms still gates the feature per user at issuance
+       (``/validate/check``) and
+       recognition (``/validate/remember_device``). A client should treat ``true``
+       as "worth attempting" and rely on those endpoints for the authoritative
+       per-user answer.
+
+    :status 200: capabilities in ``result.value``.
+    :status 401: no API client is identified.
+
+    **Example response**:
+
+    .. sourcecode:: http
+
+       HTTP/1.1 200 OK
+       Content-Type: application/json
+
+       {
+         "id": 1,
+         "jsonrpc": "2.0",
+         "result": {
+           "status": true,
+           "value": {"capabilities": {"remember_device": true}}
+         },
+         "version": "privacyIDEA unknown"
+       }
+    """
+    if g.get("client_id") is None:
+        raise AuthError(_("Authentication failure. A valid API key is required."),
+                        id=Error.AUTHENTICATE_AUTH_HEADER)
+    # Whether "remember device" is offered depends on whether a remember_device
+    # policy (SCOPE.AUTH) exists at all - this is a client-level "is it worth
+    # attempting" answer, not the per-user decision made at issuance/recognition.
+    remember_device = Match.generic(g, scope=SCOPE.AUTH,
+                                    action=PolicyAction.REMEMBER_DEVICE).any()
+    # A successful discovery is a success in the audit log; validate's
+    # before_request seeds success=False, so record it explicitly.
+    g.audit_object.log({"success": True})
+    return send_result({"capabilities": {"remember_device": remember_device}})
+
+
+@validate_blueprint.route('/remember_device', methods=['POST'])
+def check_remember_device():
+    """
+    Recognition endpoint for the persistent "remember device" cookie.
+
+    Answers a single question - *is this device remembered for this user and
+    client?* - and rotates the cookie on a hit. It is deliberately **not** an
+    authentication: it verifies no credential, triggers no challenge (no push,
+    no SMS) and does not feed the authentication accounting. A recognised device
+    lets the calling client skip the second factor; enforcing a first factor
+    beforehand is the client's responsibility.
+
+    Requires an identified API client (``X-API-Key`` -> ``g.client_id``) and the
+    ``user``/``realm`` the cookie was issued for. The cookie is bound to that
+    exact user and client, so it can never be replayed for another account or a
+    different client. A stale counter is treated as theft: the whole series is
+    invalidated and the cookie cleared. Recognition is only offered when the
+    ``remember_device`` policy allows it (the same gate ``/validate/capabilities``
+    reports); otherwise the answer is always ``false`` and a presented cookie is
+    left untouched.
+
+    Conditional access refuses recognition for a locked user, a blocked source IP
+    or a policy whose *deny* action decides this request, answering ``false``
+    without touching the presented cookie - the same body a device that is simply
+    not remembered gets, unless an administrator configured a message to show.
+    The headers still differ: a dead cookie is cleared on a miss and left alone on
+    a refusal, so a caller holding a valid API key can tell the two apart by that.
+    Accepted: clearing it on a refusal would cost the user their device on every
+    temporary lock, and a caller with a key learns the same from
+    ``/validate/check``.
+
+    Issuing a cookie stays on ``/validate/check`` (``request_persistent_cookie=1``).
+
+    :reqheader X-API-Key: the API client's key
+    :reqheader Cookie: ``pi_remember_device=<series>:<counter>``
+    :formparam user: the username the cookie was issued for
+    :formparam realm: the user's realm
+    :status 200: ``result.value`` is ``true`` when the device is recognised,
+        ``false`` otherwise (a miss is a normal answer, not an error, and so is a
+        recognition conditional access refused).
+    :status 401: no API client is identified.
+    """
+    if g.get("client_id") is None:
+        raise AuthError(_("Authentication failure. A valid API key is required."),
+                        id=Error.AUTHENTICATE_AUTH_HEADER)
+
+    user = request.User
+    # Recognition is what lets the calling client skip the second factor, so it is gated like an authentication:
+    # a lock or block that did not reach here would leave the one path that skips MFA the one path conditional
+    # access does not guard. Two orderings matter. It runs *after* the API-key requirement above, so that an
+    # unidentified caller cannot write a rejection - and the authentication-log row classifying it - for any
+    # username it cares to post; this is the only /validate endpoint that can insist on that. And it runs *before*
+    # the cookie is read, as every other gate runs before the credentials it refuses: a refused request consumes
+    # and rotates nothing, so a stolen cookie replayed while the lock is in force is neither usable nor spent, and
+    # is detected on the first presentation after the lock lifts. A refusal is audited as every conditional-access
+    # rejection is, success false and authentication REJECT, which is the one answer here that belongs in the
+    # authentication accounting the rest of this endpoint stays out of: a hit is not a successful authentication and
+    # a miss is not a failed one, but a refusal is a request that was turned away.
+    rejection = conditional_access_precheck(user, shape=REMEMBER_DEVICE_REJECTION)
+    if rejection is not None:
+        return rejection
+
+    recognised = False
+    cookie_action = None
+
+    # Only evaluate the remember_device policy (which also writes a policy-match
+    # audit entry) once we know there is actually a cookie and a bindable user to
+    # recognise, so a cookie-less poll does not pay for a discarded evaluation.
+    # Resolving the user to a stable identity (resolver, user_id, realm) is itself
+    # the existence check: a deleted/removed account no longer resolves, so
+    # user_identity returns None and its remembered devices stop being
+    # recognised - i.e. deleting the account revokes them.
+    presented = request.cookies.get(PERSISTENT_COOKIE_NAME)
+    identity = user_identity(user)
+
+    if presented and identity and Match.user(g, scope=SCOPE.AUTH,
+                                             action=PolicyAction.REMEMBER_DEVICE,
+                                             user_object=user).any():
+        result = consume_remember_device_cookie(presented, g.client_id, identity, g.get("client_ip"))
+        if result.status == RememberStatus.RECOGNIZED:
+            recognised = True
+            cookie_action = CookieAction("set", result.cookie_value, result.expires_at)
+        elif result.status == RememberStatus.GRACE:
+            # Tolerated concurrent/duplicate request: recognised, but do not
+            # rotate (the client keeps the cookie it already has).
+            recognised = True
+        elif result.status == RememberStatus.FOREIGN:
+            # The cookie is live but belongs to a different user on this same
+            # client (a shared browser). Not recognised, but leave the cookie
+            # alone - clearing it would wipe the rightful user's remembered device
+            # off the shared browser just because someone else logged in.
+            pass
+        elif result.status == RememberStatus.THEFT:
+            # consume_remember_device_cookie has already invalidated the stolen series. Record the detection
+            # first - in action_detail (which the error path does not overwrite) and as a DEVICE_TOKEN_REUSED
+            # authentication event, so conditional access can lock the account, block the source IP or notify as
+            # configured - and only then escalate. The order matters: handle_device_theft commits, so a lock wait
+            # or deadlock on its bulk delete would otherwise raise out of the view with the stolen series already
+            # gone and the incident recorded nowhere. What the escalation does, and why it reaches beyond the one
+            # replayed series, is handle_device_theft's to state.
+            log.warning(f"Persistent device cookie reuse detected for client {g.get('client_id')!r}; "
+                        f"series invalidated and all remembered devices of this user revoked.")
+            g.audit_object.add_to_log({"action_detail": "persistent cookie reuse detected"},
+                                      add_with_comma=True)
+            log_authentication(AuthEventType.DEVICE_TOKEN_REUSED, request, user=user,
+                               other_info={"client_id": g.get("client_id")})
+            handle_device_theft(identity)
+            cookie_action = CookieAction("clear")
+        else:  # miss: the cookie is dead (unknown or expired) - clear it
+            cookie_action = CookieAction("clear")
+
+    # A recognition is its own audit action ("POST /validate/remember_device") and
+    # is intentionally not marked as an authentication (no ACCEPT/REJECT), so it
+    # never counts towards the auth success/failure accounting.
+    g.audit_object.log({
+        "user": user.login, "resolver": user.resolver, "realm": user.realm,
+        "success": recognised,
+        "info": "remembered device recognised" if recognised else "device not recognised",
+    })
+
+    # Default rid (1) so send_result does not stamp result.authentication
+    # (ACCEPT/REJECT): recognition is not an authentication - the answer is
+    # result.value / detail.remembered_device, and the audit records no ACCEPT/REJECT.
+    ret = send_result(recognised, details={"remembered_device": recognised})
+    apply_cookie_action(ret, cookie_action)
+    return ret
 
 
 @validate_blueprint.route('/triggerchallenge', methods=['POST', 'GET'])
@@ -438,33 +1368,43 @@ def check():
 @postpolicy(mangle_challenge_response, request=request)
 @postpolicy(preferred_client_mode, request=request)
 @add_serial_from_response_to_g
-@check_user_or_serial_in_request(request)
+# First decorator to act on the request; see conditional_access_gate for why it sits exactly here.
+# rejection_value=0: result.value here is the number of challenges triggered, not a boolean, so a rejection answers
+# with this endpoint's own kind of nothing rather than changing the field's type.
+@conditional_access_gate(_conditional_access_identity, rejection_value=0)
+@check_user_serial_or_cred_id_in_request(request)
 @prepolicy(check_application_tokentype, request=request)
 @prepolicy(increase_failcounter_on_challenge, request=request)
-@prepolicy(check_base_action, request, action=ACTION.TRIGGERCHALLENGE)
+@prepolicy(check_base_action, request, action=PolicyAction.TRIGGERCHALLENGE)
 @prepolicy(webauthntoken_request, request=request)
-@prepolicy(webauthntoken_auth, request=request)
+@prepolicy(load_challenge_text, request=request)
+@prepolicy(fido2_auth, request=request)
 @event("validate_triggerchallenge", request, g)
 def trigger_challenge():
     """
-    An administrator can call this endpoint if he has the right of
-    ``triggerchallenge`` (scope: admin).
-    He can pass a ``user`` name and or a ``serial`` number.
-    privacyIDEA will trigger challenges for all native challenges response
-    tokens, possessed by this user or only for the given serial number.
+    Trigger a fresh challenge for every challenge-response token
+    matching the given user and/or serial. Used by the WebUI and by
+    automation that must initiate challenge-response flows on behalf
+    of a user (for example pre-positioning a push prompt).
 
-    The request needs to contain a valid PI-Authorization header.
+    Requires admin authentication and the policy action
+    :ref:`policy_triggerchallenge`. The request must carry a valid
+    ``PI-Authorization`` header.
 
-    :param user: The loginname/username of the user, who tries to authenticate.
-    :param realm: The realm of the user, who tries to authenticate. If the
-        realm is omitted, the user is looked up in the default realm.
-    :param serial: The serial number of the token.
-    :param type: The tokentype of the tokens, that are taken into account during
-        authentication. Requires authz policy application_tokentype.
-        Is ignored when a distinct serial is given.
+    If the AUTHZ-scope ``increase_failcounter_on_challenge`` policy
+    is active, the fail counter is incremented on every matching
+    token before the challenges are created.
 
-    :return: a json result with a "result" of the number of matching
-        challenge response tokens
+    :jsonparam user: user the challenges should be created for.
+    :jsonparam realm: realm of the user; defaults to the default
+        realm.
+    :jsonparam serial: restrict to a specific token.
+    :jsonparam type: restrict to tokens of this type. Requires the
+        AUTHZ policy :ref:`application_tokentype_policy`. Ignored
+        when ``serial`` is supplied.
+    :reqheader PI-Authorization: admin auth token.
+    :status 200: ``result.value`` is the number of created
+        challenges; ``detail.multi_challenge`` lists them.
 
     **Example response** for a successful triggering of challenge:
 
@@ -557,38 +1497,48 @@ def trigger_challenge():
 
     """
     user = request.User
-    serial = getParam(request.all_data, "serial")
-    token_type = getParam(request.all_data, "type")
-    details = {"messages": [],
-               "transaction_ids": []}
-    options = {"g": g,
-               "clientip": g.client_ip,
-               "user": user}
-    # Add all params to the options
-    for key, value in request.all_data.items():
-        if value and key not in ["g", "clientip", "user"]:
-            options[key] = value
+    serial = get_optional(request.all_data, "serial")
+    token_type = get_optional(request.all_data, "type")
+    details = {"messages": [], "transaction_ids": []}
 
-    token_objs = get_tokens(serial=serial, user=user, active=True, revoked=False, locked=False, tokentype=token_type)
-    # Only use the tokens, that are allowed to do challenge response
-    chal_resp_tokens = [token_obj for token_obj in token_objs if "challenge" in token_obj.mode]
+    # Add request params to the options, minus the internal token-engine state keys
+    options: dict = {k: v for k, v in request.all_data.items() if k not in INTERNAL_OPTION_KEYS}
+    options.update({"g": g, "clientip": g.client_ip, "user": user})
+
+    tokens = get_tokens(serial=serial, user=user, active=True, revoked=False, locked=False, tokentype=token_type)
+    # Only use the tokens that are allowed to do challenge
+    challenge_response_token = [token for token in tokens if "challenge" in token.mode]
     if is_true(options.get("increase_failcounter_on_challenge")):
-        for token_obj in chal_resp_tokens:
-            token_obj.inc_failcount()
-    create_challenges_from_tokens(chal_resp_tokens, details, options)
-    result_obj = len(details.get("multi_challenge"))
+        for token in challenge_response_token:
+            token.inc_failcount()
+    create_challenges_from_tokens(challenge_response_token, details, options)
+    triggered_challenges = len(details.get("multi_challenge"))
 
+    event_type = AuthEventType.CHALLENGE_TRIGGERED if triggered_challenges else AuthEventType.NO_TOKEN
+    # Record every challenged serial, not just details["serial"], which create_challenges_from_tokens leaves as
+    # only the last challenge it created.
     challenge_serials = [challenge_info["serial"] for challenge_info in details["multi_challenge"]]
+
+    log_authentication(
+        event_type,
+        request,
+        user=user,
+        serial=",".join(challenge_serials) or None,
+        transaction_id=details.get("transaction_id"),
+    )
+
+    r = send_result(triggered_challenges, rid=2, details=details)
     g.audit_object.log({
         "user": user.login,
         "resolver": user.resolver,
         "realm": user.realm,
-        "success": result_obj > 0,
-        "info": log_used_user(user, "triggered {0!s} challenges".format(result_obj)),
+        "success": triggered_challenges > 0,
+        "authentication": r.json.get("result").get("authentication"),
+        "info": log_used_user(user, f"triggered {triggered_challenges!s} challenges"),
         "serial": ",".join(challenge_serials),
     })
 
-    return send_result(result_obj, rid=2, details=details)
+    return r
 
 
 @validate_blueprint.route('/polltransaction', methods=['GET'])
@@ -596,42 +1546,72 @@ def trigger_challenge():
 @prepolicy(mangle, request=request)
 @CheckSubscription(request)
 @prepolicy(api_key_required, request=request)
+@event("validate_poll_transaction", request, g)
 def poll_transaction(transaction_id=None):
     """
-    Given a mandatory transaction ID, check if any non-expired challenge for this transaction ID
-    has been answered. In this case, return true. If this is not the case, return false.
-    This endpoint also returns false if no challenge with the given transaction ID exists.
+    Report whether a challenge has been answered. Out-of-band tokens
+    (push) poll this endpoint to learn when the user has
+    interacted with the challenge so that the calling client can
+    follow up with :http:post:`/validate/check`.
 
-    This is mostly useful for out-of-band tokens that should poll this endpoint
-    to determine when to send an authentication request to ``/validate/check``.
+    This endpoint is anonymous — no authentication header is
+    required.
 
-    :jsonparam transaction_id: a transaction ID
+    :param transaction_id: optional path component, the transaction
+        id to check. May also be supplied as a query parameter.
+    :query transaction_id: alternative to the path component.
+    :status 200: ``result.value`` is ``true`` if at least one
+        non-expired challenge with this transaction id has been
+        answered, ``false`` otherwise. ``detail.challenge_status`` is
+        one of ``accept`` (an answered challenge exists),
+        ``declined`` (the user declined a challenge they did not
+        trigger), ``cancelled`` (the user aborted a challenge they
+        triggered themselves), or ``pending`` (the challenges are
+        still open or no matching challenge exists at all).
     """
+
     if transaction_id is None:
-        transaction_id = getParam(request.all_data, "transaction_id", required)
-    # Fetch a list of non-exired challenges with the given transaction ID
+        transaction_id = get_required(request.all_data, "transaction_id")
+    # Fetch a list of challenges that are not expired with the given transaction ID
     # and determine whether it contains at least one non-expired answered challenge.
     matching_challenges = [challenge for challenge in get_challenges(transaction_id=transaction_id)
                            if challenge.is_valid()]
     answered_challenges = extract_answered_challenges(matching_challenges)
-
     if answered_challenges:
         result = True
         log_challenges = answered_challenges
+        details = {"challenge_status": "accept"}
     else:
         result = False
-        log_challenges = matching_challenges
+        # Group refused challenges by the status they report and report them in the precedence
+        # defined by CHALLENGE_REFUSAL_STATUS: "declined" (not-me) outranks "cancelled"
+        # (self-abort) as the higher-suspicion signal for conditional access.
+        refused_challenges = {}
+        for challenge in matching_challenges:
+            status = CHALLENGE_REFUSAL_STATUS.get(challenge.session)
+            if status:
+                refused_challenges.setdefault(status, []).append(challenge)
+        for status in CHALLENGE_REFUSAL_STATUS.values():
+            if refused_challenges.get(status):
+                log_challenges = refused_challenges[status]
+                details = {"challenge_status": status}
+                break
+        else:
+            log_challenges = matching_challenges
+            details = {"challenge_status": "pending"}
 
     # We now determine the information that should be written to the audit log:
     # * If there are no answered valid challenges, we log all token serials of challenges matching
     #   the transaction ID and the corresponding token owner
     # * If there are any answered valid challenges, we log their token serials and the corresponding user
+    user = User()
     if log_challenges:
         g.audit_object.log({
             "serial": ",".join(challenge.serial for challenge in log_challenges),
         })
-        # The token owner should be the same for all matching transactions
-        user = get_one_token(serial=log_challenges[0].serial).user
+        # Resolve the token/container owner of the first logged challenge.
+        user = _challenge_owner(log_challenges[0])
+
         if user:
             g.audit_object.log({
                 "user": user.login,
@@ -639,10 +1619,86 @@ def poll_transaction(transaction_id=None):
                 "realm": user.realm,
             })
 
+    # The poll outcome is deliberately NOT written to the authentication log or fed to the engine: the smartphone's
+    # answer was already logged at /ttype/push, so polling would double-count what that row already records.
+
     # In any case, we log the transaction ID
     g.audit_object.log({
-        "info": u"transaction_id: {}".format(transaction_id),
+        "info": f"status: {details.get('challenge_status')}",
+        "action_detail": f"transaction_id: {transaction_id}",
         "success": result
     })
 
-    return send_result(result)
+    return send_result(result, rid=2, details=details)
+
+
+@validate_blueprint.route('/initialize', methods=['POST', 'GET'])
+# First decorator to act on the request; see conditional_access_gate for why it sits exactly here.
+@conditional_access_gate()
+@prepolicy(fido2_auth, request=request)
+@prepolicy(disabled_token_types, request=request)
+def initialize():
+    """
+    Initialize an authentication by requesting a fresh challenge for
+    a token type. Currently only the ``passkey`` type is supported;
+    the WebUI calls this to obtain the FIDO2 challenge it then
+    forwards to the browser's ``navigator.credentials.get`` call.
+
+    For ``passkey``, the ``webauthn_relying_party_id`` policy must
+    be set (the FIDO2 prepolicy reads it from the AUTH scope); the
+    user-verification requirement is taken from the
+    ``user_verification_requirement`` policy and defaults to
+    ``preferred``.
+
+    This endpoint is anonymous — no authentication header is
+    required.
+
+    :jsonparam type: the token type to initialize a challenge for
+        (``passkey``; required).
+    :status 200: ``result.value`` is ``false`` (no authentication
+        decision yet); ``detail.transaction_id`` carries the
+        transaction id and ``detail.passkey`` carries the FIDO2
+        challenge payload that the client must pass to the
+        authenticator.
+    :status 400: the requested ``type`` is unsupported, the token
+        type is disabled by policy, or the relying-party id policy
+        is missing.
+    """
+    details = {}
+    # Covers both ways the request can fail to name an initializable type: the missing parameter (get_required
+    # raises before we can assign) and a type that is not passkey.
+    event_type = AuthEventType.INVALID_TOKEN_TYPE
+    try:
+        token_type = get_required(request.all_data, "type")
+        if token_type in request.all_data.get(PolicyAction.DISABLED_TOKEN_TYPES, []):
+            event_type = AuthEventType.NO_USABLE_TOKEN
+            raise PolicyError(_("The authentication method is not available."))
+        if token_type.lower() != "passkey":
+            raise ParameterError(
+                _("Unsupported token type '{token_type}' for authentication initialization!").format(
+                    token_type=token_type
+                )
+            )
+
+        # From here on the type is a valid passkey, so any failure below is the server failing to produce the
+        # challenge (missing policy, or an error building it), not the client failing a factor.
+        event_type = AuthEventType.CHALLENGE_TRIGGER_FAIL
+        rp_id = request.all_data[FIDO2PolicyAction.RELYING_PARTY_ID]
+        if not rp_id:
+            raise PolicyError(
+                f"Missing policy for {FIDO2PolicyAction.RELYING_PARTY_ID}, unable to create challenge!")
+
+        user_verification = get_first_policy_value(policy_action=FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT,
+                                                   default="preferred", scope=SCOPE.AUTH)
+        challenge = create_fido2_challenge(rp_id, user_verification=user_verification)
+        if f"passkey_{PolicyAction.CHALLENGETEXT}" in request.all_data:
+            challenge["message"] = request.all_data[f"passkey_{PolicyAction.CHALLENGETEXT}"]
+        details["passkey"] = challenge
+        details["transaction_id"] = challenge["transaction_id"]
+        event_type = AuthEventType.CHALLENGE_TRIGGERED
+    finally:
+        log_authentication(event_type, request, transaction_id=details.get("transaction_id"))
+
+    g.audit_object.log({"success": True})
+    response = send_result(False, rid=2, details=details)
+    return response

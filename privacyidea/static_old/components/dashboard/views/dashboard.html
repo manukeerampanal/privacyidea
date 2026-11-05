@@ -1,0 +1,584 @@
+<div class="well">
+
+    <div class="row" ng-if="latestNews">
+       <div class="col-lg-12">
+           <div class="panel panel-default">
+               <div class="panel-heading">
+                   <a ui-sref="info.rss">
+                       <span class="glyphicon glyphicon-bullhorn" aria-hidden="true"></span>
+                       <span translate>News</span>
+                   </a>
+               </div>
+               <div class="panel-body">
+                   {{ latestNews.title }}
+                   <small class="text-muted pull-right">{{ latestNews.pub_date | date:'medium' }}</small>
+               </div>
+           </div>
+       </div>
+    </div>
+
+   <div class="row dashboard-flow">
+       <div ng-class="subscriptionDetailed ? 'col-lg-9' : 'col-lg-3'">
+             <div class="panel panel-default" ng-show="checkRight('managesubscription')">
+                 <div class="panel-heading">
+                    <a ui-sref="component.subscriptions">
+                    <span class="glyphicon glyphicon-th-list"
+                          aria-hidden="true"></span>
+                    <span translate>Subscriptions</span></a>
+                    <button type="button" class="btn btn-xs btn-default pull-right"
+                            ng-if="pluginStatusLoadState === 'ok'"
+                            ng-click="toggleSubscriptionDetail()"
+                            title="{{ (subscriptionDetailed ? 'Compact view' : 'Detailed view') | translate }}"
+                            aria-label="{{ (subscriptionDetailed ? 'Compact view' : 'Detailed view') | translate }}">
+                        <span class="glyphicon"
+                              ng-class="subscriptionDetailed ? 'glyphicon-resize-small' : 'glyphicon-resize-full'"
+                              aria-hidden="true"></span>
+                    </button>
+                    <button type="button" class="btn btn-xs btn-default pull-right"
+                            style="margin-right: 4px;"
+                            ng-if="pluginStatusLoadState === 'ok'"
+                            ng-click="copySubscriptionInfo()"
+                            title="{{ 'Copy subscription info as JSON' | translate }}"
+                            aria-label="{{ 'Copy subscription info as JSON' | translate }}">
+                        <span class="glyphicon glyphicon-copy" aria-hidden="true"></span>
+                    </button>
+		 </div>
+                 <div class="panel-body">
+                     <p ng-if="pluginStatusLoadState === null" translate>Loading…</p>
+                     <p ng-if="pluginStatusLoadState === 'error'" class="text-danger" translate>
+                         Could not load subscription status.
+                     </p>
+                     <table class="table subscription-table"
+                            ng-class="{'subscription-compact': !subscriptionDetailed}"
+                            ng-if="pluginStatusLoadState === 'ok'">
+                         <thead>
+                             <tr>
+                                 <th translate>Application</th>
+                                 <th class="text-center" translate>Usage</th>
+                                 <th class="text-center" translate>Subscription</th>
+                                 <th ng-if="subscriptionDetailed" translate>Expires</th>
+                                 <th ng-if="subscriptionDetailed" translate>Versions</th>
+                                 <th ng-if="subscriptionDetailed" translate>Current version</th>
+                             </tr>
+                         </thead>
+                         <tbody>
+                             <tr ng-repeat="row in subscriptionRows"
+                                 ng-class="{'active': row.kind === 'label'}">
+                                 <!-- Section label: spans the whole row. -->
+                                 <td ng-if="row.kind === 'label'"
+                                     colspan="{{ subscriptionDetailed ? 6 : 3 }}"
+                                     ng-style="{'padding-left': (row.indent * 20) + 'px'}">
+                                     <strong>{{ row.label | translate }}</strong>
+                                 </td>
+                                 <!-- Application name (server / plugin). Links to a
+                                      different target depending on subscription state. -->
+                                 <td ng-if="row.kind !== 'label'"
+                                     ng-style="{'padding-left': (row.indent * 20) + 'px'}">
+                                     <strong ng-if="row.kind === 'server'" ng-switch="!!componentLinkTarget(row.status)">
+                                         <a ng-switch-when="true" ng-href="{{ componentLinkTarget(row.status) }}" target="_blank" rel="noopener">{{ pluginDisplayName[row.status.application] || row.status.application }}</a>
+                                         <span ng-switch-default>{{ pluginDisplayName[row.status.application] || row.status.application }}</span>
+                                     </strong>
+                                     <span ng-if="row.kind === 'plugin'" ng-switch="!!componentLinkTarget(row.status)">
+                                         <a ng-switch-when="true" ng-href="{{ componentLinkTarget(row.status) }}" target="_blank" rel="noopener">{{ pluginDisplayName[row.application] || row.application }}</a>
+                                         <span ng-switch-default>{{ pluginDisplayName[row.application] || row.application }}</span>
+                                     </span>
+                                 </td>
+                                 <!-- Usage: yes/no. Compact shows only the dot. Hover explains why. -->
+                                 <td ng-if="row.kind !== 'label'" class="text-center subscription-status-cell">
+                                     <span uib-tooltip="{{ usageReasonText(row.status) | translate }}"
+                                           tooltip-placement="top">
+                                         <span class="status-dot"
+                                               ng-class="usageDotClass(row.status)"
+                                               aria-hidden="true">●</span>
+                                         <span class="status-text" ng-if="subscriptionDetailed">{{ usageText(row.status) | translate }}</span>
+                                     </span>
+                                 </td>
+                                 <!-- Subscription state. Compact shows only the dot. Hover explains why. -->
+                                 <td ng-if="row.kind !== 'label'" class="text-center subscription-status-cell">
+                                     <span uib-tooltip="{{ subscriptionReasonText(row.status) | translate }}"
+                                           tooltip-placement="top">
+                                         <span class="status-dot"
+                                               ng-class="subscriptionDot[row.status.subscription]"
+                                               aria-hidden="true">●</span>
+                                         <span class="status-text" ng-if="subscriptionDetailed">{{ subscriptionText[row.status.subscription] | translate }}</span>
+                                     </span>
+                                 </td>
+                                 <!-- Expires (detailed view only). -->
+                                 <td ng-if="row.kind !== 'label' && subscriptionDetailed">
+                                     <span ng-if="row.status.date_till">
+                                         {{ row.status.date_till | date: "y-MM-dd" : "UTC" }}
+                                         <span ng-if="row.status.days_left > 0">
+                                             ({{ row.status.days_left }} <span translate>days left</span>)
+                                         </span>
+                                         <span ng-if="row.status.days_left === 0">
+                                             (<span translate>today</span>)
+                                         </span>
+                                         <span ng-if="row.status.days_left < 0">
+                                             ({{ -row.status.days_left }} <span translate>days ago</span>)
+                                         </span>
+                                     </span>
+                                     <span ng-if="!row.status.date_till">—</span>
+                                 </td>
+                                 <!-- Versions seen in the user-agents (detailed view only).
+                                      Capped width; scrolls inside the cell when long. -->
+                                 <td ng-if="row.kind !== 'label' && subscriptionDetailed">
+                                     <div class="subscription-versions">
+                                         <span ng-if="row.status.versions.length">{{ row.status.versions.join(", ") }}</span>
+                                         <span ng-if="!row.status.versions.length" class="text-muted">—</span>
+                                     </div>
+                                 </td>
+                                 <!-- Latest released version from GitHub (detailed view only),
+                                      version + date linking to the release page. -->
+                                 <td ng-if="row.kind !== 'label' && subscriptionDetailed">
+                                     <a ng-if="row.status.current_version && row.status.current_version_url"
+                                        ng-href="{{ row.status.current_version_url }}"
+                                        target="_blank" rel="noopener">{{ row.status.current_version }}<span ng-if="row.status.current_version_date"> ({{ row.status.current_version_date }})</span></a>
+                                     <span ng-if="row.status.current_version && !row.status.current_version_url">{{ row.status.current_version }}<span ng-if="row.status.current_version_date" class="text-muted"> ({{ row.status.current_version_date }})</span></span>
+                                     <span ng-if="!row.status.current_version" class="text-muted">—</span>
+                                 </td>
+                             </tr>
+                         </tbody>
+                     </table>
+                 </div>
+           </div>
+       </div>
+
+       <!-- The panels beside the subscription overview. While it is compact they share
+            the remaining nine columns; in the detailed view it claims nine of its own, so
+            these no longer fit next to it and wrap to the line below. -->
+       <div ng-class="subscriptionDetailed ? 'col-lg-12' : 'col-lg-9'">
+         <div class="row">
+           <!-- Stacked left of the policies: the two counters side by side with the
+                audit table filling the width underneath them. -->
+           <div class="col-lg-7">
+             <div class="row">
+       <div class="col-lg-6">
+           <div class="panel panel-default"
+                  ng-show="checkRight('tokenlist')">
+               <div class="panel-heading">
+	           <a ui-sref="token.list">
+                       <span class="glyphicon glyphicon-phone"></span>
+                       <span translate>Tokens</span>
+                   </a>
+	       </div>
+                <div class="panel-body">
+                    <table class="table">
+                        <tbody>
+                            <tr>
+                                <td translate>Total</td>
+                                <td>
+                                    <a ui-sref="token.list()">{{ tokens.total }}</a>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td translate>Hardware</td>
+                                <td>{{ tokens.hardware }}</td>
+                            </tr>
+                            <tr>
+                                <td translate>Software</td>
+                                <td>{{ tokens.software }}</td>
+                            </tr>
+                            <tr>
+                                <td translate>Unassigned Hardware</td>
+                                <td>{{ tokens.unassigned_hardware }}</td>
+                            </tr>
+                            <tr>
+                                <td translate>Unassigned Software</td>
+                                <td>{{ tokens.unassigned_software }}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+           </div>
+       </div>
+       <div class="col-lg-6">
+             <div class="panel panel-default"
+                  ng-show="checkRight('auditlog')">
+                 <div class="panel-heading">
+                    <a ui-sref="audit.log">
+                        <span class="glyphicon glyphicon-log-in" aria-hidden="true"></span>
+                        <span translate>Authentications</span>
+                    </a>
+                 </div>
+                 <div class="panel-body">
+                     <div translate>Authentications in the last 24 hours</div>
+                     <table class="table">
+                         <tbody>
+                            <tr>
+                                <td translate>success</td>
+                                <td>{{ authentications.success }}</td>
+                            </tr>
+                            <tr>
+                                <td translate>failed</td>
+                                <td>{{ authentications.fail }}</td>
+                            </tr>
+                            <tr>
+                                <td translate>failed users / tokens</td>
+                                <td>
+                                    <span ng-repeat="userobj in authentications.users">
+                                        {{ !$first ? "| " : "" }}
+                                        <a ui-sref="user.details({
+                                        username: userobj.user,
+                                        realmname: userobj.realm})">
+                                            {{ userobj.user }}@{{ userobj.realm }}[{{ userobj.fails }}]
+                                        </a>
+                                    </span>
+                                    <span ng-repeat="serial in authentications.serials">
+                                        <a ui-sref="token.details({tokenSerial: serial})">
+                                            {{ serial }}</a>
+                                    </span>
+                                </td>
+                            </tr>
+                         </tbody>
+                     </table>
+                 </div>
+           </div>
+       </div>
+             </div>
+             <div class="row">
+       <div class="col-lg-12">
+            <div class="panel panel-default"
+                  ng-show="checkRight('auditlog')">
+                 <div class="panel-heading" translate>Administration</div>
+                 <div class="panel-body">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th translate>Date</th>
+                                <th translate>Administrator</th>
+                                <th translate>Action</th>
+                                <th translate>Detail</th>
+                            </tr>
+                        </thead>
+                            <tr ng-repeat="auditentry in administration">
+                                <td>{{ auditentry.date | date: "y-MM-d HH:mm" }}</td>
+                                <td>{{ auditentry.administrator }}</td>
+                                <td>{{ auditentry.action }}</td>
+                                <td>{{ auditentry.action_detail }}</td>
+                            </tr>
+                        <tbody>
+
+                        </tbody>
+                    </table>
+                 </div>
+           </div>
+       </div>
+             </div>
+           </div>
+       <div class="col-lg-5">
+           <div class="panel panel-default"
+                ng-show="checkRight('policyread')">
+                 <div class="panel-heading">
+                    <a ui-sref="config.policies.list">
+                    <span class="glyphicon glyphicon-hand-up"
+                          aria-hidden="true"></span>
+                    <span translate>Policies</span></a>
+		 </div>
+                 <div class="panel-body">
+                    <table class="table">
+                        <tbody>
+                            <tr>
+                                <td translate>Active Policies</td>
+                                <td>{{ policies.num_active }}</td>
+                            </tr>
+                            <tr>
+                                <td span="2">
+                                    <span ng-repeat="pol in policies.active">
+                                        {{ ! $first ? "| " : "" }}<a ui-sref="config.policies.details({policyname:pol})"
+                                           ng-click="$rootScope.returnTo=dashboard;">{{ pol }}</a>
+                                    </span>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td translate>Inactive Policies</td>
+                                <td>{{ policies.num_inactive }}</td>
+                            </tr>
+                            <tr>
+                                <td span="2">
+                                    <span ng-repeat="pol in policies.inactive">
+                                        {{ ! $first ? "| " : "" }}<a ui-sref="config.policies.details({policyname:pol})"
+                                           ng-click="$rootScope.returnTo=dashboard;">{{ pol }}</a>
+                                    </span>
+
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                 </div>
+           </div>
+       </div>
+         </div>
+       </div>
+   </div>
+   <div class="row"> <!-- health monitoring: act-now data -->
+       <div class="col-lg-6">
+             <div class="panel panel-default"
+                  ng-show="checkRight('configread')">
+                 <div class="panel-heading">
+                    <span class="glyphicon glyphicon-lock" aria-hidden="true"></span>
+                    <span translate>Certificates</span>
+                    <button type="button" class="btn btn-xs btn-default pull-right"
+                            ng-click="getCertificateHealth(true)"
+                            ng-disabled="certificates.loading"
+                            title="{{ 'Refresh (bypass cache)' | translate }}">
+                        <span class="glyphicon glyphicon-refresh"></span>
+                    </button>
+                 </div>
+                 <div class="panel-body">
+                    <div ng-if="certificates.loading" translate>Checking...</div>
+                    <div ng-if="!certificates.loading && certificates.entries.length === 0" translate>
+                        No TLS-enabled LDAP resolvers configured and PI_SERVER_CERT_FILE not set.
+                    </div>
+                    <table class="table table-condensed" ng-if="certificates.entries.length > 0">
+                        <thead>
+                            <tr>
+                                <th translate>Source</th>
+                                <th translate>Expires</th>
+                                <th translate>Days until Expiry</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr ng-repeat="cert in certificates.entries"
+                                title="{{ cert.error || cert.subject }}">
+                                <td>
+                                    <span class="glyphicon"
+                                          ng-class="certificateStatusIcon(cert.status)"
+                                          aria-hidden="true"></span>
+                                    <a ng-if="cert.source === 'ldap-resolver'"
+                                       ui-sref="config.resolvers.editldapresolver({resolvername: cert.name})">
+                                        <strong>{{ cert.name }}</strong>
+                                    </a>
+                                    <a ng-if="cert.source === 'keycloak-resolver'"
+                                       ui-sref="config.resolvers.editkeycloakresolver({resolvername: cert.name})">
+                                        <strong>{{ cert.name }}</strong>
+                                    </a>
+                                    <a ng-if="cert.source === 'entraid-resolver'"
+                                       ui-sref="config.resolvers.editentraidresolver({resolvername: cert.name})">
+                                        <strong>{{ cert.name }}</strong>
+                                    </a>
+                                    <strong ng-if="cert.source !== 'ldap-resolver'
+                                                   && cert.source !== 'keycloak-resolver'
+                                                   && cert.source !== 'entraid-resolver'">{{ cert.name }}</strong>
+                                    <br>
+                                    <small>{{ cert.host }}</small>
+                                </td>
+                                <td>
+                                    <span ng-if="cert.not_after">{{ cert.not_after | date: "y-MM-dd" }}</span>
+                                    <span ng-if="!cert.not_after">{{ cert.status }}</span>
+                                </td>
+                                <td ng-class="certificateTextClass(cert.status)">
+                                    <span ng-if="cert.days_remaining !== null">{{ cert.days_remaining }}</span>
+                                    <span ng-if="cert.days_remaining === null">-</span>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                 </div>
+             </div>
+       </div>
+       <div class="col-lg-6">
+             <div class="panel panel-default"
+                  ng-show="checkRight('configread')">
+                 <div class="panel-heading">
+                    <span class="glyphicon glyphicon-time" aria-hidden="true"></span>
+                    <a ui-sref="config.resolvers.list" translate>Resolver</a>
+                    <span class="text-muted">/</span>
+                    <a ui-sref="config.realms" translate>Realm</a>
+                    <span translate>Timing</span>
+                    <small class="text-muted">
+                        (<span translate>last hour</span>)
+                    </small>
+                    <button type="button" class="btn btn-xs btn-default pull-right"
+                            ng-click="getResolverTiming()"
+                            ng-disabled="resolverTiming.loading"
+                            title="{{ 'Refresh' | translate }}">
+                        <span class="glyphicon glyphicon-refresh"></span>
+                    </button>
+                 </div>
+                 <div class="panel-body">
+                    <div ng-if="resolverTiming.loading" translate>Loading...</div>
+                    <div ng-if="!resolverTiming.loading && resolverTiming.entries.length === 0" translate>
+                        No resolver operations recorded in the selected window.
+                    </div>
+                    <table class="table table-condensed" ng-if="resolverTiming.entries.length > 0">
+                        <thead>
+                            <tr>
+                                <th translate>Resolver</th>
+                                <th translate>Requests</th>
+                                <th translate>Avg</th>
+                                <th>
+                                    <span translate>p95</span>
+                                    <span class="glyphicon glyphicon-info-sign text-muted"
+                                          style="cursor: help;"
+                                          uib-tooltip="{{ 'p95 means 95% of requests were faster than this value. The reading is rounded up to the next histogram bucket boundary, so it can appear larger than the exact maximum - that is expected, not a bug. Bucket boundaries: 50ms, 100ms, 150ms, 200ms, 250ms, 500ms, 1s, 2s, 5s. It is shown as a dash for resolvers with fewer than 20 requests in the window, where the bucket rounding would not give a meaningful value.' | translate }}"
+                                          tooltip-placement="top"></span>
+                                </th>
+                                <th translate>Max</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr ng-repeat="r in resolverTiming.entries">
+                                <td>
+                                    <a ng-if="r.detail_state"
+                                       ui-sref="{{ r.detail_state }}({resolvername: r.resolver})">
+                                        <strong>{{ r.resolver }}</strong>
+                                    </a>
+                                    <strong ng-if="!r.detail_state">{{ r.resolver }}</strong>
+                                    <span class="label label-default">{{ resolverTypeLabel(r.resolver_type) }}</span>
+                                    <br>
+                                    <small class="text-muted">
+                                        <span ng-repeat="o in r.by_op">
+                                            {{ !$first ? "| " : "" }}{{ o.op }}: {{ o.count }}
+                                        </span>
+                                    </small>
+                                </td>
+                                <td>{{ r.count }}</td>
+                                <td ng-class="resolverLatencyClass(r.avg)">
+                                    {{ formatDuration(r.avg) }}
+                                </td>
+                                <td ng-class="resolverLatencyClass(r.p95)"
+                                    title="{{ r.count < 20 ? ('Approximate - need more samples for a meaningful p95.' | translate) : '' }}">
+                                    <span ng-if="r.count >= 20">{{ formatDuration(r.p95) }}</span>
+                                    <span ng-if="r.count < 20" class="text-muted">—</span>
+                                </td>
+                                <td ng-class="resolverLatencyClass(r.max)">
+                                    {{ formatDuration(r.max) }}
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                 </div>
+             </div>
+       </div>
+   </div>
+   <div class="row"> <!-- service delivery: notification channels -->
+       <div class="col-lg-12">
+             <div class="panel panel-default"
+                  ng-show="checkRight('configread')">
+                 <div class="panel-heading">
+                    <span class="glyphicon glyphicon-send" aria-hidden="true"></span>
+                    <span translate>Notification Delivery</span>
+                    <small class="text-muted">
+                        (<span translate>last hour</span>)
+                    </small>
+                    <button type="button" class="btn btn-xs btn-default pull-right"
+                            ng-click="getNotificationDelivery()"
+                            ng-disabled="notificationDelivery.loading"
+                            title="{{ 'Refresh' | translate }}">
+                        <span class="glyphicon glyphicon-refresh"></span>
+                    </button>
+                 </div>
+                 <div class="panel-body">
+                    <div ng-if="notificationDelivery.loading" translate>Loading...</div>
+                    <div ng-if="!notificationDelivery.loading
+                                && notificationDelivery.totals.push === 0
+                                && notificationDelivery.totals.sms === 0
+                                && notificationDelivery.totals.email === 0" translate>
+                        No notification deliveries recorded in the selected window.
+                    </div>
+                    <div class="row" ng-if="!notificationDelivery.loading
+                                            && (notificationDelivery.totals.push
+                                                + notificationDelivery.totals.sms
+                                                + notificationDelivery.totals.email) > 0">
+                        <div class="col-md-4" ng-repeat="channel in ['push', 'sms', 'email']">
+                            <h4 style="text-transform: capitalize;">
+                                {{ channel | translate }}
+                                <small class="text-muted">
+                                    {{ notificationDelivery.totals[channel] }}
+                                    <span translate>total</span>
+                                </small>
+                            </h4>
+                            <div ng-if="notificationDelivery[channel].length === 0"
+                                 class="text-muted">
+                                <small translate>No deliveries</small>
+                            </div>
+                            <table class="table table-condensed"
+                                   ng-if="notificationDelivery[channel].length > 0">
+                                <thead>
+                                    <tr>
+                                        <th translate>Target</th>
+                                        <th translate>OK</th>
+                                        <th translate>Failed</th>
+                                        <th translate>p95</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr ng-repeat="entry in notificationDelivery[channel]">
+                                        <td>
+                                            <a ng-if="channel === 'email'"
+                                               ui-sref="config.smtp.edit({identifier: entry.key})">
+                                                <strong>{{ entry.key }}</strong>
+                                            </a>
+                                            <a ng-if="channel !== 'email' && smsGatewayIdByName[entry.key]"
+                                               ui-sref="config.smsgateway.edit({gateway_id: smsGatewayIdByName[entry.key]})">
+                                                <strong>{{ entry.key }}</strong>
+                                            </a>
+                                            <strong ng-if="channel !== 'email' && !smsGatewayIdByName[entry.key]">{{ entry.key }}</strong>
+                                        </td>
+                                        <td class="text-success">{{ entry.ok || 0 }}</td>
+                                        <td ng-class="deliveryFailureClass(entry)">
+                                            {{ (entry.failed || 0) + (entry.error || 0) }}
+                                        </td>
+                                        <td>
+                                            <span ng-if="entry.duration_count >= 20">
+                                                {{ formatDuration(entry.p95) }}
+                                            </span>
+                                            <span ng-if="!entry.duration_count || entry.duration_count < 20"
+                                                  class="text-muted"
+                                                  title="{{ 'Approximate - need more samples for a meaningful p95.' | translate }}">—</span>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                 </div>
+             </div>
+       </div>
+   </div>
+   <div class="row"> <!-- configuration reference -->
+       <div class="col-lg-4">
+             <div class="panel panel-default"
+                  ng-show="checkRight('eventhandling_read')">
+                 <div class="panel-heading">
+                    <a ui-sref="config.events.list">
+                        <span class="glyphicon glyphicon-flash" aria-hidden="true"></span>
+                        <span translate>Events</span>
+                    </a>
+                 </div>
+                 <div class="panel-body">
+                    <table class="table">
+                        <tbody>
+                            <tr>
+                                <td translate>Active Events</td>
+                                <td>{{ events.num_active }}</td>
+                            </tr>
+                            <tr>
+                                <td span="2">
+                                    <span ng-repeat="event in events.active">
+                                        {{ ! $first ? "| " : "" }}<a ui-sref="config.events.details({eventid:event.id})"
+                                           ng-click="$rootScope.returnTo=dashboard;">{{ event.name }}</a>
+                                    </span>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td translate>Inactive Events</td>
+                                <td>{{ events.num_inactive }}</td>
+                            </tr>
+                            <tr>
+                                <td span="2">
+                                    <span ng-repeat="event in events.inactive">
+                                        {{ ! $first ? "| " : "" }}<a ui-sref="config.events.details({eventid:event.id})"
+                                           ng-click="$rootScope.returnTo=dashboard;">{{ event.name }}</a>
+                                    </span>
+
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                 </div>
+           </div>
+       </div>
+   </div>
+</div>
+

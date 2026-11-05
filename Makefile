@@ -5,9 +5,18 @@ info:
 	@echo "make pypi             - upload package to pypi"
 	@echo "make translate        - translate WebUI"
 	@echo "make translate-server - translate string in the server code."
+	@echo "make refresh-version  - refresh the version metadata of an editable install from git"
 
 
 SIGNING_KEY=53E66E1D2CABEFCDB1D3B83E106164552E8D8149
+
+# setuptools-scm bakes the version into the .egg-info metadata at install time.
+# An editable install ("pip install -e .") therefore keeps reporting the version
+# of the commit it was installed at, even after a "git pull". This regenerates the
+# metadata from the current git state without a full (frontend) rebuild.
+refresh-version:
+	python -c "from setuptools import setup; setup()" egg_info
+	@python -c "from importlib import metadata; print('privacyIDEA', metadata.version('privacyidea'))"
 
 clean:
 	find . -name \*.pyc -exec rm {} \;
@@ -16,14 +25,6 @@ clean:
 	rm -fr cover
 	rm -f .coverage
 	(cd doc; make clean)
-
-setversion:
-	vim Makefile
-	vim setup.py
-	vim doc/conf.py
-	vim Changelog
-	@echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-	@echo "Please set a tag like:  git tag 3.17"
 
 POS = $(wildcard po/*.po)
 translate:
@@ -34,11 +35,21 @@ translate:
 	grunt nggettext_compile
 
 translate-server:
-	(cd privacyidea; pybabel extract -F babel.cfg -o messages.pot .)
+	(cd privacyidea; pybabel extract -F babel.cfg -k lazy_gettext -o messages.pot .)
 	# pybabel init -i messages.pot -d translations -l de
 	(cd privacyidea; pybabel update -i messages.pot -d translations)
+	$(MAKE) check-translations-server
 	# create the .mo file
 	(cd privacyidea; pybabel compile -d translations)
+
+# pybabel update keeps an obsolete entry when its msgid comes back into the source, which leaves a
+# duplicate definition that pybabel accepts but GNU gettext (and therefore Weblate) rejects.
+check-translations-server:
+	status=0; \
+	for catalog in privacyidea/translations/*/LC_MESSAGES/messages.po; do \
+		msgfmt --check -o /dev/null $$catalog || status=1; \
+	done; \
+	exit $$status
 
 pypi:
 	make doc-man
@@ -57,7 +68,7 @@ NPM_VERSION := $(shell npm --version 2>/dev/null)
 
 update-contrib:
 ifdef NPM_VERSION
-	(cd privacyidea/static && npm install && ./update_contrib.sh)
+	(cd privacyidea/static_old && npm install && ./update_contrib.sh)
 else
 	@echo "Command 'npm' not found! It is needed to install the JS contrib libraries."
 endif

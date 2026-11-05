@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2018-05-09 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             TAN token with to be randomly used TAN values
 #
@@ -24,10 +22,13 @@ It depends on the DB model, and the lib.tokenclass.
 """
 
 import logging
+
+from privacyidea.lib.decorators import check_token_otp_length
 from privacyidea.lib.log import log_with
 from privacyidea.lib.tokenclass import TokenClass
 from privacyidea.lib.tokens.papertoken import PaperTokenClass
-from privacyidea.lib.policy import SCOPE, ACTION, GROUP
+from privacyidea.lib.policy import SCOPE, GROUP
+from privacyidea.lib.policies.actions import PolicyAction
 from privacyidea.lib import _
 from privacyidea.lib.crypto import geturandom, hash
 
@@ -36,7 +37,7 @@ DEFAULT_COUNT = 100
 SALT_LENGTH = 4
 
 
-class TANACTION(object):
+class TANAction:
     TANTOKEN_COUNT = "tantoken_count"
 
 
@@ -47,6 +48,7 @@ class TanTokenClass(PaperTokenClass):
     OTP values. In contrast to the paper token, the OTP values of the TAN token
     can be used randomly.
     """
+    owned_tokeninfo_prefixes = frozenset({"tan."})
 
     @log_with(log)
     def __init__(self, db_token):
@@ -57,7 +59,7 @@ class TanTokenClass(PaperTokenClass):
         :type db_token:  orm object
         """
         TokenClass.__init__(self, db_token)
-        self.set_type(u"tan")
+        self.set_type("tan")
         self.hKeyRequired = False
 
     @staticmethod
@@ -93,8 +95,7 @@ class TanTokenClass(PaperTokenClass):
         """
         res = {'type': 'tan',
                'title': 'TAN Token',
-               'description': 'TAN: TANs printed on a sheet '
-                              'of paper.',
+               'description': _('TAN: TANs printed on a sheet of paper.'),
                'init': {},
                'config': {},
                'user':  ['enroll'],
@@ -102,17 +103,17 @@ class TanTokenClass(PaperTokenClass):
                'ui_enroll': ["admin", "user"],
                'policy': {
                    SCOPE.ENROLL: {
-                       TANACTION.TANTOKEN_COUNT: {
+                       TANAction.TANTOKEN_COUNT: {
                            "type": "int",
                            "desc": _("The number of OTP values, which are "
                                      "printed on the paper.")
                        },
-                       ACTION.MAXTOKENUSER: {
+                       PolicyAction.MAXTOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of TAN tokens assigned."),
                            'group': GROUP.TOKEN
                        },
-                       ACTION.MAXACTIVETOKENUSER: {
+                       PolicyAction.MAXACTIVETOKENUSER: {
                            'type': 'int',
                            'desc': _(
                                "The user may only have this maximum number of active TAN tokens assigned."),
@@ -151,9 +152,10 @@ class TanTokenClass(PaperTokenClass):
             salt = geturandom(SALT_LENGTH, hex=True)
             # Now we add all TANs to the tokeninfo of this token.
             hashed_tan = hash(tanvalue, salt)
-            self.add_tokeninfo("tan.tan{0!s}".format(tankey),
-                               "{0}:{1}".format(salt, hashed_tan))
+            self.write_tokeninfo(f"tan.tan{tankey!s}",
+                               f"{salt}:{hashed_tan}")
 
+    @check_token_otp_length
     def check_otp(self, anOtpVal, counter=None, window=None, options=None):
         """
         check if the given OTP value is valid for this token.
@@ -175,29 +177,29 @@ class TanTokenClass(PaperTokenClass):
             if tankey.startswith("tan.tan"):
                 salt, tan = tanvalue.split(":")
                 if tan == hash(anOtpVal, salt):
-                    self.del_tokeninfo(tankey)
+                    self.remove_tokeninfo(tankey)
                     return 1
 
         return res
 
     @staticmethod
-    def get_import_csv(l):
+    def get_import_csv(row):
         """
         Read the list from a csv file and return a dictionary, that can be used
         to do a token_init.
 
-        :param l: The list of the line of a csv file
-        :type l: list
+        :param row: The list of the line of a csv file
+        :type row: list
         :return: A dictionary of init params
         """
-        params = TokenClass.get_import_csv(l)
+        params = TokenClass.get_import_csv(row)
         # Delete the otplen, if it exists. The fourth column is the TANs!
         if "otplen" in params:
             del params["otplen"]
 
         # tans
-        if len(l) >= 4:
-            params["tans"] = l[3]
+        if len(row) >= 4:
+            params["tans"] = row[3]
 
         return params
 

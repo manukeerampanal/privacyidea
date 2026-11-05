@@ -1,0 +1,1012 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { provideHttpClient } from "@angular/common/http";
+import { lastValueFrom } from "rxjs";
+import { HttpTestingController, provideHttpClientTesting } from "@angular/common/http/testing";
+import { provideLocationMocks } from "@angular/common/testing";
+import { TestBed } from "@angular/core/testing";
+import { provideRouter, Router } from "@angular/router";
+import { AuthService } from "@services/auth/auth.service";
+import { ContentService } from "@services/content/content.service";
+import { Realms, RealmService } from "@services/realm/realm.service";
+import { TokenDetails, Tokens, TokenService } from "@services/token/token.service";
+import { EditUserData, UserAttributePolicy, UserData, UserService } from "./user.service";
+
+import { Component, signal } from "@angular/core";
+import { PiResponse } from "@app/app.component";
+import { FilterValue } from "@core/models/filter_value/filter_value";
+import { ROUTE_PATHS } from "@app/route_paths";
+import { environment } from "@env/environment";
+import { NotificationService } from "@services/notification/notification.service";
+import {
+  MockContentService,
+  MockHttpResourceRef,
+  MockLocalService,
+  MockNotificationService,
+  MockPiResponse,
+  MockRealmService,
+  MockTokenService
+} from "@testing/mock-services";
+import { MockAuthService } from "@testing/mock-services/mock-auth-service";
+
+function buildUser(username: string): UserData {
+  return {
+    username,
+    userid: username,
+    description: "",
+    editable: true,
+    email: `${username}@test`,
+    givenname: username,
+    surname: "Tester",
+    mobile: "",
+    phone: "",
+    resolver: ""
+  };
+}
+
+function setTokenDetailUsername(name: string) {
+  const ref = (TestBed.inject(TokenService) as unknown as MockTokenService).tokenDetailResource;
+
+  if (!ref.value()) {
+    const seeded = MockPiResponse.fromValue<Tokens>({
+      tokens: [{ username: name } as Partial<TokenDetails> as TokenDetails]
+    } as Partial<Tokens> as Tokens) as unknown as PiResponse<Tokens>;
+    ref.set(seeded);
+    return;
+  }
+
+  ref.update((resp) => {
+    const current = resp!.result!.value as unknown as Tokens;
+    const first = current.tokens?.[0] ?? ({} as Partial<TokenDetails> as TokenDetails);
+    first.username = name;
+    return {
+      ...resp!,
+      result: {
+        ...resp!.result!,
+        value: { ...current, tokens: [first] }
+      }
+    } as PiResponse<Tokens>;
+  });
+}
+
+describe("UserService", () => {
+  let userService: UserService;
+  let realmService: MockRealmService;
+  let httpMock: HttpTestingController;
+  let contentServiceMock: MockContentService;
+  let authServiceMock: MockAuthService;
+  let notificationServiceMock: MockNotificationService;
+
+  let users: UserData[];
+  let alice: UserData;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        UserService,
+        { provide: RealmService, useClass: MockRealmService },
+        { provide: AuthService, useClass: MockAuthService },
+        { provide: ContentService, useClass: MockContentService },
+        { provide: TokenService, useClass: MockTokenService },
+        { provide: NotificationService, useClass: MockNotificationService },
+        MockLocalService
+      ]
+    });
+
+    userService = TestBed.inject(UserService);
+    realmService = TestBed.inject(RealmService) as unknown as MockRealmService;
+    httpMock = TestBed.inject(HttpTestingController);
+    contentServiceMock = TestBed.inject(ContentService) as unknown as MockContentService;
+    authServiceMock = TestBed.inject(AuthService) as unknown as MockAuthService;
+    notificationServiceMock = TestBed.inject(NotificationService) as unknown as MockNotificationService;
+
+    alice = buildUser("Alice");
+    users = [alice, buildUser("Bob"), buildUser("Charlie")];
+    userService.users.set(users);
+    userService.detailsUser.set({ username: "Alice", realm: "" });
+  });
+
+  afterEach(() => {
+    httpMock.verify();
+  });
+
+  it("should be created", () => {
+    expect(userService).toBeTruthy();
+  });
+
+  it("selectedUserRealm should expose the current defaultRealm", () => {
+    realmService.realmOptions.set(["realm1", "realm2", "someRealm"]);
+    expect(userService.selectedUserRealm()).toBe("realm1");
+    realmService.setDefaultRealm("someRealm");
+    expect(userService.selectedUserRealm()).toBe("someRealm");
+  });
+
+  it("selectedUserRealm should expose first realm if no default realm is set", () => {
+    realmService.realmOptions.set(["realm1", "realm2"]);
+    expect(userService.selectedUserRealm()).toBe("realm1");
+  });
+
+  it("selectedUserRealm switches to the default realm when it resolves after the realm options", () => {
+    contentServiceMock.routeUrl.set(ROUTE_PATHS.USERS);
+    realmService.defaultRealmResource.set(MockPiResponse.fromValue<Realms>({}));
+    realmService.defaultRealmResource.isLoading.set(true);
+    realmService.realmOptions.set(["aRealm", "zRealm"]);
+    expect(userService.selectedUserRealm()).toBe("aRealm");
+
+    // The answer settles the resource, so the load ends with the value rather than after it.
+    realmService.defaultRealmResource.set(
+      MockPiResponse.fromValue<Realms>({ zRealm: { default: true, id: 1, option: "", resolver: [] } })
+    );
+    expect(realmService.defaultRealmResource.isLoading()).toBe(false);
+    expect(userService.selectedUserRealm()).toBe("zRealm");
+  });
+
+  it("seeds selectedUserRealm and selectionFilter from query parameters on navigation", () => {
+    realmService.realmOptions.set(["realm1", "defrealm"]);
+    contentServiceMock.queryParams.set({ realm: "defrealm", user: "root" });
+    contentServiceMock.routeUrl.set(ROUTE_PATHS.TOKENS_ENROLLMENT);
+
+    expect(userService.selectedUserRealm()).toBe("defrealm");
+    expect(userService.selectionUsernameFilter()).toBe("root");
+  });
+
+  it("keeps the seeded user selection when the realm changes on the same route", () => {
+    realmService.realmOptions.set(["realm1", "defrealm"]);
+    contentServiceMock.queryParams.set({ realm: "defrealm", user: "root" });
+    contentServiceMock.routeUrl.set(ROUTE_PATHS.TOKENS_ENROLLMENT);
+    expect(userService.selectionUsernameFilter()).toBe("root");
+
+    userService.selectionFilter.set("bob");
+    userService.selectedUserRealm.set("realm1");
+    expect(userService.selectionUsernameFilter()).toBe("bob");
+  });
+
+  it("resets the selection filter when navigating away without query parameters", () => {
+    realmService.realmOptions.set(["realm1", "defrealm"]);
+    contentServiceMock.queryParams.set({ realm: "defrealm", user: "root" });
+    contentServiceMock.routeUrl.set(ROUTE_PATHS.TOKENS_ENROLLMENT);
+    expect(userService.selectionUsernameFilter()).toBe("root");
+
+    contentServiceMock.queryParams.set({});
+    contentServiceMock.routeUrl.set(ROUTE_PATHS.TOKENS);
+    expect(userService.selectionUsernameFilter()).toBe("");
+  });
+
+  it("ignores a query realm that is not in the realms the user may see", () => {
+    realmService.realmOptions.set(["realm1", "defrealm"]);
+    contentServiceMock.queryParams.set({ realm: "hiddenRealm", user: "root" });
+    contentServiceMock.routeUrl.set(ROUTE_PATHS.TOKENS_ENROLLMENT);
+
+    expect(userService.selectedUserRealm()).toBe("realm1");
+  });
+
+  it("keeps a manually chosen realm when the token type changes on the same route", () => {
+    const tokenService = TestBed.inject(TokenService) as unknown as MockTokenService;
+    realmService.realmOptions.set(["realm1", "defrealm"]);
+    contentServiceMock.queryParams.set({ realm: "defrealm", user: "root" });
+    contentServiceMock.routeUrl.set(ROUTE_PATHS.TOKENS_ENROLLMENT);
+    expect(userService.selectedUserRealm()).toBe("defrealm");
+
+    userService.selectedUserRealm.set("realm1");
+    tokenService.selectedTokenType.update((type) => ({ ...type, key: "totp" }));
+
+    expect(userService.selectedUserRealm()).toBe("realm1");
+  });
+
+  it("selectedUserRealm uses the own realm of a self service user", () => {
+    realmService.realmOptions.set(["realm1", "defrealm"]);
+    authServiceMock.role.set("user");
+    authServiceMock.realm.set("selfRealm");
+    contentServiceMock.routeUrl.set(ROUTE_PATHS.TOKENS_ENROLLMENT);
+
+    expect(userService.selectedUserRealm()).toBe("selfRealm");
+  });
+
+  it("selectedUserRealm should expose empty string if no realmOptions are available", () => {
+    realmService.realmOptions.set([]);
+    expect(userService.selectedUserRealm()).toBe("");
+
+    // even setting the default realm keeps an empty string as the realm is not in the options list
+    realmService.setDefaultRealm("realm1");
+    expect(userService.selectedUserRealm()).toBe("");
+  });
+
+  it("selectedUserRealm should expose first realm if no default realm is not in the realmOptions list", () => {
+    realmService.realmOptions.set(["realm1", "realm2"]);
+    realmService.setDefaultRealm("someRealm");
+    expect(userService.selectedUserRealm()).toBe("realm1");
+  });
+
+  it("selectedUserRealm uses the opened user's realm on user details", () => {
+    contentServiceMock.onUserDetails = signal(true);
+    contentServiceMock.detailsUser.set({ username: "Alice", realm: "userRealm" });
+    expect(userService.selectedUserRealm()).toBe("userRealm");
+  });
+
+  it("allUsernames exposes every user.username", () => {
+    expect(userService.allUsernames()).toEqual(["Alice", "Bob", "Charlie"]);
+  });
+
+  it("displayUser returns the username for objects and echoes raw strings", () => {
+    expect(userService.displayUser(alice)).toBe("Alice");
+    expect(userService.displayUser("plainString")).toBe("plainString");
+  });
+
+  describe("pageSize", () => {
+    it("pageSize should be initialized with policy value", () => {
+      authServiceMock.userPageSize.set(20);
+      expect(userService.pageSize()).toBe(20);
+    });
+
+    it("pageSize should be 10 if policy value is invalid", () => {
+      authServiceMock.userPageSize.set(0);
+      expect(userService.pageSize()).toBe(10);
+    });
+  });
+
+  describe("user filtering", () => {
+    it("selectedUser returns null when userNameFilter is empty", () => {
+      expect(userService.selectedUser()).toBeNull();
+    });
+
+    it("selectedUser returns the matching user when userNameFilter is set", () => {
+      userService.selectionFilter.set("Alice");
+      expect(userService.selectedUser()).toEqual(alice);
+    });
+
+    it("filteredUsers narrows the list by the string in userFilter (case-insensitive)", () => {
+      userService.selectionFilter.set("aL"); // any case
+      expect(userService.selectionFilteredUsers()).toEqual([users[0]]);
+    });
+
+    it("should return all users when filter is empty", () => {
+      userService.selectionFilter.set("");
+      expect(userService.selectionFilteredUsers()).toEqual(users);
+    });
+  });
+
+  describe("attribute policy + attributes", () => {
+    it("setUserAttribute issues POST /user/attribute with params", () => {
+      realmService.realmOptions.set(["realm1", "realm2"]);
+      userService.setUserAttribute("department", "finance").subscribe();
+
+      const req = httpMock.expectOne((r) => r.method === "POST" && r.url.endsWith("/user/attribute"));
+      expect(req.request.params.get("user")).toBe("Alice");
+      expect(req.request.params.get("realm")).toBe("realm1");
+      expect(req.request.params.get("key")).toBe("department");
+      expect(req.request.params.get("value")).toBe("finance");
+
+      req.flush({ result: { value: 123 } });
+    });
+
+    it("deleteUserAttribute issues DELETE /user/attribute/<key>/<user>/<realm> with proper encoding", () => {
+      realmService.realmOptions.set(["realm1", "r 1"]);
+      userService.detailsUser.set({ username: "Alice Smith", realm: "" });
+      realmService.setDefaultRealm("r 1");
+
+      const key = "department/role";
+      userService.deleteUserAttribute(key).subscribe();
+
+      const expectedEnding =
+        "/user/attribute/" +
+        encodeURIComponent(key) +
+        "/" +
+        encodeURIComponent("Alice Smith") +
+        "/" +
+        encodeURIComponent("r 1");
+
+      const req = httpMock.expectOne((r) => r.method === "DELETE" && r.url.endsWith(expectedEnding));
+
+      expect(req.request.headers).toBeTruthy();
+
+      req.flush({ result: { status: true, value: true } });
+    });
+
+    it("setUserAttribute notifies on error", async () => {
+      realmService.realmOptions.set(["realm1"]);
+      const result = lastValueFrom(userService.setUserAttribute("department", "finance"));
+
+      const req = httpMock.expectOne((r) => r.method === "POST" && r.url.endsWith("/user/attribute"));
+      req.flush({ result: { error: { message: "denied" } } }, { status: 500, statusText: "Server Error" });
+
+      await expect(result).resolves.toBeUndefined();
+      expect(notificationServiceMock.error).toHaveBeenCalledWith("Failed to set user attribute. denied");
+    });
+
+    it("deleteUserAttribute notifies on error", async () => {
+      realmService.realmOptions.set(["realm1"]);
+      const result = lastValueFrom(userService.deleteUserAttribute("department"));
+
+      const req = httpMock.expectOne((r) => r.method === "DELETE");
+      req.flush({ result: { error: { message: "denied" } } }, { status: 500, statusText: "Server Error" });
+
+      await expect(result).resolves.toBeUndefined();
+      expect(notificationServiceMock.error).toHaveBeenCalledWith("Failed to delete user attribute. denied");
+    });
+  });
+
+  describe("attribute policy + attributes (no HTTP; drive signals directly)", () => {
+    it("attributePolicy defaults when attributesResource has no value", () => {
+      expect(userService.attributePolicy()).toEqual({ delete: [], set: {} });
+      expect(userService.deletableAttributes()).toEqual([]);
+      expect(userService.attributeSetMap()).toEqual({});
+      expect(userService.hasWildcardKey()).toBe(false);
+      expect(userService.keyOptions()).toEqual([]);
+    });
+
+    it("derives deletableAttributes, wildcard, and sorted keyOptions from editableAttributesResource value", () => {
+      const policy: UserAttributePolicy = {
+        delete: ["department", "attr2", "attr1"],
+        set: {
+          "*": ["2", "1"],
+          city: ["*"],
+          department: ["sales", "finance"]
+        }
+      };
+
+      (
+        userService as {
+          editableAttributesResource: UserService["editableAttributesResource"];
+        }
+      ).editableAttributesResource = new MockHttpResourceRef(
+        MockPiResponse.fromValue(policy)
+      ) as unknown as UserService["editableAttributesResource"];
+
+      expect(userService.attributePolicy()).toEqual(policy);
+      expect(userService.deletableAttributes()).toEqual(["department", "attr2", "attr1"]);
+      expect(userService.attributeSetMap()).toEqual(policy.set);
+      expect(userService.hasWildcardKey()).toBe(true);
+      expect(userService.keyOptions()).toEqual(["city", "department"]);
+    });
+
+    it("userAttributes and userAttributesList derive from userAttributesResource value", () => {
+      const attrs = { city: "Berlin", department: ["sales", "finance"] };
+
+      (userService as { userAttributesResource: UserService["userAttributesResource"] }).userAttributesResource =
+        new MockHttpResourceRef(MockPiResponse.fromValue(attrs)) as unknown as UserService["userAttributesResource"];
+
+      expect(userService.userAttributes()).toEqual(attrs);
+      expect(userService.userAttributesList()).toEqual([
+        { key: "city", value: "Berlin" },
+        { key: "department", value: "sales, finance" }
+      ]);
+    });
+
+    it("internalAttributes and internalAttributesList derive from internalAttributesResource value, formatting dict values", () => {
+      const attrs = {
+        description: "some note",
+        last_used_token: { "privacyIDEA-WebUI": "spass", "privacyIDEA-Keycloak": "totp" }
+      };
+
+      (
+        userService as {
+          internalAttributesResource: UserService["internalAttributesResource"];
+        }
+      ).internalAttributesResource = new MockHttpResourceRef(
+        MockPiResponse.fromValue(attrs)
+      ) as unknown as UserService["internalAttributesResource"];
+
+      expect(userService.internalAttributes()).toEqual(attrs);
+      expect(userService.internalAttributesList()).toEqual([
+        { key: "description", value: "some note" },
+        { key: "last_used_token", value: "privacyIDEA-WebUI: spass, privacyIDEA-Keycloak: totp" }
+      ]);
+    });
+
+    it("userAttributes falls back to {} when userAttributesResource becomes undefined", () => {
+      const ref = new MockHttpResourceRef(MockPiResponse.fromValue({ city: "Berlin" }));
+      (userService as { userAttributesResource: UserService["userAttributesResource"] }).userAttributesResource =
+        ref as unknown as UserService["userAttributesResource"];
+
+      expect(userService.userAttributes()).toEqual({ city: "Berlin" });
+
+      ref.set(undefined as unknown as MockPiResponse<{ city: string }>);
+
+      expect(userService.userAttributes()).toEqual({});
+      expect(userService.userAttributesList()).toEqual([]);
+    });
+
+    it("userAttributes handle http error of userAttributesResource", async () => {
+      contentServiceMock.onUserDetails = signal(true);
+      TestBed.tick();
+
+      const req = httpMock.expectOne((r) => r.url === "/user/attribute");
+      expect(req.request.method).toBe("GET");
+      req.flush(MockPiResponse.fromError({ message: "Permission denied" }), {
+        status: 403,
+        statusText: "Permission denied"
+      });
+      await Promise.resolve();
+
+      expect(userService.userAttributes()).toEqual({});
+      expect(userService.userAttributesList()).toEqual([]);
+
+      httpMock.expectOne((r) => r.url.includes("/user/editable_attributes"));
+    });
+
+    it("clearFilter replaces activeFilter with a fresh instance", () => {
+      const before = userService.activeFilter();
+      userService.clearFilter();
+      const after = userService.activeFilter();
+
+      expect(after).not.toBe(before);
+      expect(userService.filterParams()).toEqual({});
+    });
+  });
+
+  it("should not include empty or wildcard-only filter values in filterParams", () => {
+    userService.activeFilter.set(new FilterValue({ value: "username: email: alice@test surname:*" }));
+
+    const params = userService.filterParams();
+    expect(params).not.toHaveProperty("username");
+    expect(params).toHaveProperty("email", "*alice@test*");
+    expect(params).not.toHaveProperty("surname");
+  });
+
+  it("sends only the first word after a keyword to the server; trailing words are not appended", () => {
+    userService.activeFilter.set(new FilterValue({ value: "username: root smith" }));
+
+    const params = userService.filterParams();
+    expect(params).toHaveProperty("username", "*root*");
+  });
+
+  it("normalizes keyword case so mixed-case keys still produce a server filter", () => {
+    userService.activeFilter.set(new FilterValue({ value: "UserName: root" }));
+
+    const params = userService.filterParams();
+    expect(params).toHaveProperty("username", "*root*");
+  });
+
+  describe("has_tokens filter", () => {
+    it("normalizes has_tokens to the backend's True/False spelling, unwrapped", () => {
+      userService.activeFilter.set(new FilterValue({ value: "has_tokens: true" }));
+      expect(userService.filterParams()).toEqual({ has_tokens: "True" });
+
+      userService.activeFilter.set(new FilterValue({ value: "has_tokens: false" }));
+      expect(userService.filterParams()).toEqual({ has_tokens: "False" });
+    });
+
+    it("sends has_tokens as typed when the value does not read as a boolean, for the backend to reject", () => {
+      userService.activeFilter.set(new FilterValue({ value: "has_tokens: maybe" }));
+      expect(userService.filterParams()).toEqual({ has_tokens: "maybe" });
+    });
+
+    it("offers has_tokens as an advanced keyword, not a plain column filter", () => {
+      expect(userService.apiFilterKeys).not.toContain("has_tokens");
+      expect(userService.advancedApiFilterKeys).toContain("has_tokens");
+      expect(userService.allFilterKeys()).toContain("has_tokens");
+    });
+  });
+
+  describe("presetFilter", () => {
+    it("starts out unset", () => {
+      expect(userService.presetFilter()).toBeNull();
+    });
+
+    it("holds whatever filter is handed to it until consumed", () => {
+      const filter = new FilterValue().addEntry("has_tokens", "True");
+      userService.presetFilter.set(filter);
+      expect(userService.presetFilter()).toBe(filter);
+    });
+
+    it("keeps the user list from loading unfiltered until the user table takes the preset over", () => {
+      authServiceMock.authData.set({ ...MockAuthService.MOCK_AUTH_DATA, rights: ["userlist"] });
+      realmService.realmOptions.set(["realm1"]);
+      userService.presetFilter.set(new FilterValue().addEntry("has_tokens", "False"));
+      contentServiceMock.routeUrl.set(ROUTE_PATHS.USERS);
+      TestBed.tick();
+
+      expect(httpMock.match((r) => r.url === environment.proxyUrl + "/user/")).toEqual([]);
+
+      // What the user table does once it is on screen.
+      const preset = userService.presetFilter()!;
+      userService.presetFilter.set(null);
+      userService.setFilter(preset);
+      TestBed.tick();
+
+      const requests = httpMock.match((r) => r.url === environment.proxyUrl + "/user/");
+      expect(requests.map((r) => r.request.params.get("has_tokens"))).toEqual(["False"]);
+      httpMock.match(() => true).forEach((r) => r.flush({ result: {} }));
+    });
+
+    it("does not hold back the user list on a route whose table does not take presets over", () => {
+      authServiceMock.authData.set({ ...MockAuthService.MOCK_AUTH_DATA, rights: ["userlist"] });
+      realmService.realmOptions.set(["realm1"]);
+      userService.presetFilter.set(new FilterValue().addEntry("has_tokens", "False"));
+      contentServiceMock.onTokenDetails = signal(true);
+      TestBed.tick();
+
+      const requests = httpMock.match((r) => r.url === environment.proxyUrl + "/user/");
+      expect(requests.length).toBe(1);
+      expect(requests[0].request.params.has("has_tokens")).toBe(false);
+      httpMock.match(() => true).forEach((r) => r.flush({ result: {} }));
+    });
+  });
+
+  describe("fetchUserCount()", () => {
+    it("requests the user count without a realm param when none is given", async () => {
+      const promise = lastValueFrom(userService.fetchUserCount());
+      const req = httpMock.expectOne((r) => r.url === environment.proxyUrl + "/user/count");
+      expect(req.request.params.has("realm")).toBe(false);
+      req.flush(MockPiResponse.fromValue({ count: 3, with_tokens: 1 }));
+      await expect(promise).resolves.toEqual(
+        expect.objectContaining({ result: expect.objectContaining({ value: { count: 3, with_tokens: 1 } }) })
+      );
+    });
+
+    it("scopes the request to the given realm", () => {
+      userService.fetchUserCount("realm1").subscribe();
+      const req = httpMock.expectOne((r) => r.url === environment.proxyUrl + "/user/count");
+      expect(req.request.params.get("realm")).toBe("realm1");
+      req.flush(MockPiResponse.fromValue({ count: 0, with_tokens: 0 }));
+    });
+  });
+
+  describe("editableAttributesResource / attributePolicy", () => {
+    it("attributePolicy falls back to default when resource empty", () => {
+      expect(userService.attributePolicy()).toEqual({ delete: [], set: {} });
+    });
+
+    it("should update attributePolicy from editableAttributesResource on successful response", async () => {
+      contentServiceMock.onUserDetails = signal(true);
+      TestBed.tick();
+
+      const req = httpMock.expectOne((r) => r.url === "/user/editable_attributes/");
+      expect(req.request.method).toBe("GET");
+      const attributePolicy = { delete: ["test1", "test2"], set: { test2: ["*"], test3: ["opt1", "opt2"] } };
+      req.flush(MockPiResponse.fromValue(attributePolicy));
+      await Promise.resolve();
+
+      expect(userService.editableAttributesResource.hasValue()).toBe(true);
+      expect(userService.attributePolicy()).toEqual(attributePolicy);
+
+      httpMock.expectOne((r) => r.url.includes("/user/attribute"));
+    });
+
+    it("should handle error state from smsGatewayResource", async () => {
+      contentServiceMock.onUserDetails = signal(true);
+      TestBed.tick();
+
+      const req = httpMock.expectOne((r) => r.url === "/user/editable_attributes/");
+      expect(req.request.method).toBe("GET");
+      req.flush(MockPiResponse.fromError({ message: "Permission denied" }), {
+        status: 403,
+        statusText: "Permission denied"
+      });
+      await Promise.resolve();
+
+      expect(userService.editableAttributesResource.hasValue()).toBe(false);
+      expect(userService.attributePolicy()).toEqual({ delete: [], set: {} });
+
+      httpMock.expectOne((r) => r.url.includes("/user/attribute"));
+    });
+  });
+
+  describe("selectedUser", () => {
+    let contentService: MockContentService;
+    let authService: MockAuthService;
+
+    beforeEach(() => {
+      contentService = TestBed.inject(ContentService) as unknown as MockContentService;
+      authService = TestBed.inject(AuthService) as unknown as MockAuthService;
+
+      contentService.routeUrl.set(ROUTE_PATHS.USERS);
+      authService.authData.set({ ...MockAuthService.MOCK_AUTH_DATA, role: "admin", username: "enduser" });
+
+      userService.selectionFilter.set("");
+      userService.selectedUserRealm.set("realm1");
+      userService.usersResource = new MockHttpResourceRef(MockPiResponse.fromValue(users));
+    });
+
+    it("returns null when no token username, role != user, and selection filter empty", () => {
+      expect(userService.selectedUser()).toBeNull();
+    });
+
+    it("returns matching user when selection filter is a string", () => {
+      userService.selectionFilter.set("Alice");
+      expect(userService.selectedUser()).toEqual(alice);
+    });
+
+    it("returns matching user when selection filter is a UserData object", () => {
+      userService.selectionFilter.set(users[1]);
+      expect(userService.selectedUser()).toEqual(users[1]);
+    });
+
+    it("returns username when on token detail route and token has username", () => {
+      contentService.routeUrl.set(ROUTE_PATHS.TOKENS_DETAILS);
+
+      setTokenDetailUsername("Bob");
+
+      userService.selectionFilter.set("Alice");
+      expect(userService.selectedUser()).toEqual(users[1]);
+    });
+
+    it("when role is 'user': returns the authenticated username", () => {
+      authService.authData.set({ ...MockAuthService.MOCK_AUTH_DATA, role: "user", username: "Charlie" });
+
+      userService.selectionFilter.set("");
+      expect(userService.selectedUser()).toEqual(users[2]);
+    });
+  });
+
+  describe("userResource", () => {
+    beforeEach(() => {
+      jest.spyOn(authServiceMock, "actionAllowed").mockImplementation((action: string) => action === "userlist");
+    });
+
+    it("should return undefined if route is not USER_DETAILS", async () => {
+      contentServiceMock.routeUrl.update(() => ROUTE_PATHS.TOKENS);
+      const mockBackend = TestBed.inject(HttpTestingController);
+      TestBed.tick();
+
+      // Expect and flush the HTTP request
+      mockBackend.expectNone(environment.proxyUrl + "/user/");
+      await Promise.resolve();
+
+      expect(userService.userResource.value()).toBeUndefined();
+    });
+
+    it("should do request if route is USER_DETAILS", async () => {
+      const realm = "test-realm";
+      const user = "alice";
+      contentServiceMock.routeUrl.update(() => ROUTE_PATHS.USERS_DETAILS + "/" + user);
+      userService.detailsUser.set({ username: user, realm: "" });
+      userService.selectedUserRealm.set(realm);
+      const mockBackend = TestBed.inject(HttpTestingController);
+      TestBed.tick();
+
+      // Expect and flush the main user details request
+      const req = mockBackend.expectOne(
+        environment.proxyUrl + "/user/?include_custom_attributes=false&user=" + user + "&realm=" + realm
+      );
+      req.flush({ result: {} });
+
+      // Ignore and flush all other open requests
+      httpMock.match(() => true).forEach((r) => r.flush({ result: {} }));
+
+      await Promise.resolve();
+
+      expect(userService.userResource.value()).toBeDefined();
+      expect(userService.usersResource.value()).toBeUndefined();
+    });
+
+    it("should handle http errors", async () => {
+      const realm = "test-realm";
+      const user = "alice";
+      contentServiceMock.routeUrl.update(() => ROUTE_PATHS.USERS_DETAILS + "/" + user);
+      userService.detailsUser.set({ username: user, realm: "" });
+      userService.selectedUserRealm.set(realm);
+      const mockBackend = TestBed.inject(HttpTestingController);
+      TestBed.tick();
+
+      // Expect and flush an error response
+      const req = mockBackend.expectOne(
+        environment.proxyUrl + "/user/?include_custom_attributes=false&user=" + user + "&realm=" + realm
+      );
+      req.flush(MockPiResponse.fromError({ message: "Permission denied" }), {
+        status: 403,
+        statusText: "Permission denied"
+      });
+
+      // Ignore and flush all other open requests
+      httpMock.match(() => true).forEach((r) => r.flush({ result: {} }));
+
+      await Promise.resolve();
+
+      expect(userService.userResource.hasValue()).toBe(false);
+      expect(userService.usersResource.hasValue()).toBe(false);
+      expect(userService.user()).toEqual({
+        description: "",
+        editable: false,
+        email: "",
+        givenname: "",
+        mobile: "",
+        phone: "",
+        resolver: "",
+        surname: "",
+        userid: "",
+        username: ""
+      });
+      expect(userService.users()).toEqual([]);
+    });
+
+    it("should not show previous user details when detailsUsername changes", async () => {
+      const realm = "test-realm";
+      contentServiceMock.routeUrl.update(() => ROUTE_PATHS.USERS_DETAILS + "/alice");
+      userService.detailsUser.set({ username: "alice", realm: "" });
+      userService.selectedUserRealm.set(realm);
+      const mockBackend = TestBed.inject(HttpTestingController);
+      TestBed.tick();
+
+      // Load alice
+      const req1 = mockBackend.expectOne(
+        environment.proxyUrl + "/user/?include_custom_attributes=false&user=alice&realm=" + realm
+      );
+      req1.flush(MockPiResponse.fromValue([buildUser("alice")]));
+      httpMock.match(() => true).forEach((r) => r.flush({ result: {} }));
+      await Promise.resolve();
+
+      expect(userService.user().username).toBe("alice");
+
+      // Switch to bob — while loading, user signal should NOT keep alice's data
+      contentServiceMock.routeUrl.update(() => ROUTE_PATHS.USERS_DETAILS + "/bob");
+      userService.detailsUser.set({ username: "bob", realm: "" });
+      TestBed.tick();
+
+      // Before bob's response arrives, user should be reset to empty
+      expect(userService.user().username).toBe("");
+
+      const req2 = mockBackend.expectOne(
+        environment.proxyUrl + "/user/?include_custom_attributes=false&user=bob&realm=" + realm
+      );
+      req2.flush(MockPiResponse.fromValue([buildUser("bob")]));
+      httpMock.match(() => true).forEach((r) => r.flush({ result: {} }));
+      await Promise.resolve();
+
+      expect(userService.user().username).toBe("bob");
+    });
+  });
+
+  describe("users signal (list)", () => {
+    beforeEach(() => {
+      jest.spyOn(authServiceMock, "actionAllowed").mockImplementation((action: string) => action === "userlist");
+    });
+
+    it("should clear users when changing realm even if request fails", async () => {
+      contentServiceMock.routeUrl.set(ROUTE_PATHS.USERS);
+      userService.selectedUserRealm.set("other");
+      TestBed.tick();
+      httpMock.match(() => true).forEach((r) => r.flush({ result: { value: [] } }));
+
+      userService.selectedUserRealm.set("realm1");
+      userService.users();
+      TestBed.tick();
+
+      const req1 = httpMock.expectOne((req) => req.url.includes("/user") && req.params.get("realm") === "realm1");
+      req1.flush(MockPiResponse.fromValue([buildUser("user1")]));
+      await Promise.resolve();
+      TestBed.tick();
+
+      expect(userService.users()).toHaveLength(1);
+      expect(userService.users()[0].username).toBe("user1");
+
+      userService.selectedUserRealm.set("realm2");
+      userService.users();
+      TestBed.tick();
+
+      expect(userService.users()).toHaveLength(0);
+
+      const req2 = httpMock.expectOne((req) => req.url.includes("/user") && req.params.get("realm") === "realm2");
+      req2.flush("Error", { status: 500, statusText: "Server Error" });
+      await Promise.resolve();
+      TestBed.tick();
+
+      expect(userService.users()).toHaveLength(0);
+    });
+  });
+
+  describe("UserService createUser", () => {
+    it("should create user successfully", () => {
+      const resolver = "test";
+      const userData: EditUserData = { username: "new-user" };
+      let resultValue: boolean | undefined;
+      userService.createUser(resolver, userData).subscribe((result) => {
+        resultValue = result;
+      });
+      const req = httpMock.expectOne((r) => r.method === "POST" && r.url.includes("/user/"));
+      req.flush({ result: { value: true, status: true } });
+      expect(resultValue).toBe(true);
+      expect(req.request.body).toEqual({ user: "new-user", resolver });
+    });
+
+    it("should handle shallow failure of creating user", () => {
+      const resolver = "test";
+      const userData: EditUserData = { username: "new-user" };
+      let resultValue: boolean | undefined;
+      userService.createUser(resolver, userData).subscribe((result) => {
+        resultValue = result;
+      });
+      const req = httpMock.expectOne((r) => r.method === "POST" && r.url.includes("/user/"));
+      req.flush({ result: { value: true, status: false } });
+      expect(resultValue).toBe(false);
+      expect(req.request.body).toEqual({ user: "new-user", resolver });
+    });
+
+    it("should handle create user failure", () => {
+      const resolver = "test";
+      const userData: EditUserData = { username: "fail-user" };
+      let resultValue: boolean | undefined;
+      userService.createUser(resolver, userData).subscribe((result) => {
+        resultValue = result;
+      });
+      const req = httpMock.expectOne((r) => r.method === "POST" && r.url.includes("/user/"));
+      req.flush(
+        { result: { status: false, error: { message: "fail message" } } },
+        { status: 500, statusText: "Server Error" }
+      );
+      expect(resultValue).toBe(false);
+      expect(notificationServiceMock.error).toHaveBeenCalledWith("Failed to create user fail-user. fail" + " message");
+    });
+  });
+
+  describe("UserService editUser", () => {
+    it("should edit user successfully", () => {
+      const resolver = "test";
+      const userData: EditUserData = { username: "edit-user" };
+      let resultValue: boolean | undefined;
+      userService.editUser(resolver, userData).subscribe((result) => {
+        resultValue = result;
+      });
+      const req = httpMock.expectOne((r) => r.method === "PUT" && r.url.includes("/user/"));
+      req.flush({ result: { value: true, status: true } });
+      expect(resultValue).toBe(true);
+      expect(req.request.body).toEqual({ user: "edit-user", resolver });
+    });
+
+    it("should handle shallow edit user failure", () => {
+      const resolver = "test";
+      const userData: EditUserData = { username: "edit-user" };
+      let resultValue: boolean | undefined;
+      userService.editUser(resolver, userData).subscribe((result) => {
+        resultValue = result;
+      });
+      const req = httpMock.expectOne((r) => r.method === "PUT" && r.url.includes("/user/"));
+      req.flush({ result: { value: true, status: false } });
+      expect(resultValue).toBe(false);
+      expect(req.request.body).toEqual({ user: "edit-user", resolver });
+    });
+
+    it("should handle edit user failure", () => {
+      const resolver = "test";
+      const userData: EditUserData = { username: "fail-user" };
+      let resultValue: boolean | undefined;
+      userService.editUser(resolver, userData).subscribe((result) => {
+        resultValue = result;
+      });
+      const req = httpMock.expectOne((r) => r.method === "PUT" && r.url.includes("/user/"));
+      req.flush({ result: { status: false, error: { message: "fail" } } }, { status: 500, statusText: "Server Error" });
+      expect(resultValue).toBe(false);
+      expect(notificationServiceMock.error).toHaveBeenCalledWith("Failed to update user fail-user. fail");
+    });
+  });
+
+  describe("UserService deleteUser", () => {
+    it("should delete user successfully", () => {
+      const resolver = "test";
+      const username = "deleteuser";
+      let resultValue: boolean | undefined;
+      userService.deleteUser(resolver, username).subscribe((result) => {
+        resultValue = result;
+      });
+      const req = httpMock.expectOne((r) => r.method === "DELETE" && r.url.includes("/user/"));
+      req.flush({ result: { value: true, status: true } });
+      expect(resultValue).toBe(true);
+    });
+
+    it("should handle shallow failure", () => {
+      const resolver = "test";
+      const username = "deleteuser";
+      let resultValue: boolean | undefined;
+      userService.deleteUser(resolver, username).subscribe((result) => {
+        resultValue = result;
+      });
+      const req = httpMock.expectOne((r) => r.method === "DELETE" && r.url.includes("/user/"));
+      req.flush({ result: { value: true, status: false } });
+      expect(resultValue).toBe(false);
+    });
+
+    it("should handle delete user failure", () => {
+      const resolver = "test";
+      const username = "fail-user";
+      let resultValue: boolean | undefined;
+      userService.deleteUser(resolver, username).subscribe((result) => {
+        resultValue = result;
+      });
+      const req = httpMock.expectOne((r) => r.method === "DELETE" && r.url.includes("/user/"));
+      req.flush({ result: { error: { message: "fail" } } }, { status: 500, statusText: "Server Error" });
+      expect(resultValue).toBe(false);
+      expect(notificationServiceMock.error).toHaveBeenCalledWith("Failed to delete user fail-user. fail");
+    });
+  });
+});
+
+@Component({ template: "" })
+class RouteStubComponent {}
+
+// The details page hands the opened user to the enrollment and container pages through the query
+// string (UserDetailsComponent.enrollNewToken / createNewContainer). These scenarios drive the whole
+// round trip through the real Router and ContentService instead of a route mock.
+describe("UserService user prefill from the route", () => {
+  let router: Router;
+  let contentService: ContentService;
+  let userService: UserService;
+  let realmService: MockRealmService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        provideRouter([{ path: "**", component: RouteStubComponent }]),
+        provideLocationMocks(),
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        ContentService,
+        UserService,
+        { provide: RealmService, useClass: MockRealmService },
+        { provide: AuthService, useClass: MockAuthService },
+        { provide: TokenService, useClass: MockTokenService },
+        { provide: NotificationService, useClass: MockNotificationService },
+        MockLocalService
+      ]
+    });
+
+    router = TestBed.inject(Router);
+    contentService = TestBed.inject(ContentService);
+    userService = TestBed.inject(UserService);
+    realmService = TestBed.inject(RealmService) as unknown as MockRealmService;
+    httpMock = TestBed.inject(HttpTestingController);
+    realmService.realmOptions.set(["realm1", "defrealm"]);
+  });
+
+  afterEach(() => {
+    // The user details route starts the user resources; their payloads do not matter for routing.
+    httpMock.match(() => true).forEach((request) => request.flush({}));
+    httpMock.verify();
+  });
+
+  it("carries the opened user from the details route into the enrollment route", async () => {
+    await router.navigate([ROUTE_PATHS.USERS_DETAILS, "alice"], { queryParams: { realm: "defrealm" } });
+    contentService.detailsUser.set({ username: "alice", realm: "defrealm" });
+    expect(contentService.onUserDetails()).toBe(true);
+    expect(userService.selectedUserRealm()).toBe("defrealm");
+
+    await router.navigate([ROUTE_PATHS.TOKENS_ENROLLMENT], { queryParams: { realm: "defrealm", user: "alice" } });
+
+    expect(contentService.routeUrl()).toBe(ROUTE_PATHS.TOKENS_ENROLLMENT + "?realm=defrealm&user=alice");
+    expect(contentService.onTokensEnrollment()).toBe(true);
+    expect(userService.selectedUserRealm()).toBe("defrealm");
+    expect(userService.selectionUsernameFilter()).toBe("alice");
+  });
+
+  it("carries the opened user into the container create route and drops it on the next navigation", async () => {
+    await router.navigate([ROUTE_PATHS.CONTAINERS_CREATE], { queryParams: { realm: "defrealm", user: "alice" } });
+
+    expect(contentService.onContainersCreate()).toBe(true);
+    expect(userService.selectedUserRealm()).toBe("defrealm");
+    expect(userService.selectionUsernameFilter()).toBe("alice");
+
+    await router.navigate([ROUTE_PATHS.TOKENS]);
+
+    expect(userService.selectionUsernameFilter()).toBe("");
+  });
+
+  it("keeps a user picked on the enrollment page instead of restoring the one from the query string", async () => {
+    await router.navigate([ROUTE_PATHS.TOKENS_ENROLLMENT], { queryParams: { realm: "defrealm", user: "alice" } });
+    expect(userService.selectionUsernameFilter()).toBe("alice");
+
+    userService.selectionFilter.set("bob");
+    userService.selectedUserRealm.set("realm1");
+
+    expect(userService.selectionUsernameFilter()).toBe("bob");
+  });
+});

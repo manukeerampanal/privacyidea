@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# (c) NetKnights GmbH 2025,  https://netknights.it
 #
 #  privacyIDEA is a fork of LinOTP
 #  May 08, 2014 Cornelius Kölbel
@@ -27,20 +27,23 @@
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-__doc__="""This is the BaseClass for audit trails
+# SPDX-FileCopyrightText: 2025 Paul Lettich <paul.lettich@netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+"""This is the BaseClass for audit trails
 
 The audit is supposed to work like this. First we need to create an audit
-object. E.g. this can be done in the before_request:
+object. E.g. this can be done in the before_request::
 
     g.audit_object = getAudit(file_config)
 
-During the request, the g.audit_object can be used to add audit information:
+During the request, the g.audit_object can be used to add audit information::
 
     g.audit_object.log({"client": "123.2.3.4", "action": "validate/check"})
 
-Thus at many different places in the code, audit information can be added to
+Thus, at many different places in the code, audit information can be added to
 the audit object.
-Finally the audit_object needs to be stored to the audit storage. So we call:
+Finally, the audit_object needs to be stored to the audit storage. So we call::
 
     g.audit_object.finalize_log()
 
@@ -50,13 +53,19 @@ storage.
 
 import logging
 import traceback
+
 from privacyidea.lib.log import log_with
+from privacyidea.lib.utils import truncate_comma_list
 import datetime
 
 log = logging.getLogger(__name__)
 
+# Audit keys whose value is a list of items, e.g. the serials of all tokens a request
+# used. They are shortened per item rather than cut at the end.
+COMMA_LIST_KEYS = frozenset(["policies", "serial", "container_serial"])
 
-class Paginate(object):
+
+class Paginate:
     """
     This is a pagination object, that is used for searching audit trails.
     """
@@ -72,9 +81,9 @@ class Paginate(object):
         self.page = 1
         # the total entry numbers
         self.total = 0
-    
 
-class Audit(object):  # pragma: no cover
+
+class Audit:  # pragma: no cover
 
     is_readable = False
 
@@ -86,14 +95,14 @@ class Audit(object):  # pragma: no cover
                        the special module implementation can get its configuration.
         :type config: dict
         :param startdate: The datetime of the beginning of the request
-        :type startdate: datetime
+        :type startdate: datetime.datetime
         :return: Audit object
         """
         self.name = "AuditBase"
         self.audit_data = {'startdate': startdate or datetime.datetime.now()}
         self.config = config or {}
-        self.private = ""
-        self.public = ""
+        self.private = b""
+        self.public = b""
 
     def log_token_num(self, count):
         """
@@ -105,7 +114,7 @@ class Audit(object):  # pragma: no cover
         :type count: int
         :return:
         """
-        self.audit_data['action_detail'] = "tokennum = {0!s}".format(str(count))
+        self.audit_data['action_detail'] = f"tokennum = {str(count)!s}"
 
     @log_with(log)
     def read_keys(self, pub, priv):
@@ -130,7 +139,7 @@ class Audit(object):  # pragma: no cover
             with open(pub, 'rb') as pubkey_file:
                 self.public = pubkey_file.read()
         except Exception as e:
-            log.error("Error reading key file: {0!r})".format(e))
+            log.error(f"Error reading key file: {e!r})")
             log.debug(traceback.format_exc())
             raise e
 
@@ -139,24 +148,61 @@ class Audit(object):  # pragma: no cover
 
     @property
     def available_audit_columns(self):
-        return ['number', 'action', 'success', 'serial', 'date', 'startdate',
+        return ['number', 'action', 'success', 'authentication', 'serial', 'date', 'startdate',
                 'duration', 'token_type', 'user', 'realm', 'administrator',
                 'action_detail', 'info', 'privacyidea_server', 'client',
+                'user_agent', 'user_agent_version',
                 'log_level', 'policies', 'clearance_level', 'sig_check',
-                'missing_line', 'resolver', 'thread_id']
+                'missing_line', 'resolver', 'thread_id', 'container_serial', 'container_type']
 
-    def get_total(self, param, AND=True, display_error=True, timelimit=None):
+    def get_total(self, param: dict, admin_params: dict | None = None, AND: bool = True, display_error: bool = True,
+                  timelimit: datetime.timedelta | None = None) -> int:
         """
         This method returns the total number of audit entries
         in the audit store
         """
-        return None
+        return 0
 
     @property
     def has_data(self):
         # We check if there is actually audit_data with an action.
         # Since the audit_data is initialized with the startdate.
         return bool(self.audit_data and "action" in self.audit_data)
+
+    @property
+    def column_length(self) -> dict:
+        """
+        The maximum length of the values this audit store can hold, by key. An empty
+        mapping means that the store has no limits, which is the default: only the SQL
+        audit has columns a value has to fit into.
+        """
+        return {}
+
+    def fit_to_store(self, key: str, value):
+        """
+        Shorten a value to the length the audit store can hold. Request data ends up in
+        the audit log, so it is of arbitrary length, while the store may not be: a value
+        that does not fit is shortened, never dropped, so that the entry survives.
+
+        This is applied when the entry is written, not when it is logged: ``audit_data`` is
+        shared request state that event handlers read from, e.g. to get the serials of the
+        tokens of the request, and they need the whole value.
+
+        Values of the keys in :data:`COMMA_LIST_KEYS` hold a list of items. They are
+        shortened per item, so that every item stays recognizable instead of cutting the
+        list somewhere in the middle of an item.
+
+        :param key: the audit key the value is logged under
+        :param value: the value to shorten. Values that are not strings are returned
+            unchanged, they can not exceed a column.
+        :return: the value, shortened if necessary
+        """
+        length = self.column_length.get(key)
+        if not length or not isinstance(value, str) or len(value) <= length:
+            return value
+        if key in COMMA_LIST_KEYS and "," in value:
+            return truncate_comma_list(value, length)
+        return value[:length]
 
     @log_with(log)
     def log(self, param):
@@ -187,24 +233,25 @@ class Audit(object):  # pragma: no cover
                 # We need to create the entry
                 self.audit_data[k] = v
             else:
-                if add_with_comma:
+                if add_with_comma and self.audit_data[k]:
                     self.audit_data[k] += ","
                 self.audit_data[k] += v
 
-    def add_policy(self, policyname):
+    def add_policy(self, policy_names: set | list | str):
         """
-        This method adds a triggered policyname to the list of triggered policies.
+        This method adds triggered policy names to the list of triggered policies.
 
-        :param policyname: A string or a list of strings as policynames
+        :param policy_names: A set, list or single policy name(s)
         :return:
         """
-        if "policies" not in self.audit_data:
-            self.audit_data["policies"] = []
-        if type(policyname) == list:
-            for p in policyname:
-                self.audit_data["policies"].append(p)
-        else:
-            self.audit_data["policies"].append(policyname)
+        audit_policies = set(self.audit_data.get('policies', []))
+        if isinstance(policy_names, str):
+            audit_policies.add(policy_names)
+        elif isinstance(policy_names, list):
+            policy_names = set(policy_names)
+        if isinstance(policy_names, set):
+            audit_policies.update(policy_names)
+        self.audit_data["policies"] = list(audit_policies)
 
     def finalize_log(self):
         """
@@ -229,13 +276,23 @@ class Audit(object):  # pragma: no cover
 #        """
 #        pass
 
-    def search(self, search_dict, page_size=15, page=1, sortorder="asc",
-               timelimit=None):
+    def search(self, search_dict: dict, admin_params: dict | None = None, page_size: int = 15, page: int = 1,
+               sortorder: str = "asc", timelimit: datetime.timedelta | None = None):
         """
         This function is used to search audit events.
 
-        :param: Search parameters can be passed.
-        :return: A pagination object
+        :param search_dict: Filter parameters that are concatenated with a logical AND
+        :param admin_params: Optional admin parameters containing the admin name, admin realm and a list of realms the
+            admin is allowed to see, such as ::
+
+                {"admin": "admin_name",
+                 "admin_realm": "realm_of_the_admin",
+                 "allowed_audit_realms": ["realm1", "realm2"]}
+
+        :param page_size: Number of entries per page
+        :param page: The page number
+        :param sortorder: "asc" - ascending or "desc" - descending
+        :param timelimit: Only audit entries newer than this timedelta will be searched
         """
         return Paginate()
 
@@ -249,7 +306,8 @@ class Audit(object):  # pragma: no cover
         """
         return 0
 
-    def csv_generator(self, param=None, user=None, timelimit=None):
+    def csv_generator(self, param: dict | None = None, admin_params: dict | None = None, user=None,
+                      timelimit: datetime.timedelta | None = None):
         """
         A generator that can be used to stream the audit log
 
@@ -258,8 +316,8 @@ class Audit(object):  # pragma: no cover
         """
         pass
 
-    def search_query(self, search_dict, page_size=15, page=1, sortorder="asc",
-                     sortname="number", timelimit=None):
+    def search_query(self, search_dict: dict, admin_params: dict | None = None, page_size: int = 15, page: int = 1,
+                     sortorder: str = "asc", sortname: str = "number", timelimit: datetime.timedelta | None = None):
         """
         This function returns the audit log as an iterator on the result
         """

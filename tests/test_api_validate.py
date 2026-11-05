@@ -1,659 +1,46 @@
-# -*- coding: utf-8 -*-
-import six
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from privacyidea.lib.utils import to_unicode
-from six.moves.urllib.parse import urlencode, quote
+# SPDX-FileCopyrightText: 2024 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+import datetime
 import json
-from privacyidea.lib.tokens.pushtoken import PUSH_ACTION, strip_key
-from privacyidea.lib.utils import hexlify_and_unicode
-from .base import MyApiTestCase
-from privacyidea.lib.user import (User)
-from privacyidea.lib.tokens.totptoken import HotpTokenClass
-from privacyidea.lib.tokens.registrationtoken import RegistrationTokenClass
-from privacyidea.lib.tokenclass import DATE_FORMAT
-from privacyidea.models import (Token, Policy, Challenge, AuthCache, db, TokenOwner)
-from privacyidea.lib.authcache import _hash_password
+import time
+
+from unittest import mock
+import responses
+from dateutil.tz import tzlocal
+from testfixtures import Replace, test_datetime
+
+from privacyidea.lib import _
+from privacyidea.lib.crypto import verify_pass_hash
+from privacyidea.lib.challenge import get_challenges
 from privacyidea.lib.config import (set_privacyidea_config,
                                     get_inc_fail_count_on_false_pin,
-                                    delete_privacyidea_config)
+                                    delete_privacyidea_config, SYSCONF)
+from privacyidea.lib.container import init_container, find_container_by_serial
+from privacyidea.lib.error import Error
+from privacyidea.lib.event import delete_event
+from privacyidea.lib.event import set_event
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.policies.conditions import ConditionHandleMissingData, ConditionSection
+from privacyidea.lib.policy import SCOPE, set_policy, delete_policy, AUTHORIZED
+from privacyidea.lib.realm import set_realm, set_default_realm, delete_realm
+from privacyidea.lib.resolver import save_resolver, delete_resolver
 from privacyidea.lib.token import (get_tokens, init_token, remove_token,
                                    reset_token, enable_token, revoke_token,
-                                   set_pin, get_one_token)
-from privacyidea.lib.policy import SCOPE, ACTION, set_policy, delete_policy, AUTHORIZED
-from privacyidea.lib.event import set_event
-from privacyidea.lib.event import delete_event
-from privacyidea.lib.error import ERROR
-from privacyidea.lib.resolver import save_resolver, get_resolver_list, delete_resolver
-from privacyidea.lib.realm import set_realm, set_default_realm, delete_realm, get_realms
-from privacyidea.lib.radiusserver import add_radius
-from privacyidea.lib.challenge import get_challenges
-from privacyidea.lib.tokens.webauthn import webauthn_b64_decode
-from privacyidea.lib.tokens.registrationtoken import DEFAULT_LENGTH as DEFAULT_LENGTH_REG
-from privacyidea.lib.tokens.passwordtoken import DEFAULT_LENGTH as DEFAULT_LENGTH_PW
-from privacyidea.lib.tokenclass import ROLLOUTSTATE, CLIENTMODE
-from privacyidea.lib import _
-from passlib.hash import argon2
-from privacyidea.lib.smsprovider.SMSProvider import set_smsgateway
-
-from testfixtures import Replace, test_datetime
-import datetime
-import time
-import responses
-import mock
-import binascii
-from . import smtpmock, ldap3mock, radiusmock
-
-
-PWFILE = "tests/testdata/passwords"
-HOSTSFILE = "tests/testdata/hosts"
-DICT_FILE="tests/testdata/dictionary"
-
-LDAPDirectory = [{"dn": "cn=alice,ou=example,o=test",
-                 "attributes": {'cn': 'alice',
-                                "sn": "Cooper",
-                                "givenName": "Alice",
-                                'userPassword': 'alicepw',
-                                'oid': "2",
-                                "homeDirectory": "/home/alice",
-                                "email": "alice@test.com",
-                                "memberOf": ["cn=admins,o=test", "cn=users,o=test"],
-                                "accountExpires": 131024988000000000,
-                                "objectGUID": '\xef6\x9b\x03\xc0\xe7\xf3B'
-                                              '\x9b\xf9\xcajl\rM1',
-                                'mobile': ["1234", "45678"]}},
-                {"dn": 'cn=bob,ou=example,o=test',
-                 "attributes": {'cn': 'bob',
-                                "sn": "Marley",
-                                "givenName": "Robert",
-                                "email": "bob@example.com",
-                                "memberOf": ["cn=users,o=test"],
-                                "mobile": "123456",
-                                "homeDirectory": "/home/bob",
-                                'userPassword': 'bobpwééé',
-                                "accountExpires": 9223372036854775807,
-                                "objectGUID": '\xef6\x9b\x03\xc0\xe7\xf3B'
-                                              '\x9b\xf9\xcajl\rMw',
-                                'oid': "3"}},
-                {"dn": 'cn=manager,ou=example,o=test',
-                 "attributes": {'cn': 'manager',
-                                "givenName": "Corny",
-                                "sn": "keule",
-                                "email": "ck@o",
-                                "memberOf": ["cn=helpdesk,o=test", "cn=users,o=test"],
-                                "mobile": "123354",
-                                'userPassword': 'ldaptest',
-                                "accountExpires": 9223372036854775807,
-                                "objectGUID": '\xef6\x9b\x03\xc0\xe7\xf3B'
-                                              '\x9b\xf9\xcajl\rMT',
-                                'oid': "1"}},
-                {"dn": 'cn=frank,ou=sales,o=test',
-                 "attributes": {'cn': 'frank',
-                                "givenName": "Frank",
-                                "sn": "Hause",
-                                "email": "fh@o",
-                                "memberOf": ["cn=users,o=test"],
-                                "mobile": "123354",
-                                'userPassword': 'ldaptest',
-                                "accountExpires": 9223372036854775807,
-                                "objectGUID": '\xef7\x9b\x03\xc0\xe7\xf3B'
-                                              '\x9b\xf9\xcajl\rMT',
-                                'oid': "5"}}
-                 ]
-
-
-OTPs = ["755224",
-        "287082",
-        "359152",
-        "969429",
-        "338314",
-        "254676",
-        "287922",
-        "162583",
-        "399871",
-        "520489"]
-
-if six.PY3:
-    timezone = datetime.timezone
-else:
-    from datetime import tzinfo
-
-    class FixedTz(tzinfo):
-        # Fixed offset from UTC
-        def __init__(self, offset):
-            assert isinstance(offset, datetime.timedelta)
-            self.__offset = offset
-
-        def utcoffset(self, dt):
-            return self.__offset
-
-        def tzname(self, dt):
-            return 'test'
-
-        def dst(self, dt):
-            return datetime.timedelta(0)
-
-    timezone = FixedTz
-
-
-class AuthorizationPolicyTestCase(MyApiTestCase):
-    """
-    This tests the catch all resolvers and resolvers which also contain the
-    user.
-    A user may authenticate with the default resolver, but the user may also
-    be contained in other resolver. we check these other resolvers, too.
-
-    Testcase for issue
-    https://github.com/privacyidea/privacyidea/issues/543
-    """
-    @ldap3mock.activate
-    def test_00_create_realm(self):
-        ldap3mock.setLDAPDirectory(LDAPDirectory)
-        params = {'LDAPURI': 'ldap://localhost',
-                  'LDAPBASE': 'o=test',
-                  'BINDDN': 'cn=manager,ou=example,o=test',
-                  'BINDPW': 'ldaptest',
-                  'LOGINNAMEATTRIBUTE': 'cn',
-                  'LDAPSEARCHFILTER': '(cn=*)',
-                  'USERINFO': '{ "username": "cn",'
-                                  '"phone" : "telephoneNumber", '
-                                  '"mobile" : "mobile"'
-                                  ', "email" : "mail", '
-                                  '"surname" : "sn", '
-                                  '"givenname" : "givenName" }',
-                  'UIDTYPE': 'DN',
-                  "resolver": "catchall",
-                  "type": "ldapresolver"}
-
-        r = save_resolver(params)
-        self.assertTrue(r > 0)
-
-        params = {'LDAPURI': 'ldap://localhost',
-                  'LDAPBASE': 'ou=sales,o=test',
-                  'BINDDN': 'cn=manager,ou=example,o=test',
-                  'BINDPW': 'ldaptest',
-                  'LOGINNAMEATTRIBUTE': 'cn',
-                  'LDAPSEARCHFILTER': '(cn=*)',
-                  'USERINFO': '{ "username": "cn",'
-                              '"phone" : "telephoneNumber", '
-                              '"mobile" : "mobile"'
-                              ', "email" : "mail", '
-                              '"surname" : "sn", '
-                              '"givenname" : "givenName" }',
-                  'UIDTYPE': 'DN',
-                  "resolver": "sales",
-                  "type": "ldapresolver"}
-
-        r = save_resolver(params)
-        self.assertTrue(r > 0)
-
-        rl = get_resolver_list()
-        self.assertTrue("catchall" in rl)
-        self.assertTrue("sales" in rl)
-
-    @ldap3mock.activate
-    def test_01_resolving_user(self):
-        ldap3mock.setLDAPDirectory(LDAPDirectory)
-        # create realm
-        # If the sales resolver comes first, frank is found in sales!
-        r = set_realm("ldaprealm", resolvers=["catchall", "sales"],
-                      priority={"catchall": 2, "sales": 1})
-        set_default_realm("ldaprealm")
-        self.assertEqual(r, (["catchall", "sales"], []))
-
-        u = User("alice", "ldaprealm")
-        uid, rtype, resolver = u.get_user_identifiers()
-        self.assertEqual(resolver, "catchall")
-        u = User("frank", "ldaprealm")
-        uid, rtype, resolver = u.get_user_identifiers()
-        self.assertEqual(resolver, "sales")
-
-        # Catch all has the lower priority and contains all users
-        # ldap2 only contains sales
-        r = set_realm("ldaprealm", resolvers=["catchall", "sales"],
-                      priority={"catchall": 1, "sales": 2})
-        self.assertEqual(r, (["catchall", "sales"], []))
-
-        # Both users are found in the resolver "catchall
-        u = User("alice", "ldaprealm")
-        uid, rtype, resolver = u.get_user_identifiers()
-        self.assertEqual(resolver, "catchall")
-        u = User("frank", "ldaprealm")
-        uid, rtype, resolver = u.get_user_identifiers()
-        self.assertEqual(resolver, "catchall")
-
-    @ldap3mock.activate
-    def test_02_enroll_tokens(self):
-        ldap3mock.setLDAPDirectory(LDAPDirectory)
-        r = init_token({"type": "spass", "pin": "spass"}, user=User(
-            login="alice", realm="ldaprealm"))
-        self.assertTrue(r)
-        # The token gets assigned to frank in the resolver catchall
-        r = init_token({"type": "spass", "pin": "spass"}, user=User(
-            login="frank", realm="ldaprealm"))
-        self.assertTrue(r)
-        self.assertEqual("{0!s}".format(r.user), "<frank.catchall@ldaprealm>")
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "frank",
-                                                 "pass": "spass"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertTrue(result.get("value"))
-            self.assertEqual(result.get("authentication"), "ACCEPT")
-
-    @ldap3mock.activate
-    def test_03_classic_policies(self):
-        ldap3mock.setLDAPDirectory(LDAPDirectory)
-
-        # This policy will not match, since frank is in resolver "catchall".
-        set_policy(name="HOTPonly",
-                   action="tokentype=spass",
-                   scope=SCOPE.AUTHZ,
-                   resolver="sales")
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "frank",
-                                                 "pass": "spass"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertTrue(result.get("value"))
-            self.assertEqual(result.get("authentication"), "ACCEPT")
-
-        # If users in resolver sales are required to use HOTP, then frank still
-        # can login with a SPASS token, since he is identified as user in
-        # resolver catchall
-        set_policy(name="HOTPonly",
-                   action="tokentype=hotp",
-                   scope=SCOPE.AUTHZ,
-                   resolver="sales")
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "frank",
-                                                 "pass": "spass"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-
-        # Alice - not in sales - is allowed to login
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "pass": "spass"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertTrue(result.get("value"))
-            self.assertEqual(result.get("authentication"), "ACCEPT")
-
-    def test_04_testing_token_with_setrealm(self):
-        """
-        When testing a token in the UI, the following request is triggered.
-        https://privacyidea/validate/check
-        serial=PISM1234
-        pass=1234
-
-        If we have a setrealm policy, this request is triggered:
-        https://privacyidea/validate/check
-        serial=PISM1234
-        pass=1234
-        realm=newrealm
-        """
-        init_token({"serial": "SPASS_04", "type": "spass", "pin": "1234"})
-
-        set_policy(name="pol_setrealm_01",
-                   scope=SCOPE.AUTHZ,
-                   action="{0!s}={1!s}".format(ACTION.SETREALM, self.realm1))
-
-        # Successfully test the token
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"serial": "SPASS_04",
-                                                 "pass": "1234"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertTrue(result.get("value"))
-            self.assertEqual(result.get("authentication"), "ACCEPT")
-
-        delete_policy("pol_setrealm_01")
-        remove_token("SPASS_04")
-
-    def test_05_is_authorized(self):
-        set_policy(name="auth01", scope=SCOPE.AUTHZ, priority=2,
-                   action="{0!s}={1!s}".format(ACTION.AUTHORIZED, AUTHORIZED.DENY))
-        set_policy(name="auth02", scope=SCOPE.AUTHZ, user="frank", priority=1,
-                   action="{0!s}={1!s}".format(ACTION.AUTHORIZED, AUTHORIZED.ALLOW))
-
-        # The user frank actually has a spass token and is authorized to authenticate by policy auth02
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "frank",
-                                                 "pass": "spass"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertTrue(result.get("value"))
-            self.assertEqual(result.get("authentication"), "ACCEPT")
-
-        delete_policy("auth02")
-
-        # If his personal policy is removed, he can not authenticate anymore
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "frank",
-                                                 "pass": "spass"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 400, res)
-            result = res.json.get("result")
-            self.assertFalse(result.get("status"))
-            self.assertIn("error", result)
-            self.assertEqual(result.get("error").get("message"),
-                             "ERR401: User is not authorized to authenticate under these conditions.")
-
-        delete_policy("auth01")
-
-
-class DisplayTANTestCase(MyApiTestCase):
-
-    def test_00_run_complete_workflow(self):
-        # This is a standard workflow of a display TAN token.
-
-        # Import OCRA Token file
-        IMPORTFILE = "tests/testdata/ocra.csv"
-        with self.app.test_request_context('/token/load/ocra.csv',
-                                            method="POST",
-                                            data={"type": "oathcsv",
-                                                  "file": (IMPORTFILE,
-                                                           "oath.csv")},
-                                            headers={'Authorization': self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            value = result.get("value")['n_imported']
-            self.assertTrue(value == 1, result)
-
-        from privacyidea.lib.token import set_pin
-        set_pin("ocra1234", "test")
-
-        # Issue a challenge response
-        challenge = "83507112  ~320,00~1399458665_G6HNVF"
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"serial": "ocra1234",
-                                                 "pass": "test",
-                                                 "hashchallenge": 1,
-                                                 "challenge": challenge}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status") is True, result)
-            self.assertTrue(result.get("value") is False, result)
-            detail = res.json.get("detail")
-            transaction_id = detail.get("transaction_id")
-            hex_challenge = detail.get("attributes").get("challenge")
-            self.assertEqual(hex_challenge, "7196501689c356046867728f4feb74458dcfd079")
-
-        # Issue an authentication request
-        otpvalue = "90065298"
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"serial": "ocra1234",
-                                                 "pass": otpvalue,
-                                                 "transaction_id":
-                                                     transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status") is True, result)
-            self.assertTrue(result.get("value") is True, result)
-
-        # The second request will fail
-        otpvalue = "90065298"
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"serial": "ocra1234",
-                                                 "pass": otpvalue,
-                                                 "transcation_id":
-                                                     transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status") is True, result)
-            self.assertTrue(result.get("value") is False, result)
-
-        # Get another challenge with a random nonce
-        challenge = "83507112  ~320,00~"
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"serial": "ocra1234",
-                                                 "pass": "test",
-                                                 "hashchallenge": 1,
-                                                 "addrandomchallenge": 20,
-                                                 "challenge": challenge}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status") is True, result)
-            self.assertTrue(result.get("value") is False, result)
-            detail = res.json.get("detail")
-            transaction_id = detail.get("transaction_id")
-            hex_challenge = detail.get("attributes").get("challenge")
-            self.assertEqual(len(hex_challenge), 40)
-
-        remove_token("ocra1234")
-
-
-def setup_sms_gateway():
-    post_url = "http://smsgateway.com/sms_send_api.cgi"
-    success_body = "ID 12345"
-
-    identifier = "myGW"
-    provider_module = "privacyidea.lib.smsprovider.HttpSMSProvider" \
-                      ".HttpSMSProvider"
-    id = set_smsgateway(identifier, provider_module, description="test",
-                        options={"HTTP_METHOD": "POST",
-                                 "URL": post_url,
-                                 "RETURN_SUCCESS": "ID",
-                                 "text": "{otp}",
-                                 "phone": "{phone}"})
-    assert (id > 0)
-    # set config sms.identifier = myGW
-    r = set_privacyidea_config("sms.identifier", identifier)
-    assert (r in ["insert", "update"])
-    responses.add(responses.POST,
-                  post_url,
-                  body=success_body)
-
-
-class AValidateOfflineTestCase(MyApiTestCase):
-    """
-    Test api.validate endpoints that are responsible for offline auth.
-    """
-
-    def test_00_create_realms(self):
-        self.setUp_user_realms()
-        self.setUp_user_realm2()
-
-        # create a  token and assign it to the user
-        db_token = Token(self.serials[0], tokentype="hotp")
-        db_token.update_otpkey(self.otpkey)
-        db_token.save()
-        token = HotpTokenClass(db_token)
-        self.assertTrue(token.token.serial == self.serials[0], token)
-        token.add_user(User("cornelius", self.realm1))
-        token.set_pin("pin")
-        self.assertEqual(token.token.first_owner.user_id, "1000")
-
-    def test_01_validate_offline(self):
-        pass
-        # create offline app
-        #tokenobj = get_tokens(self.serials[0])[0]
-        from privacyidea.lib.applications.offline import REFILLTOKEN_LENGTH
-        from privacyidea.lib.machine import attach_token, detach_token
-        from privacyidea.lib.machineresolver import save_resolver, delete_resolver
-        mr_obj = save_resolver({"name": "testresolver",
-                                "type": "hosts",
-                                "filename": HOSTSFILE,
-                                "type.filename": "string",
-                                "desc.filename": "the filename with the "
-                                                 "hosts",
-                                "pw": "secret",
-                                "type.pw": "password"})
-        self.assertTrue(mr_obj > 0)
-        # Attach the offline app to pippin
-        r = attach_token(self.serials[0], "offline", hostname="pippin",
-                         resolver_name="testresolver", options={"count": 100})
-
-        # first online validation
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin287082"},
-                                           environ_base={'REMOTE_ADDR': '192.168.0.2'}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            result = data.get("result")
-            self.assertTrue(result.get("status") is True, result)
-            self.assertTrue(result.get("value") is True, result)
-            detail = res.json.get("detail")
-            self.assertEqual(detail.get("otplen"), 6)
-            auth_items = res.json.get("auth_items")
-            offline = auth_items.get("offline")[0]
-            # Check the number of OTP values
-            self.assertEqual(len(offline.get("response")), 100)
-            self.assertEqual(offline.get("username"), "cornelius")
-            refilltoken_1 = offline.get("refilltoken")
-            self.assertEqual(len(refilltoken_1), 2 * REFILLTOKEN_LENGTH)
-            # check the token counter
-            tok = get_tokens(serial=self.serials[0])[0]
-            self.assertEqual(tok.token.count, 102)
-
-        # first refill with the 5th value
-        with self.app.test_request_context('/validate/offlinerefill',
-                                           method='POST',
-                                           data={"serial": self.serials[0],
-                                                 "pass": "pin338314",
-                                                 "refilltoken": refilltoken_1},
-                                           environ_base={'REMOTE_ADDR': '192.168.0.2'}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            result = res.json.get("result")
-            self.assertTrue(result.get("status") is True, result)
-            self.assertTrue(result.get("value") is True, result)
-            auth_items = res.json.get("auth_items")
-            offline = auth_items.get("offline")[0]
-            # Check the number of OTP values
-            self.assertEqual(len(offline.get("response")), 3)
-            self.assertTrue("102" in offline.get("response"))
-            self.assertTrue("103" in offline.get("response"))
-            self.assertTrue("104" in offline.get("response"))
-            refilltoken_2 = offline.get("refilltoken")
-            self.assertEqual(len(refilltoken_2), 2 * REFILLTOKEN_LENGTH)
-            # check the token counter
-            tok = get_tokens(serial=self.serials[0])[0]
-            self.assertEqual(tok.token.count, 105)
-            # The refilltoken changes each time
-            self.assertNotEqual(refilltoken_1, refilltoken_2)
-
-        # refill with wrong refill token fails
-        with self.app.test_request_context('/validate/offlinerefill',
-                                           method='POST',
-                                           data={"serial": self.serials[0],
-                                                 "pass": "pin520489",
-                                                 "refilltoken": 'a' * 2 * REFILLTOKEN_LENGTH},
-                                           environ_base={'REMOTE_ADDR': '192.168.0.2'}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 400, res)
-            data = res.json
-            self.assertEqual(data.get("result").get("error").get("message"),
-                             u"ERR905: Token is not an offline token or refill token is incorrect")
-
-        # 2nd refill with 10th value
-        with self.app.test_request_context('/validate/offlinerefill',
-                                           method='POST',
-                                           data={"serial": self.serials[0],
-                                                 "pass": "pin520489",
-                                                 "refilltoken": refilltoken_2},
-                                           environ_base={'REMOTE_ADDR': '192.168.0.2'}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            result = res.json.get("result")
-            self.assertTrue(result.get("status") is True, result)
-            self.assertTrue(result.get("value") is True, result)
-            auth_items = res.json.get("auth_items")
-            offline = auth_items.get("offline")[0]
-            # Check the number of OTP values
-            self.assertEqual(len(offline.get("response")), 5)
-            self.assertTrue("105" in offline.get("response"))
-            self.assertTrue("106" in offline.get("response"))
-            self.assertTrue("107" in offline.get("response"))
-            self.assertTrue("108" in offline.get("response"))
-            self.assertTrue("109" in offline.get("response"))
-            refilltoken_3 = offline.get("refilltoken")
-            self.assertEqual(len(refilltoken_3), 2 * REFILLTOKEN_LENGTH)
-            # check the token counter
-            tok = get_tokens(serial=self.serials[0])[0]
-            self.assertEqual(tok.token.count, 110)
-            # The refilltoken changes each time
-            self.assertNotEqual(refilltoken_2, refilltoken_3)
-            self.assertNotEqual(refilltoken_1, refilltoken_3)
-
-        # A refill with a totally wrong OTP value fails
-        token_obj = get_tokens(serial=self.serials[0])[0]
-        old_counter = token_obj.token.count
-        with self.app.test_request_context('/validate/offlinerefill',
-                                           method='POST',
-                                           data={"serial": self.serials[0],
-                                                 "pass": "pin000000",
-                                                 "refilltoken": refilltoken_3},
-                                           environ_base={'REMOTE_ADDR': '192.168.0.2'}):
-            res = self.app.full_dispatch_request()
-            data = res.json
-            self.assertTrue(res.status_code == 400, res)
-            self.assertEqual(data.get("result").get("error").get("message"),
-                             u"ERR401: You provided a wrong OTP value.")
-        # The failed refill should not modify the token counter!
-        self.assertEqual(old_counter, token_obj.token.count)
-
-        # A refill with a wrong serial number fails
-        with self.app.test_request_context('/validate/offlinerefill',
-                                           method='POST',
-                                           data={"serial": 'ABCDEF123',
-                                                 "pass": "pin000000",
-                                                 "refilltoken": refilltoken_3},
-                                           environ_base={'REMOTE_ADDR': '192.168.0.2'}):
-            res = self.app.full_dispatch_request()
-            data = res.json
-            self.assertTrue(res.status_code == 400, res)
-            self.assertEqual(data.get("result").get("error").get("message"),
-                             u"ERR905: The token does not exist")
-
-        # Detach the token, refill should then fail
-        r = detach_token(self.serials[0], "offline", "pippin")
-        with self.app.test_request_context('/validate/offlinerefill',
-                                           method='POST',
-                                           data={"serial": self.serials[0],
-                                                 "pass": "pin520489",
-                                                 "refilltoken": refilltoken_3},
-                                           environ_base={'REMOTE_ADDR': '192.168.0.2'}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 400, res)
-            data = res.json
-            self.assertTrue(res.status_code == 400, res)
-            self.assertEqual(data.get("result").get("error").get("message"),
-                             u"ERR905: Token is not an offline token or refill token is incorrect")
+                                   get_one_token, unassign_token)
+from privacyidea.lib.tokenclass import (FAILCOUNTER_EXCEEDED,
+                                        FAILCOUNTER_CLEAR_TIMEOUT, DATE_FORMAT,
+                                        AUTH_DATE_FORMAT)
+from privacyidea.lib.tokens.registrationtoken import RegistrationTokenClass
+from privacyidea.lib.tokens.totptoken import HotpTokenClass
+from privacyidea.lib.user import (User)
+from privacyidea.lib.utils import AUTH_RESPONSE
+from privacyidea.lib.utils.compare import PrimaryComparators
+from privacyidea.models import (Token, Policy, AuthCache, db, TokenOwner, Realm, CustomUserAttribute,
+                                NodeName)
+from . import smtpmock, ldap3mock
+from .base import MyApiTestCase
+
+from .api_validate_common import LDAPDirectory, OTPs, setup_sms_gateway
 
 
 class ValidateAPITestCase(MyApiTestCase):
@@ -661,7 +48,13 @@ class ValidateAPITestCase(MyApiTestCase):
     test the api.validate endpoints
     """
 
-    def test_00_create_realms(self):
+    def setUp(self):
+        super().setUp()
+        # test_33_auth_cache asserts authcache rows, which stay empty when Redis
+        # holds the cached authentications
+        self.pin_to_database("auth")
+
+    def test_00_setup(self):
         self.setUp_user_realms()
         self.setUp_user_realm2()
 
@@ -713,7 +106,7 @@ class ValidateAPITestCase(MyApiTestCase):
                                            method='POST',
                                            data={"serial": "123456"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 400, res)
+            self.assertEqual(404, res.status_code)
 
     def test_03_check_user(self):
         # get the original counter
@@ -770,9 +163,8 @@ class ValidateAPITestCase(MyApiTestCase):
         # test successful authentication
         with self.app.test_request_context('/validate/check',
                                            method='GET',
-                                           query_string=urlencode(
-                                                    {"user": "cornelius",
-                                                     "pass": "pin287082"})):
+                                           query_string={"user": "cornelius",
+                                                         "pass": "pin287082"}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
@@ -793,9 +185,8 @@ class ValidateAPITestCase(MyApiTestCase):
         # test authentication fails with the same OTP
         with self.app.test_request_context('/validate/check',
                                            method='GET',
-                                           query_string=urlencode(
-                                                    {"user": "cornelius",
-                                                     "pass": "pin287082"})):
+                                           query_string={"user": "cornelius",
+                                                         "pass": "pin287082"}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
@@ -840,7 +231,6 @@ class ValidateAPITestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            details = res.json.get("detail")
             self.assertEqual(result.get("status"), True)
             self.assertEqual(result.get("value"), True)
 
@@ -918,7 +308,7 @@ class ValidateAPITestCase(MyApiTestCase):
         tok = get_tokens(serial="s3")[0]
         self.assertEqual(tok.token.failcount, 1)
 
-        set_privacyidea_config("IncFailCountOnFalsePin", False)
+        set_privacyidea_config(SYSCONF.INCFAILCOUNTER, False)
         self.assertFalse(get_inc_fail_count_on_false_pin())
         reset_token(serial="SE1")
         reset_token(serial="s2")
@@ -963,6 +353,11 @@ class ValidateAPITestCase(MyApiTestCase):
         tok = get_tokens(serial="s3")[0]
         self.assertEqual(tok.token.failcount, 0)
 
+        # clean up
+        remove_token("s2")
+        remove_token("s3")
+        set_privacyidea_config(SYSCONF.INCFAILCOUNTER, True)
+
     def test_07_authentication_counter_exceeded(self):
         token_obj = init_token({"serial": "pass1", "pin": "123456",
                                 "type": "spass"})
@@ -992,10 +387,11 @@ class ValidateAPITestCase(MyApiTestCase):
                             in detail.get("message"))
 
     def test_08_failcounter_counter_exceeded(self):
-        token_obj = init_token({"serial": "pass2", "pin": "123456",
-                                "type": "spass"})
-        token_obj.set_maxfail(5)
-        token_obj.set_failcount(5)
+        token = init_token({"serial": "pass2", "pin": "123456", "type": "spass"})
+        token.set_maxfail(5)
+        token.set_failcount(5)
+        past = datetime.datetime.now(tzlocal()) - datetime.timedelta(minutes=10)
+        token.write_tokeninfo(FAILCOUNTER_EXCEEDED, past.strftime(DATE_FORMAT))
         # a valid authentication will fail
         with self.app.test_request_context('/validate/check',
                                            method='POST',
@@ -1005,88 +401,89 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
             detail = res.json.get("detail")
-            self.assertEqual(result.get("value"), False)
-            self.assertEqual(detail.get("message"), "matching 1 tokens, "
-                                                    "Failcounter exceeded")
-
-    def test_10_saml_check(self):
-        # test successful authentication
-        set_privacyidea_config("ReturnSamlAttributes", "0")
-        with self.app.test_request_context('/validate/samlcheck',
+            self.assertFalse(result.get("value"))
+            self.assertEqual("Failcounter exceeded", detail.get("message"))
+        self.assertEqual(5, token.get_failcount())
+        # invalid authentication fails with same message
+        with self.app.test_request_context('/validate/check',
                                            method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin338314"}):
+                                           data={"serial": "pass2",
+                                                 "pass": "000000"}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
             detail = res.json.get("detail")
-            value = result.get("value")
-            attributes = value.get("attributes")
-            self.assertEqual(value.get("auth"), True)
-            # No SAML return attributes
-            self.assertEqual(attributes.get("email"), None)
+            self.assertFalse(result.get("value"))
+            self.assertEqual("Failcounter exceeded", detail.get("message"))
+        self.assertEqual(5, token.get_failcount())
 
-        set_privacyidea_config("ReturnSamlAttributes", "1")
-
-        with self.app.test_request_context('/validate/samlcheck',
+        # set timeout
+        set_privacyidea_config(FAILCOUNTER_CLEAR_TIMEOUT, 30)
+        # timeout not expired: same behaviour
+        # a valid authentication will fail
+        with self.app.test_request_context('/validate/check',
                                            method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin254676"}):
+                                           data={"serial": "pass2",
+                                                 "pass": "123456"}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
             detail = res.json.get("detail")
-            value = result.get("value")
-            attributes = value.get("attributes")
-            self.assertEqual(value.get("auth"), True)
-            self.assertEqual(attributes.get("email"),
-                             "user@localhost.localdomain")
-            self.assertEqual(attributes.get("givenname"), "Cornelius")
-            self.assertEqual(attributes.get("mobile"), "+491111111")
-            self.assertEqual(attributes.get("phone"),  "+491234566")
-            self.assertEqual(attributes.get("realm"),  "realm1")
-            self.assertEqual(attributes.get("username"),  "cornelius")
-
-        # Return SAML attributes On Fail
-        with self.app.test_request_context('/validate/samlcheck',
+            self.assertFalse(result.get("value"))
+            self.assertEqual("Failcounter exceeded", detail.get("message"))
+        self.assertEqual(5, token.get_failcount())
+        # invalid authentication fails with same message
+        with self.app.test_request_context('/validate/check',
                                            method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin254676"}):
+                                           data={"serial": "pass2",
+                                                 "pass": "000000"}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
             detail = res.json.get("detail")
-            value = result.get("value")
-            attributes = value.get("attributes")
-            self.assertEqual(value.get("auth"), False)
-            self.assertEqual(attributes.get("email"), None)
-            self.assertEqual(attributes.get("givenname"), None)
-            self.assertEqual(attributes.get("mobile"), None)
-            self.assertEqual(attributes.get("phone"), None)
-            self.assertEqual(attributes.get("realm"), None)
-            self.assertEqual(attributes.get("username"), None)
+            self.assertFalse(result.get("value"))
+            self.assertEqual("Failcounter exceeded", detail.get("message"))
+        self.assertEqual(5, token.get_failcount())
 
-        set_privacyidea_config("ReturnSamlAttributesOnFail", "1")
-        with self.app.test_request_context('/validate/samlcheck',
+        # timeout expired
+        set_privacyidea_config(FAILCOUNTER_CLEAR_TIMEOUT, 5)
+        # a valid authentication succeeds and resets failcount to 0
+        with self.app.test_request_context('/validate/check',
                                            method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin254676"}):
+                                           data={"serial": "pass2",
+                                                 "pass": "123456"}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
             detail = res.json.get("detail")
-            value = result.get("value")
-            attributes = value.get("attributes")
-            self.assertEqual(value.get("auth"), False)
-            self.assertEqual(attributes.get("email"),
-                             "user@localhost.localdomain")
-            self.assertEqual(attributes.get("givenname"), "Cornelius")
-            self.assertEqual(attributes.get("mobile"), "+491111111")
-            self.assertEqual(attributes.get("phone"), "+491234566")
-            self.assertEqual(attributes.get("realm"), "realm1")
-            self.assertEqual(attributes.get("username"), "cornelius")
+            self.assertTrue(result.get("value"))
+            self.assertEqual("matching 1 tokens", detail.get("message"))
+        self.assertEqual(0, token.get_failcount())
+        # an invalid auth also resets the failcount and increase it directly to one due to the invalid auth
+        token.set_failcount(5)
+        token.write_tokeninfo(FAILCOUNTER_EXCEEDED, past.strftime(DATE_FORMAT))
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"serial": "pass2",
+                                                 "pass": "000000"}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            detail = res.json.get("detail")
+            self.assertFalse(result.get("value"))
+            self.assertEqual("wrong otp pin", detail.get("message"))
+        token = get_one_token(serial=token.get_serial())
+        self.assertEqual(1, token.get_failcount())
+
+        token.delete_token()
+        set_privacyidea_config(FAILCOUNTER_CLEAR_TIMEOUT, 0)
 
     def test_11_challenge_response_hotp(self):
+        """
+        Verify that HOTP token work with the challenge_response policy. Also verify that the challenge_text policy is
+        applied correctly.
+        """
+        set_privacyidea_config(SYSCONF.INCFAILCOUNTER, False)
         serial = "CHALRESP1"
         pin = "chalresp1"
         # create a token and assign to the user
@@ -1096,52 +493,45 @@ class ValidateAPITestCase(MyApiTestCase):
         token = HotpTokenClass(db_token)
         token.add_user(User("cornelius", self.realm1))
         token.set_pin(pin)
-        # Set the failcounter
         token.set_failcount(5)
+        db_token.save()
 
-        # try to do challenge response without a policy. It will fail
+        # try to do challenge response without a policy.
         with self.app.test_request_context('/validate/check',
                                            method='POST',
                                            data={"user": "cornelius",
                                                  "pass": pin}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(res.status_code, 200, res)
             result = res.json.get("result")
             detail = res.json.get("detail")
             self.assertFalse(result.get("value"))
             self.assertEqual(detail.get("message"), _("wrong otp pin"))
             self.assertNotIn("transaction_id", detail)
+            self.assertEqual(5, token.get_failcount())
 
-        # set a chalresp policy for HOTP
-        with self.app.test_request_context('/policy/pol_chal_resp',
-                                           data={'action':
-                                                     "challenge_response=hotp",
-                                                 'scope': "authentication",
-                                                 'realm': '',
-                                                 'active': True},
-                                           method='POST',
-                                           headers={'Authorization': self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result["status"] is True, result)
-            self.assertEqual(result['value']['setPolicy pol_chal_resp'], 1, result)
+        # Policy to enable challenge-response and the text
+        challenge_text = "custom challenge text"
+        set_policy("challengetext", scope=SCOPE.AUTH, action=f"{PolicyAction.CHALLENGETEXT}={challenge_text}")
+        set_policy("challenge_response_hotp", scope=SCOPE.AUTH, action=f"{PolicyAction.CHALLENGERESPONSE}=hotp")
 
-        # create the challenge by authenticating with the OTP PIN
+        # Create the challenge by authenticating with the OTP PIN. The failcounter will not increase.
+        # The challenge message will be taken from the policy action value
         with self.app.test_request_context('/validate/check',
                                            method='POST',
                                            data={"user": "cornelius",
                                                  "pass": pin}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(res.status_code, 200, res)
             result = res.json.get("result")
             detail = res.json.get("detail")
             self.assertFalse(result.get("value"))
-            self.assertEqual(detail.get("message"), _("please enter otp: "))
+            self.assertEqual("CHALLENGE", result.get("authentication"))
+            self.assertEqual(challenge_text, detail.get("message"))
             transaction_id = detail.get("transaction_id")
-        self.assertEqual(token.get_failcount(), 5)
+            self.assertEqual(5, token.get_failcount())
 
-        # send the OTP value
+        # OTP value will be accepted and reset the failcounter
         with self.app.test_request_context('/validate/check',
                                            method='POST',
                                            data={"user": "cornelius",
@@ -1151,12 +541,15 @@ class ValidateAPITestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertTrue(result.get("value"))
+            self.assertEqual("ACCEPT", result.get("authentication"))
 
         self.assertEqual(token.get_failcount(), 0)
-        # delete the token
+        # delete the token and policies
         remove_token(serial=serial)
+        delete_policy("challengetext")
+        delete_policy("challenge_response_hotp")
+        set_privacyidea_config(SYSCONF.INCFAILCOUNTER, True)
 
     def test_11a_challenge_response_registration(self):
         serial = "CHALRESP1"
@@ -1174,7 +567,7 @@ class ValidateAPITestCase(MyApiTestCase):
                                            data={"user": "cornelius",
                                                  "pass": pin}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(res.status_code, 200, res)
             result = res.json.get("result")
             detail = res.json.get("detail")
             self.assertFalse(result.get("value"))
@@ -1183,18 +576,17 @@ class ValidateAPITestCase(MyApiTestCase):
 
         # set a chalresp policy for Registration Token
         with self.app.test_request_context('/policy/pol_chal_resp',
-                                           data={'action':
-                                                     "challenge_response=registration",
+                                           data={'action': "challenge_response=registration",
                                                  'scope': "authentication",
                                                  'realm': '',
                                                  'active': True},
                                            method='POST',
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(res.status_code, 200, res)
             result = res.json.get("result")
-            self.assertTrue(result["status"] is True, result)
-            self.assertEqual(result['value']['setPolicy pol_chal_resp'], 1, result)
+            self.assertTrue(result["status"], result)
+            self.assertGreaterEqual(result['value']['setPolicy pol_chal_resp'], 1, result)
 
         # create the challenge by authenticating with the OTP PIN
         with self.app.test_request_context('/validate/check',
@@ -1202,7 +594,7 @@ class ValidateAPITestCase(MyApiTestCase):
                                            data={"user": "cornelius",
                                                  "pass": pin}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(res.status_code, 200, res)
             result = res.json.get("result")
             detail = res.json.get("detail")
             self.assertFalse(result.get("value"))
@@ -1216,12 +608,12 @@ class ValidateAPITestCase(MyApiTestCase):
                                                  "transaction_id": transaction_id,
                                                  "pass": "regcode"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(res.status_code, 200, res)
             result = res.json.get("result")
             self.assertTrue(result.get("value"))
 
         # check, that the tokenowner table does not contain a NULL entry
-        r = db.session.query(TokenOwner).filter(TokenOwner.token_id == None).first()
+        r = db.session.query(TokenOwner).filter(TokenOwner.token_id.is_(None)).first()
         self.assertIsNone(r)
 
         # delete the policy
@@ -1231,17 +623,16 @@ class ValidateAPITestCase(MyApiTestCase):
         # Check behavior of Challenge-Response with multiple tokens
         # set a chalresp policy for HOTP
         with self.app.test_request_context('/policy/pol_chal_resp',
-                                           data={'action':
-                                                     "challenge_response=hotp",
+                                           data={'action': "challenge_response=hotp",
                                                  'scope': "authentication",
                                                  'realm': '',
                                                  'active': True},
                                            method='POST',
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(res.status_code, 200, res)
             result = res.json.get("result")
-            self.assertTrue(result["status"] is True, result)
+            self.assertTrue(result["status"], result)
             self.assertGreaterEqual(result['value']['setPolicy pol_chal_resp'], 1, result)
 
         chalresp_serials = ["CHALRESP1", "CHALRESP2"]
@@ -1259,6 +650,7 @@ class ValidateAPITestCase(MyApiTestCase):
             token.set_pin(pin)
             # Set the failcounter
             token.set_failcount(5)
+            token.save()
             tokens.append(token)
 
         # create a challenge for the first token by authenticating with the OTP PIN
@@ -1267,7 +659,7 @@ class ValidateAPITestCase(MyApiTestCase):
                                            data={"user": "cornelius",
                                                  "pass": chalresp_pins[0]}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(res.status_code, 200, res)
             result = res.json.get("result")
             detail = res.json.get("detail")
             self.assertFalse(result.get("value"))
@@ -1286,7 +678,7 @@ class ValidateAPITestCase(MyApiTestCase):
                                                      transaction_id,
                                                  "pass": "111111"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(res.status_code, 200, res)
             result = res.json.get("result")
             detail = res.json.get("detail")
             self.assertFalse(result.get("value"))
@@ -1316,6 +708,7 @@ class ValidateAPITestCase(MyApiTestCase):
 
         # Set the same failcount for both tokens
         tokens[0].set_failcount(5)
+        tokens[0].save()
 
         # trigger a challenge for both tokens
         with self.app.test_request_context('/validate/triggerchallenge',
@@ -1332,8 +725,7 @@ class ValidateAPITestCase(MyApiTestCase):
         with self.app.test_request_context('/validate/check',
                                            method='POST',
                                            data={"user": "cornelius",
-                                                 "transaction_id":
-                                                     transaction_id,
+                                                 "transaction_id": transaction_id,
                                                  "pass": "111111"}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
@@ -1369,9 +761,9 @@ class ValidateAPITestCase(MyApiTestCase):
         pol.save()
 
         # create the challenge by authenticating with the OTP PIN
-        with Replace('privacyidea.models.datetime',
+        with Replace('privacyidea.models.utils.datetime',
                      test_datetime(2020, 6, 13, 1, 2, 3,
-                                   tzinfo=timezone(datetime.timedelta(hours=+5)))):
+                                   tzinfo=datetime.timezone(datetime.timedelta(hours=+5)))):
             with self.app.test_request_context('/validate/check',
                                                method='POST',
                                                data={"user": "cornelius",
@@ -1387,9 +779,9 @@ class ValidateAPITestCase(MyApiTestCase):
         # send the OTP value while being an hour too early (timezone +1)
         # This should not happen unless there is a server misconfiguration
         # The transaction should not be removed by the janitor
-        with Replace('privacyidea.models.datetime',
+        with Replace('privacyidea.models.challenge.datetime',
                      test_datetime(2020, 6, 13, 1, 2, 4,
-                                   tzinfo=timezone(datetime.timedelta(hours=+6)))):
+                                   tzinfo=datetime.timezone(datetime.timedelta(hours=+6)))):
             with self.app.test_request_context('/validate/check',
                                                method='POST',
                                                data={"user": "cornelius",
@@ -1401,9 +793,9 @@ class ValidateAPITestCase(MyApiTestCase):
                 self.assertFalse(result.get("value"))
 
         # send the OTP value while being an hour too late (timezone -1)
-        with Replace('privacyidea.models.datetime',
+        with Replace('privacyidea.models.challenge.datetime',
                      test_datetime(2020, 6, 13, 1, 2, 4,
-                                   tzinfo=timezone(datetime.timedelta(hours=+1)))):
+                                   tzinfo=datetime.timezone(datetime.timedelta(hours=+1)))):
             with self.app.test_request_context('/validate/check',
                                                method='POST',
                                                data={"user": "cornelius",
@@ -1414,18 +806,22 @@ class ValidateAPITestCase(MyApiTestCase):
                 result = res.json.get("result")
                 self.assertFalse(result.get("value"))
 
-        # check that the challenge is removed
-        self.assertFalse(get_challenges(transaction_id=transaction_id))
+        # check that no usable challenge remains. The DB janitor deletes the
+        # expired row; the Redis cache reaps via TTL, so an expired challenge
+        # can still be present there briefly - but it is no longer valid, which
+        # is what every consumer checks. Assert on validity, not raw presence,
+        # so the test is backend-agnostic.
+        self.assertFalse([c for c in get_challenges(transaction_id=transaction_id) if c.is_valid()])
 
         # delete the token
         remove_token(serial=serial)
         pol.delete()
 
     def test_12_challenge_response_sms(self):
+        unassign_token(self.serials[0])
         # set a chalresp policy for SMS
         with self.app.test_request_context('/policy/pol_chal_resp',
-                                           data={'action':
-                                                     "challenge_response=sms",
+                                           data={'action': "challenge_response=sms",
                                                  'scope': "authentication",
                                                  'realm': '',
                                                  'active': True},
@@ -1455,10 +851,8 @@ class ValidateAPITestCase(MyApiTestCase):
             result = res.json.get("result")
             detail = res.json.get("detail")
             self.assertFalse(result.get("value"))
-            self.assertTrue("The PIN was correct, "
-                            "but the SMS could not be sent" in
-                            detail.get("message"))
-            transaction_id = detail.get("transaction_id")
+            self.assertIn("The PIN was correct, but the SMS could not be sent", detail.get("message"),
+                          detail.get("message"))
 
         # disable the token. The detail->message should be empty
         r = enable_token(serial=serial, enable=False)
@@ -1472,8 +866,7 @@ class ValidateAPITestCase(MyApiTestCase):
             result = res.json.get("result")
             detail = res.json.get("detail")
             self.assertFalse(result.get("value"))
-            self.assertEqual(detail.get("message"),
-                             "No active challenge response token found")
+            self.assertEqual("Token is disabled", detail.get("message"))
 
         # delete the token
         remove_token(serial=serial)
@@ -1483,8 +876,7 @@ class ValidateAPITestCase(MyApiTestCase):
         smtpmock.setdata(response={"hans@dampf.com": (200, 'OK')})
         # set a chalresp policy for Email
         with self.app.test_request_context('/policy/pol_chal_resp',
-                                           data={'action':
-                                                     "challenge_response=email",
+                                           data={'action': "challenge_response=email",
                                                  'scope': "authentication",
                                                  'realm': '',
                                                  'active': True},
@@ -1514,7 +906,7 @@ class ValidateAPITestCase(MyApiTestCase):
             result = res.json.get("result")
             detail = res.json.get("detail")
             self.assertFalse(result.get("value"))
-            self.assertEqual(detail.get("message"), _("Enter the OTP from the Email:"))
+            self.assertEqual(detail.get("message"), _("Enter the OTP from the Email"))
             transaction_id = detail.get("transaction_id")
 
         # send the OTP value
@@ -1522,13 +914,11 @@ class ValidateAPITestCase(MyApiTestCase):
         with self.app.test_request_context('/validate/check',
                                            method='POST',
                                            data={"user": "cornelius",
-                                                 "state":
-                                                     transaction_id,
+                                                 "state": transaction_id,
                                                  "pass": "359152"}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertTrue(result.get("value"))
 
         # delete the token
@@ -1604,8 +994,7 @@ class ValidateAPITestCase(MyApiTestCase):
         set_privacyidea_config("splitAtSign", "0")
         with self.app.test_request_context('/validate/check',
                                            method='POST',
-                                           data={"user":
-                                                    "cornelius@" + self.realm2,
+                                           data={"user": "cornelius@" + self.realm2,
                                                  "pass": serial2}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 400, res)
@@ -1613,8 +1002,7 @@ class ValidateAPITestCase(MyApiTestCase):
         set_privacyidea_config("splitAtSign", "1")
         with self.app.test_request_context('/validate/check',
                                            method='POST',
-                                           data={"user":
-                                                    "cornelius@" + self.realm2,
+                                           data={"user": "cornelius@" + self.realm2,
                                                  "pass": serial2}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
@@ -1624,8 +1012,7 @@ class ValidateAPITestCase(MyApiTestCase):
         # Also test url-encoded parameters
         with self.app.test_request_context('/validate/check',
                                            method='POST',
-                                           data={"user":
-                                                    "cornelius%40" + self.realm2,
+                                           data={"user": "cornelius%40" + self.realm2,
                                                  "pass": serial2}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
@@ -1637,8 +1024,7 @@ class ValidateAPITestCase(MyApiTestCase):
         delete_privacyidea_config("splitAtSign")
         with self.app.test_request_context('/validate/check',
                                            method='POST',
-                                           data={"user":
-                                                    "cornelius@" + self.realm2,
+                                           data={"user": "cornelius@" + self.realm2,
                                                  "pass": serial2}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
@@ -1656,8 +1042,7 @@ class ValidateAPITestCase(MyApiTestCase):
         # counter = 8, is out of sync
         with self.app.test_request_context('/validate/check',
                                            method='POST',
-                                           data={"user":
-                                                    "cornelius@" + self.realm2,
+                                           data={"user": "cornelius@" + self.realm2,
                                                  "pass": "async399871"}):
             res = self.app.full_dispatch_request()
             self.assertEqual(res.status_code, 200)
@@ -1668,8 +1053,7 @@ class ValidateAPITestCase(MyApiTestCase):
         # Authentication is successful
         with self.app.test_request_context('/validate/check',
                                            method='POST',
-                                           data={"user":
-                                                    "cornelius@" + self.realm2,
+                                           data={"user": "cornelius@" + self.realm2,
                                                  "pass": "async520489"}):
             res = self.app.full_dispatch_request()
             self.assertEqual(res.status_code, 200)
@@ -1685,21 +1069,20 @@ class ValidateAPITestCase(MyApiTestCase):
                             "otpkey": self.otpkey,
                             "pin": "async"}, User("cornelius", self.realm2))
         set_privacyidea_config("AutoResync", True)
-        set_policy(name="mcr_resync", scope=SCOPE.AUTH, action=ACTION.RESYNC_VIA_MULTICHALLENGE)
+        set_policy(name="mcr_resync", scope=SCOPE.AUTH, action=PolicyAction.RESYNC_VIA_MULTICHALLENGE)
         token.set_sync_window(10)
         token.set_count_window(5)
         # counter = 8, is out of sync
         with self.app.test_request_context('/validate/check',
                                            method='POST',
-                                           data={"user":
-                                                    "cornelius@" + self.realm2,
+                                           data={"user": "cornelius@" + self.realm2,
                                                  "pass": "async399871"}):
             res = self.app.full_dispatch_request()
             self.assertEqual(res.status_code, 200)
             result = res.json.get("result")
             detail = res.json.get("detail")
             self.assertEqual(detail.get('multi_challenge')[0].get("message"),
-                             u'To resync your token, please enter the next OTP value')
+                             'To resync your token, please enter the next OTP value')
             self.assertEqual(result.get("value"), False)
             transaction_id = res.json.get("detail").get("transaction_id")
             self.assertTrue(transaction_id)
@@ -1707,8 +1090,7 @@ class ValidateAPITestCase(MyApiTestCase):
         # A false response will fail
         with self.app.test_request_context('/validate/check',
                                            method='POST',
-                                           data={"user":
-                                                     "cornelius@" + self.realm2,
+                                           data={"user": "cornelius@" + self.realm2,
                                                  "transaction_id": transaction_id,
                                                  "pass": "520111"}):
             res = self.app.full_dispatch_request()
@@ -1720,8 +1102,7 @@ class ValidateAPITestCase(MyApiTestCase):
         # Authentication is successful
         with self.app.test_request_context('/validate/check',
                                            method='POST',
-                                           data={"user":
-                                                    "cornelius@" + self.realm2,
+                                           data={"user": "cornelius@" + self.realm2,
                                                  "transaction_id": transaction_id,
                                                  "pass": "520489"}):
             res = self.app.full_dispatch_request()
@@ -1743,7 +1124,7 @@ class ValidateAPITestCase(MyApiTestCase):
         # set policy for timelimit
         set_policy(name="pol_time1",
                    scope=SCOPE.AUTHZ,
-                   action="{0!s}=2/20s".format(ACTION.AUTHMAXSUCCESS))
+                   action=f"{PolicyAction.AUTHMAXSUCCESS!s}=2/20s")
 
         for i in [1, 2]:
             with self.app.test_request_context('/validate/check',
@@ -1778,7 +1159,7 @@ class ValidateAPITestCase(MyApiTestCase):
         # set policy for timelimit
         set_policy(name="pol_time1",
                    scope=SCOPE.AUTHZ,
-                   action="{0!s}=2/20s".format(ACTION.AUTHMAXFAIL))
+                   action=f"{PolicyAction.AUTHMAXFAIL!s}=2/20s")
 
         for i in [1, 2]:
             with self.app.test_request_context('/validate/check',
@@ -1804,22 +1185,22 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertEqual(result.get("value"), False)
             details = res.json.get("detail")
             self.assertEqual(details.get("message"),
-                             "Only 2 failed authentications per 0:00:20")
+                             "Only 2 failed authentications per 0:00:20 allowed.")
 
         delete_policy("pol_time1")
         remove_token(token.token.serial)
 
     def test_19_validate_passthru(self):
         # user passthru, realm: self.realm2, passwd: pthru
-        set_policy(name="pthru", scope=SCOPE.AUTH, action=ACTION.PASSTHRU)
+        set_policy(name="pthru", scope=SCOPE.AUTH, action=PolicyAction.PASSTHRU)
 
         # Passthru with GET request
         with self.app.test_request_context(
                 '/validate/check',
                 method='GET',
-                query_string=urlencode({"user": "passthru",
-                                        "realm": self.realm2,
-                                        "pass": "pthru"})):
+                query_string={"user": "passthru",
+                              "realm": self.realm2,
+                              "pass": "pthru"}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
@@ -1837,7 +1218,7 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertEqual(result.get("value"), True)
 
         # Test if the policies "reset_all_tokens" and "passthru" work out fine at the same time
-        set_policy(name="reset_all_tokens", scope=SCOPE.AUTH, action=ACTION.RESETALLTOKENS)
+        set_policy(name="reset_all_tokens", scope=SCOPE.AUTH, action=PolicyAction.RESETALLTOKENS)
         # Passthru with POST Request
         with self.app.test_request_context('/validate/check',
                                            method='POST',
@@ -1918,7 +1299,7 @@ class ValidateAPITestCase(MyApiTestCase):
         # user disableduser, realm: self.realm2, passwd: superSecret
         set_policy(name="disabled",
                    scope=SCOPE.AUTH,
-                   action="{0!s}={1!s}".format(ACTION.OTPPIN, "userstore"))
+                   action=f"{PolicyAction.OTPPIN}=userstore")
         # enroll two tokens
         r = init_token({"type": "spass", "serial": "spass1d"},
                        user=User("disableduser", self.realm2))
@@ -1964,7 +1345,7 @@ class ValidateAPITestCase(MyApiTestCase):
         user = "lockeduser"
         set_policy(name="locked",
                    scope=SCOPE.AUTH,
-                   action="{0!s}={1!s}".format(ACTION.OTPPIN, "tokenpin"))
+                   action=f"{PolicyAction.OTPPIN}=tokenpin")
         r = init_token({"type": "spass", "serial": "spass1l",
                         "pin": "locked"},
                        user=User(user, self.realm2))
@@ -1997,8 +1378,7 @@ class ValidateAPITestCase(MyApiTestCase):
         serial = "t23"
         set_policy(name="pass_no",
                    scope=SCOPE.AUTH,
-                   action="{0!s},{1!s}".format(ACTION.PASSNOTOKEN,
-                                               ACTION.PASSNOUSER))
+                   action=f"{PolicyAction.PASSONNOTOKEN!s},{PolicyAction.PASSONNOUSER!s}")
 
         r = init_token({"type": "spass", "serial": serial,
                         "pin": pin}, user=User(user, self.realm2))
@@ -2031,13 +1411,13 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertEqual(result.get("value"), True)
             detail = res.json.get("detail")
             self.assertEqual(detail.get("message"),
-                             u"user does not exist, accepted "
-                             u"due to 'pass_no'")
+                             "user does not exist, accepted "
+                             "due to 'pass_no'")
 
         # Creating a notification event. The non-existing user must
         # still be able to pass!
         eid = set_event("notify", event=["validate_check"], action="sendmail",
-                  handlermodule="UserNotification", conditions={"token_locked": True})
+                        handlermodule="UserNotification", conditions={"token_locked": True})
 
         with self.app.test_request_context('/validate/check',
                                            method='POST',
@@ -2050,8 +1430,8 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertEqual(result.get("value"), True)
             detail = res.json.get("detail")
             self.assertEqual(detail.get("message"),
-                             u"user does not exist, accepted "
-                             u"due to 'pass_no'")
+                             "user does not exist, accepted "
+                             "due to 'pass_no'")
 
         delete_event(eid)
 
@@ -2069,8 +1449,8 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertEqual(result.get("value"), True)
             detail = res.json.get("detail")
             self.assertEqual(detail.get("message"),
-                             u"user has no token, "
-                             u"accepted due to 'pass_no'")
+                             "user has no token, "
+                             "accepted due to 'pass_no'")
 
         r = get_tokens(user=User(user, self.realm2), count=True)
         self.assertEqual(r, 1)
@@ -2108,12 +1488,8 @@ class ValidateAPITestCase(MyApiTestCase):
         # Now we set a policy, that a non existing user will authenticate
         set_policy(name="pol1",
                    scope=SCOPE.AUTH,
-                   action="{0}, {1}, {2}, {3}=none".format(
-                       ACTION.RESETALLTOKENS,
-                       ACTION.PASSNOUSER,
-                       ACTION.PASSNOTOKEN,
-                       ACTION.OTPPIN
-                   ),
+                   action=f"{PolicyAction.RESETALLTOKENS}, {PolicyAction.PASSONNOUSER}, {PolicyAction.PASSONNOTOKEN}, "
+                          f"{PolicyAction.OTPPIN}=none",
                    realm=self.realm1)
         # Check that the non existing user MisterX is allowed to authenticate
         with self.app.test_request_context('/validate/check',
@@ -2125,13 +1501,11 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertTrue(res.status_code == 200, res)
             detail = res.json.get("detail")
             self.assertEqual(detail.get("message"),
-                             u'user does not exist, accepted due to \'pol1\'')
+                             'user does not exist, accepted due to \'pol1\'')
         delete_policy("pol1")
 
     @responses.activate
     def test_24_trigger_challenge(self):
-        from privacyidea.lib.smsprovider.SMSProvider import set_smsgateway
-        from privacyidea.lib.config import set_privacyidea_config
         setup_sms_gateway()
 
         self.setUp_user_realms()
@@ -2154,6 +1528,7 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
             self.assertEqual(result.get("value"), 1)
+            self.assertEqual(result.get("authentication"), AUTH_RESPONSE.CHALLENGE)
             detail = res.json.get("detail")
             self.assertEqual(detail.get("messages")[0],
                              _("Enter the OTP from the SMS:"))
@@ -2185,6 +1560,7 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
             self.assertEqual(result.get("value"), 1)
+            self.assertEqual(result.get("authentication"), AUTH_RESPONSE.CHALLENGE)
             detail = res.json.get("detail")
             self.assertEqual(detail.get("messages")[0],
                              _("Enter the OTP from the SMS:"))
@@ -2224,9 +1600,9 @@ class ValidateAPITestCase(MyApiTestCase):
         self.assertTrue(r)
 
         set_policy("emailtext", scope=SCOPE.AUTH,
-                   action="{0!s}=Dein <otp>".format(EMAILACTION.EMAILTEXT))
+                   action=f"{EMAILACTION.EMAILTEXT!s}=Dein <otp>")
         set_policy("emailsubject", scope=SCOPE.AUTH,
-                   action="{0!s}=Dein OTP".format(EMAILACTION.EMAILSUBJECT))
+                   action=f"{EMAILACTION.EMAILSUBJECT!s}=Dein OTP")
 
         # Trigger challenge for serial number
         with self.app.test_request_context('/validate/triggerchallenge',
@@ -2238,10 +1614,8 @@ class ValidateAPITestCase(MyApiTestCase):
             result = res.json.get("result")
             self.assertEqual(result.get("value"), 1)
             detail = res.json.get("detail")
-            self.assertEqual(detail.get("messages")[0],
-                             _("Enter the OTP from the Email:"))
-            transaction_id = detail.get("transaction_ids")[0]
-            # check the sent message
+            self.assertEqual(detail.get("messages")[0], _("Enter the OTP from the Email"))
+            # check the send message
             sent_message = smtpmock.get_sent_message()
             self.assertTrue("RGVpbiAyODcwODI=" in sent_message)
             self.assertTrue("Subject: Dein OTP" in sent_message)
@@ -2255,16 +1629,15 @@ class ValidateAPITestCase(MyApiTestCase):
         OTPKE2 = "31323334353637383930313233343536373839AA"
         user = User("multichal", self.realm1)
         pin = "test49"
-        token_a = init_token({"serial": "CR2A",
-                              "type": "hotp",
-                              "otpkey": OTPKE2,
-                              "pin": pin}, user)
-        token_b = init_token({"serial": "CR2B",
-                              "type": "hotp",
-                              "otpkey": self.otpkey,
-                              "pin": pin}, user)
-        set_policy("test49", scope=SCOPE.AUTH, action="{0!s}=HOTP".format(
-            ACTION.CHALLENGERESPONSE))
+        init_token({"serial": "CR2A",
+                    "type": "hotp",
+                    "otpkey": OTPKE2,
+                    "pin": pin}, user)
+        init_token({"serial": "CR2B",
+                    "type": "hotp",
+                    "otpkey": self.otpkey,
+                    "pin": pin}, user)
+        set_policy("test49", scope=SCOPE.AUTH, action=f"{PolicyAction.CHALLENGERESPONSE!s}=hotp")
         # both tokens will be a valid challenge response token!
 
         transaction_id = None
@@ -2280,18 +1653,15 @@ class ValidateAPITestCase(MyApiTestCase):
             detail = res.json.get("detail")
             transaction_id = detail.get("transaction_id")
             multi_challenge = detail.get("multi_challenge")
-            self.assertEqual(multi_challenge[0].get("serial"), "CR2A")
-            self.assertEqual(transaction_id,
-                             multi_challenge[0].get("transaction_id"))
-            self.assertEqual("interactive", multi_challenge[0].get("client_mode"))
-            self.assertEqual(transaction_id,
-                             multi_challenge[1].get("transaction_id"))
-            self.assertEqual(multi_challenge[1].get("serial"), "CR2B")
-            self.assertEqual("interactive", multi_challenge[1].get("client_mode"))
+            self.assertEqual(len(multi_challenge), 2)
+            serials = {c.get("serial") for c in multi_challenge}
+            self.assertEqual(serials, {"CR2A", "CR2B"})
+            for challenge in multi_challenge:
+                self.assertEqual(transaction_id, challenge.get("transaction_id"))
+                self.assertEqual("interactive", challenge.get("client_mode"))
 
         # There are two challenges in the database
-        r = Challenge.query.filter(Challenge.transaction_id ==
-                                   transaction_id).all()
+        r = get_challenges(transaction_id=transaction_id)
         self.assertEqual(len(r), 2)
 
         # check that both serials appear in the audit log
@@ -2317,13 +1687,73 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertEqual(serial, "CR2B")
 
         # No challenges in the database
-        r = Challenge.query.filter(Challenge.transaction_id ==
-                                   transaction_id).all()
+        r = get_challenges(transaction_id=transaction_id)
         self.assertEqual(len(r), 0)
 
         remove_token("CR2A")
         remove_token("CR2B")
         delete_policy("test49")
+
+    def test_26a_audit_serials_of_three_challenges(self):
+        # The audit entry of every leg of a challenge response authentication names the
+        # tokens that were involved in it
+        self.setUp_user_realms()
+        OTPKE2 = "31323334353637383930313233343536373839AA"
+        user = User("multichal", self.realm1)
+        pin = "test26a"
+        # The serials are long enough that the comma separated list of all three of them
+        # does not fit into a 40 character audit column
+        serials = ["CR3A0000000000001", "CR3B0000000000002", "CR3C0000000000003"]
+        init_token({"serial": serials[0], "type": "hotp", "otpkey": OTPKE2, "pin": pin}, user)
+        init_token({"serial": serials[1], "type": "hotp", "otpkey": self.otpkey, "pin": pin}, user)
+        init_token({"serial": serials[2], "type": "hotp", "genkey": 1, "pin": pin}, user)
+        set_policy("test26a", scope=SCOPE.AUTH,
+                   action=f"{PolicyAction.CHALLENGERESPONSE!s}=hotp")
+
+        # First leg: the PIN triggers a challenge for each of the three tokens
+        with self.app.test_request_context('/validate/check', method='POST',
+                                           data={"user": "multichal", "realm": self.realm1, "pass": pin}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            self.assertFalse(res.json.get("result").get("value"))
+            detail = res.json.get("detail")
+            transaction_id = detail.get("transaction_id")
+            self.assertEqual(set(serials), {c.get("serial") for c in detail.get("multi_challenge")})
+
+        self.assertEqual(3, len(get_challenges(transaction_id=transaction_id)))
+
+        # All three challenged tokens are named in the audit log
+        audit_entry = self.find_most_recent_audit_entry(action='* /validate/check')
+        self.assertEqual(set(serials), set(audit_entry.get('serial').split(',')), audit_entry)
+
+        # Second leg with a wrong OTP value: the tokens that were asked are still the
+        # tokens the failed attempt was made against
+        with self.app.test_request_context('/validate/check', method='POST',
+                                           data={"user": "multichal", "realm": self.realm1,
+                                                 "transaction_id": transaction_id, "pass": "111111"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            self.assertFalse(res.json.get("result").get("value"))
+
+        audit_entry = self.find_most_recent_audit_entry(action='* /validate/check')
+        self.assertEqual(set(serials), set(audit_entry.get('serial').split(',')), audit_entry)
+
+        # Third leg with the OTP value of the second token: only the token that answered
+        # is named, not the two tokens that were also challenged
+        with self.app.test_request_context('/validate/check', method='POST',
+                                           data={"user": "multichal", "realm": self.realm1,
+                                                 "transaction_id": transaction_id, "pass": "287082"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            self.assertTrue(res.json.get("result").get("value"))
+            self.assertEqual(serials[1], res.json.get("detail").get("serial"))
+
+        audit_entry = self.find_most_recent_audit_entry(action='* /validate/check')
+        self.assertEqual(serials[1], audit_entry.get('serial'), audit_entry)
+
+        for serial in serials:
+            remove_token(serial)
+        delete_policy("test26a")
 
     def test_27_multiple_challenge_response_different_pin(self):
         # Test the challenges for multiple active tokens with different PINs
@@ -2333,16 +1763,15 @@ class ValidateAPITestCase(MyApiTestCase):
         user = User("multichal", self.realm1)
         pinA = "testA"
         pinB = "testB"
-        token_a = init_token({"serial": "CR2A",
-                              "type": "hotp",
-                              "otpkey": OTPKE2,
-                              "pin": pinA}, user)
-        token_b = init_token({"serial": "CR2B",
-                              "type": "hotp",
-                              "otpkey": self.otpkey,
-                              "pin": pinB}, user)
-        set_policy("test48", scope=SCOPE.AUTH, action="{0!s}=HOTP".format(
-            ACTION.CHALLENGERESPONSE))
+        init_token({"serial": "CR2A",
+                    "type": "hotp",
+                    "otpkey": OTPKE2,
+                    "pin": pinA}, user)
+        init_token({"serial": "CR2B",
+                    "type": "hotp",
+                    "otpkey": self.otpkey,
+                    "pin": pinB}, user)
+        set_policy("test48", scope=SCOPE.AUTH, action=f"{PolicyAction.CHALLENGERESPONSE!s}=hotp")
         # both tokens will be a valid challenge response token!
 
         transaction_id = None
@@ -2364,8 +1793,7 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertEqual(len(multi_challenge), 1)
 
         # There is ONE challenge in the database
-        r = Challenge.query.filter(Challenge.transaction_id ==
-                                   transaction_id).all()
+        r = get_challenges(transaction_id=transaction_id)
         self.assertEqual(len(r), 1)
 
         # Check the second response to the challenge, the second step in
@@ -2387,8 +1815,7 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertEqual(serial, "CR2B")
 
         # No challenges in the database
-        r = Challenge.query.filter(Challenge.transaction_id ==
-                                   transaction_id).all()
+        r = get_challenges(transaction_id=transaction_id)
         self.assertEqual(len(r), 0)
 
         remove_token("CR2A")
@@ -2397,8 +1824,7 @@ class ValidateAPITestCase(MyApiTestCase):
 
     def test_28_validate_radiuscheck(self):
         # setup a spass token
-        token_obj = init_token({"serial": "pass3", "pin": "123456",
-                                "type": "spass"})
+        init_token({"serial": "pass3", "pin": "123456", "type": "spass"})
 
         # test successful authentication
         with self.app.test_request_context('/validate/radiuscheck',
@@ -2420,31 +1846,35 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertEqual(res.data, b'')
 
         # test authentication fails with an unknown user
-        # here, we get an ordinary JSON response
+        # The view raises, but /validate/radiuscheck must still answer with an
+        # empty body and a 400 status code (construct_radius_response is
+        # re-applied on the error path).
         with self.app.test_request_context('/validate/radiuscheck',
                                            method='POST',
                                            data={"user": "unknown",
                                                  "pass": "123456"}):
             res = self.app.full_dispatch_request()
             self.assertEqual(res.status_code, 400)
-            result = res.json.get("result")
-            self.assertFalse(result.get("status"))
+            self.assertEqual(res.data, b'')
+        # Check that we have a failed attempt with the username in the audit
+        ae = self.find_most_recent_audit_entry(action='* /validate/radiuscheck')
+        self.assertEqual(0, ae.get("success"), ae)
+        self.assertEqual("unknown", ae.get("user"), ae)
 
     def test_29_several_CR_one_locked(self):
         # A user has several CR tokens. One of the tokens is locked.
         self.setUp_user_realms()
         user = User("multichal", self.realm1)
         pin = "test"
-        token_a = init_token({"serial": "CR2A",
-                              "type": "hotp",
-                              "otpkey": self.otpkey,
-                              "pin": pin}, user)
-        token_b = init_token({"serial": "CR2B",
-                              "type": "hotp",
-                              "otpkey": self.otpkey,
-                              "pin": pin}, user)
-        set_policy("test48", scope=SCOPE.AUTH, action="{0!s}=HOTP".format(
-            ACTION.CHALLENGERESPONSE))
+        init_token({"serial": "CR2A",
+                    "type": "hotp",
+                    "otpkey": self.otpkey,
+                    "pin": pin}, user)
+        init_token({"serial": "CR2B",
+                    "type": "hotp",
+                    "otpkey": self.otpkey,
+                    "pin": pin}, user)
+        set_policy("test48", scope=SCOPE.AUTH, action=f"{PolicyAction.CHALLENGERESPONSE!s}=hotp")
         # both tokens will be a valid challenge response token!
 
         # One token is locked
@@ -2555,7 +1985,7 @@ class ValidateAPITestCase(MyApiTestCase):
 
         # policy only allows HOTP.
         set_policy("onlyHOTP", scope=SCOPE.AUTHZ,
-                   action="{0!s}=hotp".format(ACTION.TOKENTYPE))
+                   action=f"{PolicyAction.TOKENTYPE!s}=hotp")
 
         # He can not authenticate with the spass token!
         with self.app.test_request_context('/validate/check',
@@ -2566,13 +1996,13 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertEqual(res.status_code, 403)
             result = res.json.get("result")
             self.assertEqual(result.get("status"), False)
-            self.assertEqual(result.get("error").get("code"), ERROR.POLICY)
+            self.assertEqual(result.get("error").get("code"), Error.POLICY)
             detail = res.json.get("detail")
             self.assertEqual(detail, None)
 
         # Define a passthru policy
         set_policy("passthru", scope=SCOPE.AUTH,
-                   action="{0!s}=userstore".format(ACTION.PASSTHRU))
+                   action=f"{PolicyAction.PASSTHRU!s}=userstore")
 
         # A user with a passthru policy can authenticate, since he has not tokentype
         with self.app.test_request_context('/validate/check',
@@ -2601,7 +2031,6 @@ class ValidateAPITestCase(MyApiTestCase):
 
         # Configure the SMS Gateway
         setup_sms_gateway()
-        from privacyidea.lib.config import set_privacyidea_config
 
         self.setUp_user_realms()
         user = User("cornelius", self.realm1)
@@ -2616,8 +2045,8 @@ class ValidateAPITestCase(MyApiTestCase):
                     "email": "hallo@example.com",
                     "pin": "email"}, user)
 
-        set_policy("chalsms", SCOPE.AUTH, "sms_{0!s}=check your sms".format(ACTION.CHALLENGETEXT))
-        set_policy("chalemail", SCOPE.AUTH, "email_{0!s}=check your email".format(ACTION.CHALLENGETEXT))
+        set_policy("chalsms", SCOPE.AUTH, f"sms_{PolicyAction.CHALLENGETEXT!s}=check your sms")
+        set_policy("chalemail", SCOPE.AUTH, f"email_{PolicyAction.CHALLENGETEXT!s}=check your email")
 
         # Challenge Response with email
         with self.app.test_request_context('/validate/check',
@@ -2662,10 +2091,57 @@ class ValidateAPITestCase(MyApiTestCase):
 
         delete_policy("chalsms")
         delete_policy("chalemail")
+
+        # Challenge_text with tags
+        set_policy("chalsms", SCOPE.AUTH, r"sms_challenge_text=Hello {user}\, please enter "
+                                          "the otp sent to {phone},  increase_failcounter_on_challenge")
+        set_policy("chalemail", SCOPE.AUTH, r"email_challenge_text=Hello {user}\, please enter "
+                                            "the otp sent to {email},  increase_failcounter_on_challenge")
+
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "cornelius",
+                                                 "pass": "PIN"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200)
+            resp = res.json
+            self.assertIn("Hello Cornelius, please enter the otp sent to 123456",
+                          resp.get("detail").get("message"))
+            self.assertIn("Hello Cornelius, please enter the otp sent to hallo@example.com",
+                          resp.get("detail").get("message"))
+
+        with self.app.test_request_context('/policy/chalsms',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            self.assertTrue(res.json['result']['status'], res.json)
+            value = res.json['result']['value']
+            sms_policy = value[0]
+            self.assertEqual(sms_policy.get("action").get("increase_failcounter_on_challenge"), True, sms_policy)
+            self.assertIn("Hello {user}\\, please enter", sms_policy.get("action").get("sms_challenge_text"),
+                          sms_policy)
+
         remove_token("CHAL1")
         remove_token("CHAL2")
-        remove_token("CHAL3")
         remove_token("CHAL4")
+        delete_policy("chalsms")
+        delete_policy("chalemail")
+
+        # unknown tag
+        set_policy("chalsms", SCOPE.AUTH, "sms_challenge_text=This {tag} should disappear")
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "cornelius",
+                                                 "pass": "PIN"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200)
+            resp = res.json
+            self.assertIn("This  should disappear",
+                          resp.get("detail").get("message"))
+
+        remove_token("CHAL3")
+        delete_policy("chalsms")
 
     def test_01_check_invalid_input(self):
         # Empty username
@@ -2677,7 +2153,7 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertTrue(res.status_code == 400, res)
             result = res.json.get("result")
             error_msg = result.get("error").get("message")
-            self.assertEqual("ERR905: You need to specify a serial or a user.", error_msg)
+            self.assertEqual("ERR905: You need to specify a serial, user or credential_id.", error_msg)
 
         # wrong username
         with self.app.test_request_context('/validate/check',
@@ -2755,13 +2231,13 @@ class ValidateAPITestCase(MyApiTestCase):
                              'CACHE_TIMEOUT': 0
                              })
         self.assertTrue(rid)
-        added, failed = set_realm("tr", ["myLDAPres"])
+        added, failed = set_realm("tr", [{'name': "myLDAPres"}])
         self.assertEqual(added, ["myLDAPres"])
         self.assertEqual(failed, [])
 
         params = {"type": "spass",
                   "pin": "spass"}
-        init_token(params, User("alice", "tr"))
+        token = init_token(params, User("alice", "tr"))
 
         # Alice Cooper is in the LDAP directory, but Cooper is the secondary login name
         with self.app.test_request_context('/validate/check',
@@ -2778,23 +2254,25 @@ class ValidateAPITestCase(MyApiTestCase):
         # Now check the audit!
         with self.app.test_request_context('/audit/',
                                            method='GET',
-                                           data={"action": "*check*", "user": "alice"},
+                                           query_string={"action": "*check*", "user": "alice"},
                                            headers={"Authorization": self.at}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             json_response = res.json
             self.assertTrue(json_response.get("result").get("status"), res)
             self.assertEqual(json_response.get("result").get("value").get("count"), 1)
-            self.assertTrue("logged in as Cooper." in json_response.get("result").get("value").get("auditdata")[0].get("info"),
-                            json_response.get("result").get("value").get("auditdata"))
+            self.assertTrue(
+                "logged in as Cooper." in json_response.get("result").get("value").get("auditdata")[0].get("info"),
+                json_response.get("result").get("value").get("auditdata"))
 
+        token.delete_token()
         self.assertTrue(delete_realm("tr"))
         self.assertTrue(delete_resolver("myLDAPres"))
 
     def test_33_auth_cache(self):
         init_token({"otpkey": self.otpkey},
                    user=User("cornelius", self.realm1))
-        set_policy(name="authcache", action="{0!s}=4m".format(ACTION.AUTH_CACHE), scope=SCOPE.AUTH)
+        set_policy(name="authcache", action=f"{PolicyAction.AUTH_CACHE!s}=4m", scope=SCOPE.AUTH)
         with self.app.test_request_context('/validate/check',
                                            method='POST',
                                            data={"user": "cornelius",
@@ -2808,12 +2286,8 @@ class ValidateAPITestCase(MyApiTestCase):
 
         # Check that there is an entry with this OTP value in the auth_cache
         cached_auths = AuthCache.query.filter(AuthCache.username == "cornelius", AuthCache.realm == self.realm1).all()
-        found = False
-        for cached_auth in cached_auths:
-            if argon2.verify(OTPs[1], cached_auth.authentication):
-                found = True
-                break
-        self.assertTrue(found)
+        self.assertTrue(any(verify_pass_hash(OTPs[1], cached_auth.authentication)
+                            for cached_auth in cached_auths))
 
         # Authenticate again with the same OTP
         with self.app.test_request_context('/validate/check',
@@ -2827,7 +2301,7 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertTrue(result.get("status"))
             self.assertTrue(result.get("value"))
             detail = res.json.get("detail")
-            self.assertEqual(detail.get("message"), u"Authenticated by AuthCache.")
+            self.assertEqual(detail.get("message"), "Authenticated by AuthCache.")
 
         delete_policy("authcache")
 
@@ -2843,7 +2317,7 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertTrue(result.get("status"))
             self.assertFalse(result.get("value"))
             detail = res.json.get("detail")
-            self.assertEqual(detail.get("message"), u"wrong otp value. previous otp used again")
+            self.assertEqual(detail.get("message"), "wrong otp value. previous otp used again")
 
         # If there is no authcache, the same value must not be used again!
         with self.app.test_request_context('/validate/check',
@@ -2857,9 +2331,11 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertTrue(result.get("status"))
             self.assertTrue(result.get("value"))
 
-        # Check that there is no entry with this OTP value in the auth_cache
-        r = AuthCache.query.filter(AuthCache.authentication == _hash_password(OTPs[2])).first()
-        self.assertFalse(bool(r))
+        # Check that there is no entry with this OTP value in the auth_cache. A hash carries a
+        # random salt, so a stored entry never equals a freshly computed hash and has to be
+        # verified against instead.
+        self.assertFalse(any(verify_pass_hash(OTPs[2], entry.authentication)
+                             for entry in AuthCache.query.all()))
 
         # Authenticate again with the same OTP value will fail
         with self.app.test_request_context('/validate/check',
@@ -2891,11 +2367,11 @@ class ValidateAPITestCase(MyApiTestCase):
             self.assertEqual(res.status_code, 400, res)
             result = res.json['result']
             self.assertEqual(result['error']['message'],
-                             u"ERR905: Given serial does not belong to given user!",
+                             "ERR905: Given serial does not belong to given user!",
                              result)
 
         # try to authenticate with a token assigned to a different user
-        token.add_user(User(u"nönäscii", self.realm2))
+        token.add_user(User("nönäscii", self.realm2))
         token.set_pin("pin")
         self.assertEqual(token.token.owners.first().user_id, "1116")
         with self.app.test_request_context('/validate/check',
@@ -2907,25 +2383,25 @@ class ValidateAPITestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             result = res.json['result']
             self.assertEqual(result['error']['message'],
-                             u"ERR905: Given serial does not belong to given user!",
+                             "ERR905: Given serial does not belong to given user!",
                              result)
             self.assertEqual(res.status_code, 400, res)
 
     def test_35_application_tokentype(self):
         # The user has two tokens
-        r = init_token({"type": "hotp",
-                        "genkey": 1,
-                        "pin": "trigpin",
-                        "serial": "tok_hotp"},
-                       user=User("cornelius", self.realm1))
-        r = init_token({"type": "totp",
-                        "genkey": 1,
-                        "pin": "trigpin",
-                        "serial": "tok_totp"},
-                       user=User("cornelius", self.realm1))
+        init_token({"type": "hotp",
+                    "genkey": 1,
+                    "pin": "trigpin",
+                    "serial": "tok_hotp"},
+                   user=User("cornelius", self.realm1))
+        init_token({"type": "totp",
+                    "genkey": 1,
+                    "pin": "trigpin",
+                    "serial": "tok_totp"},
+                   user=User("cornelius", self.realm1))
         # Hotp and totp are allowed for trigger challenge
         set_policy(name="pol_chalresp", scope=SCOPE.AUTH,
-                   action="{0!s}=hot totp".format(ACTION.CHALLENGERESPONSE))
+                   action=f"{PolicyAction.CHALLENGERESPONSE!s}=hot totp")
 
         # trigger a challenge for both tokens
         with self.app.test_request_context('/validate/triggerchallenge',
@@ -2948,7 +2424,7 @@ class ValidateAPITestCase(MyApiTestCase):
         # Set a policy, that the application is allowed to specify tokentype
         set_policy(name="pol_application_tokentype",
                    scope=SCOPE.AUTHZ,
-                   action=ACTION.APPLICATION_TOKENTYPE)
+                   action=PolicyAction.APPLICATION_TOKENTYPE)
 
         # Trigger another challenge for HOTP
         with self.app.test_request_context('/validate/triggerchallenge',
@@ -2975,10 +2451,10 @@ class ValidateAPITestCase(MyApiTestCase):
                    tokenkind="software", user=User("cornelius", self.realm1))
         init_token({"type": "spass", "serial": "hardwareToken", "pin": "hardware1"},
                    tokenkind="hardware", user=User("cornelius", self.realm1))
-        set_policy(name="always_deny_access", action="{0!s}=deny_access".format(ACTION.AUTHORIZED),
+        set_policy(name="always_deny_access", action=f"{PolicyAction.AUTHORIZED!s}=deny_access",
                    scope=SCOPE.AUTHZ, priority=100)
         # policy to allow tokens, condition is deactivated. All tokens will be authorized
-        set_policy(name="allow_hardware_tokens", action="{0!s}=grant_access".format(ACTION.AUTHORIZED),
+        set_policy(name="allow_hardware_tokens", action=f"{PolicyAction.AUTHORIZED!s}=grant_access",
                    scope=SCOPE.AUTHZ, priority=1,
                    conditions=[("tokeninfo", "tokenkind", "equals", "hardware", False)])
 
@@ -3059,9 +2535,8 @@ class ValidateAPITestCase(MyApiTestCase):
         # test successful authentication
         with self.app.test_request_context('/validate/check',
                                            method='GET',
-                                           query_string=urlencode(
-                                                    {"user": "cornelius",
-                                                     "pass": otp_now})):
+                                           query_string={"user": "cornelius",
+                                                         "pass": otp_now}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
@@ -3071,9 +2546,8 @@ class ValidateAPITestCase(MyApiTestCase):
         # check the same OTP value again
         with self.app.test_request_context('/validate/check',
                                            method='GET',
-                                           query_string=urlencode(
-                                                    {"user": "cornelius",
-                                                     "pass": otp_now})):
+                                           query_string={"user": "cornelius",
+                                                         "pass": otp_now}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
@@ -3084,2582 +2558,902 @@ class ValidateAPITestCase(MyApiTestCase):
         # clean up
         remove_token("totp_previous")
 
+    def test_37_challenge_response_hotp_with_container(self):
+        serial = "CHALRESP1"
+        pin = "chalresp1"
+        # create a token and assign to the user
+        db_token = Token(serial, tokentype="hotp")
+        db_token.update_otpkey(self.otpkey)
+        db_token.save()
+        token = HotpTokenClass(db_token)
+        token.add_user(User("cornelius", self.realm1))
+        token.set_pin(pin)
+        container_serial = init_container({"type": "smartphone"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+        container.add_token(token)
 
-class RegistrationValidity(MyApiTestCase):
+        # Set the failcounter
+        token.set_failcount(5)
+        token.save()
 
-    def setUp(self):
-        super(RegistrationValidity, self).setUp()
-        self.setUp_user_realms()
+        # set a chalresp policy for HOTP
+        set_policy("policy", scope=SCOPE.AUTH, action=f"{PolicyAction.CHALLENGERESPONSE}=hotp")
 
-    def test_00_registrationtoken_with_validity_period(self):
-        r = init_token({"type": "registration"},
-                       user=User("cornelius", self.realm1))
-        password = r.init_details.get("otpkey")
-
-        # The enddate is 17 minutes in the past
-        end_date = datetime.datetime.now() - datetime.timedelta(minutes=17)
-        end_date_str = end_date.strftime(DATE_FORMAT)
-        r.set_validity_period_end(end_date_str)
-        # now check if authentication fails
+        # create the challenge by authenticating with the OTP PIN
         with self.app.test_request_context('/validate/check',
                                            method='POST',
                                            data={"user": "cornelius",
-                                                 "pass": quote(password)}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            self.assertEqual("matching 1 tokens, Outside validity period",
-                             detail.get("message"), (detail, password))
-
-
-class RegistrationAndPasswordToken(MyApiTestCase):
-
-    def setUp(self):
-        self.setUp_user_realms()
-
-    def test_00_registration_tokens(self):
-        # Registration tokens always do a genkey, even if we do not set it
-        with self.app.test_request_context('/token/init',
-                                           method='POST',
-                                           data={'user': 'cornelius',
-                                                 'type': 'registration'},
-                                           headers={'Authorization': self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            detail = data.get("detail")
-            regcode = detail.get("registrationcode")
-            self.assertEqual(DEFAULT_LENGTH_REG, len(regcode))
-            # Check if a number is contained
-            self.assertRegexpMatches(regcode, "[0-9]+")
-            # Check if a character is contained
-            self.assertRegexpMatches(regcode, "[a-zA-Z]+")
-
-        # now check if authentication
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": quote(regcode)}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertEqual("ACCEPT", data.get("result").get("authentication"), (data, regcode))
-
-        # Create a reg token with explicitly setting genkey
-        with self.app.test_request_context('/token/init',
-                                           method='POST',
-                                           data={'user': 'cornelius',
-                                                 'type': 'registration',
-                                                 'genkey': 1},
-                                           headers={'Authorization': self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            detail = data.get("detail")
-            regcode = detail.get("registrationcode")
-
-        # now check the authentication
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": quote(regcode)}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertEqual("ACCEPT", data.get("result").get("authentication"), (data, regcode))
-
-        # create a reg token, where the otpkey is ignored
-        with self.app.test_request_context('/token/init',
-                                           method='POST',
-                                           data={'user': 'cornelius',
-                                                 'type': 'registration',
-                                                 'otpkey': "hallo"},
-                                           headers={'Authorization': self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            detail = data.get("detail")
-            regcode = detail.get("registrationcode")
-            self.assertEqual(DEFAULT_LENGTH_REG, len(regcode))
-            self.assertNotEqual("hallo", regcode)
-
-        # now check the authentication
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": quote(regcode)}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertEqual("ACCEPT", data.get("result").get("authentication"), (data, regcode))
-
-        # The registration code was generated. The passed otpkey was NOT used.
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "hallo"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertEqual("REJECT", data.get("result").get("authentication"), data)
-
-    def test_01_password_tokens(self):
-        # The password token requires either an otpkey or genkey
-        with self.app.test_request_context('/token/init',
-                                           method='POST',
-                                           data={'user': 'cornelius',
-                                                 'type': 'pw'},
-                                           headers={'Authorization': self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(400, res.status_code)
-            data = res.json
-            error = data.get("result").get("error")
-            self.assertEqual(905, error.get("code"))
-            self.assertEqual("ERR905: Missing parameter: 'otpkey'", error.get("message"), data)
-
-        # Try setting an explicit password
-        with self.app.test_request_context('/token/init',
-                                           method='POST',
-                                           data={'user': 'cornelius',
-                                                 'type': 'pw',
-                                                 'otpkey': 'topsecret',
-                                                 'pin': 'test'},
-                                           headers={'Authorization': self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(200, res.status_code)
-            data = res.json
-            detail = data.get("detail")
-            serial = detail.get("serial")
-
-        # now check the authentication
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "testtopsecret"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertEqual("ACCEPT", data.get("result").get("authentication"), data)
-        # delete token
-        remove_token(serial)
-
-        # Try getting a generated password
-        with self.app.test_request_context('/token/init',
-                                           method='POST',
-                                           data={'user': 'cornelius',
-                                                 'type': 'pw',
-                                                 'genkey': 1,
-                                                 'pin': 'test'},
-                                           headers={'Authorization': self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(200, res.status_code)
-            data = res.json
-            detail = data.get("detail")
-            serial = detail.get("serial")
-            password = detail.get("password")
-            self.assertEqual(DEFAULT_LENGTH_PW, len(password))
-            # Check if a number is contained
-            self.assertRegexpMatches(password, "[0-9]+")
-            # Check if a character is contained
-            self.assertRegexpMatches(password, "[a-zA-Z]+")
-
-        # now check the authentication
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": quote(u"test{0!s}".format(password))}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertEqual("ACCEPT", data.get("result").get("authentication"), (data, password))
-        # delete token
-        remove_token(serial)
-
-
-class WebAuthn(MyApiTestCase):
-
-    username = "selfservice"
-    pin = "webauthnpin"
-    serial = "WAN0001D434"
-
-    def setUp(self):
-        # Set up the WebAuthn Token from the lib test case
-        super(MyApiTestCase, self).setUp()
-        self.setUp_user_realms()
-
-        set_policy("wan1", scope=SCOPE.ENROLL,
-                   action="webauthn_relying_party_id=example.com")
-        set_policy("wan2", scope=SCOPE.ENROLL,
-                   action="webauthn_relying_party_name=example")
-
-    def test_01_enroll_token_cumstom_description(self):
-        client_data = "eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoibmgwaUJ6MFNNbmRsVnNQUkdM" \
-                      "dk9DUWMtUHByUHhPSmYzMEtlWm1UWFk5NCIsIm9yaWdpbiI6Imh0dHBzOi8vcGkuZXhhbXBsZS5jb" \
-                      "20iLCJjcm9zc09yaWdpbiI6ZmFsc2V9"
-        regdata = """o2NmbXRmcGFja2VkZ2F0dFN0bXSjY2FsZyZjc2lnWEgwRgIhANAt-cBR3mZglj13PZPXA3srJYxX
-↵J6v-LzxAhmxZM7AsAiEAxu4gi8AiKOfyhU68HcIBHuIwgjBWJUlt4cIETWFYdetjeDVjgVkCwDCC
-↵ArwwggGkoAMCAQICBAOt8BIwDQYJKoZIhvcNAQELBQAwLjEsMCoGA1UEAxMjWXViaWNvIFUyRiBS
-↵b290IENBIFNlcmlhbCA0NTcyMDA2MzEwIBcNMTQwODAxMDAwMDAwWhgPMjA1MDA5MDQwMDAwMDBa
-↵MG0xCzAJBgNVBAYTAlNFMRIwEAYDVQQKDAlZdWJpY28gQUIxIjAgBgNVBAsMGUF1dGhlbnRpY2F0
-↵b3IgQXR0ZXN0YXRpb24xJjAkBgNVBAMMHVl1YmljbyBVMkYgRUUgU2VyaWFsIDYxNzMwODM0MFkw
-↵EwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGZ6HnBYtt9w57kpCoEYWpbMJ_soJL3a-CUj5bW6VyuTM
-↵Zc1UoFnPvcfJsxsrHWwYRHnCwGH0GKqVS1lqLBz6F6NsMGowIgYJKwYBBAGCxAoCBBUxLjMuNi4x
-↵LjQuMS40MTQ4Mi4xLjcwEwYLKwYBBAGC5RwCAQEEBAMCBDAwIQYLKwYBBAGC5RwBAQQEEgQQ-iuZ
-↵3J45QlePkkow0jxBGDAMBgNVHRMBAf8EAjAAMA0GCSqGSIb3DQEBCwUAA4IBAQAo67Nn_tHY8OKJ
-↵68qf9tgHV8YOmuV8sXKMmxw4yru9hNkjfagxrCGUnw8t_Awxa_2xdbNuY6Iru1gOrcpSgNB5hA5a
-↵HiVyYlo7-4dgM9v7IqlpyTi4nOFxNZQAoSUtlwKpEpPVRRnpYN0izoon6wXrfnm3UMAC_tkBa3Ee
-↵ya10UBvZFMu-jtlXEoG3T0TrB3zmHssGq4WpclUmfujjmCv0PwyyGjgtI1655M5tspjEBUJQQCMr
-↵K2HhDNcMYhW8A7fpQHG3DhLRxH-WZVou-Z1M5Vp_G0sf-RTuE22eYSBHFIhkaYiARDEWZTiJuGSG
-↵2cnJ_7yThUU1abNFdEuMoLQ3aGF1dGhEYXRhWMSjeab27q-5pV43jBGANOJ1Hmgvq58tMKsT0hJV
-↵hs4ZR0EAAAD4-iuZ3J45QlePkkow0jxBGABAkNhnmLSbmlUebUHbpXxU-zMfqtnIqT5y2E3sfQgW
-↵wE1FlUGvPg_c4zNcIucBnQAN8qTHJ8clzq7v5oQnnJz7T6UBAgMmIAEhWCBARZY9ak9nT6EI-dwL
-↵uj0TB5-XjlmAvivyWLi9WSI7pCJYIEJicw0LtP_hdy8yh6ANEUXBJsWtkGDci9DcN1rDG1tE"""
-        # First enrollment step
-        with self.app.test_request_context('/token/init',
-                                           method='POST',
-                                           data={"user": self.username,
-                                                 "pin": self.pin,
-                                                 "serial": self.serial,
-                                                 "type": "webauthn",
-                                                 "description": "my description",
-                                                 "genkey": 1},
-                                           headers={"authorization": self.at,
-                                                    "Host": "pi.example.com",
-                                                    "Origin": "https://pi.example.com"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            webAuthnRequest = data.get("detail").get("webAuthnRegisterRequest")
-            self.assertEqual("Please confirm with your WebAuthn token", webAuthnRequest.get("message"))
-            transaction_id = webAuthnRequest.get("transaction_id")
-
-        # We need to change the nonce in the challenge database to use our recorded WebAuthN enrollment data
-        recorded_nonce = "nh0iBz0SMndlVsPRGLvOCQc-PprPxOJf30KeZmTXY94"
-        recorded_nonce_hex = hexlify_and_unicode(webauthn_b64_decode(recorded_nonce))
-        # Update the nonce in the challenge database.
-        from privacyidea.lib.challenge import get_challenges
-        chal = get_challenges(serial=self.serial, transaction_id=transaction_id)[0]
-        chal.challenge = recorded_nonce_hex
-        chal.save()
-
-        # 2nd enrollment step
-        with self.app.test_request_context('/token/init',
-                                           method='POST',
-                                           data={"user": self.username,
-                                                 "pin": self.pin,
-                                                 "serial": self.serial,
-                                                 "type": "webauthn",
-                                                 "transaction_id": transaction_id,
-                                                 "clientdata": client_data,
-                                                 "regdata": regdata},
-                                           headers={"authorization": self.at,
-                                                    "Host": "pi.example.com",
-                                                    "Origin": "https://pi.example.com"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertEqual('my description',
-                             data.get("detail").get("webAuthnRegisterResponse").get("subject"))
-
-        # Test, if the token received the automatic description
-        self.assertEqual(get_tokens(serial=self.serial)[0].token.description, "my description")
-        remove_token(self.serial)
-
-    def test_02_enroll_token(self):
-        client_data = "eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoibmgwaUJ6MFNNbmRsVnNQUkdM" \
-                      "dk9DUWMtUHByUHhPSmYzMEtlWm1UWFk5NCIsIm9yaWdpbiI6Imh0dHBzOi8vcGkuZXhhbXBsZS5jb" \
-                      "20iLCJjcm9zc09yaWdpbiI6ZmFsc2V9"
-        regdata = """o2NmbXRmcGFja2VkZ2F0dFN0bXSjY2FsZyZjc2lnWEgwRgIhANAt-cBR3mZglj13PZPXA3srJYxX
-↵J6v-LzxAhmxZM7AsAiEAxu4gi8AiKOfyhU68HcIBHuIwgjBWJUlt4cIETWFYdetjeDVjgVkCwDCC
-↵ArwwggGkoAMCAQICBAOt8BIwDQYJKoZIhvcNAQELBQAwLjEsMCoGA1UEAxMjWXViaWNvIFUyRiBS
-↵b290IENBIFNlcmlhbCA0NTcyMDA2MzEwIBcNMTQwODAxMDAwMDAwWhgPMjA1MDA5MDQwMDAwMDBa
-↵MG0xCzAJBgNVBAYTAlNFMRIwEAYDVQQKDAlZdWJpY28gQUIxIjAgBgNVBAsMGUF1dGhlbnRpY2F0
-↵b3IgQXR0ZXN0YXRpb24xJjAkBgNVBAMMHVl1YmljbyBVMkYgRUUgU2VyaWFsIDYxNzMwODM0MFkw
-↵EwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGZ6HnBYtt9w57kpCoEYWpbMJ_soJL3a-CUj5bW6VyuTM
-↵Zc1UoFnPvcfJsxsrHWwYRHnCwGH0GKqVS1lqLBz6F6NsMGowIgYJKwYBBAGCxAoCBBUxLjMuNi4x
-↵LjQuMS40MTQ4Mi4xLjcwEwYLKwYBBAGC5RwCAQEEBAMCBDAwIQYLKwYBBAGC5RwBAQQEEgQQ-iuZ
-↵3J45QlePkkow0jxBGDAMBgNVHRMBAf8EAjAAMA0GCSqGSIb3DQEBCwUAA4IBAQAo67Nn_tHY8OKJ
-↵68qf9tgHV8YOmuV8sXKMmxw4yru9hNkjfagxrCGUnw8t_Awxa_2xdbNuY6Iru1gOrcpSgNB5hA5a
-↵HiVyYlo7-4dgM9v7IqlpyTi4nOFxNZQAoSUtlwKpEpPVRRnpYN0izoon6wXrfnm3UMAC_tkBa3Ee
-↵ya10UBvZFMu-jtlXEoG3T0TrB3zmHssGq4WpclUmfujjmCv0PwyyGjgtI1655M5tspjEBUJQQCMr
-↵K2HhDNcMYhW8A7fpQHG3DhLRxH-WZVou-Z1M5Vp_G0sf-RTuE22eYSBHFIhkaYiARDEWZTiJuGSG
-↵2cnJ_7yThUU1abNFdEuMoLQ3aGF1dGhEYXRhWMSjeab27q-5pV43jBGANOJ1Hmgvq58tMKsT0hJV
-↵hs4ZR0EAAAD4-iuZ3J45QlePkkow0jxBGABAkNhnmLSbmlUebUHbpXxU-zMfqtnIqT5y2E3sfQgW
-↵wE1FlUGvPg_c4zNcIucBnQAN8qTHJ8clzq7v5oQnnJz7T6UBAgMmIAEhWCBARZY9ak9nT6EI-dwL
-↵uj0TB5-XjlmAvivyWLi9WSI7pCJYIEJicw0LtP_hdy8yh6ANEUXBJsWtkGDci9DcN1rDG1tE"""
-        # First enrollment step
-        with self.app.test_request_context('/token/init',
-                                           method='POST',
-                                           data={"user": self.username,
-                                                 "pin": self.pin,
-                                                 "serial": self.serial,
-                                                 "type": "webauthn",
-                                                 "genkey": 1},
-                                           headers={"authorization": self.at,
-                                                    "Host": "pi.example.com",
-                                                    "Origin": "https://pi.example.com"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            webAuthnRequest = data.get("detail").get("webAuthnRegisterRequest")
-            self.assertEqual("Please confirm with your WebAuthn token", webAuthnRequest.get("message"))
-            transaction_id = webAuthnRequest.get("transaction_id")
-
-        # We need to change the nonce in the challenge database to use our recorded WebAuthN enrollment data
-        recorded_nonce = "nh0iBz0SMndlVsPRGLvOCQc-PprPxOJf30KeZmTXY94"
-        recorded_nonce_hex = hexlify_and_unicode(webauthn_b64_decode(recorded_nonce))
-        # Update the nonce in the challenge database.
-        from privacyidea.lib.challenge import get_challenges
-        chal = get_challenges(serial=self.serial, transaction_id=transaction_id)[0]
-        chal.challenge = recorded_nonce_hex
-        chal.save()
-
-        # 2nd enrollment step
-        with self.app.test_request_context('/token/init',
-                                           method='POST',
-                                           data={"user": self.username,
-                                                 "pin": self.pin,
-                                                 "serial": self.serial,
-                                                 "type": "webauthn",
-                                                 "transaction_id": transaction_id,
-                                                 "clientdata": client_data,
-                                                 "regdata": regdata},
-                                           headers={"authorization": self.at,
-                                                    "Host": "pi.example.com",
-                                                    "Origin": "https://pi.example.com"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertEqual('Yubico U2F EE Serial 61730834',
-                             data.get("detail").get("webAuthnRegisterResponse").get("subject"))
-
-        # Test, if the token received the automatic description
-        self.assertEqual(get_tokens(serial=self.serial)[0].token.description, "Yubico U2F EE Serial 61730834")
-
-    def test_10_validate_check(self):
-        # Run challenge request agsint /validate/check
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": self.username,
-                                                 "pass": self.pin},
-                                           headers={"Host": "pi.example.com",
-                                                    "Origin": "https://pi.example.com"}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(200, res.status_code)
-            data = res.json
-            self.assertTrue("transaction_id" in data.get("detail"))
-            self.assertEqual(self.serial, data.get("detail").get("serial"))
-            self.assertEqual("Please confirm with your WebAuthn token (Yubico U2F EE Serial 61730834)",
-                             data.get("detail").get("message"))
-
-    def test_11_trigger_challenge(self):
-        # Run challenge request agsint /validate/triggerchallenge
-        with self.app.test_request_context('/validate/triggerchallenge',
-                                           method='POST',
-                                           data={"user": self.username},
-                                           headers={"Host": "pi.example.com",
-                                                    "authorization": self.at,
-                                                    "Origin": "https://pi.example.com"}):
-            res = self.app.full_dispatch_request()
-            data = res.json
-            print(data)
-            self.assertEqual(200, res.status_code)
-            self.assertTrue("transaction_id" in data.get("detail"))
-            self.assertEqual(self.serial, data.get("detail").get("serial"))
-            self.assertEqual("Please confirm with your WebAuthn token (Yubico U2F EE Serial 61730834)",
-                             data.get("detail").get("message"))
-
-        remove_token(self.serial)
-
-    def test_20_authenticate_with_token(self):
-        # Ensure that a not readily enrolled WebAuthn token does not disturb the usage
-        # of an HOTP token with challenge response.
-        client_data = "eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoibmgwaUJ6MFNNbmRsVnNQUkdM" \
-                      "dk9DUWMtUHByUHhPSmYzMEtlWm1UWFk5NCIsIm9yaWdpbiI6Imh0dHBzOi8vcGkuZXhhbXBsZS5jb" \
-                      "20iLCJjcm9zc09yaWdpbiI6ZmFsc2V9"
-        regdata = """o2NmbXRmcGFja2VkZ2F0dFN0bXSjY2FsZyZjc2lnWEgwRgIhANAt-cBR3mZglj13PZPXA3srJYxX
-↵J6v-LzxAhmxZM7AsAiEAxu4gi8AiKOfyhU68HcIBHuIwgjBWJUlt4cIETWFYdetjeDVjgVkCwDCC
-↵ArwwggGkoAMCAQICBAOt8BIwDQYJKoZIhvcNAQELBQAwLjEsMCoGA1UEAxMjWXViaWNvIFUyRiBS
-↵b290IENBIFNlcmlhbCA0NTcyMDA2MzEwIBcNMTQwODAxMDAwMDAwWhgPMjA1MDA5MDQwMDAwMDBa
-↵MG0xCzAJBgNVBAYTAlNFMRIwEAYDVQQKDAlZdWJpY28gQUIxIjAgBgNVBAsMGUF1dGhlbnRpY2F0
-↵b3IgQXR0ZXN0YXRpb24xJjAkBgNVBAMMHVl1YmljbyBVMkYgRUUgU2VyaWFsIDYxNzMwODM0MFkw
-↵EwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGZ6HnBYtt9w57kpCoEYWpbMJ_soJL3a-CUj5bW6VyuTM
-↵Zc1UoFnPvcfJsxsrHWwYRHnCwGH0GKqVS1lqLBz6F6NsMGowIgYJKwYBBAGCxAoCBBUxLjMuNi4x
-↵LjQuMS40MTQ4Mi4xLjcwEwYLKwYBBAGC5RwCAQEEBAMCBDAwIQYLKwYBBAGC5RwBAQQEEgQQ-iuZ
-↵3J45QlePkkow0jxBGDAMBgNVHRMBAf8EAjAAMA0GCSqGSIb3DQEBCwUAA4IBAQAo67Nn_tHY8OKJ
-↵68qf9tgHV8YOmuV8sXKMmxw4yru9hNkjfagxrCGUnw8t_Awxa_2xdbNuY6Iru1gOrcpSgNB5hA5a
-↵HiVyYlo7-4dgM9v7IqlpyTi4nOFxNZQAoSUtlwKpEpPVRRnpYN0izoon6wXrfnm3UMAC_tkBa3Ee
-↵ya10UBvZFMu-jtlXEoG3T0TrB3zmHssGq4WpclUmfujjmCv0PwyyGjgtI1655M5tspjEBUJQQCMr
-↵K2HhDNcMYhW8A7fpQHG3DhLRxH-WZVou-Z1M5Vp_G0sf-RTuE22eYSBHFIhkaYiARDEWZTiJuGSG
-↵2cnJ_7yThUU1abNFdEuMoLQ3aGF1dGhEYXRhWMSjeab27q-5pV43jBGANOJ1Hmgvq58tMKsT0hJV
-↵hs4ZR0EAAAD4-iuZ3J45QlePkkow0jxBGABAkNhnmLSbmlUebUHbpXxU-zMfqtnIqT5y2E3sfQgW
-↵wE1FlUGvPg_c4zNcIucBnQAN8qTHJ8clzq7v5oQnnJz7T6UBAgMmIAEhWCBARZY9ak9nT6EI-dwL
-↵uj0TB5-XjlmAvivyWLi9WSI7pCJYIEJicw0LtP_hdy8yh6ANEUXBJsWtkGDci9DcN1rDG1tE"""
-        # First enrollment step
-        with self.app.test_request_context('/token/init',
-                                           method='POST',
-                                           data={"user": self.username,
-                                                 "pin": self.pin,
-                                                 "serial": self.serial,
-                                                 "type": "webauthn",
-                                                 "genkey": 1},
-                                           headers={"authorization": self.at,
-                                                    "Host": "pi.example.com",
-                                                    "Origin": "https://pi.example.com"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            webAuthnRequest = data.get("detail").get("webAuthnRegisterRequest")
-            self.assertEqual("Please confirm with your WebAuthn token", webAuthnRequest.get("message"))
-            transaction_id = webAuthnRequest.get("transaction_id")
-
-        # The token is now in the client_wait rollout state. We do not do the 2nd enrollment step
-        toks = get_tokens(serial=self.serial)
-        self.assertEqual(ROLLOUTSTATE.CLIENTWAIT, toks[0].rollout_state)
-
-        # Now we create the 2nd token of the user, an HOTP token
-        with self.app.test_request_context('/token/init',
-                                           method='POST',
-                                           data={"user": self.username,
-                                                 "pin": self.pin,
-                                                 "otpkey": self.otpkey,
-                                                 "type": "hotp",
-                                                 "serial": "hotpX1"},
-                                           headers={"authorization": self.at,
-                                                    "Host": "pi.example.com",
-                                                    "Origin": "https://pi.example.com"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertTrue(data.get("result").get("value"))
-        # We need a policy for HOTP trigger challenge
-        set_policy(name="trigpol", scope=SCOPE.AUTH, action="{0!s}=hotp".format(ACTION.CHALLENGERESPONSE))
-        # Check if the challenge is triggered for the HOTP token
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": self.username,
-                                                 "pass": self.pin},
-                                           headers={"Host": "pi.example.com",
-                                                    "Origin": "https://pi.example.com"}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(200, res.status_code)
-            data = res.json
-            transaction_id = data.get("detail").get("transaction_id")
-            messages = data.get("detail").get("messages")
-            # There is a working chal resp message for the HOTP token
-            self.assertIn("please enter otp: ", messages)
-            # The WebAuthn token died not work, so there is no challenge for this one
-            self.assertIn("Token is not yet enrolled", messages)
-
-        # Authenticate with HOTP
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": self.username,
-                                                 "transaction_id": transaction_id,
-                                                 "pass": self.valid_otp_values[0]},
-                                           headers={"Host": "pi.example.com",
-                                                    "Origin": "https://pi.example.com"}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(200, res.status_code)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertTrue(result.get("value"))
-
-        # check if the challenge is triggered for the HOTP token via triggerchallenge
-        with self.app.test_request_context('/validate/triggerchallenge',
-                                           method='POST',
-                                           data={"user": self.username},
-                                           headers={"authorization": self.at,
-                                                    "Host": "pi.example.com",
-                                                    "Origin": "https://pi.example.com"}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(200, res.status_code)
-            data = res.json
-            transaction_id = data.get("detail").get("transaction_id")
-
-        # Authenticate with HOTP
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": self.username,
-                                                 "transaction_id": transaction_id,
-                                                 "pass": self.valid_otp_values[1]},
-                                           headers={"Host": "pi.example.com",
-                                                    "Origin": "https://pi.example.com"}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(200, res.status_code)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertTrue(result.get("value"))
-
-        delete_policy("trigpol")
-        remove_token("hotpX1")
-        remove_token(self.serial)
-
-
-class MultiChallege(MyApiTestCase):
-
-    serial = "hotp1"
-
-    """
-    for test 3
-    """
-
-    server_private_key = rsa.generate_private_key(public_exponent=65537,
-                                                  key_size=4096,
-                                                  backend=default_backend())
-    server_private_key_pem = to_unicode(server_private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption()))
-    server_public_key_pem = to_unicode(server_private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo))
-
-    # We now allow white spaces in the firebase config name
-    firebase_config_name = "my firebase config"
-
-    smartphone_private_key = rsa.generate_private_key(public_exponent=65537,
-                                                      key_size=4096,
-                                                      backend=default_backend())
-    smartphone_public_key = smartphone_private_key.public_key()
-    smartphone_public_key_pem = to_unicode(smartphone_public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo))
-    # The smartphone sends the public key in URLsafe and without the ----BEGIN header
-    smartphone_public_key_pem_urlsafe = strip_key(smartphone_public_key_pem).replace("+", "-").replace("/", "_")
-    serial_push = "PIPU001"
-
-    def setUp(self):
-        super(MultiChallege, self).setUp()
-        self.setUp_user_realms()
-
-    def test_00_pin_change_via_validate_chalresp(self):
-        # Test PIN change after challenge response authentication
-        # Create policy change pin on first use
-        set_policy("first_use", scope=SCOPE.ENROLL, action=ACTION.CHANGE_PIN_FIRST_USE)
-        set_policy("via_validate", scope=SCOPE.AUTH, action=ACTION.CHANGE_PIN_VIA_VALIDATE)
-        set_policy("hotp_chalresp", scope=SCOPE.AUTH, action="{0!s}=hotp".format(ACTION.CHALLENGERESPONSE))
-
-        with self.app.test_request_context('/token/init', method='POST',
-                                           data={"user": "cornelius", "pin": "test",
-                                                 "serial": self.serial, "otpkey": self.otpkey},
-                                           headers={"Authorization": self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertTrue(result.get("value"))
-
-        # 1st authentication creates a PIN change challenge via challenge response
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "test"}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertFalse(result.get("value"))
-            details = res.json['detail']
-            transaction_id = details.get("transaction_id")
-
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": self.valid_otp_values[1],
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            details = res.json['detail']
-            self.assertFalse(result.get("value"))
-            transaction_id = details.get("transaction_id")
-            self.assertEqual("Please enter a new PIN", details.get("message"))
-
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "newpin",
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertFalse(result.get("value"))
-            details = res.json['detail']
-            transaction_id = details.get("transaction_id")
-            self.assertEqual("Please enter the new PIN again", details.get("message"))
-
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "newpin",
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertTrue(result.get("value"))
-            details = res.json['detail']
-            self.assertEqual("PIN successfully set.", details.get("message"))
-            self.assertTrue(result.get("value"))
-
-        # Now try to authenticate with the "newpin"
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "newpin{0!s}".format(self.valid_otp_values[2])}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertTrue(result.get("value"))
-
-        remove_token(self.serial)
-        delete_policy("first_use")
-        delete_policy("via_validate")
-        delete_policy("hotp_chalresp")
-
-    def test_01_pin_change_via_validate_single_shot(self):
-        # Test PIN change after authentication with a single shot authentication
-        # Create policy change pin on first use
-        set_policy("first_use", scope=SCOPE.ENROLL, action=ACTION.CHANGE_PIN_FIRST_USE)
-        set_policy("via_validate", scope=SCOPE.AUTH, action=ACTION.CHANGE_PIN_VIA_VALIDATE)
-        set_policy("hotp_chalresp", scope=SCOPE.AUTH, action="{0!s}=hotp".format(ACTION.CHALLENGERESPONSE))
-
-        with self.app.test_request_context('/token/init', method='POST',
-                                           data={"user": "cornelius", "pin": "test",
-                                                 "serial": self.serial, "otpkey": self.otpkey},
-                                           headers={"Authorization": self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertTrue(result.get("value"))
-
-        # 1st authentication creates a PIN change challenge via challenge response
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "test{0!s}".format(self.valid_otp_values[1])}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertFalse(result.get("value"))
-            details = res.json['detail']
-            transaction_id = details.get("transaction_id")
-            self.assertEqual("Please enter a new PIN", details.get("message"))
-
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "newpin",
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertFalse(result.get("value"))
-            details = res.json['detail']
-            transaction_id = details.get("transaction_id")
-            self.assertEqual("Please enter the new PIN again", details.get("message"))
-
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "newpin",
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertTrue(result.get("value"))
-            details = res.json['detail']
-            self.assertEqual("PIN successfully set.", details.get("message"))
-            self.assertTrue(result.get("value"))
-
-        # Now try to authenticate with the "newpin"
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "newpin{0!s}".format(self.valid_otp_values[2])}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertTrue(result.get("value"))
-
-        remove_token(self.serial)
-        delete_policy("first_use")
-        delete_policy("via_validate")
-        delete_policy("hotp_chalresp")
-
-    def test_02_challenge_text_header(self):
-        # Test PIN change after authentication with a single shot authentication
-        # Create policy change pin on first use
-        set_policy("first_use", scope=SCOPE.ENROLL, action=ACTION.CHANGE_PIN_FIRST_USE)
-        set_policy("via_validate", scope=SCOPE.AUTH, action=ACTION.CHANGE_PIN_VIA_VALIDATE)
-        set_policy("hotp_chalresp", scope=SCOPE.AUTH, action="{0!s}=hotp".format(ACTION.CHALLENGERESPONSE))
-        challenge_header = "Choose one: <ul>"
-        set_policy("challenge_header", scope=SCOPE.AUTH,
-                   action="{0!s}={1!s}".format(ACTION.CHALLENGETEXT_HEADER, challenge_header))
-
-        with self.app.test_request_context('/token/init', method='POST',
-                                           data={"user": "cornelius", "pin": "test",
-                                                 "serial": self.serial, "otpkey": self.otpkey},
-                                           headers={"Authorization": self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertTrue(result.get("value"))
-
-        # 1st authentication creates a PIN change challenge via challenge response
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "test{0!s}".format(self.valid_otp_values[1])}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertFalse(result.get("value"))
-            details = res.json['detail']
-            transaction_id = details.get("transaction_id")
-            # check that the challenge header is contained in the message
-            self.assertEqual("{0!s}<li>Please enter a new PIN</li>\n".format(challenge_header),
-                             details.get("message"))
-
-        remove_token(self.serial)
-        delete_policy("first_use")
-        delete_policy("via_validate")
-        delete_policy("hotp_chalresp")
-        delete_policy("challenge_header")
-
-    def test_03_preferred_client_mode(self):
-        REGISTRATION_URL = "http://test/ttype/push"
-        TTL = "10"
-
-        self.setUp_user_realms()
-
-        # set policy
-        from privacyidea.lib.tokens.pushtoken import POLL_ONLY
-        set_policy("push2", scope=SCOPE.ENROLL,
-                   action="{0!s}={1!s},{2!s}={3!s},{4!s}={5!s}".format(
-                       PUSH_ACTION.FIREBASE_CONFIG, POLL_ONLY,
-                       PUSH_ACTION.REGISTRATION_URL, REGISTRATION_URL,
-                       PUSH_ACTION.TTL, TTL))
-
-        # create push token for user
-        # 1st step
-        with self.app.test_request_context('/token/init',
-                                           method='POST',
-                                           data={"type": "push",
-                                                 "pin": "otppin",
-                                                 "user": "selfservice",
-                                                 "realm": self.realm1,
-                                                 "serial": self.serial_push,
-                                                 "genkey": 1},
-                                           headers={'Authorization': self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            detail = res.json.get("detail")
-            serial = detail.get("serial")
-            enrollment_credential = detail.get("enrollment_credential")
-
-        # 2nd step: as performed by the smartphone
-        with self.app.test_request_context('/ttype/push',
-                                           method='POST',
-                                           data={"enrollment_credential": enrollment_credential,
-                                                 "serial": serial,
-                                                 "pubkey": self.smartphone_public_key_pem_urlsafe,
-                                                 "fbtoken": "firebaseT"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            detail = res.json.get("detail")
-
-
-        # create hotp token for user
-        init_token({"serial": "CR2A",
-                             "type": "hotp",
-                             "otpkey": "31323334353637383930313233343536373839AA",
-                             "pin": "otppin"}, user=User("selfservice", self.realm1))
-        set_policy("test49", scope=SCOPE.AUTH, action="{0!s}=HOTP".format(
-            ACTION.CHALLENGERESPONSE))
-
-        set_policy("test", scope=SCOPE.AUTH, action="{0!s}=poll, webauthn, interactive, u2f".format(
-            ACTION.PREFERREDCLIENTMODE))
-
-        # authenticate with spass
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "selfservice",
-                                                 "realm": self.realm1,
-                                                 "pass": "otppin"}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            detail = res.json.get("detail")
-            self.assertEqual(detail.get("preferred_client_mode"), 'poll')
-
-        delete_policy("test49")
-        delete_policy("test")
-        delete_policy("push2")
-
-    def test_04_preferred_client_mode_default(self):
-        self.setUp_user_realms()
-        OTPKE2 = "31323334353637383930313233343536373839"
-        user = User("multichal", self.realm1)
-        pin = "test49"
-        token_a = init_token({"serial": "CR2AAA",
-                              "type": "hotp",
-                              "otpkey": OTPKE2,
-                              "pin": pin}, user)
-        token_b = init_token({"serial": "CR2B",
-                              "type": "hotp",
-                              "otpkey": self.otpkey,
-                              "pin": pin}, user)
-        set_policy("test49", scope=SCOPE.AUTH, action="{0!s}=HOTP".format(
-            ACTION.CHALLENGERESPONSE))
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "multichal",
-                                                 "realm": self.realm1,
                                                  "pass": pin}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            self.assertEqual(result.get("value"), False)
-            detail = res.json.get("detail")
-            self.assertEqual(detail.get("preferred_client_mode"), 'interactive')
-
-        delete_policy("test49")
-
-    def test_05_preferred_client_mode_no_accepted_values(self):
-        self.setUp_user_realms()
-        OTPKE2 = "31323334353637383930313233343536373839"
-        user = User("multichal", self.realm1)
-        pin = "test49"
-        token_a = init_token({"serial": "CR2AAA",
-                              "type": "hotp",
-                              "otpkey": OTPKE2,
-                              "pin": pin}, user)
-        token_b = init_token({"serial": "CR2B",
-                              "type": "hotp",
-                              "otpkey": self.otpkey,
-                              "pin": pin}, user)
-        set_policy("test49", scope=SCOPE.AUTH, action="{0!s}=HOTP".format(
-            ACTION.CHALLENGERESPONSE))
-        # both tokens will be a valid challenge response token!
-        set_policy("test", scope=SCOPE.AUTH, action="{0!s}=wrong, falsch, Chigau, sbagliato".format(
-            ACTION.PREFERREDCLIENTMODE))
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "multichal",
-                                                 "realm": self.realm1,
-                                                 "pass": pin}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            detail = res.json.get("detail")
-            self.assertEqual(detail.get("preferred_client_mode"), 'interactive')
-
-        delete_policy("test49")
-        delete_policy("test")
-
-class AChallengeResponse(MyApiTestCase):
-
-    serial = "hotp1"
-    serial_email = "email1"
-    serial_sms= "sms1"
-
-    def setUp(self):
-        super(AChallengeResponse, self).setUp()
-        self.setUp_user_realms()
-
-    def test_01_challenge_response_token_deactivate(self):
-        # New token for the user "selfservice"
-        Token("hotp1", "hotp", otpkey=self.otpkey, userid=1004, resolver=self.resolvername1,
-              realm=self.realm1).save()
-        # Define HOTP token to be challenge response
-        set_policy(name="pol_cr", scope=SCOPE.AUTH, action="{0!s}=hotp".format(ACTION.CHALLENGERESPONSE))
-        set_pin(self.serial, "pin")
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "selfservice",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            self.assertEqual(data.get("result").get("authentication"), "CHALLENGE")
-            detail = data.get("detail")
-            self.assertTrue("enter otp" in detail.get("message"), detail.get("message"))
-            transaction_id = detail.get("transaction_id")
-
-        # Now we try to provide the OTP value
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "selfservice",
-                                                 "pass": self.valid_otp_values[0],
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("value"))
-            self.assertEqual(data.get("result").get("authentication"), "ACCEPT")
-
-        # Now we send the challenge and then we disable the token
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "selfservice",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            self.assertEqual(data.get("result").get("authentication"), "CHALLENGE")
-            detail = data.get("detail")
-            self.assertTrue("enter otp" in detail.get("message"), detail.get("message"))
-            transaction_id = detail.get("transaction_id")
-
-        # disable the token
-        enable_token(self.serial, False)
-
-        # Now we try to provide the OTP value, but authentication must fail, since the token is disabled
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "selfservice",
-                                                 "pass": self.valid_otp_values[1],
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertFalse(data.get("result").get("value"))
-            self.assertEqual(data.get("result").get("authentication"), "REJECT")
-            detail = data.get("detail")
-            self.assertEqual(detail.get("message"), "Challenge matches, but token is not fit for challenge. Token is disabled")
-
-        # The token is still disabled. We are checking, if we can do a challenge response
-        # for a disabled token
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "selfservice",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            self.assertEqual(data.get("result").get("authentication"), "REJECT")
-            detail = data.get("detail")
-            self.assertTrue("No active challenge response" in detail.get("message"), detail.get("message"))
-
-        delete_policy("pol_cr")
-
-    @smtpmock.activate
-    def test_02_two_challenge_response_tokens(self):
-        smtpmock.setdata(response={"bla@example.com": (200, 'OK')})
-        # We test two challenge response tokens. One is active, one is disabled.
-        # Enroll an Email-Token to the user
-        init_token(user=User("selfservice", self.realm1),
-                   param={"serial": self.serial_email,
-                          "type": "email",
-                          "email": "bla@example.com",
-                          "otpkey": self.otpkey})
-        set_pin(self.serial_email, "pin")
-
-        toks = get_tokens(user=User("selfservice", self.realm1))
-        self.assertEqual(len(toks), 2)
-        self.assertFalse(toks[0].token.active)
-        self.assertTrue(toks[1].token.active)
-
-        # Now we create a challenge with two tokens
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "selfservice",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            self.assertEqual(data.get("result").get("authentication"), "CHALLENGE")
-            detail = data.get("detail")
-            # Only the email token is active and creates a challenge!
-            self.assertEqual(u"Enter the OTP from the Email:", detail.get("message"))
-
-        # Now test with triggerchallenge
-        with self.app.test_request_context('/validate/triggerchallenge',
-                                           method='POST',
-                                           data={"user": "selfservice"},
-                                           headers={"Authorization": self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            # Triggerchallenge returns the numbers of tokens in the "value
-            self.assertEqual(data.get("result").get("value"), 1)
-            detail = data.get("detail")
-            # Only the email token is active and creates a challenge!
-            self.assertEqual(u"Enter the OTP from the Email:", detail.get("messages")[0])
-        remove_token(self.serial_email)
-
-    @smtpmock.activate
-    def test_03_two_challenges_from_one_email_token(self):
-        set_privacyidea_config("email.concurrent_challenges", "True")
-        smtpmock.setdata(response={"bla@example.com": (200, 'OK')})
-        # remove tokens for user cornelius
-        remove_token(user=User("cornelius", self.realm1))
-        # Enroll an Email-Token to the user
-        init_token(user=User("cornelius", self.realm1),
-                   param={"serial": self.serial_email,
-                          "type": "email",
-                          "email": "bla@example.com",
-                          "otpkey": self.otpkey})
-        set_pin(self.serial_email, "pin")
-
-        toks = get_tokens(user=User("cornelius", self.realm1))
-        self.assertEqual(len(toks), 1)
-
-        # Now we create the first challenge
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            # Only the email token is active and creates a challenge!
-            self.assertEqual(u"Enter the OTP from the Email:", detail.get("message"))
-            transaction_id1 = detail.get("transaction_id")
-
-        # Now we create the second challenge
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            # Only the email token is active and creates a challenge!
-            self.assertEqual(u"Enter the OTP from the Email:", detail.get("message"))
-            transaction_id2 = detail.get("transaction_id")
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "transaction_id": transaction_id2,
-                                                 "pass": OTPs[2]}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertTrue(data.get("result").get("value"))
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "transaction_id": transaction_id1,
-                                                 "pass": OTPs[1]}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertTrue(data.get("result").get("value"))
-
-        remove_token(self.serial_email)
-        delete_privacyidea_config("email.concurrent_challenges")
-
-    @smtpmock.activate
-    def test_04_only_last_challenge_from_one_email_token(self):
-        set_privacyidea_config("email.concurrent_challenges", "False")
-        smtpmock.setdata(response={"bla@example.com": (200, 'OK')})
-        # remove tokens for user cornelius
-        remove_token(user=User("cornelius", self.realm1))
-        # Enroll an Email-Token to the user
-        init_token(user=User("cornelius", self.realm1),
-                   param={"serial": self.serial_email,
-                          "type": "email",
-                          "email": "bla@example.com",
-                          "otpkey": self.otpkey})
-        set_pin(self.serial_email, "pin")
-
-        toks = get_tokens(user=User("cornelius", self.realm1))
-        self.assertEqual(len(toks), 1)
-
-        # Now we create the first challenge
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            # Only the email token is active and creates a challenge!
-            self.assertEqual(u"Enter the OTP from the Email:", detail.get("message"))
-            transaction_id1 = detail.get("transaction_id")
-
-        # Now we create the second challenge
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            # Only the email token is active and creates a challenge!
-            self.assertEqual(u"Enter the OTP from the Email:", detail.get("message"))
-            transaction_id2 = detail.get("transaction_id")
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "transaction_id": transaction_id1,
-                                                 "pass": OTPs[1]}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            # The first challenge will not authenticate anymore, since the OTP is not stored in the challenge data
-            # and the token counter was increased
-            self.assertFalse(data.get("result").get("value"))
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "transaction_id": transaction_id2,
-                                                 "pass": OTPs[2]}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertTrue(data.get("result").get("value"))
-
-        remove_token(self.serial_email)
-        delete_privacyidea_config("email.concurrent_challenges")
-
-    @responses.activate
-    def test_05_two_challenges_from_one_sms_token(self):
-        # Configure the SMS Gateway
-        setup_sms_gateway()
-
-        ### Now do the enrollment and authentication
-        set_privacyidea_config("sms.concurrent_challenges", "True")
-        # remove tokens for user cornelius
-        remove_token(user=User("cornelius", self.realm1))
-        # Enroll an SMS-Token to the user
-        init_token(user=User("cornelius", self.realm1),
-                   param={"serial": self.serial_sms,
-                          "type": "sms",
-                          "phone": "1234567",
-                          "otpkey": self.otpkey})
-        set_pin(self.serial_sms, "pin")
-
-        toks = get_tokens(user=User("cornelius", self.realm1))
-        self.assertEqual(len(toks), 1)
-
-        # Now we create the first challenge
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            self.assertEqual(u"Enter the OTP from the SMS:", detail.get("message"))
-            transaction_id1 = detail.get("transaction_id")
-
-        # Now we create the second challenge
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            self.assertEqual(u"Enter the OTP from the SMS:", detail.get("message"))
-            transaction_id2 = detail.get("transaction_id")
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "transaction_id": transaction_id2,
-                                                 "pass": OTPs[2]}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertTrue(data.get("result").get("value"))
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "transaction_id": transaction_id1,
-                                                 "pass": OTPs[1]}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertTrue(data.get("result").get("value"))
-
-        remove_token(self.serial_sms)
-        delete_privacyidea_config("sms.concurrent_challenges")
-
-    @responses.activate
-    def test_06_only_last_challenges_from_one_sms_token(self):
-        # Configure the SMS Gateway
-        setup_sms_gateway()
-
-        ### Now do the enrollment and authentication
-        try:
-            delete_privacyidea_config("sms.concurrent_challenges")
-        except AttributeError:
-            pass
-
-        # remove tokens for user cornelius
-        remove_token(user=User("cornelius", self.realm1))
-        # Enroll an SMS-Token to the user
-        init_token(user=User("cornelius", self.realm1),
-                   param={"serial": self.serial_sms,
-                          "type": "sms",
-                          "phone": "1234567",
-                          "otpkey": self.otpkey})
-        set_pin(self.serial_sms, "pin")
-
-        toks = get_tokens(user=User("cornelius", self.realm1))
-        self.assertEqual(len(toks), 1)
-
-        # Now we create the first challenge
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            self.assertEqual(u"Enter the OTP from the SMS:", detail.get("message"))
-            transaction_id1 = detail.get("transaction_id")
-
-        # Now we create the second challenge
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            self.assertEqual(u"Enter the OTP from the SMS:", detail.get("message"))
-            transaction_id2 = detail.get("transaction_id")
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "transaction_id": transaction_id1,
-                                                 "pass": OTPs[1]}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            # First OTP fails, since the counter increased
-            self.assertFalse(data.get("result").get("value"))
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "transaction_id": transaction_id2,
-                                                 "pass": OTPs[2]}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            # Last value succeeds
-            self.assertTrue(data.get("result").get("value"))
-
-        remove_token(self.serial_sms)
-
-    @responses.activate
-    def test_07_disabled_sms_token_will_not_trigger_challenge(self):
-        # Configure the SMS Gateway
-        setup_sms_gateway()
-
-        # remove tokens for user cornelius
-        remove_token(user=User("cornelius", self.realm1))
-        # Enroll an SMS-Token to the user
-        init_token(user=User("cornelius", self.realm1),
-                   param={"serial": self.serial_sms,
-                          "type": "sms",
-                          "phone": "1234567",
-                          "otpkey": self.otpkey})
-        set_pin(self.serial_sms, "pin")
-        # disable the token
-        enable_token(self.serial_sms, False)
-
-        toks = get_tokens(user=User("cornelius", self.realm1))
-        self.assertEqual(len(toks), 1)
-
-        # Now we try to create a challenge
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            self.assertEqual(u"No active challenge response token found", detail.get("message"))
-
-        remove_token(self.serial_sms)
-
-    def test_08_challenge_text(self):
-        # We create two HOTP tokens for the user as challenge response and run a
-        # challenge response request with both tokens.
-        set_policy(name="pol_header",
-                   scope=SCOPE.AUTH,
-                   action="{0!s}=These are your options:<ul>".format(ACTION.CHALLENGETEXT_HEADER))
-        # Set a policy for the footer
-        set_policy(name="pol_footer",
-                   scope=SCOPE.AUTH,
-                   action="{0!s}=</ul>.<b>Authenticate Now!</b>".format(ACTION.CHALLENGETEXT_FOOTER))
-        # make HOTP a challenge response token
-        set_policy(name="pol_hotp",
-                   scope=SCOPE.AUTH,
-                   action="{0!s}=hotp".format(ACTION.CHALLENGERESPONSE))
-
-        init_token({"serial": "tok1",
-                    "otpkey": self.otpkey,
-                    "pin": "pin"}, user=User("cornelius", self.realm1))
-        init_token({"serial": "tok2",
-                    "otpkey": self.otpkey,
-                    "pin": "pin"}, user=User("cornelius", self.realm1))
-
-        # Now we try to create a challenge
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            self.assertEqual(detail.get("message"),
-                             'These are your options:<ul><li>please enter otp: </li>\n</ul>.<b>Authenticate Now!</b>')
-
-        remove_token("tok1")
-        remove_token("tok2")
-        delete_policy("pol_header")
-        delete_policy("pol_footer")
-        delete_policy("pol_hotp")
-
-    def test_09_challenge_response_inc_failcounter(self):
-        # make HOTP a challenge response token
-        set_policy(name="pol_hotp",
-                   scope=SCOPE.AUTH,
-                   action="{0!s}=hotp".format(ACTION.CHALLENGERESPONSE))
-        init_token({"serial": "tok1",
-                    "otpkey": self.otpkey,
-                    "pin": "pin"}, user=User("cornelius", self.realm1))
-
-        # On token fails to challenge response
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            transaction_id = detail.get("transaction_id")
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "wrongOTP",
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            self.assertEqual("tok1", detail.get("serial"))
-            self.assertEqual("hotp", detail.get("type"))
-            self.assertEqual("Response did not match the challenge.", detail.get("message"))
-
-        init_token({"serial": "tok2",
-                    "otpkey": self.otpkey,
-                    "pin": "pin"}, user=User("cornelius", self.realm1))
-
-        # Now, two tokens will not match
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            transaction_id = detail.get("transaction_id")
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "wrongOTP",
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            detail = data.get("detail")
-            self.assertTrue("serial" not in detail)
-            self.assertEqual("Response did not match for 2 tokens.", detail.get("message"))
-
-        # Now check the fail counters of the tokens
-        self.assertEqual(2, get_one_token(serial="tok1").token.failcount)
-        self.assertEqual(1, get_one_token(serial="tok2").token.failcount)
-
-        remove_token("tok1")
-        remove_token("tok2")
-        delete_policy("pol_hotp")
-
-    def test_10_unique_transaction_id(self):
-        # Tokens should create a unique transaction id
-        # The TiQR token changes the transaction id.
-
-        # Assign token to user:
-        r = init_token({"serial": "tok1", "type": "hotp", "otpkey": self.otpkey},
-                       user=User("cornelius", self.realm1))
-        self.assertTrue(r)
-        r = init_token({"serial": "tok2", "type": "tiqr", "otpkey": self.otpkey},
-                       user=User("cornelius", self.realm1))
-        self.assertTrue(r)
-
-        set_policy("chalresp", scope=SCOPE.AUTHZ, action="{0!s}=hotp".format(ACTION.TRIGGERCHALLENGE))
-
-        with self.app.test_request_context('/validate/triggerchallenge',
-                                           method='POST',
-                                           data={"user": "cornelius"},
-                                           headers={"authorization": self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertEqual(data.get("result").get("value"), 2)
-            # The two challenges should be the same
-            multichallenge = data.get("detail").get("multi_challenge")
-            transaction_id = data.get("detail").get("transaction_id")
-            self.assertEqual(multichallenge[0].get("transaction_id"), transaction_id)
-            self.assertEqual(multichallenge[1].get("transaction_id"), transaction_id)
-
-        delete_policy("chalresp")
-        remove_token("tok1")
-        remove_token("tok2")
-
-    @radiusmock.activate
-    def test_11_validate_radiustoken(self):
-        # A RADIUS token with RADIUS challenge response
-        # remove all tokens of user Cornelius
-        user_obj = User("cornelius", self.realm1)
-        remove_token(user=user_obj)
-
-        r = add_radius(identifier="myserver", server="1.2.3.4",
-                       secret="testing123", dictionary=DICT_FILE)
-        self.assertTrue(r > 0)
-        token = init_token({"type": "radius",
-                            "serial": "rad1",
-                            "radius.identifier": "myserver",
-                            "radius.local_checkpin": False,
-                            "radius.user": u"nönäscii"},
-                           user=user_obj)
-        radiusmock.setdata(timeout=False, response=radiusmock.AccessChallenge)
-        with self.app.test_request_context('/validate/check',
-                                           method="POST",
-                                           data={"user": "cornelius",
-                                                 "pass": "radiuspassword"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            transaction_id = data.get("detail").get("transaction_id")
-
-        # Now we send the response to this request but the wrong response!
-        radiusmock.setdata(timeout=False, response=radiusmock.AccessReject)
-        with self.app.test_request_context('/validate/check',
-                                           method="POST",
-                                           data={"user": "cornelius",
-                                                 "pass": "wrongPW",
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-            t = data.get("detail").get("transaction_id")
-            # No transaction_id
-            self.assertIsNone(t)
-
-        # Finally we succeed
-        radiusmock.setdata(timeout=False, response=radiusmock.AccessAccept)
-        with self.app.test_request_context('/validate/check',
-                                           method="POST",
-                                           data={"user": "cornelius",
-                                                 "pass": "correctPW",
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertTrue(data.get("result").get("value"))
-            t = data.get("detail").get("transaction_id")
-            # No transaction_id
-            self.assertIsNone(t)
-
-        # A second request tries to use the same transaction_id, but the RADIUS server
-        # responds with a Reject
-        radiusmock.setdata(timeout=False, response=radiusmock.AccessReject)
-        with self.app.test_request_context('/validate/check',
-                                           method="POST",
-                                           data={"user": "cornelius",
-                                                 "pass": "correctPW",
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
-
-        # And finally a single shot authentication, no chal resp, no transaction_id
-        radiusmock.setdata(timeout=False, response=radiusmock.AccessAccept)
-        with self.app.test_request_context('/validate/check',
-                                           method="POST",
-                                           data={"user": "cornelius",
-                                                 "pass": "correctPW"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertTrue(data.get("result").get("value"))
-        remove_token("rad1")
-
-    def test_12_polltransaction(self):
-        # Assign token to user:
-        r = init_token({"serial": "tok1", "type": "hotp", "otpkey": self.otpkey},
-                       user=User("cornelius", self.realm1))
-        self.assertTrue(r)
-        r = init_token({"serial": "tok2", "type": "tiqr", "otpkey": self.otpkey},
-                       user=User("cornelius", self.realm1))
-        self.assertTrue(r)
-
-        with self.app.test_request_context('/validate/triggerchallenge',
-                                           method='POST',
-                                           data={"user": "cornelius"},
-                                           headers={"authorization": self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertEqual(data.get("result").get("value"), 2)
-            # The two challenges should be the same
-            multichallenge = data.get("detail").get("multi_challenge")
-            transaction_id = data.get("detail").get("transaction_id")
-            self.assertEqual(multichallenge[0].get("transaction_id"), transaction_id)
-            self.assertEqual(multichallenge[1].get("transaction_id"), transaction_id)
-
-        # Check that serials are written to the audit log
-        entry = self.find_most_recent_audit_entry(action="*/validate/triggerchallenge*")
-        self.assertIn("tok1", entry["serial"])
-        self.assertIn("tok2", entry["serial"])
-
-        # add a really old expired challenge for tok1
-        old_transaction_id = "1111111111"
-        old_challenge = Challenge(serial="tok1", transaction_id=old_transaction_id, challenge="")
-        old_challenge_timestamp = datetime.datetime.now() - datetime.timedelta(days=3)
-        old_challenge.timestamp = old_challenge_timestamp
-        old_challenge.expiration = old_challenge_timestamp + datetime.timedelta(minutes=120)
-        old_challenge.save()
-
-        # Check behavior of the polltransaction endpoint
-        # POST is not allowed
-        with self.app.test_request_context("/validate/polltransaction", method="POST"):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 405)
-
-        # transaction_id is required
-        with self.app.test_request_context("/validate/polltransaction", method="GET",
-                                           data={}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 400)
-            self.assertFalse(res.json["result"]["status"])
-            self.assertIn("Missing parameter: 'transaction_id'", res.json["result"]["error"]["message"])
-
-        # wildcards do not work
-        with self.app.test_request_context("/validate/polltransaction", method="GET",
-                                           data={"transaction_id": "*"}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            self.assertTrue(res.json["result"]["status"])
-            self.assertFalse(res.json["result"]["value"])
-
-        # a non-existent transaction_id just returns false
-        with self.app.test_request_context("/validate/polltransaction", method="GET",
-                                           data={"transaction_id": "123456"}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            self.assertTrue(res.json["result"]["status"])
-            self.assertFalse(res.json["result"]["value"])
-
-        # check audit log
-        entry = self.find_most_recent_audit_entry(action="*/validate/polltransaction*")
-        self.assertEqual(entry["info"], "transaction_id: 123456")
-        self.assertEqual(entry["serial"], None)
-        self.assertEqual(entry["user"], None)
-
-        # polling the transaction returns false, because no challenge has been answered
-        with self.app.test_request_context("/validate/polltransaction", method="GET",
-                                           data={"transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            self.assertTrue(res.json["result"]["status"])
-            self.assertFalse(res.json["result"]["value"])
-
-        # but audit log contains both serials and the user
-        entry = self.find_most_recent_audit_entry(action="*/validate/polltransaction*")
-        self.assertEqual(entry["info"], "transaction_id: {}".format(transaction_id))
-        self.assertIn("tok1", entry["serial"])
-        self.assertIn("tok2", entry["serial"])
-        self.assertFalse(entry["success"])
-        self.assertEqual(entry["user"], "cornelius")
-        self.assertEqual(entry["resolver"], "resolver1")
-        self.assertEqual(entry["realm"], self.realm1)
-
-        # polling the expired transaction returns false
-        with self.app.test_request_context("/validate/polltransaction", method="GET",
-                                           data={"transaction_id": old_transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            self.assertTrue(res.json["result"]["status"])
-            self.assertFalse(res.json["result"]["value"])
-
-        # and the audit log contains no serials and the user
-        entry = self.find_most_recent_audit_entry(action="*/validate/polltransaction*")
-        self.assertEqual(entry["info"], "transaction_id: {}".format(old_transaction_id))
-        self.assertEqual(entry["serial"], None)
-        self.assertFalse(entry["success"])
-
-        # Mark one challenge as answered
-        Challenge.query.filter_by(serial="tok1", transaction_id=transaction_id).update({"otp_valid": True})
-        db.session.commit()
-
-        # polling the transaction returns true, because the challenge has been answered
-        with self.app.test_request_context("/validate/polltransaction", method="GET",
-                                           data={"transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            self.assertTrue(res.json["result"]["status"])
-            self.assertTrue(res.json["result"]["value"])
-
-        entry = self.find_most_recent_audit_entry(action="*/validate/polltransaction*")
-        self.assertEqual(entry["info"], "transaction_id: {}".format(transaction_id))
-        # tok2 is not written to the audit log
-        self.assertEqual(entry["serial"], "tok1")
-        self.assertTrue(entry["success"])
-        self.assertEqual(entry["user"], "cornelius")
-        self.assertEqual(entry["resolver"], "resolver1")
-        self.assertEqual(entry["realm"], self.realm1)
-
-        # polling the transaction again gives the same result, even with the more REST-y endpoint
-        with self.app.test_request_context("/validate/polltransaction/{}".format(transaction_id), method="GET",
-                                           data={}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            self.assertTrue(res.json["result"]["status"])
-            self.assertTrue(res.json["result"]["value"])
-
-        remove_token("tok1")
-        remove_token("tok2")
-
-        # polling the transaction now gives false
-        with self.app.test_request_context("/validate/polltransaction/{}".format(transaction_id), method="GET",
-                                           data={"transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            self.assertTrue(res.json["result"]["status"])
-            self.assertFalse(res.json["result"]["value"])
-
-    def test_13_chal_resp_indexed_secret(self):
-        my_secret = "HelloMyFriend"
-        tok = init_token({"otpkey": my_secret,
-                          "pin": "test",
-                          "serial": "PIIX01",
-                          "type": "indexedsecret"},
-                         user=User("cornelius", self.realm1))
-        # Trigger a challenge
-        transaction_id = None
-        password = None
-        with self.app.test_request_context("/validate/check",
-                                           data={"user": "cornelius",
-                                                 "pass": "test"}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            response = res.json
-            self.assertTrue(response.get("result").get("status"))
-            self.assertFalse(response.get("result").get("value"))
-            transaction_id = response.get("detail").get("transaction_id")
-            random_positions = response.get("detail").get("attributes").get("random_positions")
-            password_list = [my_secret[x - 1] for x in random_positions]
-            password = "".join(password_list)
-
-        with self.app.test_request_context("/validate/check",
-                                           data={"user": "cornelius",
-                                                 "transaction_id": transaction_id,
-                                                 "pass": password}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            response = res.json
-            # successful authentication
-            self.assertTrue(response.get("result").get("value"))
-
-        # ennroll an empty indexedsecret token and check the raised exception
-        remove_token("PIIX01")
-        tok = init_token({"otpkey": "",
-                          "pin": "test",
-                          "serial": "PIIX01",
-                          "type": "indexedsecret"},
-                         user=User("cornelius", self.realm1))
-        with self.app.test_request_context("/validate/check",
-                                           data={"user": "cornelius",
-                                                 "pass": "test"}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 400)
-            response = res.json
-            result = response.get("result")
-            self.assertFalse(result.get("status"))
-            self.assertEqual(u'ERR401: The indexedsecret token has an empty secret '
-                             u'and can not be used for authentication.',
-                             result.get("error").get("message"))
-        remove_token("PIIX01")
-
-    def test_14_indexed_secret_multichallenge(self):
-        index_secret = "abcdefghijklmn"
-        serial = "indx001"
-        tok = init_token({"type": "indexedsecret", "otpkey": index_secret, "pin": "index", "serial": serial},
-                         user=User("cornelius", self.realm1))
-        tok.add_tokeninfo("multichallenge", 1)
-
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius", "pass": "index"}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertFalse(result.get("value"))
-            detail = res.json.get("detail")
-            transaction_id = detail.get("transaction_id")
-            position = detail.get("attributes").get("random_positions")[0]
-
-        # First response
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius", "pass": index_secret[position - 1],
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertFalse(result.get("value"))
-            detail = res.json.get("detail")
-            transaction_id = detail.get("transaction_id")
-            position = detail.get("attributes").get("random_positions")[0]
-
-        # Second response
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius", "pass": index_secret[position - 1],
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            # Successful authentication!
-            self.assertTrue(result.get("value"))
-
-        remove_token(serial)
-
-    def test_15_questionnaire_multichallenge(self):
-        questionnaire = {"Question1": "Answer1",
-                         "Question2": "Answer2",
-                         "Question3": "Answer3",
-                         "Q4": "A4",
-                         "Q5": "A5"}
-        serial = "quest001"
-        found_questions = []
-        tok = init_token({"type": "question", "questions": questionnaire, "pin": "quest", "serial": serial},
-                         user=User("cornelius", self.realm1))
-
-        # We want two questions during authentication
-        set_policy(name="questpol", scope=SCOPE.AUTH, action="question_number=6")
-
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius", "pass": "quest"}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertFalse(result.get("value"))
-            detail = res.json.get("detail")
-            transaction_id = detail.get("transaction_id")
-            question = detail.get("message")
-            found_questions.append(question)
-
-        # Run 5 responses that require more
-        for i in range(0, 5):
-            with self.app.test_request_context('/validate/check', method='POST',
-                                               data={"user": "cornelius", "pass": questionnaire.get(question),
-                                                     "transaction_id": transaction_id}):
-                res = self.app.full_dispatch_request()
-                self.assertEqual(res.status_code, 200)
-                result = res.json['result']
-                self.assertFalse(result.get("value"))
-                detail = res.json.get("detail")
-                transaction_id = detail.get("transaction_id")
-                question = detail.get("message")
-                found_questions.append(question)
-
-        self.assertEqual(len(set(found_questions)), 5)
-
-        # Now we run the last resonse. It can be any of the 5 originial questions again.
-
-        # Sixth and last response will be successful
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "cornelius", "pass": questionnaire.get(question),
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            # Successful authentication!
-            self.assertTrue(result.get("value"))
-
-        # But we still have 5 distinct questions
-        self.assertEqual(len(set(found_questions)), 5)
-        remove_token(serial)
-        delete_policy("questpol")
-
-    def test_16_4eyes_multichallenge_with_pin(self):
-        # We require 1 token in realm1 and 2 tokens in realm2
-        required_tokens = {"realm1": {"selected": True,
-                                      "count": 1},
-                           "realm3": {"selected": True,
-                                      "count": 2}}
-        serial = "4eyes001"
-        # We want more than one realm
-        self.setUp_user_realm3()
-        tok = init_token({"type": "4eyes", "4eyes": required_tokens, "pin": "pin", "serial": serial},
-                         user=User("root", self.realm3))
-        self.assertTrue(tok.get_tokeninfo("4eyes"), "realm1:1,realm3:2")
-
-        # Now we enroll some tokens for the 3 admins.
-        # user: cornelius@realm1
-        tok = init_token({"type": "hotp", "otpkey": self.otpkey, "pin": "adminpin1", "serial": "admintok1"},
-                         user=User("cornelius", self.realm1))
-        self.assertTrue(tok.get_tokeninfo("tokenkind"), "software")
-        # user: cornelius@realm3
-        tok = init_token({"type": "hotp", "otpkey": self.otpkey, "pin": "adminpin2", "serial": "admintok2"},
-                         user=User("cornelius", self.realm3))
-        self.assertTrue(tok.get_tokeninfo("tokenkind"), "software")
-        # user: privacyidea@realm3
-        tok = init_token({"type": "hotp", "otpkey": self.otpkey, "pin": "adminpin3", "serial": "admintok3"},
-                         user=User("privacyidea", self.realm3))
-        self.assertTrue(tok.get_tokeninfo("tokenkind"), "software")
-
-        # Start the authentication with the PIN of the 4eyes token
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "root", "realm": self.realm3, "pass": "pin"}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
             detail = res.json.get("detail")
             self.assertFalse(result.get("value"))
             transaction_id = detail.get("transaction_id")
-            self.assertTrue(transaction_id)
 
-        # Authenticate with the first admin token
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "root@realm3",
-                                                 "pass": "adminpin1" + self.valid_otp_values[1],
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertFalse(result.get("value"))
-            detail = res.json.get("detail")
-            transaction_id = detail.get("transaction_id")
-            self.assertEqual("Please authenticate with another token from either realm: realm3.",
-                             detail.get("message"))
+        # Authentication is not yet successfully, hence the last_authentication time stamp shall not be updated yet
+        self.assertIsNone(container.last_authentication)
 
-        # Authenticate with the second admin token
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "root@realm3",
-                                                 "pass": "adminpin2" + self.valid_otp_values[1],
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertFalse(result.get("value"))
-            detail = res.json.get("detail")
-            transaction_id = detail.get("transaction_id")
-            self.assertEqual("Please authenticate with another token from either realm: realm3.",
-                             detail.get("message"))
-
-        # If we would use the 2nd token *again*, then the authentication fails
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "root@realm3",
-                                                 "pass": "adminpin2" + self.valid_otp_values[2],
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertFalse(result.get("value"))
-            detail = res.json.get("detail")
-            self.assertNotIn("transaction_id", detail)
-            self.assertEqual("Response did not match the challenge.", detail.get("message"))
-
-        # Authenticate with the third admin token
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "root@realm3",
-                                                 "pass": "adminpin3" + self.valid_otp_values[1],
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertTrue(result.get("value"))
-            detail = res.json.get("detail")
-
-        remove_token(serial)
-        remove_token("admintok1")
-        remove_token("admintok2")
-        remove_token("admintok3")
-
-    def test_17_4eyes_multichallenge(self):
-        # We require 1 token in realm1 and 2 tokens in realm2
-        required_tokens = {"realm1": {"selected": True,
-                                      "count": 1},
-                           "realm3": {"selected": True,
-                                      "count": 2}}
-        serial = "4eyes001"
-        # We want more than one realm
-        self.setUp_user_realm3()
-        # Init 4eyes token without PIN
-        tok = init_token({"type": "4eyes", "4eyes": required_tokens, "serial": serial},
-                         user=User("root", self.realm3))
-        self.assertTrue(tok.get_tokeninfo("4eyes"), "realm1:1,realm3:2")
-
-        # Now we enroll some tokens for the 3 admins.
-        # user: cornelius@realm1
-        tok = init_token({"type": "hotp", "otpkey": self.otpkey, "pin": "adminpin1", "serial": "admintok1"},
-                         user=User("cornelius", self.realm1))
-        self.assertTrue(tok.get_tokeninfo("tokenkind"), "software")
-        # user: cornelius@realm3
-        tok = init_token({"type": "hotp", "otpkey": self.otpkey, "pin": "adminpin2", "serial": "admintok2"},
-                         user=User("cornelius", self.realm3))
-        self.assertTrue(tok.get_tokeninfo("tokenkind"), "software")
-        # user: privacyidea@realm3
-        tok = init_token({"type": "hotp", "otpkey": self.otpkey, "pin": "adminpin3", "serial": "admintok3"},
-                         user=User("privacyidea", self.realm3))
-        self.assertTrue(tok.get_tokeninfo("tokenkind"), "software")
-
-        # Start the authentication with one of the tokens!
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "root@realm3",
-                                                 "pass": "adminpin2" + self.valid_otp_values[1]}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            detail = res.json.get("detail")
-            self.assertFalse(result.get("value"))
-            transaction_id = detail.get("transaction_id")
-            self.assertTrue(transaction_id)
-
-        # Authenticate with the 2nd admin token
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "root@realm3",
-                                                 "pass": "adminpin1" + self.valid_otp_values[1],
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertFalse(result.get("value"))
-            detail = res.json.get("detail")
-            transaction_id = detail.get("transaction_id")
-            self.assertTrue(transaction_id)
-
-        # Authenticate with the second admin token
-        with self.app.test_request_context('/validate/check', method='POST',
-                                           data={"user": "root@realm3",
-                                                 "pass": "adminpin3" + self.valid_otp_values[1],
-                                                 "transaction_id": transaction_id}):
-            res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 200)
-            result = res.json['result']
-            self.assertTrue(result.get("value"))
-
-        remove_token(serial)
-        remove_token("admintok1")
-        remove_token("admintok2")
-        remove_token("admintok3")
-
-    @smtpmock.activate
-    def test_18_email_triggerchallenge_no_pin(self):
-        # Test that the HOTP value from an email token without a PIN
-        # can not be used in challenge response after the challenge expired.
-        smtpmock.setdata(response={"hans@dampf.com": (200, 'OK')})
-        self.setUp_user_realms()
-        self.setUp_user_realm2()
-        serial = "smtp01"
-        user = "timelimituser"
-        # Create token without PIN
-        r = init_token({"type": "email", "serial": serial,
-                        "otpkey": self.otpkey,
-                        "email": "hans@dampf.com"}, user=User(user, self.realm2))
-        self.assertTrue(r)
-
-        # Trigger challenge for the user
-        with self.app.test_request_context('/validate/triggerchallenge',
+        # send the OTP value
+        with self.app.test_request_context('/validate/check',
                                            method='POST',
-                                           data={"user": user, "realm": self.realm2},
-                                           headers={'Authorization': self.at}):
+                                           data={"user": "cornelius",
+                                                 "transaction_id":
+                                                     transaction_id,
+                                                 "pass": "359152"}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            self.assertEqual(result.get("value"), 1)
-            detail = res.json.get("detail")
-            self.assertEqual(detail.get("messages")[0],
-                             _("Enter the OTP from the Email:"))
-            transaction_id = detail.get("transaction_id")
+            self.assertTrue(result.get("value"))
 
-        # If we wait long enough, the challenge has expired,
-        # while the HOTP value 287082 in itself would still be valid.
-        # However, the authentication with the expired transaction_id has to fail
-        new_utcnow = datetime.datetime.utcnow().replace(tzinfo=None) + datetime.timedelta(minutes=12)
-        new_now = datetime.datetime.now().replace(tzinfo=None) + datetime.timedelta(minutes=12)
-        with mock.patch('privacyidea.models.datetime') as mock_datetime:
-            mock_datetime.utcnow.return_value = new_utcnow
-            mock_datetime.now.return_value = new_now
-            with self.app.test_request_context('/validate/check',
-                                               method='POST',
-                                               data={"user": user, "realm": self.realm2,
-                                                     "transaction_id": transaction_id,
-                                                     "pass": self.valid_otp_values[1]}):
+        # check last authentication
+        auth_time = datetime.datetime.now(datetime.UTC)
+        last_auth = container.last_authentication
+        time_diff = abs((auth_time - last_auth).total_seconds())
+        self.assertLessEqual(time_diff, 2)
+
+        # delete the token
+        remove_token(serial=serial)
+
+    def test_38_disable_token_types_for_auth(self):
+        """A spass token is accepted and a HOTP token triggers the challenge response,
+        then a policy disables both types."""
+        self.setUp_user_realms()
+        serial_1 = "SPASS1"
+        serial_2 = "HOTP1"
+
+        # Create a working Simple-Pass token and HOTP token
+        init_token({"serial": serial_1,
+                    "type": "spass",
+                    "pin": "1"},
+                   user=User("cornelius", self.realm1))
+
+        init_token({"serial": serial_2,
+                    "type": "hotp",
+                    "pin": "2",
+                    "otpkey": self.otpkey},
+                   user=User("cornelius", self.realm1))
+
+        # It authenticates successfully before the policy is set
+        with self.app.test_request_context(
+                "/validate/check",
+                method="POST",
+                data={"user": "cornelius", "realm": self.realm1, "pass": "1"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json["result"]
+            self.assertEqual(result["authentication"], "ACCEPT")
+
+        # Set a policy to trigger challenge response for HOTP
+        set_policy(name="challenge_response", scope=SCOPE.AUTH, action=f"{PolicyAction.CHALLENGERESPONSE}=hotp")
+
+        with self.app.test_request_context(
+                "/validate/check",
+                method="POST",
+                data={"user": "cornelius", "realm": self.realm1, "pass": "2"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json["result"]
+            self.assertEqual(result["authentication"], "CHALLENGE")
+
+        # Disable the spass and hotp token for authentication
+        set_policy(name="disable_some_token", scope=SCOPE.AUTH,
+                   action=f"{PolicyAction.DISABLED_TOKEN_TYPES}=spass hotp")
+
+        # The very same auth attempt must now be rejected
+        with self.app.test_request_context(
+                "/validate/check",
+                method="POST",
+                data={"user": "cornelius", "realm": self.realm1, "pass": "1"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json["result"]
+            self.assertEqual(result["authentication"], "REJECT")
+
+        with self.app.test_request_context(
+                "/validate/check",
+                method="POST",
+                data={"user": "cornelius", "realm": self.realm1, "pass": "2"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json["result"]
+            self.assertEqual(result["authentication"], "REJECT")
+
+        # Clean-up
+        remove_token(serial=serial_1)
+        remove_token(serial=serial_2)
+        delete_policy("challenge_response")
+        delete_policy("disable_some_token")
+
+    def test_39_invalid_user(self):
+        self.setUp_user_realms()
+        self.setUp_user_realm3()
+        set_default_realm(self.realm3)
+        # User exist in realm1 (default realm) and realm3
+        user = User("cornelius", self.realm1)
+        token = init_token({"type": "spass", "pin": "1234"}, user=user)
+        user_realm1 = User("hans", self.realm1)
+        token_realm1 = init_token({"type": "spass", "pin": "1234"}, user=user_realm1)
+
+        # successful authentication
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": user.login, "realm": user.realm, "pass": "1234"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+
+        # --- User does not exist in realm ---
+        # only pass username uses default realm (username does not exist in default realm)
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": "eve", "pass": "1234"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(400, res.status_code, res)
+            error = res.json.get("result").get("error")
+            self.assertEqual(904, error.get("code"), error)
+            self.assertEqual(f"ERR904: User <eve@{self.realm3}> does not exist.", error.get("message"),
+                             error)
+
+        # Pass username and realm
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": "eve", "realm": self.realm1, "pass": "1234"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(400, res.status_code, res)
+            error = res.json.get("result").get("error")
+            self.assertEqual(904, error.get("code"), error)
+            self.assertEqual(f"ERR904: User <eve@{self.realm1}> does not exist.", error.get("message"),
+                             error)
+
+        # Pass username and resolver (sets default realm)
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": "eve", "resolver": self.resolvername1, "pass": "1234"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(400, res.status_code, res)
+            error = res.json.get("result").get("error")
+            self.assertEqual(904, error.get("code"), error)
+            self.assertEqual(f"ERR904: User <eve.{self.resolvername1}@{self.realm3}> does not exist.",
+                             error.get("message"),
+                             error)
+
+        # Pass username, realm, and resolver
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": "eve", "realm": self.realm1, "resolver": self.resolvername1,
+                                                 "pass": "1234"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(400, res.status_code, res)
+            error = res.json.get("result").get("error")
+            self.assertEqual(904, error.get("code"), error)
+            self.assertEqual(f"ERR904: User <eve.{self.resolvername1}@{self.realm1}> does not exist.",
+                             error.get("message"),
+                             error)
+
+        # --- Realm of user was deleted ---
+        realm = Realm.query.filter_by(name=self.realm1).first()
+        for user_attribute in CustomUserAttribute.query.filter_by(realm_id=realm.id).all():
+            user_attribute.delete()
+        realm.delete()
+
+        # only pass username uses default realm: same username exist in defrealm
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": user.login, "pass": "1234"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            result = res.json["detail"]
+            self.assertEqual("The user has no tokens assigned", result["message"], result)
+
+        # only pass username uses default realm: username does not exist in defrealm
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": user_realm1.login, "pass": "1234"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(400, res.status_code, res)
+            error = res.json.get("result").get("error")
+            self.assertEqual(904, error.get("code"), error)
+            self.assertEqual(f"ERR904: User <{user_realm1.login}@{self.realm3}> does not exist.", error.get("message"),
+                             error)
+
+        # pass username and realm
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": user.login, "realm": user.realm, "pass": "1234"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(400, res.status_code, res)
+            error = res.json.get("result").get("error")
+            self.assertEqual(904, error.get("code"), error)
+            self.assertEqual(f"ERR904: User <{user.login}@{user.realm}> does not exist.", error.get("message"), error)
+
+        # pass username, realm, and resolver
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": user.login, "realm": user.realm, "resolver": user.resolver,
+                                                 "pass": "1234"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(400, res.status_code, res)
+            error = res.json.get("result").get("error")
+            self.assertEqual(904, error.get("code"), error)
+            self.assertEqual(f"ERR904: User <{user.login}.{user.resolver}@{user.realm}> does not exist.",
+                             error.get("message"), error)
+
+        # Pass user and serial
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": user.login, "realm": user.realm, "serial": token.get_serial(),
+                                                 "pass": "1234"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(400, res.status_code, res)
+            error = res.json.get("result").get("error")
+            self.assertEqual(904, error.get("code"), error)
+            self.assertIn("ERR904", error.get("message"))
+            self.assertIn("user can not be found in any resolver in this realm", error.get("message"))
+
+        # --- Resolver is not in realm ---
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": user.login, "realm": user.realm,
+                                                 "resolver": self.resolvername3, "pass": "1234"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(400, res.status_code, res)
+            error = res.json.get("result").get("error")
+            self.assertEqual(904, error.get("code"), error)
+            self.assertEqual(f"ERR904: User <{user.login}.{self.resolvername3}@{user.realm}> does not exist.",
+                             error.get("message"), error)
+
+        token.delete_token()
+        token_realm1.delete_token()
+
+    def test_40_set_realm(self):
+        self.setUp_user_realms()
+        set_default_realm(self.realm1)
+        self.setUp_user_realm3()
+
+        token = init_token({"type": "spass", "pin": "test"}, user=User("corny", self.realm3))
+
+        # auth without realm fails (as user is not in default realm)
+        with self.app.test_request_context("/validate/check",
+                                           method="POST",
+                                           data={"user": "corny",
+                                                 "pass": "test"}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 400, res)
+
+        # set policy for auth realm
+        set_policy("realm_auth", scope=SCOPE.AUTH, action=f"{PolicyAction.SET_REALM}={self.realm3}")
+
+        # pass no realm
+        self.set_default_g_variables()
+        with self.app.test_request_context("/validate/check",
+                                           method="POST",
+                                           data={"user": "corny",
+                                                 "pass": "test"}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("status"), result)
+            self.assertTrue(result.get("value"), result)
+            self.assertEqual("ACCEPT", result.get("authentication"), result)
+
+        # pass a different realm
+        self.set_default_g_variables()
+        with self.app.test_request_context("/validate/check",
+                                           method="POST",
+                                           data={"user": "corny",
+                                                 "realm": self.realm1,
+                                                 "pass": "test"}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("status"), result)
+            self.assertTrue(result.get("value"), result)
+            self.assertEqual("ACCEPT", result.get("authentication"), result)
+
+        # pass non-existing different realm
+        self.set_default_g_variables()
+        with self.app.test_request_context("/validate/check",
+                                           method="POST",
+                                           data={"user": "corny",
+                                                 "realm": "random",
+                                                 "pass": "test"}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("status"), result)
+            self.assertTrue(result.get("value"), result)
+            self.assertEqual("ACCEPT", result.get("authentication"), result)
+
+        # set_realm takes precedence over mangle and setrealm policy
+        set_policy("mangle", scope=SCOPE.AUTH, action=f"{PolicyAction.MANGLE}=realm/.*/mangledRealm/")
+        set_policy("setrealm", scope=SCOPE.AUTHZ, action=f"{PolicyAction.SETREALM}=setrealm")
+        self.set_default_g_variables()
+        with self.app.test_request_context("/validate/check",
+                                           method="POST",
+                                           data={"user": "corny",
+                                                 "realm": self.realm1,
+                                                 "pass": "test"}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("status"), result)
+            self.assertTrue(result.get("value"), result)
+            self.assertEqual("ACCEPT", result.get("authentication"), result)
+
+        token.delete_token()
+        delete_policy("realm_auth")
+        delete_policy("mangle")
+        delete_policy("setrealm")
+
+    def test_41_set_realm_conditions(self):
+        self.setUp_user_realms()
+        self.setUp_user_realm3()
+        token_corny = init_token({"type": "spass", "pin": "test"}, user=User("corny", self.realm3))
+        token_hans = init_token({"type": "spass", "pin": "test1234"}, user=User("hans", self.realm1))
+
+        # set policy for auth realm with condition on IP address
+        set_policy("realm_auth", scope=SCOPE.AUTH, action=f"{PolicyAction.SET_REALM}={self.realm3}",
+                   client="6.7.8.9")
+
+        # auth with different realm from different IP works
+        with self.app.test_request_context("/validate/check",
+                                           method="POST",
+                                           data={"user": "hans",
+                                                 "realm": self.realm1,
+                                                 "pass": "test1234"},
+                                           environ_base={"REMOTE_ADDR": "1.2.3.4"}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("status"), result)
+            self.assertTrue(result.get("value"), result)
+            self.assertEqual("ACCEPT", result.get("authentication"), result)
+            self.assertEqual(token_hans.get_serial(), res.json.get("detail").get("serial"))
+
+        # auth from matching IP enforces realm3
+        with self.app.test_request_context("/validate/check",
+                                           method="POST",
+                                           data={"user": "corny",
+                                                 "pass": "test"},
+                                           environ_base={"REMOTE_ADDR": "6.7.8.9"}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("status"), result)
+            self.assertTrue(result.get("value"), result)
+            self.assertEqual("ACCEPT", result.get("authentication"), result)
+            self.assertEqual(token_corny.get_serial(), res.json.get("detail").get("serial"))
+
+        # set policy for auth realm with condition on user agent
+        delete_policy("realm_auth")
+        set_policy("realm_auth", scope=SCOPE.AUTH, action=f"{PolicyAction.SET_REALM}={self.realm3}",
+                   user_agents="privacyIDEA-Keycloak")
+
+        # auth with different realm from different User Agent works
+        with self.app.test_request_context("/validate/check",
+                                           method="POST",
+                                           data={"user": "hans",
+                                                 "realm": self.realm1,
+                                                 "pass": "test1234"},
+                                           headers={"User-Agent": "PAM"}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("status"), result)
+            self.assertTrue(result.get("value"), result)
+            self.assertEqual("ACCEPT", result.get("authentication"), result)
+            self.assertEqual(token_hans.get_serial(), res.json.get("detail").get("serial"))
+
+        # auth from matching User-Agent enforces realm3
+        with self.app.test_request_context("/validate/check",
+                                           method="POST",
+                                           data={"user": "corny",
+                                                 "pass": "test"},
+                                           headers={"User-Agent": "privacyIDEA-Keycloak"}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("status"), result)
+            self.assertTrue(result.get("value"), result)
+            self.assertEqual("ACCEPT", result.get("authentication"), result)
+            self.assertEqual(token_corny.get_serial(), res.json.get("detail").get("serial"))
+
+        # set policy for auth realm with condition on node
+        delete_policy("realm_auth")
+        # Use merge() rather than add() because the app's create_app() already
+        # inserts Node1 at startup (PI_NODE_UUID in config.py). On Postgres a
+        # plain INSERT here aborts the whole transaction; merge() is idempotent.
+        # Re-bind the names to the merge() return values — the original transient
+        # instances are not added to the session, and later db.session.delete()
+        # would fail with "Instance is not persisted".
+        node1 = db.session.merge(NodeName(id="8e4272a9-9037-40df-8aa3-976e4a04b5a9", name="Node1"))
+        node2 = db.session.merge(NodeName(id="d1d7fde6-330f-4c12-88f3-58a1752594bf", name="Node2"))
+        set_policy("realm_auth", scope=SCOPE.AUTH, action=f"{PolicyAction.SET_REALM}={self.realm3}",
+                   pinode="Node1")
+
+        # auth with different realm on different node
+        with mock.patch("privacyidea.lib.policy.get_privacyidea_node") as mock_node:
+            mock_node.return_value = "Node2"
+            with self.app.test_request_context("/validate/check",
+                                               method="POST",
+                                               data={"user": "hans",
+                                                     "realm": self.realm1,
+                                                     "pass": "test1234"}):
                 res = self.app.full_dispatch_request()
                 self.assertTrue(res.status_code == 200, res)
                 result = res.json.get("result")
-                self.assertFalse(result.get("value"))
-                detail = res.json.get("detail")
-                self.assertEqual("Response did not match the challenge.", detail.get("message"))
+                self.assertTrue(result.get("status"), result)
+                self.assertTrue(result.get("value"), result)
+                self.assertEqual("ACCEPT", result.get("authentication"), result)
+                self.assertEqual(token_hans.get_serial(), res.json.get("detail").get("serial"))
 
-        remove_token(serial)
+        # auth on matching node
+        with mock.patch("privacyidea.lib.policy.get_privacyidea_node") as mock_node:
+            mock_node.return_value = "Node1"
+            with self.app.test_request_context("/validate/check",
+                                               method="POST",
+                                               data={"user": "corny",
+                                                     "pass": "test"}):
+                res = self.app.full_dispatch_request()
+                self.assertTrue(res.status_code == 200, res)
+                result = res.json.get("result")
+                self.assertTrue(result.get("status"), result)
+                self.assertTrue(result.get("value"), result)
+                self.assertEqual("ACCEPT", result.get("authentication"), result)
+                self.assertEqual(token_corny.get_serial(), res.json.get("detail").get("serial"))
 
-    def test_19_increase_failcounter_on_challenge(self):
-        # Create email token
-        init_token({
-            "type": "email",
-            "serial": self.serial_email,
-            "email": "hans@dampf.com",
-            "pin": "pin"},
-            user=User("cornelius", self.realm1))
+        # set policy for auth realm with condition on user
+        delete_policy("realm_auth")
+        set_policy("realm_auth", scope=SCOPE.AUTH,
+                   action=f"{PolicyAction.SET_REALM}={self.realm3}",
+                   user="corny")
 
-        # Create SMS token
-        init_token({
-            "type": "sms",
-            "serial": self.serial_sms,
-            "phone": "123456",
-            "pin": "pin"},
-            user=User("cornelius", self.realm1))
-
-        # Create HOTP token
-        init_token({
-            "type": "hotp",
-            "serial": "hotp_serial",
-            "otpkey": "abcde12345",
-            "pin": "pin"},
-            user=User("cornelius", self.realm1))
-
-        # Now check the fail counters of the tokens, all should be 0
-        self.assertEqual(0, get_one_token(serial=self.serial_email).token.failcount)
-        self.assertEqual(0, get_one_token(serial=self.serial_sms).token.failcount)
-        self.assertEqual(0, get_one_token(serial="hotp_serial").token.failcount)
-
-        # Set the increase_failcounter_on_challenge policy
-        set_policy(name="increase_failcounter_on_challenge",
-                   scope=SCOPE.AUTH,
-                   action=ACTION.INCREASE_FAILCOUNTER_ON_CHALLENGE)
-
-        # Now we create the challenges via validate/check
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "cornelius",
-                                                 "pass": "pin"}):
+        # auth with different realm from different User Agent works
+        with self.app.test_request_context("/validate/check",
+                                           method="POST",
+                                           data={"user": "hans",
+                                                 "realm": self.realm1,
+                                                 "pass": "test1234"}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("status"), result)
+            self.assertTrue(result.get("value"), result)
+            self.assertEqual("ACCEPT", result.get("authentication"), result)
+            self.assertEqual(token_hans.get_serial(), res.json.get("detail").get("serial"))
 
-        # The failcounter (email, sms) increased by 1
-        self.assertEqual(1, get_one_token(serial=self.serial_email).token.failcount)
-        self.assertEqual(1, get_one_token(serial=self.serial_sms).token.failcount)
-        self.assertEqual(0, get_one_token(serial="hotp_serial").token.failcount)
-
-        # Trigger a challenge for all token via validate/triggerchallenge
-        with self.app.test_request_context('/validate/triggerchallenge',
-                                           method='POST',
-                                           data={"user": "cornelius"},
-                                           headers={"Authorization": self.at}):
+        # auth from matching User-Agent enforces realm3
+        with self.app.test_request_context("/validate/check",
+                                           method="POST",
+                                           data={"user": "corny",
+                                                 "pass": "test"}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("status"), result)
+            self.assertTrue(result.get("value"), result)
+            self.assertEqual("ACCEPT", result.get("authentication"), result)
+            self.assertEqual(token_corny.get_serial(), res.json.get("detail").get("serial"))
 
-        # All failcounter increased by 1
-        self.assertEqual(2, get_one_token(serial=self.serial_email).token.failcount)
-        self.assertEqual(2, get_one_token(serial=self.serial_sms).token.failcount)
-        self.assertEqual(1, get_one_token(serial="hotp_serial").token.failcount)
+        # set policy for auth realm with condition on user agent
+        delete_policy("realm_auth")
+        set_policy("realm_auth", scope=SCOPE.AUTH,
+                   action=f"{PolicyAction.SET_REALM}={self.realm3}",
+                   user_agents="privacyIDEA-Keycloak")
 
-        # Clean up
-        remove_token(self.serial_email)
-        remove_token(self.serial_sms)
-        remove_token("hotp_serial")
-        delete_policy("increase_failcounter_on_challenge")
+        token_corny.delete_token()
+        token_hans.delete_token()
+        delete_policy("realm_auth")
+        db.session.delete(node1)
+        db.session.delete(node2)
 
+    def test_42_hide_specific_error_message(self):
+        """
+        Currently, the HTTP Status codes that are returned are mixed 200 and 401.
+        # TODO we need to consistently apply 401 for any kind of authentication failure, 403 for authorization failure
+        # TODO and 200 only for successful requests
 
-class TriggeredPoliciesTestCase(MyApiTestCase):
+        This test checks that the message is generic, but the status code checks are not worth much currently.
+        """
+        set_policy(name="hide_error_message", scope=SCOPE.AUTH, action=f"{PolicyAction.HIDE_SPECIFIC_ERROR_MESSAGE}")
+        # User does not exist: 401
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={
+                                               "user": "cornelius2",
+                                               "pass": "1234"
+                                           }):
+            res = self.app.full_dispatch_request()
+            self._assert_unspecific_message_with_401(res)
 
-    def setUp(self):
-        super(TriggeredPoliciesTestCase, self).setUp()
+        # User cornelius is in the realm that will be created
         self.setUp_user_realms()
-
-    def test_00_two_policies(self):
-        set_policy("otppin", scope=SCOPE.AUTH, action="{0!s}=none".format(ACTION.OTPPIN))
-        set_policy("lastauth", scope=SCOPE.AUTHZ, action="{0!s}=1s".format(ACTION.LASTAUTH))
-
-        # Create a Spass token
-        tok = init_token({"serial": "triggtoken", "type": "spass"})
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"serial": "triggtoken", "pass": ""}):
+        # Undo changes from other tests...
+        set_default_realm(self.realm1)
+        # User has no tokens assigned, currently returns 200 should be 401
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={
+                                               "user": "cornelius",
+                                               "pass": "1234"
+                                           }):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertTrue(data.get("result").get("value"))
+            self._assert_unspecific_message_with_200(res)
 
-        # This authentication triggered the policy "otppin"
-        with self.app.test_request_context('/audit/',
-                                           method='GET',
-                                           data={"policies": "*otppin*"},
-                                           headers={"Authorization": self.at}):
+        token = init_token({"type": "spass", "pin": "21"}, user=User("cornelius", self.realm1))
+
+        # Wrong OTP: currently 200, should be 401
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={
+                                               "user": "cornelius",
+                                               "pass": "1234"
+                                           }):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            json_response = res.json
-            self.assertTrue(json_response.get("result").get("status"), res)
-            self.assertEqual(json_response.get("result").get("value").get(
-                "count"), 1)
+            self._assert_unspecific_message_with_200(res)
 
-        # Now wait a second and try to authenticate. Authentication should fail
-        # due to policy "lastauth". Thus the policies "otppin" and "lastauth" are
-        # triggered
-        time.sleep(1.5)
-
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"serial": "triggtoken", "pass": ""}):
+        token.set_failcount(10)
+        token.save()
+        # Failcount exceeded: currently 200, should be 401
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={
+                                               "user": "cornelius",
+                                               "pass": "21"
+                                           }):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            data = res.json
-            self.assertTrue(data.get("result").get("status"))
-            self.assertFalse(data.get("result").get("value"))
+            self._assert_unspecific_message_with_200(res)
 
-        # This authentication triggered the policy "otppin" and "lastauth"
-        with self.app.test_request_context('/audit/',
-                                           method='GET',
-                                           data={"policies": "*lastauth*"},
-                                           headers={"Authorization": self.at}):
+        token.set_failcount(0)
+        token.save()
+
+        # lastauth: currently 200, should be 401
+        now = datetime.datetime.now(datetime.UTC)
+        thirty_days_ago = now - datetime.timedelta(days=30)
+        token.write_tokeninfo(PolicyAction.LASTAUTH, thirty_days_ago.strftime(AUTH_DATE_FORMAT))
+        set_policy("lastauth", scope=SCOPE.AUTHZ, action=f"{PolicyAction.LASTAUTH}=7d")
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={
+                                               "user": "cornelius",
+                                               "pass": "21"
+                                           }):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            json_response = res.json
-            self.assertTrue(json_response.get("result").get("status"), res)
-            self.assertEqual(json_response.get("result").get("value").get("count"), 1)
-            # Both policies have triggered
-            self.assertEqual(json_response.get("result").get("value").get("auditdata")[0].get("policies"),
-                             "otppin,lastauth")
-
-        # clean up
-        remove_token("triggtoken")
-        delete_policy("otppin")
+            self._assert_unspecific_message_with_200(res)
         delete_policy("lastauth")
 
-
-class MultiChallengeEnrollTest(MyApiTestCase):
-
-    # Note: Testing the enrollment of the push token is done in test_api_push_validate.py
-
-    def setUp(self):
-        super(MultiChallengeEnrollTest, self).setUp()
-
-        ldap3mock.setLDAPDirectory(LDAPDirectory)
-        params = {'LDAPURI': 'ldap://localhost',
-                  'LDAPBASE': 'o=test',
-                  'BINDDN': 'cn=manager,ou=example,o=test',
-                  'BINDPW': 'ldaptest',
-                  'LOGINNAMEATTRIBUTE': 'cn',
-                  'LDAPSEARCHFILTER': '(cn=*)',
-                  'USERINFO': '{ "username": "cn",'
-                              '"phone" : "telephoneNumber", '
-                              '"mobile" : "mobile"'
-                              ', "email" : "mail", '
-                              '"surname" : "sn", '
-                              '"givenname" : "givenName" }',
-                  'UIDTYPE': 'DN',
-                  "resolver": "catchall",
-                  "type": "ldapresolver"}
-
-        r = save_resolver(params)
-        self.assertTrue(r > 0)
-
-    @ldap3mock.activate
-    def test_01_enroll_HOTP(self):
-        # Init LDAP
-        ldap3mock.setLDAPDirectory(LDAPDirectory)
-        # create realm
-        r = set_realm("ldaprealm", resolvers=["catchall"])
-        set_default_realm("ldaprealm")
-
-        # 1. set policies.
-        # Policy scope:auth, action:enroll_via_multichallenge=hotp
-        set_policy("pol_passthru", scope=SCOPE.AUTH, action=ACTION.PASSTHRU)
-
-        # 2. authenticate user via passthru
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "pass": "alicepw"}):
+        # Successful authentication to double-check: currently 200, should be 200
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={
+                                               "user": "cornelius",
+                                               "pass": "21"
+                                           }):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            self.assertTrue(result.get("status"))
+            self.assertEqual("ACCEPT", result.get("authentication"))
             self.assertTrue(result.get("value"))
-            self.assertEqual(result.get("authentication"), "ACCEPT")
 
-        # Set enroll policy
-        set_policy("pol_multienroll", scope=SCOPE.AUTH,
-                   action="{0!s}=hotp".format(ACTION.ENROLL_VIA_MULTICHALLENGE))
-        # Now we should get an authentication Challenge
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "pass": "alicepw"}):
+        delete_policy("hide_error_message")
+
+    def test_43_hide_auth_error_status(self):
+        """
+        hide_auth_error_status returns a uniform 401 HTTP status code for
+        failed authentications, so the status code cannot be used to
+        distinguish the reason a request failed.
+        """
+        self.setUp_user_realms()
+        set_default_realm(self.realm1)
+        init_token({"type": "spass", "serial": "spass_status", "pin": "test43"},
+                   user=User("cornelius", self.realm1))
+        # authorized=deny makes an otherwise successful authentication fail with HTTP 400
+        set_policy(name="deny_all", scope=SCOPE.AUTHZ,
+                   action=f"{PolicyAction.AUTHORIZED}={AUTHORIZED.DENY}")
+
+        # Without the policy a denied authorization is HTTP 400 ...
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": "cornelius", "pass": "test43"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertFalse(result.get("value"))
-            self.assertEqual(result.get("authentication"), "CHALLENGE")
-            detail = res.json.get("detail")
-            transaction_id = detail.get("transaction_id")
-            self.assertTrue("Please scan the QR code!" in detail.get("message"), detail.get("message"))
-            # Get image and client_mode
-            self.assertEqual(CLIENTMODE.INTERACTIVE, detail.get("client_mode"))
-            # Check, that multi_challenge is also contained.
-            self.assertEqual(CLIENTMODE.INTERACTIVE, detail.get("multi_challenge")[0].get("client_mode"))
-            self.assertIn("image", detail)
-            serial = detail.get("serial")
-
-        # 3. scan the qrcode / Get the OTP value
-        token_obj = get_tokens(serial=serial)[0]
-        otp = token_obj._calc_otp(1)
-
-        # 4. run the 2nd authentication with the OTP value and the transaction_id
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "transaction_id": transaction_id,
-                                                 "pass": otp}):
+            self.assertEqual(400, res.status_code, res.json)
+        # ... and an unknown user is also HTTP 400 (UserError)
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": "unknown", "pass": "test43"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertTrue(result.get("value"))
-            self.assertEqual(result.get("authentication"), "ACCEPT")
+            self.assertEqual(400, res.status_code, res.json)
 
-        # Cleanup
-        delete_policy("pol_passthru")
-        delete_policy("pol_multienroll")
-        remove_token(serial)
-
-    @ldap3mock.activate
-    def test_02_enroll_TOTP(self):
-        # Init LDAP
-        ldap3mock.setLDAPDirectory(LDAPDirectory)
-        # create realm
-        r = set_realm("ldaprealm", resolvers=["catchall"])
-        set_default_realm("ldaprealm")
-
-        # 1. set policies.
-        # Policy scope:auth, action:enroll_via_multichallenge=hotp
-        set_policy("pol_passthru", scope=SCOPE.AUTH, action=ACTION.PASSTHRU)
-
-        # 2. authenticate user via passthru
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "pass": "alicepw"}):
+        # With the policy active every failure returns a uniform 401
+        set_policy(name="hide_status", scope=SCOPE.HARDENING,
+                   action=PolicyAction.HIDE_AUTH_ERROR_STATUS)
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": "cornelius", "pass": "test43"}):
             res = self.app.full_dispatch_request()
-            self.assertEqual(200, res.status_code)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertTrue(result.get("value"))
-            self.assertEqual(result.get("authentication"), "ACCEPT")
-
-        # Set enroll policy
-        set_policy("pol_multienroll", scope=SCOPE.AUTH,
-                   action="{0!s}=totp".format(ACTION.ENROLL_VIA_MULTICHALLENGE))
-        # Now we should get an authentication Challenge
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "pass": "alicepw"}):
+            self.assertEqual(401, res.status_code, res.json)
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": "unknown", "pass": "test43"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertFalse(result.get("value"))
-            self.assertEqual(result.get("authentication"), "CHALLENGE")
-            detail = res.json.get("detail")
-            transaction_id = detail.get("transaction_id")
-            self.assertTrue("Please scan the QR code!" in detail.get("message"), detail.get("message"))
-            # Get image and client_mode
-            self.assertEqual(CLIENTMODE.INTERACTIVE, detail.get("client_mode"))
-            # Check, that multi_challenge is also contained.
-            self.assertEqual(CLIENTMODE.INTERACTIVE, detail.get("multi_challenge")[0].get("client_mode"))
-            self.assertIn("image", detail)
-            serial = detail.get("serial")
+            self.assertEqual(401, res.status_code, res.json)
 
-        # 3. scan the qrcode / Get the OTP value
-        token_obj = get_tokens(serial=serial)[0]
-        counter = int(time.time() / 30)
-        otp = token_obj._calc_otp(counter)
-
-        # 4a. fail to authenticate with a wrong OTP value
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "transaction_id": transaction_id,
-                                                 "pass": "123"}):
+        # The policy only affects the authentication endpoints: a
+        # ResourceNotFoundError on a non-auth endpoint keeps its 404
+        with self.app.test_request_context('/policy/unknown_policy', method="DELETE",
+                                           headers={"Authorization": self.at}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertFalse(result.get("value"))
-            self.assertEqual(result.get("authentication"), "REJECT")
+            self.assertEqual(404, res.status_code, res.json)
 
-        # 4. run the 2nd authentication with the OTP value and the transaction_id
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "transaction_id": transaction_id,
-                                                 "pass": otp}):
+        delete_policy("deny_all")
+        delete_policy("hide_status")
+        remove_token("spass_status")
+
+    def test_44_hide_auth_error_status_is_defensive(self):
+        """
+        A failure while evaluating the hardening policy must not turn the error
+        response into a 500. get_auth_error_status_code falls back to the mapped
+        status code when the policy backend raises.
+        """
+        from privacyidea.lib.policy import PolicyClass
+        self.setUp_user_realms()
+        set_default_realm(self.realm1)
+        set_policy(name="hide_status", scope=SCOPE.HARDENING,
+                   action=PolicyAction.HIDE_AUTH_ERROR_STATUS)
+
+        original_list_policies = PolicyClass.list_policies
+
+        def raise_for_hardening(self, *args, **kwargs):
+            if kwargs.get("scope") == SCOPE.HARDENING:
+                raise Exception("policy backend unavailable")
+            return original_list_policies(self, *args, **kwargs)
+
+        # An unknown user fails with HTTP 400; with the hardening evaluation
+        # raising, the response falls back to 400 instead of a 500.
+        with mock.patch.object(PolicyClass, "list_policies", raise_for_hardening):
+            with self.app.test_request_context('/validate/check', method="POST",
+                                               data={"user": "unknown", "pass": "1234"}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(400, res.status_code, res.json)
+
+        delete_policy("hide_status")
+
+    def test_45_hide_specific_error_message_matches_the_policy_realm(self):
+        """
+        The policy is matched against the user of the request, so a policy
+        restricted to another realm must leave the specific message intact.
+        """
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+        set_default_realm(self.realm1)
+        init_token({"type": "spass", "serial": "spass_realm", "pin": "test45"},
+                   user=User("cornelius", self.realm1))
+
+        set_policy(name="hide_error_message", scope=SCOPE.AUTH,
+                   action=f"{PolicyAction.HIDE_SPECIFIC_ERROR_MESSAGE}=true", realm=self.realm2)
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": "cornelius", "pass": "wrong"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertTrue(result.get("value"))
-            self.assertEqual(result.get("authentication"), "ACCEPT")
+            self.assertEqual("wrong otp pin", res.json.get("detail").get("message"))
 
-        # Cleanup
-        delete_policy("pol_passthru")
-        delete_policy("pol_multienroll")
-        remove_token(serial)
-
-    @ldap3mock.activate
-    @smtpmock.activate
-    def test_03_enroll_EMail(self):
-        # Init LDAP
-        ldap3mock.setLDAPDirectory(LDAPDirectory)
-        # mock email sending
-        smtpmock.setdata(response={"alice@example.com": (200, 'OK')})
-        # create realm
-        r = set_realm("ldaprealm", resolvers=["catchall"])
-        set_default_realm("ldaprealm")
-
-        # 1. set policies.
-        set_policy("pol_passthru", scope=SCOPE.AUTH, action=ACTION.PASSTHRU)
-
-        # 2. authenticate user via passthru
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "pass": "alicepw"}):
+        set_policy(name="hide_error_message", scope=SCOPE.AUTH,
+                   action=f"{PolicyAction.HIDE_SPECIFIC_ERROR_MESSAGE}=true", realm=self.realm1)
+        with self.app.test_request_context('/validate/check', method="POST",
+                                           data={"user": "cornelius", "pass": "wrong"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertTrue(result.get("value"))
-            self.assertEqual(result.get("authentication"), "ACCEPT")
+            self._assert_unspecific_message_with_200(res)
 
-        # Set Policy scope:auth, action:enroll_via_multichallenge=email
-        set_policy("pol_multienroll", scope=SCOPE.AUTH,
-                   action="{0!s}=email".format(ACTION.ENROLL_VIA_MULTICHALLENGE))
-        # Now we should get an authentication Challenge
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "pass": "alicepw"}):
+        delete_policy("hide_error_message")
+        remove_token("spass_realm")
+
+    def test_46_hide_specific_error_message_evaluates_userinfo_conditions(self):
+        """
+        A userinfo condition is evaluated against the user of the request. The
+        user is available, so the outcome must not depend on the configured
+        handling of missing data.
+        """
+        self.setUp_user_realms()
+        set_default_realm(self.realm1)
+        init_token({"type": "spass", "serial": "spass_condition", "pin": "test46"},
+                   user=User("cornelius", self.realm1))
+
+        for handle_missing_data in [ConditionHandleMissingData.RAISE_ERROR.value,
+                                    ConditionHandleMissingData.IS_TRUE.value,
+                                    ConditionHandleMissingData.IS_FALSE.value]:
+            # cornelius has this email, so the condition matches and the message is masked
+            set_policy(name="hide_error_message", scope=SCOPE.AUTH,
+                       action=f"{PolicyAction.HIDE_SPECIFIC_ERROR_MESSAGE}=true",
+                       conditions=[(ConditionSection.USERINFO, "email", PrimaryComparators.EQUALS,
+                                    "user@localhost.localdomain", True, handle_missing_data)])
+            with self.app.test_request_context('/validate/check', method="POST",
+                                               data={"user": "cornelius", "pass": "wrong"}):
+                res = self.app.full_dispatch_request()
+                self._assert_unspecific_message_with_200(res)
+
+            # The condition does not match, so the specific message is kept
+            set_policy(name="hide_error_message", scope=SCOPE.AUTH,
+                       action=f"{PolicyAction.HIDE_SPECIFIC_ERROR_MESSAGE}=true",
+                       conditions=[(ConditionSection.USERINFO, "email", PrimaryComparators.EQUALS,
+                                    "someone.else@localhost.localdomain", True, handle_missing_data)])
+            with self.app.test_request_context('/validate/check', method="POST",
+                                               data={"user": "cornelius", "pass": "wrong"}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual("wrong otp pin", res.json.get("detail").get("message"))
+
+        delete_policy("hide_error_message")
+        remove_token("spass_condition")
+
+    def test_47_hide_specific_error_message_on_exception_paths(self):
+        """
+        The @postpolicy chain of /validate/check does not run when the view
+        raises: the exception is turned into a response by the error handlers,
+        bypassing hide_specific_error_message. These error paths must still be
+        masked so the specific failure reason does not leak.
+
+        The following non-exotic errors are covered:
+          * unknown serial          -> ResourceNotFoundError
+          * serial/user mismatch    -> ParameterError
+          * revoked token           -> TokenAdminError
+        """
+        self.setUp_user_realms()
+        set_default_realm(self.realm1)
+        init_token({"type": "spass", "serial": "spass_err", "pin": "test47"},
+                   user=User("cornelius", self.realm1))
+
+        # request data for each exception path
+        unknown_serial = {"serial": "unknown_serial_47", "pass": "test47"}
+        # "root" exists in the realm but does not own spass_err -> ParameterError
+        serial_user_mismatch = {"serial": "spass_err", "user": "root", "pass": "test47"}
+
+        # Without the policy the specific reason is exposed
+        for data in (unknown_serial, serial_user_mismatch):
+            with self.app.test_request_context('/validate/check', method="POST", data=data):
+                res = self.app.full_dispatch_request()
+                error = res.json.get("result").get("error")
+                self.assertNotEqual("Authentication failed.", error.get("message"), res.json)
+
+        # A revoked token also raises instead of returning a normal response
+        revoke_token("spass_err")
+        revoked = {"serial": "spass_err", "pass": "test47"}
+        with self.app.test_request_context('/validate/check', method="POST", data=revoked):
             res = self.app.full_dispatch_request()
-            self.assertEqual(200, res.status_code)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertFalse(result.get("value"))
-            self.assertEqual(result.get("authentication"), "CHALLENGE")
-            detail = res.json.get("detail")
-            transaction_id = detail.get("transaction_id")
-            self.assertTrue("Please enter your new email address!" in detail.get("message"), detail.get("message"))
-            # Get image and client_mode
-            self.assertEqual(CLIENTMODE.INTERACTIVE, detail.get("client_mode"))
-            # Check, that multi_challenge is also contained.
-            self.assertEqual(CLIENTMODE.INTERACTIVE, detail.get("multi_challenge")[0].get("client_mode"))
-            self.assertIn("image", detail)
-            serial = detail.get("serial")
+            error = res.json.get("result").get("error")
+            self.assertNotEqual("Authentication failed.", error.get("message"), res.json)
 
-        # 3. Enter the email address and finalize the token
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "transaction_id": transaction_id,
-                                                 "pass": "alice@example.com"}):
+        # With the policy enabled, every one of these error paths is masked
+        set_policy(name="hide_error_message", scope=SCOPE.AUTH,
+                   action=f"{PolicyAction.HIDE_SPECIFIC_ERROR_MESSAGE}=true")
+        for data in (unknown_serial, serial_user_mismatch, revoked):
+            with self.app.test_request_context('/validate/check', method="POST", data=data):
+                res = self.app.full_dispatch_request()
+                result = res.json.get("result")
+                error = result.get("error")
+                # The generic message replaces the specific reason ...
+                self.assertEqual("Authentication failed.", error.get("message"), res.json)
+                # ... and the error code is remapped to the generic AUTHENTICATE id
+                self.assertEqual(Error.AUTHENTICATE, error.get("code"), res.json)
+                # The detail is reset so nothing leaks through it either
+                self.assertEqual("Authentication failed.",
+                                 res.json.get("detail").get("message"), res.json)
+
+        delete_policy("hide_error_message")
+        remove_token("spass_err")
+
+    def test_48_radiuscheck_error_paths_return_empty_body(self):
+        """
+        /validate/radiuscheck must always answer with an empty body (the
+        construct_radius_response post-policy). This must also hold on the
+        error path, where the view raises and the @postpolicy chain never runs.
+        An error is always the failure case for the RADIUS adapter, so the
+        status code is a generic 400.
+        """
+        self.setUp_user_realms()
+        set_default_realm(self.realm1)
+        init_token({"type": "spass", "serial": "spass_radius_err", "pin": "test48"},
+                   user=User("cornelius", self.realm1))
+
+        cases = [
+            # unknown serial -> ResourceNotFoundError
+            {"serial": "unknown_serial_48", "pass": "test48"},
+            # serial/user mismatch -> ParameterError
+            {"serial": "spass_radius_err", "user": "root", "pass": "test48"},
+            # unknown user
+            {"user": "unknown", "pass": "test48"},
+        ]
+        for data in cases:
+            with self.app.test_request_context('/validate/radiuscheck', method="POST",
+                                               data=data):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(400, res.status_code, res.data)
+                self.assertEqual(b'', res.data)
+                # The shaped replacement response must still carry the shared
+                # after_request caching guarantee.
+                self.assertEqual("no-store", res.headers.get("Cache-Control"), res.headers)
+
+        # A revoked token raises TokenAdminError -> still an empty 400
+        revoke_token("spass_radius_err")
+        with self.app.test_request_context('/validate/radiuscheck', method="POST",
+                                           data={"serial": "spass_radius_err", "pass": "test48"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            detail = res.json.get("detail")
-            self.assertTrue(result.get("status"))
-            self.assertFalse(result.get("value"))
-            self.assertEqual(result.get("authentication"), "CHALLENGE")
-            transaction_id = detail.get("transaction_id")
+            self.assertEqual(400, res.status_code, res.data)
+            self.assertEqual(b'', res.data)
+            self.assertEqual("no-store", res.headers.get("Cache-Control"), res.headers)
 
-        # The email was sent, with the OTP value
-        token_obj = get_tokens(serial=serial)[0]
-        otp = token_obj._calc_otp(1)
-
-        # 4. run the 2nd authentication with the OTP value and the transaction_id
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "transaction_id": transaction_id,
-                                                 "pass": otp}):
+        # Malformed application/json makes get_all_params() raise before the
+        # view and Flask produces a non-JSON (HTML) 400. /validate/radiuscheck
+        # must still collapse it to the documented empty 400, not leak the body.
+        with self.app.test_request_context('/validate/radiuscheck', method="POST",
+                                           data='{"serial": "spass_radius_err", ',
+                                           content_type="application/json"):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertTrue(result.get("value"))
-            self.assertEqual(result.get("authentication"), "ACCEPT")
+            self.assertEqual(400, res.status_code, res.data)
+            self.assertEqual(b'', res.data)
 
-        # Cleanup
-        delete_policy("pol_passthru")
-        delete_policy("pol_multienroll")
-        remove_token(serial)
+        remove_token("spass_radius_err")
 
-    @ldap3mock.activate
-    @responses.activate
-    def test_04_enroll_SMS(self):
-        # Init LDAP
-        ldap3mock.setLDAPDirectory(LDAPDirectory)
-        # mock http response
-        setup_sms_gateway()
+    def test_49_shape_error_response_only_affects_check_and_radiuscheck(self):
+        """
+        The shared after_request error shaping must be restricted to the two
+        routes served by the check() view (/validate/check and
+        /validate/radiuscheck). Other validate endpoints such as
+        /validate/offlinerefill deliberately do their own token-scope masking
+        with their own error code and must not be rewritten to the generic
+        "Authentication failed."/AUTHENTICATE just because an AUTH-scope
+        hide_specific_error_message policy is active.
+        """
+        self.setUp_user_realms()
+        set_default_realm(self.realm1)
+        # An AUTH-scope hide policy that would mask /validate/check errors
+        set_policy(name="hide_error_message", scope=SCOPE.AUTH,
+                   action=f"{PolicyAction.HIDE_SPECIFIC_ERROR_MESSAGE}=true")
 
-        # create realm
-        r = set_realm("ldaprealm", resolvers=["catchall"])
-        set_default_realm("ldaprealm")
-
-        # 1. set policies.
-        set_policy("pol_passthru", scope=SCOPE.AUTH, action=ACTION.PASSTHRU)
-
-        # 2. authenticate user via passthru
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "pass": "alicepw"}):
+        # /validate/offlinerefill raises for an unknown token (ParameterError).
+        # No offline-refill token-scope policy is set, so it keeps its specific
+        # message and its own PARAMETER error code - it must not be rewritten.
+        with self.app.test_request_context('/validate/offlinerefill', method="POST",
+                                           data={"serial": "unknown_offline_49",
+                                                 "refilltoken": "x", "pass": ""}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertTrue(result.get("value"))
-            self.assertEqual(result.get("authentication"), "ACCEPT")
+            error = res.json.get("result").get("error")
+            self.assertNotEqual(Error.AUTHENTICATE, error.get("code"), res.json)
+            self.assertEqual(Error.PARAMETER, error.get("code"), res.json)
+            self.assertNotIn("Authentication failed.", error.get("message"), res.json)
 
-        # Set Policy scope:auth, action:enroll_via_multichallenge=email
-        set_policy("pol_multienroll", scope=SCOPE.AUTH,
-                   action="{0!s}=sms".format(ACTION.ENROLL_VIA_MULTICHALLENGE))
-        # Now we should get an authentication Challenge
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "pass": "alicepw"}):
+        delete_policy("hide_error_message")
+
+    def test_50_options_request_is_not_shaped(self):
+        """
+        Flask answers OPTIONS itself without dispatching to the view, but
+        after_request still runs. The shaping must not collapse that reply into
+        the empty 400 of the RADIUS adapter, or CORS preflight and method
+        discovery break for /validate/radiuscheck.
+        """
+        with self.app.test_request_context('/validate/radiuscheck', method="OPTIONS"):
             res = self.app.full_dispatch_request()
-            self.assertEqual(200, res.status_code)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertFalse(result.get("value"))
-            self.assertEqual(result.get("authentication"), "CHALLENGE")
-            detail = res.json.get("detail")
-            transaction_id = detail.get("transaction_id")
-            self.assertTrue("Please enter your new phone number!" in detail.get("message"), detail.get("message"))
-            # Get image and client_mode
-            self.assertEqual(CLIENTMODE.INTERACTIVE, detail.get("client_mode"))
-            # Check, that multi_challenge is also contained.
-            self.assertEqual(CLIENTMODE.INTERACTIVE, detail.get("multi_challenge")[0].get("client_mode"))
-            self.assertIn("image", detail)
-            serial = detail.get("serial")
+            self.assertEqual(200, res.status_code, res.data)
+            self.assertEqual(b'', res.data)
+            self.assertSetEqual({"GET", "HEAD", "OPTIONS", "POST"}, set(res.allow))
 
-        # 3. Enter the phone number and finalize the token
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "transaction_id": transaction_id,
-                                                 "pass": "99555555"}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            detail = res.json.get("detail")
-            self.assertTrue(result.get("status"))
-            self.assertFalse(result.get("value"))
-            self.assertEqual(result.get("authentication"), "CHALLENGE")
-            transaction_id = detail.get("transaction_id")
+    def _assert_unspecific_message_with_401(self, response):
+        self.assertEqual(401, response.status_code, response.json)
+        result = response.json.get("result")
+        error = result.get("error")
+        self.assertEqual(Error.AUTHENTICATE, error.get("code"))
+        self.assertEqual("Authentication failed.", error.get("message"))
+        self.assertEqual(2, len(error))
+        detail = response.json.get("detail")
+        self.assertEqual("Authentication failed.", detail.get("message"))
+        self.assertIn("threadid", detail)
+        self.assertEqual(2, len(detail))
 
-        # The SMS was sent, with the OTP value
-        token_obj = get_tokens(serial=serial)[0]
-        otp = token_obj._calc_otp(1)
+    def _assert_unspecific_message_with_200(self, response):
+        """
+        Responses with 200 do not contain the error section.
+        """
+        self.assertEqual(200, response.status_code, response.json)
+        detail = response.json.get("detail")
+        self.assertEqual("Authentication failed.", detail.get("message"), detail)
+        self.assertIn("threadid", detail)
+        self.assertEqual(2, len(detail), detail)
 
-        # 4. run the 2nd authentication with the OTP value and the transaction_id
-        with self.app.test_request_context('/validate/check',
-                                           method='POST',
-                                           data={"user": "alice",
-                                                 "transaction_id": transaction_id,
-                                                 "pass": otp}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            self.assertTrue(result.get("status"))
-            self.assertTrue(result.get("value"))
-            self.assertEqual(result.get("authentication"), "ACCEPT")
-
-        # Cleanup
-        delete_policy("pol_passthru")
-        delete_policy("pol_multienroll")
-        remove_token(serial)
+        result = response.json.get("result")
+        self.assertEqual("REJECT", result.get("authentication"))
+        self.assertFalse(result.get("value"))

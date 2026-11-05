@@ -1,0 +1,115 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { provideHttpClient } from "@angular/common/http";
+import { provideHttpClientTesting } from "@angular/common/http/testing";
+import { ComponentFixture, TestBed } from "@angular/core/testing";
+import { provideRouter, Router } from "@angular/router";
+import { ROUTE_PATHS } from "@app/route_paths";
+import { AuthService } from "@services/auth/auth.service";
+import { DialogService } from "@services/dialog/dialog.service";
+import { ResolverService } from "@services/resolver/resolver.service";
+import { UserService } from "@services/user/user.service";
+import { MockContentService, MockDialogService, MockRealmService, MockUserService } from "@testing/mock-services";
+import { MockAuthService } from "@testing/mock-services/mock-auth-service";
+import { MockResolverService } from "@testing/mock-services/mock-resolver-service";
+import { UserTableActionsComponent } from "./user-table-actions.component";
+import { ContentService } from "@services/content/content.service";
+import { RealmService } from "@services/realm/realm.service";
+
+describe("UserTableActionsComponent", () => {
+  let component: UserTableActionsComponent;
+  let fixture: ComponentFixture<UserTableActionsComponent>;
+  let resolverService: MockResolverService;
+  let userService: MockUserService;
+  let authService: MockAuthService;
+  let router: Router;
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      providers: [
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        provideRouter([]),
+        { provide: AuthService, useClass: MockAuthService },
+        { provide: ResolverService, useClass: MockResolverService },
+        { provide: UserService, useClass: MockUserService },
+        { provide: DialogService, useClass: MockDialogService },
+        { provide: ContentService, useClass: MockContentService },
+        { provide: RealmService, useClass: MockRealmService }
+      ],
+      imports: [UserTableActionsComponent]
+    }).compileComponents();
+
+    resolverService = TestBed.inject(ResolverService) as unknown as MockResolverService;
+    userService = TestBed.inject(UserService) as unknown as MockUserService;
+    authService = TestBed.inject(AuthService) as unknown as MockAuthService;
+    router = TestBed.inject(Router);
+    jest.spyOn(router, "navigateByUrl").mockResolvedValue(true);
+
+    fixture = TestBed.createComponent(UserTableActionsComponent);
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+  });
+
+  it("should create", () => {
+    expect(component).toBeTruthy();
+  });
+
+  it("anyEditableResolver returns true if editableResolvers is non-empty", () => {
+    resolverService.editableResolvers.set(["resolver1"]);
+    expect(component.anyEditableResolver()).toBe(true);
+  });
+
+  it("anyEditableResolver returns false if editableResolvers is empty", () => {
+    resolverService.editableResolvers.set([]);
+    expect(component.anyEditableResolver()).toBe(false);
+  });
+
+  it("navigateToCreateUser navigates to user new page", () => {
+    userService.selectedUserRealm.set("testRealm");
+    component.navigateToCreateUser();
+    expect(router.navigateByUrl).toHaveBeenCalledWith(ROUTE_PATHS.USERS_NEW);
+  });
+
+  describe("the offer to create a user", () => {
+    const createUserButton = (): HTMLElement | undefined =>
+      Array.from(fixture.nativeElement.querySelectorAll("button") as NodeListOf<HTMLElement>).find((button) =>
+        button.textContent?.includes("Create User")
+      );
+
+    beforeEach(() => {
+      authService.authData.set({ ...MockAuthService.MOCK_AUTH_DATA, rights: ["adduser"] });
+      resolverService.editableResolvers.set(["resolver1"]);
+    });
+
+    it("stands beside the realm selector where the actions carry the table", () => {
+      fixture.detectChanges();
+      expect(createUserButton()).toBeDefined();
+    });
+
+    it("is left out where the actions stand in for the table", () => {
+      fixture.componentRef.setInput("showCreateUser", false);
+      fixture.detectChanges();
+
+      expect(createUserButton()).toBeUndefined();
+      // The realm selector is the reason the panel projects the actions at all, so it has to stay.
+      expect(fixture.nativeElement.textContent).toContain("Select Realm");
+    });
+  });
+});

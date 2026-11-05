@@ -1,22 +1,26 @@
-# -*- coding: utf-8 -*-
+from email import message_from_string
+
 from privacyidea.lib.resolver import save_resolver
-from privacyidea.lib.realm import set_realm
-from .base import MyApiTestCase
-from privacyidea.lib.policy import SCOPE, ACTION, set_policy
+from privacyidea.lib.realm import set_realm, set_default_realm
+from .base import MyApiTestCase, PristineSqliteFixtures
+from privacyidea.lib.policy import SCOPE, PolicyClass, delete_policy, set_policy
+from privacyidea.lib.policies.actions import PolicyAction
 from privacyidea.lib.resolvers.SQLIdResolver import IdResolver as SQLResolver
-import json
 from privacyidea.lib.smtpserver import add_smtpserver
 from . import smtpmock
 from privacyidea.lib.config import set_privacyidea_config
 from privacyidea.lib.passwordreset import create_recoverycode
 from privacyidea.lib.user import User
-from privacyidea.lib.error import ERROR
+from privacyidea.lib.error import Error
+from unittest import mock
+from privacyidea.api import register
 
 
-class RegisterTestCase(MyApiTestCase):
+class RegisterTestCase(PristineSqliteFixtures, MyApiTestCase):
     """
     test the api.register and api.recover endpoints
     """
+    pristine_fixtures = ["tests/testdata/testuser.sqlite"]
     parameters = {'Driver': 'sqlite',
                   'Server': '/tests/testdata/',
                   'Database': "testuser.sqlite",
@@ -34,6 +38,18 @@ class RegisterTestCase(MyApiTestCase):
     }
 
     usernames = ["corneliusReg", "corneliusRegFail"]
+
+    def _resend_and_check_unspecific_error(self, status_code: int):
+        set_policy(name="hide_specific_error_message", scope=SCOPE.REGISTER,
+                   action=f"{PolicyAction.HIDE_SPECIFIC_ERROR_MESSAGE}=true")
+        try:
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, status_code, res)
+            data = res.json
+            self.assertEqual(data["result"]["error"]["code"], Error.REGISTRATION)
+            self.assertEqual(data["result"]["error"]["message"], "Failed registering new user")
+        finally:
+            delete_policy("hide_specific_error_message")
 
     def test_00_delete_users(self):
         # If the test failed and some users are still in the database (from
@@ -54,14 +70,13 @@ class RegisterTestCase(MyApiTestCase):
         r = save_resolver(param)
         self. assertTrue(r > 0)
 
-        added, failed = set_realm("register", resolvers=["register"])
+        added, failed = set_realm("register", resolvers=[{'name': "register"}])
         self.assertTrue(len(added) > 0, added)
         self.assertEqual(len(failed), 0, failed)
 
         # create policy
         r = set_policy(name="pol2", scope=SCOPE.REGISTER,
-                       action="{0!s}={1!s}, {2!s}={3!s}".format(ACTION.REALM, "register",
-                                                ACTION.RESOLVER, "register"))
+                       action=f"{PolicyAction.REALM}=register, {PolicyAction.RESOLVER}=register")
 
         # Try to register, but missing parameter
         with self.app.test_request_context('/register',
@@ -69,7 +84,10 @@ class RegisterTestCase(MyApiTestCase):
                                            data={"username": "cornelius",
                                                  "surname": "Kölbel"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 400, res)
+            self.assertEqual(res.status_code, 400, res)
+            self.assertEqual(res.json["result"]["error"]["code"], 905, res.json)
+            self.assertEqual(res.json["result"]["error"]["message"],
+                             "ERR905: Missing parameter: givenname", res.json)
 
         # Register fails, missing SMTP config
         with self.app.test_request_context('/register',
@@ -81,16 +99,16 @@ class RegisterTestCase(MyApiTestCase):
                                                  "email":
                                                      "cornelius@privacyidea.org"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 400, res)
+            self.assertEqual(res.status_code, 400, res)
             data = res.json
-            self.assertEqual(data.get("result").get("error").get("code"), ERROR.REGISTRATION)
+            self.assertEqual(data.get("result").get("error").get("code"), Error.REGISTRATION)
             self.assertEqual(data.get("result").get("error").get("message"),
-                         u'ERR402: No SMTP server configuration specified!')
+                         'ERR402: No SMTP server configuration specified!')
 
         # Set SMTP config and policy
         add_smtpserver("myserver", "1.2.3.4", sender="pi@localhost")
         set_policy("pol3", scope=SCOPE.REGISTER,
-                   action="{0!s}=myserver".format(ACTION.EMAILCONFIG))
+                   action=f"{PolicyAction.EMAILCONFIG!s}=myserver")
         with self.app.test_request_context('/register',
                                            method='POST',
                                            data={"username": "corneliusReg",
@@ -100,7 +118,9 @@ class RegisterTestCase(MyApiTestCase):
                                                  "email":
                                                      "cornelius@privacyidea.org"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(res.status_code, 200, res)
+            self.assertTrue(res.json["result"]["value"], res.json)
+            # TODO: Check if the registration email was send through the logs
 
         # Registering the user a second time will fail
         with self.app.test_request_context('/register',
@@ -112,20 +132,87 @@ class RegisterTestCase(MyApiTestCase):
                                                  "email":
                                                      "cornelius@privacyidea.org"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 400, res)
+            self.assertEqual(res.status_code, 400, res)
+            self.assertEqual(res.json["result"]["error"]["code"], 402, res.json)
+            self.assertEqual(res.json["result"]["error"]["message"],
+                             "ERR402: The username is already registered!", res.json)
+
+            self._resend_and_check_unspecific_error(400)
 
         # get the register status
         with self.app.test_request_context('/register',
                                            method='GET'):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(res.status_code, 200, res)
             data = res.json
             self.assertEqual(data.get("result").get("value"), True)
+
+    @smtpmock.activate
+    def test_01b_register_falls_back_to_default_realm(self):
+        # Without a SCOPE.REGISTER realm policy, the user must be created in
+        # the configured default realm.
+        smtpmock.setdata(response={"another@privacyidea.org": (200, "OK")})
+        # Drop the realm part of pol2; keep the resolver mapping.
+        set_policy(name="pol2", scope=SCOPE.REGISTER,
+                   action=f"{PolicyAction.RESOLVER}=register")
+        set_default_realm("register")
+        try:
+            with self.app.test_request_context('/register',
+                                               method='POST',
+                                               data={"username": "corneliusRegDefault",
+                                                     "surname": "Kölbel",
+                                                     "givenname": "Cornelius",
+                                                     "password": "cammerah",
+                                                     "email": "another@privacyidea.org"}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(res.status_code, 200, res.data)
+                self.assertTrue(res.json["result"]["value"], res.json)
+        finally:
+            # Restore the realm policy used by the remaining tests.
+            set_policy(name="pol2", scope=SCOPE.REGISTER,
+                       action=f"{PolicyAction.REALM}=register, {PolicyAction.RESOLVER}=register")
+            # Clean up the user we just created so test_99 stays idempotent.
+            y = SQLResolver()
+            y.loadConfig(self.parameters)
+            uid = y.getUserId("corneliusRegDefault")
+            if uid:
+                y.delete_user(uid)
 
     @smtpmock.activate
     def test_02_reset_password(self):
         smtpmock.setdata(response={"cornelius@privacyidea.org": (200, "OK")})
         set_privacyidea_config("recovery.identifier", "myserver")
+        # With a trusted PI_BASE_URL configured, recovery works and the link
+        # host is taken from the configuration, never from the inbound request
+        # host (which is "localhost" here)
+        self.app.config["PI_BASE_URL"] = "https://pi.example.com"
+        try:
+            with self.app.test_request_context('/recover',
+                                               method='POST',
+                                               data={"user": "corneliusReg",
+                                                     "realm": "register",
+                                                     "email":
+                                                         "cornelius@privacyidea.org"}):
+                res = self.app.full_dispatch_request()
+                self.assertTrue(res.status_code == 200, res.data)
+                data = res.json
+                self.assertEqual(data.get("result").get("value"), True)
+                # The emailed link host is the configured PI_BASE_URL, not the
+                # request host (which is "localhost" here).
+                body = message_from_string(
+                    smtpmock.get_sent_message()).get_payload(decode=True).decode("utf-8")
+                self.assertIn("https://pi.example.com/#!/reset/corneliusReg@register/", body)
+                self.assertNotIn("localhost", body)
+        finally:
+            self.app.config.pop("PI_BASE_URL", None)
+
+    @smtpmock.activate
+    def test_02b_recover_requires_base_url(self):
+        # Without a configured PI_BASE_URL, the recovery link would be built
+        # from the untrusted HTTP Host header, so the endpoint must refuse
+        smtpmock.setdata(response={"cornelius@privacyidea.org": (200, "OK")})
+        set_privacyidea_config("recovery.identifier", "myserver")
+        self.app.config.pop("PI_BASE_URL", None)
         with self.app.test_request_context('/recover',
                                            method='POST',
                                            data={"user": "corneliusReg",
@@ -133,9 +220,8 @@ class RegisterTestCase(MyApiTestCase):
                                                  "email":
                                                      "cornelius@privacyidea.org"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res.data)
-            data = res.json
-            self.assertEqual(data.get("result").get("value"), True)
+            self.assertEqual(res.status_code, 400, res.data)
+            self.assertFalse(res.json.get("result").get("status"))
 
     @smtpmock.activate
     def test_03_set_new_password(self):
@@ -170,8 +256,40 @@ class RegisterTestCase(MyApiTestCase):
             data = res.json
             self.assertEqual(data.get("result").get("value"), False)
 
+        # The failed reset attempt is recorded in the audit log.
+        audit_entry = self.find_most_recent_audit_entry(action='POST /recover/reset')
+        self.assertEqual(0, audit_entry['success'], audit_entry)
+
         # test the new password
 
+
+    def test_04_deprecation_is_logged_only_where_the_feature_is_configured(self):
+        # The log line is evidence that an installation relies on self-registration, so it is
+        # written where the feature is configured and not where the endpoint is merely probed.
+        def deprecation_warnings(method):
+            register._deprecation_warned.clear()
+            with mock.patch("privacyidea.api.register.log") as mock_log:
+                with self.app.test_request_context('/register', method=method):
+                    self.app.full_dispatch_request()
+                # Called twice, to pin that the line is written once per process
+                with self.app.test_request_context('/register', method=method):
+                    self.app.full_dispatch_request()
+            return [call[0][0] for call in mock_log.warning.call_args_list
+                    if "deprecated" in call[0][0]]
+
+        # Configured, as the preceding tests left it: the status endpoint answers True and
+        # leaves the line once, however often it is called.
+        warnings = deprecation_warnings('GET')
+        self.assertEqual(1, len(warnings), warnings)
+        self.assertIn("GET /register", warnings[0])
+
+        # Not configured: the endpoint is merely being probed, which says nothing about whether
+        # this installation uses self-registration, so it must leave no trace.
+        register_policies = [policy["name"] for policy
+                             in PolicyClass().list_policies(scope=SCOPE.REGISTER)]
+        for name in register_policies:
+            delete_policy(name)
+        self.assertEqual([], deprecation_warnings('GET'))
 
     def test_99_delete_users(self):
         self.test_00_delete_users()

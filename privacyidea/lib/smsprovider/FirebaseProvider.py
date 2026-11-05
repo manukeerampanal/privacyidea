@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #    2019-02-12 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #
 #
@@ -23,15 +21,20 @@ Firebase Cloud Messaging Service.
 This provider is used for the push token and can be used for SMS tokens.
 """
 
-from privacyidea.lib.smsprovider.SMSProvider import (ISMSProvider)
+import json
+import logging
+import time
+from json import JSONDecodeError
+
+from google.auth.transport import requests
+from google.auth.transport.requests import AuthorizedSession
+from google.oauth2 import service_account
+from requests import Session
+
+from privacyidea.lib import _
 from privacyidea.lib.error import ConfigAdminError
 from privacyidea.lib.framework import get_app_local_store
-from privacyidea.lib import _
-import logging
-from google.oauth2 import service_account
-from google.auth.transport.requests import AuthorizedSession
-import json
-import time
+from privacyidea.lib.smsprovider.SMSProvider import ALLOW_PUSH, ISMSProvider
 
 FIREBASE_URL_SEND = 'https://fcm.googleapis.com/v1/projects/{0!s}/messages:send'
 SCOPES = ['https://www.googleapis.com/auth/cloud-platform',
@@ -67,19 +70,19 @@ def get_firebase_access_token(config_file_name):
         credentials = service_account.Credentials.from_service_account_file(config_file_name,
                                                                             scopes=SCOPES)
 
-        log.debug("Fetching a new access_token for {!r} from firebase...".format(config_file_name))
+        log.debug(f"Fetching a new access_token for {config_file_name!r} from firebase...")
         # We do not use a lock here: The worst that could happen is that two threads
         # fetch new auth tokens concurrently. In this case, one of them wins and
         # is written to the dictionary.
         app_store[fbt][config_file_name] = credentials
         readable_time = credentials.expiry.isoformat() if credentials.expiry else 'Never'
-        log.debug(u"Setting the expiration for {!r} of the new access_token "
-                  u"to {!s}.".format(config_file_name, readable_time))
+        log.debug(f"Setting the expiration for {config_file_name!r} of the new access_token "
+                  f"to {readable_time!s}.")
 
     return app_store[fbt][config_file_name]
 
 
-class FIREBASE_CONFIG:
+class FirebaseConfig:
     REGISTRATION_URL = "registration URL"
     TTL = "time to live"
     JSON_CONFIG = "JSON config file"
@@ -87,6 +90,9 @@ class FIREBASE_CONFIG:
 
 
 class FirebaseProvider(ISMSProvider):
+
+    supports_push_messages = True
+    push_messages_enabled_by_default = True
 
     def __init__(self, db_smsprovider_object=None, smsgateway=None):
         ISMSProvider.__init__(self, db_smsprovider_object, smsgateway)
@@ -105,84 +111,94 @@ class FirebaseProvider(ISMSProvider):
         :return: bool
         """
         res = False
-
-        credentials = get_firebase_access_token(self.smsgateway.option_dict.get(
-            FIREBASE_CONFIG.JSON_CONFIG))
-
-        authed_session = AuthorizedSession(credentials)
-
-        headers = {
-            'Content-Type': 'application/json; UTF-8',
-        }
-        fcm_message = {
-            "message": {
-                        "data": data,
-                        "token": firebase_token,
-                        "notification": {
-                            "title": data.get("title"),
-                            "body": data.get("question")
-                        },
-                        "android": {
-                                    "priority": "HIGH",
-                                    "ttl": "120s",
-                                    "fcm_options": {"analytics_label": "AndroidPushToken"}
-                                   },
-                        "apns": {
-                                 "headers": {
-                                             "apns-priority": "10",
-                                             "apns-push-type": "alert",
-                                             "apns-collapse-id": "privacyidea.pushtoken",
-                                             "apns-expiration": str(int(time.time()) + 120)
-                                            },
-                                 "payload": {
-                                             "aps": {
-                                                     "alert": {
-                                                               "title": data.get("title"),
-                                                               "body": data.get("question"),
-                                                              },
-                                                     "sound": "default",
-                                                     "category": "PUSH_AUTHENTICATION"
-                                                    },
-                                            },
-                                 "fcm_options": {"analytics_label": "iOSPushToken"}
-                                }
-                       }
-            }
+        credentials = get_firebase_access_token(self.smsgateway.option_dict.get(FirebaseConfig.JSON_CONFIG))
 
         proxies = {}
-        if self.smsgateway.option_dict.get(FIREBASE_CONFIG.HTTPS_PROXY):
-            proxies["https"] = self.smsgateway.option_dict.get(FIREBASE_CONFIG.HTTPS_PROXY)
-        a = self.smsgateway.option_dict.get(FIREBASE_CONFIG.JSON_CONFIG)
-        with open(a) as f:
-            server_config = json.load(f)
-        url = FIREBASE_URL_SEND.format(server_config["project_id"])
-        resp = authed_session.post(url, data=json.dumps(fcm_message), headers=headers, proxies=proxies)
+        auth_request = None
+        if self.smsgateway.option_dict.get(FirebaseConfig.HTTPS_PROXY):
+            proxies["https"] = self.smsgateway.option_dict.get(FirebaseConfig.HTTPS_PROXY)
+            session = Session()
+            session.proxies.update(proxies)
+            auth_request = requests.Request(session=session)
 
-        if resp.status_code == 200:
+        authed_session = AuthorizedSession(credentials, auth_request=auth_request)
+
+        headers = {'Content-Type': 'application/json; UTF-8'}
+        fcm_message = {
+            "message": {
+                "data": data,
+                "token": firebase_token,
+                "notification": {
+                    "title": data.get("title"),
+                    "body": data.get("question")
+                },
+                "android": {
+                    "priority": "HIGH",
+                    "ttl": "120s",
+                    "fcm_options": {"analytics_label": "AndroidPushToken"}
+                },
+                "apns": {
+                    "headers": {
+                        "apns-priority": "10",
+                        "apns-push-type": "alert",
+                        "apns-collapse-id": "privacyidea.pushtoken",
+                        "apns-expiration": str(int(time.time()) + 120)
+                    },
+                    "payload": {
+                        "aps": {
+                            "alert": {
+                                "title": data.get("title"),
+                                "body": data.get("question"),
+                            },
+                            "sound": "default",
+                            "category": "PUSH_AUTHENTICATION"
+                        },
+                    },
+                    "fcm_options": {"analytics_label": "iOSPushToken"}
+                }
+            }
+        }
+
+        file_path = self.smsgateway.option_dict.get(FirebaseConfig.JSON_CONFIG)
+        with open(file_path) as config_file:
+            server_config = json.load(config_file)
+        url = FIREBASE_URL_SEND.format(server_config["project_id"])
+        response = authed_session.post(url, data=json.dumps(fcm_message),
+                                       headers=headers, proxies=proxies)
+
+        if response.status_code == 200:
             log.debug("Message sent successfully to Firebase service.")
             res = True
         else:
-            log.warning(u"Failed to send message to firebase service: {0!s}".format(resp.text))
+            log.warning(f"Failed to send message to firebase service: {response.text}")
 
         return res
 
     def check_configuration(self):
         """
         This method checks the sanity of the configuration of this provider.
-        If there is a configuration error, than an exception is raised.
+        If there is a configuration error, an exception is raised.
         :return:
         """
-        json_file = self.smsgateway.option_dict.get(FIREBASE_CONFIG.JSON_CONFIG)
+        file_path = self.smsgateway.option_dict.get(FirebaseConfig.JSON_CONFIG)
+        if not file_path:
+            raise ConfigAdminError(description="No JSON config file provided.")
         server_config = None
-        with open(json_file) as f:
-            server_config = json.load(f)
+        try:
+            with open(file_path) as config_file:
+                server_config = json.load(config_file)
+        except FileNotFoundError as error:
+            log.error("The JSON config file could not be found: %s", error)
+            raise ConfigAdminError(description="The JSON config file could not be found.") from error
+        except JSONDecodeError as error:
+            log.error("The config file has an invalid JSON format: %s", error)
+            raise ConfigAdminError(description="The config file has an invalid JSON format.") from error
         if server_config:
             if server_config.get("type") != "service_account":
                 raise ConfigAdminError(description="The JSON file is not a valid firebase credentials file.")
 
         else:
             raise ConfigAdminError(description="Please check your configuration. Can not load JSON file.")
-
 
     @classmethod
     def parameters(cls):
@@ -193,18 +209,20 @@ class FirebaseProvider(ISMSProvider):
 
         :return: dict
         """
-        params = {"options_allowed": False,
-                  "headers_allowed": False,
-                  "parameters": {
-                      FIREBASE_CONFIG.JSON_CONFIG: {
-                          "required": True,
-                          "description": _("The filename of the JSON config file, that allows privacyIDEA to talk"
-                                           " to the Firebase REST API.")
-                      },
-                      FIREBASE_CONFIG.HTTPS_PROXY: {
-                          "required": False,
-                          "description": _("Proxy setting for HTTPS connections to googleapis.com.")
-                      }
-                  }
-                  }
+        params = {
+            "options_allowed": False,
+            "headers_allowed": False,
+            "parameters": {
+                FirebaseConfig.JSON_CONFIG: {
+                    "required": True,
+                    "description": _("The filename of the JSON config file, that allows privacyIDEA to talk"
+                                     " to the Firebase REST API.")
+                },
+                FirebaseConfig.HTTPS_PROXY: {
+                    "required": False,
+                    "description": _("Proxy setting for HTTPS connections to googleapis.com.")
+                },
+                ALLOW_PUSH: cls.allow_push_parameter()
+            }
+        }
         return params

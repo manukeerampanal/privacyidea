@@ -1,0 +1,20 @@
+@use "styles";
+
+.conditions-grid {
+  display: flex;
+  flex-direction: column;
+  gap: calc(16px / 4 * 3);
+  min-width: 350px;
+}
+
+// One card per condition kind, on the page container.
+.conditions-container {
+  @include styles.card-recessed(3);
+  padding: 8px 12px;
+
+  .conditions-title {
+    font-size: 1.2em;
+    font-weight: 500;
+    margin: 0 0 8px;
+  }
+}

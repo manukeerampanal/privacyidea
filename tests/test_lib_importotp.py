@@ -1,9 +1,11 @@
-# coding: utf-8
 """
 This test file tests the lib.importotp
 
 """
-import pytest
+# The token export fixtures below are line-oriented data that cannot be wrapped.
+# ruff: noqa: E501
+import gnupg
+import unittest
 
 from .base import MyTestCase
 from privacyidea.lib.importotp import (parseOATHcsv, parseYubicoCSV,
@@ -14,6 +16,12 @@ from privacyidea.lib.token import remove_token
 from privacyidea.lib.token import init_token
 from privacyidea.lib.importotp import export_pskc
 from privacyidea.lib.utils import hexlify_and_unicode
+
+try:
+    _g = gnupg.GPG()
+    gpg_available = True
+except OSError as _e:
+    gpg_available = False
 
 XML_PSKC_PASSWORD_PREFIX = """<?xml version="1.0" encoding="UTF-8"?>
   <KeyContainer
@@ -704,7 +712,7 @@ class ImportOTPTestCase(MyTestCase):
     def test_06_export_pskc(self):
         # create three tokens
         t1 = init_token({"serial": "t1", "type": "hotp", "otpkey": "123456",
-                         "description": u"söme ünicøde"})
+                         "description": "söme ünicøde"})
         t2 = init_token({"serial": "t2", "type": "totp", "otpkey": "123456",
                          "description": "something <with> xml!"})
         t3 = init_token({"serial": "t3", "type": "spass", "otpkey": "123456"})
@@ -716,7 +724,7 @@ class ImportOTPTestCase(MyTestCase):
         # Only 3 tokens exported, the spass token does not get exported!
         self.assertEqual(token_num, 3)
         self.assertEqual(len(psk), 32)
-        export = "{0!s}".format(soup)
+        export = f"{soup!s}"
         # remote the tokens
         remove_token("t1")
         remove_token("t2")
@@ -733,11 +741,12 @@ class ImportOTPTestCase(MyTestCase):
         self.assertEqual(tokens.get("t2").get("timeStep"), "30")
         self.assertEqual(tokens.get("t2").get("description"), "something <with> xml!")
         # password token
-        self.assertEqual(tokens.get("t4").get("otpkey"), u"lässig")
+        self.assertEqual(tokens.get("t4").get("otpkey"), "lässig")
 
 
 class GPGTestCase(MyTestCase):
 
+    @unittest.skipIf(not gpg_available, "'gpg' binary not available")
     def test_00_gpg_decrypt(self):
         GPG = GPGImport({"PI_GNUPG_HOME": "tests/testdata/gpg"})
         pubkeys = GPG.get_publickeys()

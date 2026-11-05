@@ -1,0 +1,707 @@
+# (c) NetKnights GmbH 2024,  https://netknights.it
+#
+# This code is free software; you can redistribute it and/or
+# modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+# as published by the Free Software Foundation; either
+# version 3 of the License, or any later version.
+#
+# This code is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+#
+# You should have received a copy of the GNU Affero General Public
+# License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# SPDX-FileCopyrightText: 2024 Nils Behlen <nils.behlen@netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+import json
+import logging
+import re
+
+import cryptography.x509
+from cryptography.hazmat._oid import NameOID
+from cryptography.hazmat.primitives import serialization
+from cryptography.x509 import Certificate, NameAttribute
+from flask_babel import lazy_gettext
+from webauthn import (generate_registration_options,
+                      options_to_json, verify_registration_response, verify_authentication_response)
+from webauthn.authentication.verify_authentication_response import VerifiedAuthentication
+from webauthn.helpers import bytes_to_base64url, base64url_to_bytes, parse_attestation_object
+from webauthn.helpers.cose import COSEAlgorithmIdentifier
+from webauthn.helpers.exceptions import InvalidRegistrationResponse, InvalidAuthenticationResponse, InvalidJSONStructure
+from webauthn.helpers.structs import (AttestationConveyancePreference, AuthenticatorSelectionCriteria,
+                                      ResidentKeyRequirement,
+                                      PublicKeyCredentialDescriptor, UserVerificationRequirement, AttestationObject,
+                                      PublicKeyCredentialCreationOptions)
+from webauthn.registration.verify_registration_response import VerifiedRegistration
+
+from privacyidea.lib import _, fido2
+from privacyidea.lib.challenge import get_challenges
+from privacyidea.lib.config import get_from_config
+from privacyidea.lib.decorators import check_token_locked
+from privacyidea.lib.error import EnrollmentError, ParameterError, Error, PolicyError
+from privacyidea.lib.fido2.config import FIDO2ConfigOptions
+from privacyidea.lib.fido2.policy_action import FIDO2PolicyAction, PasskeyAction
+from privacyidea.lib.fido2.token_info import FIDO2TokenInfo
+from privacyidea.lib.fido2.util import (hash_credential_id, save_credential_id_hash,
+                                        credential_id_is_registered_to_other_token)
+from privacyidea.lib.log import log_with
+from privacyidea.lib.params import get_optional, get_required, get_required_one_of, get_optional_one_of
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.policy import SCOPE
+from privacyidea.lib.token import create_challenge
+from privacyidea.lib.tokenclass import TokenClass, ClientMode, AuthenticationMode
+from privacyidea.lib.tokenrolloutstate import RolloutState
+
+log = logging.getLogger(__name__)
+
+# Default template for the passkey user label. The tags are resolved during enrollment, {user} evaluates to
+# the login name, so the default keeps the previous behaviour (the login name). The resolved value is used as
+# the WebAuthn user.name, which is what the authenticator shows in the credential selection during login, and
+# is mirrored into user.displayName.
+DEFAULT_USER_LABEL = "{user}"
+
+# The WebAuthn user.name and user.displayName are free-form strings, but authenticators MAY truncate them to
+# 64 bytes (WebAuthn §5.4.3 / CTAP2). We truncate here so the value that is stored and displayed is deterministic.
+USER_LABEL_MAX_BYTES = 64
+
+# A user label tag has the form {tagname}, where tagname consists of word characters.
+USER_LABEL_TAG_PATTERN = re.compile(r"\{(\w+)\}")
+
+
+class PasskeyTokenClass(TokenClass):
+    """
+    Implements a token class for passkeys (fido2). This is very similar to the webauthn token class, but uses a lib
+    for registration and authentication. It is less configurable, always requires resident key and uses excluded
+    credentials by default.
+    It shares the following policy configuration with the webauthn token class:
+
+    - RP_ID
+    - RP_NAME
+    - USER_VERIFICATION_REQUIREMENT (default: PREFERRED)
+    - PUBLIC_KEY_CREDENTIAL_ALGORITHMS (default: ECDSA_SHA_256, RSASSA_PKCS1_v1_5_SHA_256)
+    """
+    mode = [AuthenticationMode.CHALLENGE]
+    client_mode = ClientMode.WEBAUTHN
+
+    owned_tokeninfo_keys = frozenset({FIDO2TokenInfo.AAGUID, FIDO2TokenInfo.ATTESTATION_CERTIFICATE,
+                                      FIDO2TokenInfo.BACKED_UP, FIDO2TokenInfo.CREDENTIAL_ID_HASH,
+                                      FIDO2TokenInfo.DEVICE_TYPE, FIDO2TokenInfo.PUBLIC_KEY,
+                                      FIDO2TokenInfo.RELYING_PARTY_ID, FIDO2TokenInfo.RELYING_PARTY_NAME,
+                                      FIDO2TokenInfo.SIGN_COUNT, FIDO2TokenInfo.USER_ID})
+    # A passkey is one of the token types the offline machine application supports. It can be offline on
+    # several machines, so the token that authorizes a refill is stored per machine name. Removing one only
+    # revokes the refill for that machine, so an administrator may do it.
+    owned_tokeninfo_prefixes = frozenset({"refilltoken_"})
+    deletable_tokeninfo_prefixes = frozenset({"refilltoken_"})
+
+    def __init__(self, db_token):
+        super().__init__(db_token)
+        self.set_type(self.get_class_type())
+
+    @staticmethod
+    def get_class_type():
+        return "passkey"
+
+    @staticmethod
+    def get_class_prefix():
+        return "PIPK"
+
+    @staticmethod
+    @log_with(log)
+    def get_class_info(key=None, ret='all'):
+        """
+        Returns a dict with information about the passkey token class and related policy options.
+        The parameter ret can be used to specify the "section" of the information that should be returned.
+        """
+        res = {
+            "type": "passkey",
+            "title": "Passkey",
+            "description": _("Passkey: A secret stored on a device, unlocked with biometrics."),
+            "init": {},
+            'config': {},
+            'user': ['enroll'],
+            'ui_enroll': ["admin", "user"],
+            'policy': {
+                SCOPE.AUTH: {
+                    PolicyAction.CHALLENGETEXT: {
+                        'type': 'str',
+                        'desc': _("Alternative challenge message to use when authenticating with a passkey."
+                                  "You can also use tags for replacement, "
+                                  "check the documentation for more details.")
+                    },
+                    PasskeyAction.EnableTriggerByPIN: {
+                        'type': 'bool',
+                        'desc': _("When enabled, passkey token can be triggered with the PIN or via the "
+                                  "/validate/triggerchallenge endpoint. For privacyIDEA plugins, "
+                                  "this is not recommended. It is advised to use a condition, for example on a "
+                                  "user-agent, with this policy."),
+                    },
+                    PasskeyAction.AllowedAuthenticatorDeviceTypes: {
+                        'type': 'str',
+                        'desc': _("Only allow authentication with passkeys reporting a specific device type, given "
+                                  "as a space-separated list of 'single_device' and/or 'multi_device'. A "
+                                  "single_device credential is not backed up (typically a hardware security key or "
+                                  "a non-syncing platform authenticator), a multi_device credential is backed up "
+                                  "and can be used on several devices (a synced/cloud passkey). This is checked on "
+                                  "every authentication, so it also applies to passkeys enrolled before the policy "
+                                  "was set. The device type is reported by the authenticator and not verified by an "
+                                  "attestation, so this does not keep out an authenticator that reports a wrong "
+                                  "device type. By default both types are accepted."),
+                    },
+                    PasskeyAction.EnforceUserHandle: {
+                        'type': 'bool',
+                        'desc': _("Require that the userHandle returned by the authenticator matches the FIDO2 "
+                                  "user ID that was recorded for the user when the passkey was enrolled. By "
+                                  "default, privacyIDEA identifies the user solely via the credential ID and its "
+                                  "assignment to a user in privacyIDEA, so a passkey that is unassigned and then "
+                                  "assigned to a different user will authenticate as that different user. "
+                                  "Enabling this detects such a reassignment for regular clients, at the cost of "
+                                  "the authentication failing for any passkey that was enrolled before this "
+                                  "attribute was recorded. Note that, unlike the device type, the userHandle is "
+                                  "not covered by the WebAuthn assertion signature: it is a safeguard against an "
+                                  "unintended reassignment, not a defense against a client that deliberately "
+                                  "sends a forged value."),
+                    }
+                },
+                SCOPE.ENROLL: {
+                    PasskeyAction.AttestationConveyancePreference: {
+                        'type': 'str',
+                        'desc': _("Request attestation from the authenticator during the registration. The attestation "
+                                  "certificate will be saved in the token info. The default value is 'none'."),
+                        'value': [v for v in AttestationConveyancePreference],
+                        'group': 'WebAuthn'
+                    },
+                    PasskeyAction.UserLabel: {
+                        'type': 'str',
+                        'desc': _("The name of the passkey that the authenticator shows in the credential selection "
+                                  "during login (and during registration). Use this to tell passkeys apart, e.g. when "
+                                  "the same login name exists in several realms. You can use the tags {user} (login "
+                                  "name), {realm}, {resolver} and {serial}, as well as any attribute the user's "
+                                  "resolver provides (e.g. {givenname}, {surname}, {email}), for replacement, e.g. "
+                                  "'{user}@{realm}'. The resolved value is also used as the display name. Unknown tags "
+                                  "resolve to an empty string and the result is limited to 64 bytes. If the value is "
+                                  "empty or the policy is not set, the login name of the user is used."),
+                        'group': 'WebAuthn'
+                    },
+                    PasskeyAction.AllowedAuthenticatorDeviceTypes: {
+                        'type': 'str',
+                        'desc': _("Restrict passkey enrollment to authenticators reporting a specific device type, "
+                                  "given as a space-separated list of 'single_device' and/or 'multi_device'. A "
+                                  "single_device credential is not backed up (typically a hardware security key or "
+                                  "a non-syncing platform authenticator), a multi_device credential is backed up "
+                                  "and can be used on several devices (a synced/cloud passkey). The device type is "
+                                  "reported by the authenticator and cannot be requested up front, so enrollment is "
+                                  "rejected afterwards if it does not match. It is not verified by an attestation, "
+                                  "so this does not keep out an authenticator that reports a wrong device type. By "
+                                  "default both types are accepted."),
+                        'group': 'WebAuthn'
+                    }
+                }
+            }
+        }
+        return res.get(key, {}) if key else res
+
+    @log_with(log)
+    def get_init_detail(self, params=None, user=None):
+        """
+        First step of enrollment: Returns the registration data for the passkey token.
+        Also creates a challenge in the database which has to be verified in the second step.
+        The following parameters are required in params:
+        - "webauthn_relying_party_id" (FIDO2PolicyAction.RELYING_PARTY_ID)
+        - "webauthn_relying_party_name" (FIDO2PolicyAction.RELYING_PARTY_NAME)
+
+        The following parameters are optional in params to customize the registration:
+        - "registered_credential_ids": A list of credential IDs that are already registered with the user.
+        - FIDO2PolicyAction.PUBLIC_KEY_CREDENTIAL_ALGORITHMS (default: ECDSA_SHA_256, RSASSA_PKCS1_v1_5_SHA_256)
+        - FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT (default: PREFERRED)
+        - PasskeyAction.AttestationConveyancePreference (default: NONE)
+        """
+        if self.token.rollout_state == RolloutState.CLIENTWAIT:
+            token_user = self.user or user
+            if not token_user:
+                raise ParameterError("User must be provided for passkey enrollment!",
+                                     id=Error.PARAMETER_USER_MISSING)
+
+            rp_id = get_required(params, FIDO2PolicyAction.RELYING_PARTY_ID)
+            rp_name = get_required(params, FIDO2PolicyAction.RELYING_PARTY_NAME)
+
+            response_detail: dict = TokenClass.get_init_detail(self, params, token_user)
+            response_detail['rollout_state'] = self.token.rollout_state
+            nonce_base64 = fido2.challenge.get_fido2_nonce()
+            challenge_validity: int = int(get_from_config(FIDO2ConfigOptions.CHALLENGE_VALIDITY_TIME,
+                                                          get_from_config('DefaultChallengeValidityTime', 120)))
+            challenge = create_challenge(self.token.serial,
+                                         transaction_id=None,
+                                         challenge=nonce_base64,
+                                         session="",
+                                         validitytime=challenge_validity)
+
+            # User ID
+            internal_attrs = token_user.internal_attributes
+            fido2_user_id = base64url_to_bytes(
+                internal_attrs[FIDO2TokenInfo.USER_ID]) if FIDO2TokenInfo.USER_ID in internal_attrs else None
+
+            # Excluded Credentials
+            reg_ids = get_optional(params, "registered_credential_ids") or []
+            registered_credential_ids: list[bytes] = [base64url_to_bytes(cred_id) for cred_id in reg_ids]
+            excluded_credentials: list[PublicKeyCredentialDescriptor] = ([PublicKeyCredentialDescriptor(id=cred)
+                                                                          for cred in registered_credential_ids])
+
+            # Key Algorithms
+            pub_key_algorithms = get_optional(params, FIDO2PolicyAction.PUBLIC_KEY_CREDENTIAL_ALGORITHMS,
+                                              default=[COSEAlgorithmIdentifier.ECDSA_SHA_256,
+                                                       COSEAlgorithmIdentifier.RSASSA_PKCS1_v1_5_SHA_256])
+
+            # User Verification
+            user_verification: UserVerificationRequirement = UserVerificationRequirement.PREFERRED
+            if FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT in params:
+                user_verification = UserVerificationRequirement(params[FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT])
+
+            # Attestation (None is recommended for passkeys)
+            attestation: AttestationConveyancePreference = AttestationConveyancePreference.NONE
+            if PasskeyAction.AttestationConveyancePreference in params:
+                attestation = AttestationConveyancePreference(params[PasskeyAction.AttestationConveyancePreference])
+
+            # User label (configurable via policy, supports tags for replacement). This is the name the
+            # authenticator shows in the credential selection during login. The same value is used as the
+            # display name for authenticator/passkey managers that show it.
+            user_label_template = get_optional(params, PasskeyAction.UserLabel, default=DEFAULT_USER_LABEL)
+            user_label = self._resolve_user_label_tags(user_label_template, token_user)
+
+            registration_options: PublicKeyCredentialCreationOptions = generate_registration_options(
+                rp_id=rp_id,
+                rp_name=rp_name,
+                user_name=user_label,
+                user_display_name=user_label,
+                user_id=fido2_user_id,
+                attestation=attestation,
+                authenticator_selection=AuthenticatorSelectionCriteria(
+                    resident_key=ResidentKeyRequirement.REQUIRED,
+                    user_verification=user_verification,
+                ),
+                challenge=base64url_to_bytes(nonce_base64),
+                exclude_credentials=excluded_credentials,
+                supported_pub_key_algs=pub_key_algorithms,
+                timeout=12000,
+            )
+
+            # Save the userid if there was none before
+            if not fido2_user_id:
+                fido2_user_id = registration_options.user.id
+                token_user.set_internal_attribute(FIDO2TokenInfo.USER_ID, bytes_to_base64url(fido2_user_id))
+
+            options_json: str = options_to_json(registration_options)
+            response_detail["passkey_registration"] = json.loads(options_json)
+            response_detail["transaction_id"] = challenge.transaction_id
+
+            # Add RP ID, Name and user_id to the token info
+            self.add_tokeninfo_dict({
+                FIDO2TokenInfo.RELYING_PARTY_ID: rp_id,
+                FIDO2TokenInfo.RELYING_PARTY_NAME: rp_name,
+                FIDO2TokenInfo.USER_ID: bytes_to_base64url(fido2_user_id)
+            })
+        else:
+            response_detail = {}
+        return response_detail
+
+    def _resolve_user_label_tags(self, template: str, user) -> str:
+        """
+        Resolve the tags in the passkey user label template. A tag has the form {tagname}.
+
+        The following tags are always available: {user} (the login name), {realm}, {resolver} and {serial}.
+        Additionally, every attribute the user's resolver provides can be used as a tag, e.g. {givenname},
+        {surname}, {email} or {mobile} for an LDAP resolver. The built-in tags take precedence over resolver
+        attributes with the same name.
+
+        Unknown tags and tags whose value is empty are replaced with an empty string. Static text and braces that
+        do not form a valid tag are kept as they are. If the whole template resolves to an empty value, the login
+        name is used as a fallback so the WebAuthn user.name is never empty. The result is truncated to 64 bytes
+        because authenticators may not store longer names.
+
+        :param template: The user label template, e.g. "{user}@{realm}" or "{givenname} {surname}"
+        :param user: The user the passkey is enrolled for
+        :return: The user label with all tags replaced, truncated to 64 bytes
+        """
+        tags = {}
+        # Attributes the resolver provides for the user (e.g. LDAP attributes)
+        try:
+            tags.update(user.info)
+        except Exception as ex:
+            log.debug("Could not read user info while resolving passkey user label tags: %s", ex)
+        # Built-in tags win over resolver attributes with the same name
+        tags.update({"user": user.login, "realm": user.realm, "resolver": user.resolver,
+                     "serial": self.token.serial})
+
+        def replace_tag(match):
+            value = tags.get(match.group(1))
+            return str(value) if value is not None else ""
+
+        user_label = USER_LABEL_TAG_PATTERN.sub(replace_tag, template)
+
+        # If the template resolved to an empty (or whitespace-only) value, e.g. because it only referenced
+        # tags that the resolver does not provide, fall back to the login name. The user label becomes the
+        # WebAuthn user.name, which must not be empty or the authenticator may reject the registration.
+        if not user_label.strip():
+            user_label = user.login
+
+        encoded_user_label = user_label.encode("utf-8")
+        if len(encoded_user_label) > USER_LABEL_MAX_BYTES:
+            user_label = encoded_user_label[:USER_LABEL_MAX_BYTES].decode("utf-8", errors="ignore")
+        return user_label
+
+    def update(self, param, reset_failcount=True):
+        """
+        Second step of enrollment: Verify the registration data from the authenticator with the challenge from the
+        database. If the registration is successful, the token is set to enrolled and metadata is written to the token
+        info.
+        To complete the registration, the following parameters are required in param:
+        - attestationObject
+        - clientDataJSON
+        - credential_id
+        - rawId
+        - authenticatorAttachment
+        - transaction_id
+        - HTTP_ORIGIN
+        - FIDO2PolicyAction.RELYING_PARTY_ID ("webauthn_relying_party_id")
+        """
+        response_detail = {"details": {"serial": self.token.serial}}
+
+        attestation = get_optional(param, "attestationObject")
+        client_data = get_optional(param, "clientDataJSON")
+
+        if not attestation and not client_data:
+            # First enrollment step, or a new enrollment of an enrolled token: wait for the registration data
+            if self.token.rollout_state != RolloutState.CLIENTWAIT:
+                self.token.rollout_state = RolloutState.CLIENTWAIT
+                self.token.active = False
+                # Set the description in the first enrollment step
+                if "description" in param:
+                    self.set_description(param["description"])
+
+        elif not (attestation and client_data and self.token.rollout_state == RolloutState.CLIENTWAIT):
+            # A registration is only taken complete and for a token that waits for it
+            raise EnrollmentError(f"The token {self.token.serial} is not waiting for this registration data.")
+
+        else:
+            # Finalize the registration by verifying the registration data from the authenticator
+            credential_id = get_required(param, "credential_id")
+            credential_id_raw = get_required(param, "rawId")
+            authenticator_attachment = get_required(param, "authenticatorAttachment")
+            transaction_id = get_required(param, "transaction_id")
+            expected_rp_id = get_required(param, FIDO2PolicyAction.RELYING_PARTY_ID)
+            expected_origin = get_required(param, "HTTP_ORIGIN")
+
+            serial = self.token.serial
+            challenges = [challenge for challenge in get_challenges(serial=serial, transaction_id=transaction_id)
+                          if challenge.is_valid()]
+
+            if not len(challenges):
+                raise EnrollmentError(f"The enrollment challenge does not exist or has timed out for {serial}")
+            challenge = challenges[0]
+            try:
+                registration_verification: VerifiedRegistration = verify_registration_response(
+                    credential={
+                        "id": credential_id,
+                        "rawId": credential_id_raw,
+                        "response": {
+                            "attestationObject": attestation,
+                            "clientDataJSON": client_data
+                        },
+                        "type": "public-key",
+                        "authenticatorAttachment": authenticator_attachment,
+                    },
+                    expected_challenge=challenge.challenge.encode("utf-8"),
+                    expected_origin=expected_origin,
+                    expected_rp_id=expected_rp_id,
+                )
+            except InvalidRegistrationResponse as ex:
+                log.error(f"Invalid registration response: {ex}")
+                raise EnrollmentError(f"Invalid registration response: {ex}")
+            except InvalidJSONStructure as ex:
+                log.error(f"Invalid JSON structure: {ex}")
+                raise EnrollmentError(f"Invalid JSON structure: {ex}")
+
+            # The credential that is registered is the one in the attestation, and the credential_id of the request
+            # has to match it.
+            attested_credential_id = registration_verification.credential_id
+            if credential_id != bytes_to_base64url(attested_credential_id):
+                log.warning(f"The credential_id of the request does not match the attested credential of the "
+                            f"passkey {serial}.")
+                raise EnrollmentError("The credential_id does not match the attested credential.")
+            if credential_id_is_registered_to_other_token(attested_credential_id, self.token.id):
+                log.warning(f"The credential of the passkey {serial} is already registered to another token.")
+                raise EnrollmentError("The credential is already registered to another token.")
+
+            # Checking policy scope=SCOPE.ENROLL, action=PasskeyAction.AllowedAuthenticatorDeviceTypes.
+            # The device type (single_device/multi_device) is derived from the backup-eligible flag in the
+            # signed authenticatorData, it can only be known once the authenticator has responded, not requested
+            # up front like resident_key or user_verification, so a non-matching registration is rejected here.
+            allowed_device_types = get_optional(param, PasskeyAction.AllowedAuthenticatorDeviceTypes)
+            if allowed_device_types and registration_verification.credential_device_type not in allowed_device_types:
+                log.warning(f"The passkey {serial!s} is not allowed to be registered due to policy restriction "
+                            f"{PasskeyAction.AllowedAuthenticatorDeviceTypes!s}")
+                raise PolicyError("This authenticator is not allowed to be registered as a passkey due to a "
+                                  "policy restriction.")
+
+            # Return info if this enroll_via_multichallenge or not
+            evm_value = False
+            data = challenge.get_data()
+            if data and isinstance(data, dict) and PolicyAction.ENROLL_VIA_MULTICHALLENGE in data:
+                evm_value = data[PolicyAction.ENROLL_VIA_MULTICHALLENGE]
+            response_detail.update({PolicyAction.ENROLL_VIA_MULTICHALLENGE: evm_value})
+
+            # Verification successful, set the token to enrolled and save information returned by the authenticator
+            self.token.rollout_state = RolloutState.ENROLLED
+            # Protect the credential_id by setting it as the token secret
+            self.set_otpkey(bytes_to_base64url(attested_credential_id))
+
+            # Token Info
+            credential_id_hash = hash_credential_id(attested_credential_id)
+            token_info: dict = {
+                FIDO2TokenInfo.DEVICE_TYPE: registration_verification.credential_device_type,
+                FIDO2TokenInfo.BACKED_UP: registration_verification.credential_backed_up,
+                FIDO2TokenInfo.PUBLIC_KEY: bytes_to_base64url(registration_verification.credential_public_key),
+                FIDO2TokenInfo.AAGUID: registration_verification.aaguid,
+                FIDO2TokenInfo.SIGN_COUNT: registration_verification.sign_count,
+                FIDO2TokenInfo.CREDENTIAL_ID_HASH: credential_id_hash
+            }
+            # Save the credential_id hash to an extra table to be able to find the token faster
+            save_credential_id_hash(credential_id_hash, self.token.id)
+
+            # If the attestation object contains a x5c certificate, save it in the token info
+            # and set the description to the CN if it is not already set
+            if registration_verification.attestation_object:
+                attestation_object: AttestationObject = parse_attestation_object(
+                    registration_verification.attestation_object)
+                if attestation_object.att_stmt and attestation_object.att_stmt.x5c:
+                    attestation_certificate: Certificate = cryptography.x509.load_der_x509_certificate(
+                        attestation_object.att_stmt.x5c[0])
+                    certificate_pem: str = (attestation_certificate.public_bytes(serialization.Encoding.PEM)
+                                            .decode("utf-8").replace("\n", ""))
+                    token_info[FIDO2TokenInfo.ATTESTATION_CERTIFICATE] = certificate_pem
+                    if not self.token.description:
+                        attributes: list[NameAttribute] = attestation_certificate.subject.get_attributes_for_oid(
+                            NameOID.COMMON_NAME)
+                        if attributes:
+                            self.set_description(attributes[0].value)
+            self.add_tokeninfo_dict(token_info)
+            self.token.active = True
+            self.token.save()
+            # Remove the challenge
+            challenges[0].delete()
+        return response_detail
+
+    @check_token_locked
+    def check_otp(self, otpval, counter=None, window=None, options=None):
+        """
+        :param otpval: Unused for this token type
+        :type otpval: None
+        :param counter: Unused for this token type
+        :type counter: int
+        :param window: Unused for this token type
+        :type window: None
+        :param options: Contains the data from the client, along with policy configurations.
+                        For compatibility with the WebAuthnTokenClass, some keys can have multiple names.
+                        The following keys are required:
+
+                        - "challenge"
+                        - "authenticatorData" or "authenticatordata"
+                        - "clientDataJSON" or "clientdata"
+                        - "signature" or "signaturedata"
+                        - "userHandle" or "userhandle"
+                        - "HTTP_ORIGIN"
+
+                        The following keys are optional:
+
+                        - "webauthn_user_verification_requirement" (FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT),
+                          defaults to preferred
+                        - PasskeyAction.AllowedAuthenticatorDeviceTypes, a list of allowed values for
+                          credential_device_type ("single_device"/"multi_device"). Unset/empty means no restriction.
+                        - PasskeyAction.EnforceUserHandle, if truthy, requires the userHandle to match the FIDO2
+                          user ID recorded for the token's assigned user at enrollment.
+
+        :type options: dict
+        :return: A numerical value where values larger than zero indicate success.
+        :rtype: int
+        """
+        authenticator_data = get_required_one_of(options, ["authenticatorData", "authenticatordata"])
+        client_data_json = get_required_one_of(options, ["clientDataJSON", "clientdata"])
+        signature = get_required_one_of(options, ["signature", "signaturedata"])
+        user_handle = get_optional_one_of(options, ["userHandle", "userhandle"])
+        expected_challenge = get_required(options, "challenge").encode("utf-8")
+        expected_origin = get_required(options, "HTTP_ORIGIN")
+        user_verification = get_optional(options, FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT, "preferred")
+        credential_id = self.token.get_otpkey().getKey().decode("utf-8")
+        rp_id = self.get_tokeninfo(FIDO2TokenInfo.RELYING_PARTY_ID)
+
+        # The sign count and the public key are read back from the token info. A value that is missing or not of
+        # the expected shape means the token is unusable, which has to fail the authentication rather than raise
+        # out of the request.
+        try:
+            current_sign_count = int(self.get_tokeninfo(FIDO2TokenInfo.SIGN_COUNT))
+            public_key = base64url_to_bytes(self.get_tokeninfo(FIDO2TokenInfo.PUBLIC_KEY))
+        except (TypeError, ValueError) as ex:
+            log.error(f"Passkey {self.token.serial} has an unusable sign count or public key in its token info: "
+                      f"{ex}")
+            return -1
+
+        try:
+            verified_authentication: VerifiedAuthentication = verify_authentication_response(
+                credential={
+                    "id": credential_id,
+                    "rawId": credential_id,
+                    "response": {
+                        "authenticatorData": authenticator_data,
+                        "clientDataJSON": client_data_json,
+                        "signature": signature,
+                        "userHandle": user_handle,
+                    },
+                    "type": "public-key",
+                    "authenticatorAttachment": "cross-platform",
+                    "clientExtensionResults": {},
+                },
+                expected_challenge=expected_challenge,
+                expected_rp_id=rp_id,
+                expected_origin=expected_origin,
+                require_user_verification=user_verification == "required",
+                credential_current_sign_count=current_sign_count,
+                credential_public_key=public_key,
+            )
+        except InvalidAuthenticationResponse as ex:
+            log.error(f"Passkey authentication failed: {ex}")
+            return -1
+
+        # The signature and sign count are valid proof that this authenticator (not a clone or a replay) produced
+        # this response, independent of whether a policy below then still refuses the login - so the new sign
+        # count is persisted right away. Deferring this until after the policy checks would leave the stored sign
+        # count stale, letting the very same valid response be re-verified again (e.g. after a policy change)
+        # instead of being consumed on its first, legitimate use.
+        self.write_tokeninfo(FIDO2TokenInfo.SIGN_COUNT, verified_authentication.new_sign_count)
+
+        # Checking policy scope=SCOPE.AUTH, action=PasskeyAction.AllowedAuthenticatorDeviceTypes.
+        # Unlike an AAGUID or attachment recorded at enrollment, the device type is derived from the signed
+        # backup-eligible flag in authenticatorData, so it is re-verified cryptographically on every single
+        # authentication instead of being trusted from a (possibly outdated) value stored at enrollment.
+        # This returns -1 rather than raising: passkeys can also reach check_otp through the passkey_trigger_by_pin
+        # / check_token_list path, which does not catch PolicyError and would abort evaluation of any other
+        # pending challenge-response token for the same request.
+        allowed_device_types = get_optional(options, PasskeyAction.AllowedAuthenticatorDeviceTypes)
+        if allowed_device_types and verified_authentication.credential_device_type not in allowed_device_types:
+            log.warning(f"Passkey {self.token.serial} is not allowed to authenticate due to policy restriction "
+                        f"{PasskeyAction.AllowedAuthenticatorDeviceTypes!s}")
+            return -1
+
+        # Checking policy scope=SCOPE.AUTH, action=PasskeyAction.EnforceUserHandle.
+        # privacyIDEA otherwise resolves the user purely via the credential ID's assignment in the database,
+        # never re-checking it against the FIDO2 user ID that was recorded at enrollment. This is opt-in
+        # because it breaks authentication for passkeys enrolled before the user ID was recorded, and because
+        # reassigning a passkey token to a different user is an established (if narrow) admin workflow.
+        if get_optional(options, PasskeyAction.EnforceUserHandle):
+            stored_user_handle = self.user.internal_attributes.get(FIDO2TokenInfo.USER_ID) if self.user else None
+            # Compare decoded bytes, not the raw strings: the client encodes userHandle with plain base64
+            # (RFC 4648 alphabet, padded), while the stored value is base64url (unpadded). Both decode to the
+            # same bytes for a real match, but the encoded strings themselves would not be equal.
+            handles_match = False
+            if stored_user_handle and user_handle:
+                try:
+                    handles_match = base64url_to_bytes(user_handle) == base64url_to_bytes(stored_user_handle)
+                except Exception as ex:
+                    log.warning(f"Could not decode userHandle for passkey {self.token.serial}: {ex}")
+            if not handles_match:
+                log.warning(f"Passkey {self.token.serial} userHandle does not match the FIDO2 user ID recorded "
+                            f"for its assigned user; refusing authentication due to policy restriction "
+                            f"{PasskeyAction.EnforceUserHandle!s}")
+                return -1
+
+        return 1
+
+    @classmethod
+    def get_default_challenge_text_auth(cls) -> str:
+        return str(lazy_gettext("Please authenticate with your passkey!"))
+
+    @classmethod
+    def get_default_challenge_text_register(cls) -> str:
+        return str(lazy_gettext("Please confirm the registration with your passkey!"))
+
+    def create_challenge(self, transactionid=None, options=None):
+        """
+        Passkey does not create a challenge itself, it uses an open challenge acquired from /validate/initialize.
+        By returning False here, passkey tokens will not generate a challenge via
+        /validate/triggerchallenge -> create_challenge_from_tokens()
+        Optionally, creating a challenge can be enabled by setting the passkey_trigger_by_pin policy
+        """
+        if options and PasskeyAction.EnableTriggerByPIN in options and options[PasskeyAction.EnableTriggerByPIN]:
+            rp_id = get_required(options, FIDO2PolicyAction.RELYING_PARTY_ID)
+            user_verification = get_optional(options, FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT, "preferred")
+            # check if options contains a nonce that was generated from a previous passkey challenge and reuse it
+            nonce = options.get("passkey_nonce", None)
+            challenge = fido2.challenge.create_fido2_challenge(rp_id, user_verification=user_verification, nonce=nonce,
+                                                               transaction_id=transactionid, serial=self.token.serial)
+            message = options.get("passkey_challenge_text", challenge["message"])
+            transaction_id = challenge["transaction_id"]
+            challenge_details = {"challenge": challenge["challenge"], "rpId": rp_id,
+                                 "userVerification": user_verification}
+            # TODO this vvv is horrible
+            return True, message, transaction_id, challenge_details
+        else:
+            return False, "", transactionid, {}
+
+    @log_with(log)
+    def use_for_authentication(self, options):
+        return self.is_active()
+
+    def inc_failcount(self):
+        """
+        Do not increment the fail count for passkey, since their authentication process is decoupled from the usual.
+        """
+        pass
+
+    @classmethod
+    def is_multichallenge_enrollable(cls):
+        return True
+
+    @log_with(log)
+    def is_challenge_request(self, passw, user=None, options=None):
+        """
+        This token type is always challenge-response. If the pin matches, a challenge should be created.
+        """
+        if options and PasskeyAction.EnableTriggerByPIN in options and options[PasskeyAction.EnableTriggerByPIN]:
+            return self.check_pin(passw, user=user, options=options)
+        return False
+
+    @check_token_locked
+    def authenticate(self, passw, user=None, options=None):
+        """
+        This is called from check_tokenlist. Suppress missing params here so "wrong otp value" is returned if no
+        authentication could be made.
+        """
+        try:
+            get_required_one_of(options, ["authenticatorData", "authenticatordata"])
+            get_required_one_of(options, ["clientDataJSON", "clientdata"])
+            get_required_one_of(options, ["signature", "signaturedata"])
+            get_optional_one_of(options, ["userHandle", "userhandle"])
+            get_required(options, "challenge")
+            get_required(options, "HTTP_ORIGIN")
+            get_optional(options, FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT, "preferred")
+        except ParameterError as e:
+            log.debug(f"Missing parameter for authentication with passkey: {e}")
+            # TODO authenticate has horrible return values
+            return False, -1, None
+
+        pin_match = self.check_pin(passw, user=user, options=options)
+        if not pin_match:
+            return False, -1, None
+        otp_match = self.check_otp(None, 0, None, options)
+        return pin_match, otp_match, None
+
+    def import_token(self, token_information: dict):
+        """
+        Import a passkey token.
+        """
+        super().import_token(token_information)
+        if self.user:
+            self.user.set_internal_attribute(FIDO2TokenInfo.USER_ID,
+                                             self.get_tokeninfo(FIDO2TokenInfo.USER_ID, default=""))

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 #  2018-06-20 Friedrich Weber <friedrich.weber@netknights.it>
 #             Initial skeleton
 #
@@ -23,7 +22,7 @@ can be given a set of options.
 """
 
 
-class BaseTask(object):
+class BaseTask:
     """
     A BaseTask returns a list of supported options.
     """

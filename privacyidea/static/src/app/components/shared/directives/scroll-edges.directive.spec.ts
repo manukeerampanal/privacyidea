@@ -1,0 +1,305 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { Component, ViewChild } from "@angular/core";
+import { ComponentFixture, TestBed } from "@angular/core/testing";
+import { ScrollEdgesDirective } from "./scroll-edges.directive";
+
+interface EdgeEntry {
+  isIntersecting: boolean;
+}
+type EdgeCallback = (entries: EdgeEntry[]) => void;
+
+interface FakeObserver {
+  cb: EdgeCallback;
+  options: IntersectionObserverInit;
+  observed: Element[];
+  disconnect: jest.Mock;
+}
+
+interface FakeResizeObserver {
+  cb: () => void;
+  observed: Element[];
+  disconnect: jest.Mock;
+}
+
+@Component({
+  standalone: true,
+  imports: [ScrollEdgesDirective],
+  template: `
+    <div
+      #region
+      class="table-scroll-region"
+      appScrollEdges>
+      <div class="content">content</div>
+    </div>
+  `
+})
+class HostComponent {
+  @ViewChild("region") region!: { nativeElement: HTMLElement };
+}
+
+@Component({
+  standalone: true,
+  imports: [ScrollEdgesDirective],
+  template: `
+    <div
+      #region
+      class="table-scroll-region"
+      appScrollEdges>
+      <table>
+        <tr class="mat-mdc-header-row"></tr>
+      </table>
+    </div>
+  `
+})
+class HostWithHeaderRowComponent {
+  @ViewChild("region") region!: { nativeElement: HTMLElement };
+}
+
+// A table page's card: controls (filter row, action row) above the scroll region.
+@Component({
+  standalone: true,
+  imports: [ScrollEdgesDirective],
+  template: `
+    <div
+      #card
+      class="card">
+      <div class="filter-paginator-container"></div>
+      <div class="actions-row"></div>
+      <div
+        #region
+        class="table-scroll-region"
+        appScrollEdges>
+        <div class="content">content</div>
+      </div>
+    </div>
+  `
+})
+class HostWithControlsComponent {
+  @ViewChild("card") card!: { nativeElement: HTMLElement };
+  @ViewChild("region") region!: { nativeElement: HTMLElement };
+}
+
+describe("ScrollEdgesDirective", () => {
+  let fixture: ComponentFixture<HostComponent>;
+  let observers: FakeObserver[];
+  let resizeObservers: FakeResizeObserver[];
+
+  beforeEach(async () => {
+    observers = [];
+    resizeObservers = [];
+    (globalThis.IntersectionObserver as unknown as jest.Mock).mockImplementation(
+      (cb: EdgeCallback, options: IntersectionObserverInit) => {
+        const observer: FakeObserver = { cb, options, observed: [], disconnect: jest.fn() };
+        observers.push(observer);
+        return {
+          observe: (el: Element) => observer.observed.push(el),
+          unobserve: jest.fn(),
+          disconnect: observer.disconnect
+        };
+      }
+    );
+    (globalThis.ResizeObserver as unknown as jest.Mock).mockImplementation((cb: () => void) => {
+      const observer: FakeResizeObserver = { cb, observed: [], disconnect: jest.fn() };
+      resizeObservers.push(observer);
+      return {
+        observe: (el: Element) => observer.observed.push(el),
+        unobserve: jest.fn(),
+        disconnect: observer.disconnect
+      };
+    });
+
+    await TestBed.configureTestingModule({ imports: [HostComponent] }).compileComponents();
+    fixture = TestBed.createComponent(HostComponent);
+    fixture.detectChanges();
+  });
+
+  function regionEl(): HTMLElement {
+    return fixture.componentInstance.region.nativeElement;
+  }
+
+  it("inserts a zero-height sentinel at the top and bottom of the scroll region", () => {
+    const first = regionEl().firstElementChild as HTMLElement;
+    const last = regionEl().lastElementChild as HTMLElement;
+    expect(first.tagName.toLowerCase()).toBe("div");
+    expect(first.style.height).toBe("0px");
+    expect(last.style.height).toBe("0px");
+    expect(first).not.toBe(last);
+  });
+
+  it("observes both sentinels with the region itself as the root", () => {
+    expect(observers).toHaveLength(2);
+    expect(observers[0].options.root).toBe(regionEl());
+    expect(observers[1].options.root).toBe(regionEl());
+    expect(observers[0].observed[0]).toBe(regionEl().firstElementChild);
+    expect(observers[1].observed[0]).toBe(regionEl().lastElementChild);
+  });
+
+  it("toggles scrolled-from-top when the top sentinel leaves and re-enters view", () => {
+    observers[0].cb([{ isIntersecting: false }]);
+    expect(regionEl().classList.contains("scrolled-from-top")).toBe(true);
+    observers[0].cb([{ isIntersecting: true }]);
+    expect(regionEl().classList.contains("scrolled-from-top")).toBe(false);
+  });
+
+  it("toggles more-below based on the bottom sentinel visibility", () => {
+    observers[1].cb([{ isIntersecting: false }]);
+    expect(regionEl().classList.contains("more-below")).toBe(true);
+    observers[1].cb([{ isIntersecting: true }]);
+    expect(regionEl().classList.contains("more-below")).toBe(false);
+  });
+
+  it("disconnects both observers and removes both sentinels on destroy", () => {
+    const first = regionEl().firstElementChild;
+    const last = regionEl().lastElementChild;
+    fixture.destroy();
+    expect(observers[0].disconnect).toHaveBeenCalled();
+    expect(observers[1].disconnect).toHaveBeenCalled();
+    expect(first!.isConnected).toBe(false);
+    expect(last!.isConnected).toBe(false);
+  });
+
+  it("does not insert a header shadow layer when the host has no header row", () => {
+    expect(regionEl().querySelector(".sticky-header-shadow")).toBeNull();
+    expect(resizeObservers).toHaveLength(0);
+  });
+});
+
+describe("ScrollEdgesDirective below a page's controls", () => {
+  let fixture: ComponentFixture<HostWithControlsComponent>;
+  let topObserver: FakeObserver;
+
+  beforeEach(async () => {
+    const observers: FakeObserver[] = [];
+    (globalThis.IntersectionObserver as unknown as jest.Mock).mockImplementation(
+      (cb: EdgeCallback, options: IntersectionObserverInit) => {
+        const observer: FakeObserver = { cb, options, observed: [], disconnect: jest.fn() };
+        observers.push(observer);
+        return { observe: (el: Element) => observer.observed.push(el), unobserve: jest.fn(), disconnect: jest.fn() };
+      }
+    );
+    await TestBed.configureTestingModule({ imports: [HostWithControlsComponent] }).compileComponents();
+    fixture = TestBed.createComponent(HostWithControlsComponent);
+    fixture.detectChanges();
+    topObserver = observers[0];
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  function regionEl(): HTMLElement {
+    return fixture.componentInstance.region.nativeElement;
+  }
+
+  // Gives the card's action row `rowHeight` px (what collapsing frees) and the region `overflow` px
+  // of hidden content.
+  function layOut(rowHeight: number, overflow: number): void {
+    const row = fixture.nativeElement.querySelector(".actions-row") as HTMLElement;
+    jest.spyOn(row, "getBoundingClientRect").mockReturnValue({ height: rowHeight } as DOMRect);
+    Object.defineProperty(regionEl(), "clientHeight", { value: 500, configurable: true });
+    Object.defineProperty(regionEl(), "scrollHeight", { value: 500 + overflow, configurable: true });
+  }
+
+  it("collapses the controls once scrolled when the overflow outlasts what collapsing frees", () => {
+    layOut(150, 151);
+
+    topObserver.cb([{ isIntersecting: false }]);
+
+    expect(regionEl().classList.contains("scrolled-from-top")).toBe(true);
+    expect(regionEl().classList.contains("controls-collapsed")).toBe(true);
+  });
+
+  it("keeps the controls when collapsing them could make the content fit, but still marks it scrolled", () => {
+    layOut(150, 150);
+
+    topObserver.cb([{ isIntersecting: false }]);
+
+    expect(regionEl().classList.contains("scrolled-from-top")).toBe(true);
+    expect(regionEl().classList.contains("controls-collapsed")).toBe(false);
+  });
+
+  it("expands the controls again once scrolled back to the top", () => {
+    layOut(150, 400);
+    topObserver.cb([{ isIntersecting: false }]);
+
+    topObserver.cb([{ isIntersecting: true }]);
+
+    expect(regionEl().classList.contains("scrolled-from-top")).toBe(false);
+    expect(regionEl().classList.contains("controls-collapsed")).toBe(false);
+  });
+});
+
+describe("ScrollEdgesDirective with a header row", () => {
+  let fixture: ComponentFixture<HostWithHeaderRowComponent>;
+  let resizeObservers: FakeResizeObserver[];
+
+  beforeEach(async () => {
+    resizeObservers = [];
+    (globalThis.IntersectionObserver as unknown as jest.Mock).mockImplementation(() => ({
+      observe: jest.fn(),
+      unobserve: jest.fn(),
+      disconnect: jest.fn()
+    }));
+    (globalThis.ResizeObserver as unknown as jest.Mock).mockImplementation((cb: () => void) => {
+      const observer: FakeResizeObserver = { cb, observed: [], disconnect: jest.fn() };
+      resizeObservers.push(observer);
+      return {
+        observe: (el: Element) => observer.observed.push(el),
+        unobserve: jest.fn(),
+        disconnect: observer.disconnect
+      };
+    });
+
+    await TestBed.configureTestingModule({ imports: [HostWithHeaderRowComponent] }).compileComponents();
+    fixture = TestBed.createComponent(HostWithHeaderRowComponent);
+    fixture.detectChanges();
+  });
+
+  function regionEl(): HTMLElement {
+    return fixture.componentInstance.region.nativeElement;
+  }
+
+  it("inserts a header shadow layer right after the top sentinel and observes the header row's size", () => {
+    const headerRow = regionEl().querySelector(".mat-mdc-header-row") as HTMLElement;
+    const shadow = regionEl().querySelector(".sticky-header-shadow");
+
+    expect(shadow).not.toBeNull();
+    expect(regionEl().children[1]).toBe(shadow);
+    expect(resizeObservers).toHaveLength(1);
+    expect(resizeObservers[0].observed[0]).toBe(headerRow);
+  });
+
+  it("writes the header row's height as --sticky-header-height on the region", () => {
+    const headerRow = regionEl().querySelector(".mat-mdc-header-row") as HTMLElement;
+    Object.defineProperty(headerRow, "offsetHeight", { value: 56, configurable: true });
+
+    resizeObservers[0].cb();
+
+    expect(regionEl().style.getPropertyValue("--sticky-header-height")).toBe("56px");
+  });
+
+  it("disconnects the header ResizeObserver and removes the shadow layer on destroy", () => {
+    const shadow = regionEl().querySelector(".sticky-header-shadow");
+    fixture.destroy();
+
+    expect(resizeObservers[0].disconnect).toHaveBeenCalled();
+    expect(shadow!.isConnected).toBe(false);
+  });
+});

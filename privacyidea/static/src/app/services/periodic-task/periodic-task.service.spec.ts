@@ -1,0 +1,295 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+
+import { provideHttpClient } from "@angular/common/http";
+import { HttpTestingController, provideHttpClientTesting } from "@angular/common/http/testing";
+import { TestBed } from "@angular/core/testing";
+import { ROUTE_PATHS } from "@app/route_paths";
+import { AuthService } from "@services/auth/auth.service";
+import { ContentService } from "@services/content/content.service";
+import { DialogService } from "@services/dialog/dialog.service";
+import { NotificationService } from "@services/notification/notification.service";
+import { MockMatDialogRef } from "@testing/mock-mat-dialog-ref";
+import { MockContentService, MockDialogService, MockNotificationService } from "@testing/mock-services";
+import { MockAuthService } from "@testing/mock-services/mock-auth-service";
+import { MockPiResponse } from "@testing/mock-services/mock-utils";
+import { Subject } from "rxjs";
+import {
+  EMPTY_PERIODIC_TASK,
+  PERIODIC_TASK_MODULES,
+  PeriodicTask,
+  PeriodicTaskModule,
+  PeriodicTaskService
+} from "./periodic-task.service";
+
+describe("PeriodicTaskService", () => {
+  let service: PeriodicTaskService;
+  let httpTestingController: HttpTestingController;
+  let contentMock: MockContentService;
+  let notifyMock: MockNotificationService;
+  let dialogServiceMock: MockDialogService;
+  let confirmClosed: Subject<boolean>;
+
+  beforeEach(() => {
+    TestBed.configureTestingModule({
+      providers: [
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        PeriodicTaskService,
+        { provide: AuthService, useClass: MockAuthService },
+        { provide: ContentService, useClass: MockContentService },
+        { provide: NotificationService, useClass: MockNotificationService },
+        { provide: DialogService, useClass: MockDialogService }
+      ]
+    });
+
+    service = TestBed.inject(PeriodicTaskService);
+    httpTestingController = TestBed.inject(HttpTestingController);
+    contentMock = TestBed.inject(ContentService) as unknown as MockContentService;
+    notifyMock = TestBed.inject(NotificationService) as unknown as MockNotificationService;
+    contentMock.routeUrl.set("/configuration/periodictasks");
+    dialogServiceMock = TestBed.inject(DialogService) as unknown as MockDialogService;
+    confirmClosed = new Subject();
+    const dialogRefMock = new MockMatDialogRef();
+    dialogRefMock.afterClosed.mockReturnValue(confirmClosed);
+    dialogServiceMock.openDialog.mockReturnValue(dialogRefMock);
+  });
+
+  afterEach(() => {
+    httpTestingController.verify();
+    jest.restoreAllMocks();
+  });
+
+  it("should be created", () => {
+    expect(service).toBeTruthy();
+  });
+
+  describe("periodicTaskModuleResource", () => {
+    let authService: MockAuthService;
+
+    beforeEach(() => {
+      authService = TestBed.inject(AuthService) as unknown as MockAuthService;
+      contentMock.routeUrl.set(ROUTE_PATHS.CONFIGURATION_PERIODIC_TASKS);
+    });
+
+    it("requests the task modules with periodictask_read", () => {
+      authService.authData.set({ ...MockAuthService.MOCK_AUTH_DATA, rights: ["periodictask_read"] });
+      TestBed.tick();
+
+      httpTestingController.expectOne((r) => r.url.endsWith("/periodictask/taskmodules/"));
+      httpTestingController.expectOne((r) => r.url.endsWith("/periodictask/"));
+    });
+
+    it("does not request the task modules without periodictask_read", () => {
+      authService.authData.set({ ...MockAuthService.MOCK_AUTH_DATA, rights: ["periodictask_write"] });
+      TestBed.tick();
+
+      httpTestingController.expectNone((r) => r.url.endsWith("/periodictask/taskmodules/"));
+    });
+  });
+
+  it("should delete a periodic task on confirmation and show success notification", async () => {
+    const task = { ...EMPTY_PERIODIC_TASK, id: 7 } as unknown as PeriodicTask;
+    const mockResponse = MockPiResponse.fromValue(7);
+    const deletePromise = service.deleteWithConfirmDialog(task);
+
+    confirmClosed.next(true);
+    confirmClosed.complete();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const req = httpTestingController.expectOne((r) => r.url.includes("periodictask/7") && r.method === "DELETE");
+    req.flush(mockResponse);
+
+    const result = await deletePromise;
+    expect(result).toEqual(mockResponse);
+    expect(notifyMock.success).toHaveBeenCalledWith("Successfully deleted periodic task.");
+  });
+
+  it("should do nothing when deletion is cancelled", async () => {
+    const task = { ...EMPTY_PERIODIC_TASK, id: 8 } as unknown as PeriodicTask;
+    const deletePromise = service.deleteWithConfirmDialog(task);
+
+    confirmClosed.next(false);
+    confirmClosed.complete();
+
+    const result = await deletePromise;
+    expect(result).toBeUndefined();
+    httpTestingController.expectNone((r) => r.url.includes("periodictask/8"));
+    expect(notifyMock.success).not.toHaveBeenCalled();
+  });
+
+  it("should enable a periodic task", async () => {
+    const mockResponse = MockPiResponse.fromValue("4");
+    const promise = service.enablePeriodicTask(4);
+    const req = httpTestingController.expectOne((r) => r.url.includes("periodictask/enable/4") && r.method === "POST");
+    expect(req.request.body).toEqual({});
+    req.flush(mockResponse);
+    const result = await promise;
+    expect(result).toEqual(mockResponse);
+  });
+
+  it("should handle error when enabling a periodic task", async () => {
+    service.periodicTasksResource.reload = jest.fn();
+    const promise = service.enablePeriodicTask(4);
+    const req = httpTestingController.expectOne((r) => r.url.includes("periodictask/enable/4"));
+    req.flush(null, { status: 401, statusText: "Enabling periodic task not allowed" });
+    const result = await promise;
+    expect(notifyMock.error).toHaveBeenCalledWith("Failed to enable periodic task!");
+    expect(service.periodicTasksResource.reload).toHaveBeenCalled();
+    expect(result).toBeUndefined();
+  });
+
+  it("should disable a periodic task", async () => {
+    const mockResponse = MockPiResponse.fromValue("4");
+    const promise = service.disablePeriodicTask(6);
+    const req = httpTestingController.expectOne((r) => r.url.includes("periodictask/disable/6"));
+    expect(req.request.body).toEqual({});
+    req.flush(mockResponse);
+    const result = await promise;
+    expect(result).toEqual(mockResponse);
+  });
+
+  it("should handle error when disabling a periodic task", async () => {
+    service.periodicTasksResource.reload = jest.fn();
+    const promise = service.disablePeriodicTask(6);
+    const req = httpTestingController.expectOne((r) => r.url.includes("periodictask/disable/6"));
+    req.flush(null, { status: 500, statusText: "Server Error" });
+    const result = await promise;
+    expect(notifyMock.error).toHaveBeenCalledWith("Failed to disable periodic task!");
+    expect(service.periodicTasksResource.reload).toHaveBeenCalled();
+    expect(result).toBeUndefined();
+  });
+
+  it("should delete a periodic task", (done) => {
+    const mockResponse = { status: true, value: "4" };
+    service.deletePeriodicTask(4).subscribe((res) => {
+      expect(res).toEqual(mockResponse);
+      done();
+    });
+    const req = httpTestingController.expectOne((r) => r.url.includes("periodictask/4") && r.method === "DELETE");
+    req.flush(mockResponse);
+  });
+
+  it("should handle error when deleting a periodic task", (done) => {
+    service.deletePeriodicTask(4).subscribe({
+      error: () => {
+        expect(notifyMock.error).toHaveBeenCalledWith("Failed to delete periodic task. fail");
+        done();
+      }
+    });
+    const req = httpTestingController.expectOne((r) => r.url.includes("4") && r.method === "DELETE");
+    req.flush(MockPiResponse.fromError({ message: "fail" }), { status: 400, statusText: "Bad Request" });
+  });
+
+  it("should save a periodic task", (done) => {
+    const mockResponse = { result: EMPTY_PERIODIC_TASK };
+    service.savePeriodicTask(EMPTY_PERIODIC_TASK).subscribe((res) => {
+      expect(res?.result).toEqual(EMPTY_PERIODIC_TASK);
+      done();
+    });
+    const req = httpTestingController.expectOne((r) => r.url.includes("/periodictask/") && r.method === "POST");
+    req.flush(mockResponse);
+  });
+
+  it("should handle error when saving a periodic task", (done) => {
+    service.savePeriodicTask(EMPTY_PERIODIC_TASK).subscribe((response) => {
+      expect(response).toBeUndefined();
+      expect(notifyMock.error).toHaveBeenCalledWith("Failed to save periodic task. failure message");
+      done();
+    });
+    const req = httpTestingController.expectOne((r) => r.url.includes("/periodictask/") && r.method === "POST");
+    req.flush(MockPiResponse.fromError({ message: "failure message" }), { status: 400, statusText: "Bad Request" });
+  });
+
+  it("should fetch all module options", () => {
+    const mockOptions = MockPiResponse.fromValue({ opt1: { type: "str", description: "desc" } });
+    service.fetchAllModuleOptions();
+    PERIODIC_TASK_MODULES.forEach((module) => {
+      const req = httpTestingController.expectOne((r) => r.url.includes(`periodictask/options/${module}`));
+      req.flush(mockOptions);
+    });
+    expect(service.moduleOptions()).toEqual(
+      expect.objectContaining({
+        SimpleStats: expect.any(Object),
+        EventCounter: expect.any(Object)
+      })
+    );
+  });
+
+  it("should handle error when fetching module options", () => {
+    service.fetchAllModuleOptions();
+    // Only flush error for the first request; others will be canceled
+    const reqs = PERIODIC_TASK_MODULES.map((module) =>
+      httpTestingController.expectOne((r) => r.url.includes(`periodictask/options/${module}`))
+    );
+    reqs[0].flush(null, { status: 500, statusText: "Server Error" });
+    // Do NOT flush the rest, as they are canceled
+    expect(notifyMock.error).toHaveBeenCalledWith("Failed to fetch module options.");
+    expect(service.moduleOptions()).toEqual({});
+  });
+
+  describe("fetchAllModuleOptions dynamic module list", () => {
+    it("uses the module list from periodicTaskModuleResource when available, including unknown modules", () => {
+      const dynamicModules = [...PERIODIC_TASK_MODULES, "NewModule"];
+      service.periodicTaskModuleResource.value.set(MockPiResponse.fromValue(dynamicModules as PeriodicTaskModule[]));
+
+      service.fetchAllModuleOptions();
+
+      dynamicModules.forEach((module) => {
+        const req = httpTestingController.expectOne((r) => r.url.includes(`periodictask/options/${module}`));
+        req.flush(MockPiResponse.fromValue({ opt1: { type: "str", description: "desc" } }));
+      });
+
+      expect(service.moduleOptions()).toEqual(
+        expect.objectContaining({
+          SimpleStats: expect.any(Object),
+          EventCounter: expect.any(Object),
+          NewModule: expect.any(Object)
+        })
+      );
+    });
+
+    it("falls back to PERIODIC_TASK_MODULES when the module resource has no value", () => {
+      service.periodicTaskModuleResource.value.set(MockPiResponse.fromValue(undefined));
+
+      service.fetchAllModuleOptions();
+
+      PERIODIC_TASK_MODULES.forEach((module) => {
+        const req = httpTestingController.expectOne((r) => r.url.includes(`periodictask/options/${module}`));
+        req.flush(MockPiResponse.fromValue({}));
+      });
+
+      expect(service.moduleOptions()).not.toHaveProperty("NewModule");
+    });
+
+    it("skips modules already in moduleOptions and only fetches missing ones", () => {
+      service.moduleOptions.set({ SimpleStats: { some_opt: { name: "some_opt", type: "bool", description: "" } } });
+
+      service.fetchAllModuleOptions();
+
+      httpTestingController.expectNone((r) => r.url.includes("periodictask/options/SimpleStats"));
+      const req = httpTestingController.expectOne((r) => r.url.includes("periodictask/options/EventCounter"));
+      req.flush(MockPiResponse.fromValue({ ec_opt: { type: "str", description: "" } }));
+
+      expect(service.moduleOptions()).toHaveProperty("SimpleStats");
+      expect(service.moduleOptions()).toHaveProperty("EventCounter");
+    });
+  });
+});

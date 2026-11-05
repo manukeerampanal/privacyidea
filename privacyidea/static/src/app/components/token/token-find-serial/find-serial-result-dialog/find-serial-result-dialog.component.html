@@ -1,0 +1,47 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
+<app-dialog-wrapper
+  title="Search for Token"
+  i18n-title="@@token.searchToken"
+  [actions]="[action]"
+  [showCloseButton]="false"
+  (actionTriggered)="onAction($event)">
+  @if (data.foundSerial) {
+    <div class="alert alert-success">
+      <span i18n="@@token.serialNumberOtp"
+        >The Serial number for the OTP value {{ data.otpValue }} is
+        <a
+          class="link"
+          role="button"
+          tabindex="0"
+          [attr.aria-label]="linkLabel(data.foundSerial)"
+          (click)="onClickSerial()"
+          (keydown.enter)="onClickSerial()"
+          (keydown.space)="$event.preventDefault(); onClickSerial()">
+          {{ data.foundSerial }}.</a
+        ></span
+      >
+    </div>
+  } @else {
+    <div class="alert alert-warning">
+      <span i18n="@@token.noSerialNumber">No Serial number could be found for OTP value {{ data.otpValue }}.</span>
+    </div>
+  }
+</app-dialog-wrapper>

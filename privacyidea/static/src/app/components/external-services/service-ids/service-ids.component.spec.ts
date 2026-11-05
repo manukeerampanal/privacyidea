@@ -1,0 +1,133 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+
+import { provideHttpClient } from "@angular/common/http";
+import { provideHttpClientTesting } from "@angular/common/http/testing";
+import { ComponentFixture, TestBed } from "@angular/core/testing";
+import { provideRouter, Router } from "@angular/router";
+import { ROUTE_PATHS } from "@app/route_paths";
+import { ServiceIdsComponent } from "@components/external-services/service-ids/service-ids.component";
+import { AuthService } from "@services/auth/auth.service";
+import { DialogService } from "@services/dialog/dialog.service";
+import { ServiceIdService } from "@services/service-id/service-id.service";
+import { TableUtilsService } from "@services/table-utils/table-utils.service";
+import { MockMatDialogRef } from "@testing/mock-mat-dialog-ref";
+import { expectsTableStateGating } from "@testing/table-state-gating";
+import {
+  MockAuthService,
+  MockDialogService,
+  MockServiceIdService,
+  MockTableUtilsService
+} from "@testing/mock-services";
+import { Subject } from "rxjs";
+
+describe("ServiceIdsComponent", () => {
+  let component: ServiceIdsComponent;
+  let fixture: ComponentFixture<ServiceIdsComponent>;
+  let serviceIdServiceMock: MockServiceIdService;
+  let dialogServiceMock: MockDialogService;
+  let confirmClosed: Subject<boolean>;
+  let router: Router;
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [ServiceIdsComponent],
+      providers: [
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        provideRouter([]),
+        { provide: ServiceIdService, useClass: MockServiceIdService },
+        { provide: AuthService, useClass: MockAuthService },
+        { provide: DialogService, useClass: MockDialogService },
+        { provide: TableUtilsService, useClass: MockTableUtilsService }
+      ]
+    }).compileComponents();
+
+    serviceIdServiceMock = TestBed.inject(ServiceIdService) as unknown as MockServiceIdService;
+    serviceIdServiceMock.serviceIds.set([
+      { servicename: "service1", description: "desc1", id: 1 },
+      { servicename: "service2", description: "desc2", id: 2 }
+    ]);
+
+    fixture = TestBed.createComponent(ServiceIdsComponent);
+    dialogServiceMock = TestBed.inject(DialogService) as unknown as MockDialogService;
+    router = TestBed.inject(Router);
+    jest.spyOn(router, "navigateByUrl").mockResolvedValue(true);
+    confirmClosed = new Subject();
+    const dialogRefMock = new MockMatDialogRef();
+    dialogRefMock.afterClosed.mockReturnValue(confirmClosed);
+    dialogServiceMock.openDialog.mockReturnValue(dialogRefMock);
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+  });
+
+  it("gates the table on its read right, row count and filter", () => {
+    expectsTableStateGating({
+      state: component.tableState,
+      right: "serviceid_list"
+    });
+  });
+
+  it("should create", () => {
+    expect(component).toBeTruthy();
+  });
+
+  it("should only select the service IDs left by the filter", async () => {
+    component.onFilterInput("service1");
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    component.selector.selectAllRows();
+
+    expect(component.selector.selectedRows().map((row) => row.servicename)).toEqual(["service1"]);
+  });
+
+  it("should display service IDs from service", () => {
+    expect(component.serviceIdDataSource().data.length).toBe(2);
+    expect(component.serviceIdDataSource().data[0].servicename).toBe("service1");
+  });
+
+  it("should filter service IDs", () => {
+    component.onFilterInput("service1");
+    expect(component.serviceIdDataSource().filter).toBe("service1");
+  });
+
+  it("should navigate to edit page when editing a service ID", () => {
+    const serviceId = serviceIdServiceMock.serviceIds()[0];
+    component.onEditServiceId(serviceId);
+    expect(router.navigateByUrl).toHaveBeenCalledWith(
+      ROUTE_PATHS.EXTERNAL_SERVICES_SERVICE_IDS_DETAILS + serviceId.servicename
+    );
+  });
+
+  it("should navigate to create page", () => {
+    component.onCreateNewServiceId();
+    expect(router.navigateByUrl).toHaveBeenCalledWith(ROUTE_PATHS.EXTERNAL_SERVICES_SERVICE_IDS_NEW);
+  });
+
+  it("should delete service ID after confirmation", async () => {
+    const serviceId = serviceIdServiceMock.serviceIds()[0];
+    component.selector.selectRow(serviceId);
+    component.deleteSelected();
+    expect(dialogServiceMock.openDialog).toHaveBeenCalled();
+    confirmClosed.next(true);
+    confirmClosed.complete();
+    expect(serviceIdServiceMock.deleteServiceId).toHaveBeenCalledWith("service1");
+  });
+});

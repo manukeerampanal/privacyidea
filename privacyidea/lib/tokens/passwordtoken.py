@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  privacyIDEA is a fork of LinOTP
 #  2014-12-05 Cornelius Kölbel <cornelius@privacyidea.org>
 #             Migration to flask
@@ -20,18 +18,18 @@ This file contains the definition of the password token class
 
 import logging
 
+
 from privacyidea.lib.crypto import zerome, safe_compare
 from privacyidea.lib.utils import to_unicode
 from privacyidea.lib.tokenclass import TokenClass
 from privacyidea.lib.log import log_with
 from privacyidea.lib.decorators import check_token_locked
 from privacyidea.lib import _
-from privacyidea.lib.policy import SCOPE, ACTION, GROUP
+from privacyidea.lib.policy import SCOPE, GROUP
+from privacyidea.lib.policies.actions import PolicyAction
 from privacyidea.api.lib.prepolicy import _generate_pin_from_policy
+from privacyidea.lib.utils import is_true
 
-
-optional = True
-required = False
 
 # We use an easier length of 12 for password tokens
 DEFAULT_LENGTH = 12
@@ -47,9 +45,11 @@ class PasswordTokenClass(TokenClass):
     This Token can be used for a scenario like losttoken
     """
 
-    password_detail_key = "password"
+    password_detail_key = "password"  # nosec B105 # key name
+    default_length = DEFAULT_LENGTH
+    default_contents = DEFAULT_CONTENTS
 
-    class SecretPassword(object):
+    class SecretPassword:
 
         def __init__(self, secObj):
             self.secretObject = secObj
@@ -81,10 +81,10 @@ class PasswordTokenClass(TokenClass):
 
     def __init__(self, aToken):
         TokenClass.__init__(self, aToken)
-        self.otp_len = DEFAULT_LENGTH
-        self.otp_contents = DEFAULT_CONTENTS
+        self.otp_len = self.default_length
+        self.otp_contents = self.default_contents
         self.hKeyRequired = True
-        self.set_type(u"pw")
+        self.set_type("pw")
 
     @staticmethod
     def get_class_type():
@@ -119,12 +119,12 @@ class PasswordTokenClass(TokenClass):
                'ui_enroll': [],
                'policy': {
                    SCOPE.ENROLL: {
-                       ACTION.MAXTOKENUSER: {
+                       PolicyAction.MAXTOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of password tokens assigned."),
                            'group': GROUP.TOKEN
                        },
-                       ACTION.MAXACTIVETOKENUSER: {
+                       PolicyAction.MAXACTIVETOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of active password tokens assigned."),
                            'group': GROUP.TOKEN
@@ -149,13 +149,19 @@ class PasswordTokenClass(TokenClass):
         :type param: dict
         :return: None
         """
-        if "genkey" in param:
+        otp_key = param.get("otpkey")
+        force_genkey = param.get("policies", {}).get(
+            f"{self.get_tokentype()}_{PolicyAction.FORCE_SERVER_GENERATE}", False)
+        if force_genkey or not otp_key:
+            param["genkey"] = True
+        genkey = is_true(param.get("genkey"))
+        if genkey:
             # Otherwise genkey and otpkey will raise an exception in
             # PasswordTokenClass
             del param["genkey"]
             type_prefix = self.get_class_type()
-            length_param = "{0!s}.length".format(type_prefix)
-            contents_param = "{0!s}.contents".format(type_prefix)
+            length_param = f"{type_prefix}.length"
+            contents_param = f"{type_prefix}.contents"
             if length_param in param:
                 size = param[length_param]
                 del param[length_param]
@@ -168,7 +174,7 @@ class PasswordTokenClass(TokenClass):
                 contents = self.otp_contents
             param["otpkey"] = _generate_pin_from_policy(contents, size=int(size))
         if "otpkey" in param:
-            param["otplen"] = len(param["otpkey"])
+            param["otplen"] = len(param.get("otpkey"))
         TokenClass.update(self, param)
 
     @log_with(log, log_entry=False)
@@ -178,7 +184,7 @@ class PasswordTokenClass(TokenClass):
         This checks the static password
 
         :param anOtpVal: This contains the "OTP" value, which is the static
-        password
+            password
         :return: result of password check, 0 in case of success, -1 if fail
         :rtype: int
         """

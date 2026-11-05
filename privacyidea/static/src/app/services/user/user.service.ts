@@ -1,0 +1,685 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { HttpClient, httpResource, HttpResourceRef } from "@angular/common/http";
+import { computed, effect, inject, Injectable, linkedSignal, Signal, signal, WritableSignal } from "@angular/core";
+import { Sort } from "@angular/material/sort";
+import { AuthService, AuthServiceInterface } from "@services/auth/auth.service";
+import { ContentService, ContentServiceInterface, DetailsUser } from "@services/content/content.service";
+import { RealmService, RealmServiceInterface } from "@services/realm/realm.service";
+import { TokenService, TokenServiceInterface } from "@services/token/token.service";
+
+import { PiResponse } from "@app/app.component";
+import { ROUTE_PATHS } from "@app/route_paths";
+import { FilterValue } from "@core/models/filter_value/filter_value";
+import { parseFilterTokens } from "@core/models/filter_value_generic/filter-value-generic";
+import { environment } from "@env/environment";
+import { NotificationService } from "@services/notification/notification.service";
+import {
+  FilterableTableService,
+  FilterableTableServiceInterface
+} from "@services/table-utils/filterable-table-service";
+import { buildFilterParams, filterParamsEqual, toBooleanParam } from "@utils/filter.utils";
+import { Observable, of } from "rxjs";
+import { catchError, map } from "rxjs/operators";
+
+const apiFilterKeys = ["description", "email", "givenname", "mobile", "phone", "resolver", "surname", "username"];
+
+// Not a user store attribute but privacyIDEA's own record, hence passed through unwrapped: the
+// backend reads it as a boolean, not as a pattern.
+const advancedApiFilterKeys = ["has_tokens"];
+
+const exactMatchKeys = new Set(["resolver", "has_tokens"]);
+const booleanKeys = new Set(["has_tokens"]);
+
+export interface UserData {
+  description: string;
+  editable: boolean;
+  email: string;
+  givenname: string;
+  mobile: string;
+  phone: string;
+  resolver: string;
+  surname: string;
+  userid: string;
+  username: string;
+
+  [key: string]: unknown; // Allow additional custom properties
+}
+
+/** Partial-failure report the /user/ endpoint attaches when a resolver of the realm could not be queried. */
+export interface UserListResponseDetail {
+  skipped_resolvers?: string[];
+}
+
+/** The users of a listing, and how many of them own a token. */
+export interface UserCount {
+  count: number;
+  with_tokens: number;
+}
+
+export interface EditUserData {
+  username: string;
+  description?: string;
+  email?: string;
+  givenname?: string;
+  surname?: string;
+  mobile?: string;
+  phone?: string;
+
+  [key: string]: unknown; // Allow additional custom properties
+}
+
+export type UserPayload = Omit<EditUserData, "username"> & {
+  user: string;
+  resolver: string;
+};
+
+export interface UserAttributePolicy {
+  delete: string[];
+  set: Record<string, string[]>;
+}
+
+export type AttributeValue = string | string[] | Record<string, string>;
+
+export interface UserServiceInterface extends FilterableTableServiceInterface {
+  userAttributes: Signal<Record<string, AttributeValue>>;
+  userAttributesList: Signal<{ key: string; value: string }[]>;
+  userAttributesResource: HttpResourceRef<PiResponse<Record<string, AttributeValue>> | undefined>;
+
+  internalAttributes: Signal<Record<string, AttributeValue>>;
+  internalAttributesList: Signal<{ key: string; value: string }[]>;
+  internalAttributesResource: HttpResourceRef<PiResponse<Record<string, AttributeValue>> | undefined>;
+
+  attributePolicy: Signal<UserAttributePolicy>;
+  deletableAttributes: Signal<string[]>;
+  attributeSetMap: Signal<Record<string, string[]>>;
+  hasWildcardKey: Signal<boolean>;
+  keyOptions: Signal<string[]>;
+
+  selectedUser: Signal<UserData | null>;
+  selectionFilter: WritableSignal<string | UserData | null>;
+  selectionFilteredUsers: Signal<UserData[]>;
+
+  allUsernames: Signal<string[]>;
+  selectionUsernameFilter: Signal<string>;
+  selectionFilteredUsernames: Signal<string[]>;
+
+  selectedUserRealm: WritableSignal<string>;
+
+  userResource: HttpResourceRef<PiResponse<UserData[]> | undefined>;
+  user: WritableSignal<UserData>;
+  usersResource: HttpResourceRef<PiResponse<UserData[], UserListResponseDetail | undefined> | undefined>;
+  users: WritableSignal<UserData[]>;
+  skippedResolvers: Signal<string[]>;
+  presetFilter: WritableSignal<FilterValue | null>;
+
+  detailsUser: WritableSignal<DetailsUser>;
+
+  setUserAttribute(key: string, value: string): Observable<PiResponse<number> | undefined>;
+
+  deleteUserAttribute(key: string): Observable<PiResponse<number> | undefined>;
+
+  createUser(resolver: string, userData: EditUserData): Observable<boolean>;
+
+  editUser(resolver: string, userData: EditUserData): Observable<boolean>;
+
+  deleteUser(resolver: string, username: string): Observable<boolean>;
+
+  fetchUserCount(realm?: string): Observable<PiResponse<UserCount, UserListResponseDetail | undefined>>;
+
+  displayUser(user: UserData | string): string;
+}
+
+@Injectable()
+export class UserService extends FilterableTableService implements UserServiceInterface {
+  private readonly realmService: RealmServiceInterface = inject(RealmService);
+  private readonly contentService: ContentServiceInterface = inject(ContentService);
+  private readonly tokenService: TokenServiceInterface = inject(TokenService);
+  private readonly authService: AuthServiceInterface = inject(AuthService);
+  private readonly notificationService = inject(NotificationService);
+  private readonly http = inject(HttpClient);
+  private baseUrl = environment.proxyUrl + "/user/";
+  filterValue = signal({} as Record<string, string>);
+
+  constructor() {
+    super();
+    effect(() => {
+      // Ensure the users are loaded for the autocomplete on allowed routes.
+      this.selectionFilteredUsernames();
+    });
+
+    effect(() => {
+      this.notificationService.handleResourceError(this.userResource.error(), "user details");
+    });
+
+    effect(() => {
+      this.notificationService.handleResourceError(this.usersResource.error(), "users");
+    });
+    effect(() => {
+      this.notificationService.handleResourceError(this.editableAttributesResource.error(), "editable attributes");
+    });
+    effect(() => {
+      this.notificationService.handleResourceError(this.userAttributesResource.error(), "user attributes");
+    });
+    effect(() => {
+      this.notificationService.handleResourceError(this.internalAttributesResource.error(), "internal attributes");
+    });
+  }
+
+  attributePolicy = computed<UserAttributePolicy>(() => {
+    let policies: UserAttributePolicy | undefined = { delete: [], set: {} };
+    if (this.editableAttributesResource.hasValue()) {
+      policies = this.editableAttributesResource.value()?.result?.value ?? { delete: [], set: {} };
+    }
+    return policies;
+  });
+
+  deletableAttributes = computed<string[]>(() => this.attributePolicy().delete ?? []);
+
+  editableAttributesResource = httpResource<PiResponse<UserAttributePolicy>>(() => {
+    // Only load editable user attributes on the user details page.
+    if (!this.contentService.onUserDetails()) {
+      return undefined;
+    }
+
+    return {
+      url: this.baseUrl + "editable_attributes/",
+      method: "GET",
+      headers: this.authService.getHeaders(),
+      params: { user: this.detailsUser().username, realm: this.selectedUserRealm() }
+    };
+  });
+
+  attributeSetMap = computed<Record<string, string[]>>(() => this.attributePolicy().set ?? {});
+
+  hasWildcardKey = computed<boolean>(() => Object.prototype.hasOwnProperty.call(this.attributeSetMap(), "*"));
+
+  keyOptions = computed<string[]>(() =>
+    Object.keys(this.attributeSetMap())
+      .filter((k) => k !== "*")
+      .sort()
+  );
+
+  private formatAttributeValue(raw: AttributeValue): string {
+    if (Array.isArray(raw)) {
+      return raw.join(", ");
+    }
+    if (raw !== null && typeof raw === "object") {
+      return Object.entries(raw)
+        .map(([key, value]) => `${key}: ${value}`)
+        .join(", ");
+    }
+    return String(raw ?? "");
+  }
+
+  userAttributes = computed<Record<string, AttributeValue>>(() => {
+    if (!this.userAttributesResource.hasValue()) return {};
+    return this.userAttributesResource.value()?.result?.value ?? {};
+  });
+
+  userAttributesList = computed(() =>
+    Object.entries(this.userAttributes()).map(([key, raw]) => ({
+      key,
+      value: this.formatAttributeValue(raw)
+    }))
+  );
+
+  userAttributesResource = httpResource<PiResponse<Record<string, AttributeValue>>>(() => {
+    // Only load user attributes on the user details page.
+    if (!this.contentService.onUserDetails()) {
+      return undefined;
+    }
+
+    return {
+      url: this.baseUrl + "attribute",
+      method: "GET",
+      headers: this.authService.getHeaders(),
+      params: { user: this.detailsUser().username, realm: this.selectedUserRealm() }
+    };
+  });
+
+  internalAttributes = computed<Record<string, AttributeValue>>(() => {
+    if (!this.internalAttributesResource.hasValue()) return {};
+    return this.internalAttributesResource.value()?.result?.value ?? {};
+  });
+
+  internalAttributesList = computed(() =>
+    Object.entries(this.internalAttributes()).map(([key, raw]) => ({
+      key,
+      value: this.formatAttributeValue(raw)
+    }))
+  );
+
+  internalAttributesResource = httpResource<PiResponse<Record<string, AttributeValue>>>(() => {
+    // Only load internal attributes on the user details page, and only for
+    // admins that hold the get_user_internal_attributes right (self-service
+    // users never do, as it's an admin-only policy).
+    if (!this.contentService.onUserDetails()) {
+      return undefined;
+    }
+    if (!this.authService.actionAllowed("get_user_internal_attributes")) {
+      return undefined;
+    }
+
+    return {
+      url: this.baseUrl + "internal_attribute",
+      method: "GET",
+      headers: this.authService.getHeaders(),
+      params: { user: this.detailsUser().username, realm: this.selectedUserRealm() }
+    };
+  });
+
+  detailsUser = this.contentService.detailsUser;
+
+  readonly apiFilterKeys = apiFilterKeys;
+  override readonly advancedApiFilterKeys = advancedApiFilterKeys;
+  override readonly exactMatchKeys = exactMatchKeys;
+
+  /** A filter another view handed over, applied by the user table once it is on screen. */
+  presetFilter: WritableSignal<FilterValue | null> = signal<FilterValue | null>(null);
+
+  readonly activeFilter = signal(new FilterValue());
+
+  override readonly filterParams = computed<Record<string, string>>(
+    () => {
+      // Parse with the single-token grammar so only the first word after a `key:` is sent as the
+      // server filter; any trailing words are standalone free-text terms (value === null) and are
+      // filtered client-side across all columns instead of being appended to the keyword value.
+      const entries = parseFilterTokens(this.activeFilter().filterString)
+        .filter((token) => token.value !== null)
+        // Normalize the keyword to lower case so mixed-case input (e.g. "UserName:") still matches
+        // the allowed-filter list and the emitted API param key stays canonical. Only the key is
+        // normalized. The value is passed through case-preserving, so case matching is the resolver's
+        // decision rather than the frontend's.
+        .map((token) => [token.key.toLowerCase(), token.value] as const)
+        .map(([key, value]) => [key, booleanKeys.has(key) ? (toBooleanParam(value ?? "") ?? value) : value] as const);
+      return buildFilterParams(entries, this.allFilterKeys(), this.exactMatchKeys);
+    },
+    { equal: filterParamsEqual }
+  );
+
+  pageSize = linkedSignal(() => (this.authService.userPageSize() > 0 ? this.authService.userPageSize() : 10));
+
+  pageIndex = linkedSignal({
+    source: () => ({
+      filterValue: this.activeFilter(),
+      pageSize: this.pageSize(),
+      routeUrl: this.contentService.routeUrl()
+    }),
+    computation: () => 0
+  });
+
+  sort = signal({ active: "", direction: "" } as Sort);
+
+  selectedUserRealm: WritableSignal<string> = linkedSignal({
+    source: () => ({
+      routeUrl: this.contentService.routeUrl(),
+      queryRealm: this.contentService.queryParams()["realm"] ?? "",
+      detailsUserRealm: this.contentService.detailsUser().realm,
+      defaultRealm: this.realmService.defaultRealm(),
+      realmOptions: this.realmService.realmOptions(),
+      defaultRealmResolved: this.realmService.defaultRealmResolved(),
+      selectedTokenType: this.tokenService.selectedTokenType(),
+      authRole: this.authService.role(),
+      authRealm: this.authService.realm()
+    }),
+    computation: (source, previous): string => {
+      // The previous value is only trustworthy if the default realm was already
+      // known when it was picked, otherwise it may be a provisional first option.
+      const previousRealm = previous?.source.defaultRealmResolved ? previous.value : "";
+      const routeChanged = source.routeUrl !== previous?.source.routeUrl;
+      const fallbackRealm = previousRealm || this.defaultRealm();
+      // On user details the realm of the opened user is the source of truth
+      if (this.contentService.onUserDetails()) {
+        return source.detailsUserRealm || fallbackRealm;
+      }
+      if (source.queryRealm) {
+        const realm = routeChanged ? source.queryRealm : fallbackRealm;
+        if (source.realmOptions.length > 0 && !source.realmOptions.includes(realm)) {
+          return this.defaultRealm();
+        }
+        return realm;
+      }
+      if (source.routeUrl.startsWith(ROUTE_PATHS.USERS)) {
+        return fallbackRealm;
+      }
+      return this.defaultRealm();
+    }
+  });
+
+  private defaultRealm(): string {
+    const options = this.realmService.realmOptions();
+    let defaultRealm = this.realmService.defaultRealm();
+    if (!options.includes(defaultRealm)) {
+      // user is not allowed to see the default realm
+      defaultRealm = "";
+    }
+    const realm = this.authService.role() === "user" ? this.authService.realm() : defaultRealm;
+    return realm || options[0] || "";
+  }
+
+  selectionFilter = linkedSignal<{ realm: string; routeUrl: string; queryUser: string }, UserData | string>({
+    source: () => ({
+      realm: this.selectedUserRealm(),
+      routeUrl: this.contentService.routeUrl(),
+      queryUser: this.contentService.queryParams()["user"] ?? ""
+    }),
+    computation: (source, previous) => {
+      if (!source.queryUser) {
+        return "";
+      }
+      // A navigation seeds the selection from the query parameter, while a selection made afterwards
+      // on the same route wins over it.
+      const sameRoute = previous !== undefined && previous.source.routeUrl === source.routeUrl;
+      return sameRoute ? previous.value : source.queryUser;
+    }
+  });
+
+  selectionUsernameFilter = computed<string>(() => {
+    const filter = this.selectionFilter();
+    if (typeof filter === "string") {
+      return filter;
+    }
+    return filter?.username ?? "";
+  });
+
+  userResource = httpResource<PiResponse<UserData[]>>(() => {
+    // Do not load user details if the action is not allowed.
+    if (!this.authService.actionAllowed("userlist")) {
+      return undefined;
+    }
+    // Only load user details on the user details page for admins and always for users.
+    if (!this.contentService.onUserDetails() && this.authService.role() !== "user") {
+      return undefined;
+    }
+
+    return {
+      url: this.baseUrl,
+      method: "GET",
+      headers: this.authService.getHeaders(),
+      params: {
+        include_custom_attributes: false,
+        ...(this.detailsUser().username && { user: this.detailsUser().username }),
+        ...(this.selectedUserRealm() && { realm: this.selectedUserRealm() })
+      }
+    };
+  });
+
+  user: WritableSignal<UserData> = linkedSignal({
+    source: () => ({
+      userRes: this.userResource.hasValue() ? this.userResource.value() : undefined,
+      isLoading: this.userResource.isLoading(),
+      error: this.userResource.error(),
+      detailsUsername: this.detailsUser().username
+    }),
+    computation: (source, previous) => {
+      const emptyDetails: UserData = {
+        description: "",
+        editable: false,
+        email: "",
+        givenname: "",
+        mobile: "",
+        phone: "",
+        resolver: "",
+        surname: "",
+        userid: "",
+        username: ""
+      };
+      if (source.error) return emptyDetails;
+      const value = source.userRes?.result?.value?.[0];
+      if (!value) {
+        if (!source.isLoading) return emptyDetails;
+        if (source.detailsUsername !== previous?.source.detailsUsername) return emptyDetails;
+        return previous?.value ?? emptyDetails;
+      }
+      return value;
+    }
+  });
+
+  usersResource = httpResource<PiResponse<UserData[], UserListResponseDetail | undefined>>(() => {
+    const selectedUserRealm = this.selectedUserRealm();
+    // Do not load users if the action is not allowed.
+    if (!this.authService.actionAllowed("userlist")) {
+      return undefined;
+    }
+    // Load users only if a realm is selected.
+    if (!selectedUserRealm) {
+      return undefined;
+    }
+    // Only load users on routes with a user list or selection.
+    const onAllowedRoute =
+      this.contentService.onTokenDetails() ||
+      this.contentService.onContainersDetails() ||
+      this.contentService.onTokens() ||
+      this.contentService.onUsers() ||
+      this.contentService.onContainersCreate() ||
+      this.contentService.onTokensEnrollment();
+
+    if (!onAllowedRoute) {
+      return undefined;
+    }
+    // A filter handed over by another view is applied by the user table once it exists; loading
+    // before that would fetch the whole unfiltered list just to throw it away.
+    if (this.contentService.onUsers() && this.presetFilter()) {
+      return undefined;
+    }
+    // On the tokens route we require at least one selected token before loading users.
+    if (this.contentService.onTokens() && !this.tokenService.tokenSelection.hasSelection()) {
+      return undefined;
+    }
+
+    return {
+      url: this.baseUrl,
+      method: "GET",
+      headers: this.authService.getHeaders(),
+      params: {
+        realm: selectedUserRealm,
+        attributes: "username,userid,givenname,surname,email,phone,mobile,description,resolver,editable",
+        include_custom_attributes: false,
+        ...this.filterParams()
+      }
+    };
+  });
+
+  /** Resolvers of the selected realm that the server could not query, so the list on screen is incomplete. */
+  skippedResolvers = computed<string[]>(() =>
+    this.usersResource.hasValue() ? (this.usersResource.value()?.detail?.skipped_resolvers ?? []) : []
+  );
+
+  users: WritableSignal<UserData[]> = linkedSignal({
+    source: () => ({
+      userRes: this.usersResource.hasValue() ? this.usersResource.value() : undefined,
+      isLoading: this.usersResource.isLoading(),
+      error: this.usersResource.error(),
+      realm: this.selectedUserRealm()
+    }),
+    computation: (source, previous) => {
+      if (source.error) return [];
+      const users = source.userRes?.result?.value;
+      if (users) return users;
+      // No value: distinguish loading vs settled-without-data
+      if (!source.isLoading) return [];
+      // Loading: keep previous only if the realm did not change
+      if (source.realm !== previous?.source.realm) return [];
+      return previous?.value ?? [];
+    }
+  });
+
+  selectedUser = computed<UserData | null>(() => {
+    let tokenUsername = "";
+    if (this.contentService.onTokenDetails() && this.tokenService.tokenDetailResource.hasValue()) {
+      const token = this.tokenService.tokenDetailResource.value()?.result?.value?.tokens?.[0];
+      tokenUsername = token?.username ?? "";
+    }
+
+    let targetUsername = "";
+    if (tokenUsername) {
+      targetUsername = tokenUsername;
+    } else if (this.authService.role() === "user") {
+      targetUsername = this.authService.username();
+    } else {
+      targetUsername = this.selectionUsernameFilter();
+      if (!targetUsername) {
+        return null;
+      }
+    }
+
+    const users = this.users();
+    const found = users.find((u) => u.username === targetUsername);
+    if (found) return found;
+
+    return {
+      username: targetUsername,
+      description: "",
+      editable: false,
+      email: "",
+      givenname: "",
+      mobile: "",
+      phone: "",
+      resolver: "",
+      surname: "",
+      userid: ""
+    } as UserData;
+  });
+
+  allUsernames = computed<string[]>(() => this.users().map((user) => user.username));
+
+  selectionFilteredUsers = computed<UserData[]>(() => {
+    const userFilter = this.selectionFilter();
+    if (typeof userFilter !== "string" || userFilter.trim() === "") {
+      return this.users();
+    }
+    const filterValue = userFilter.toLowerCase().trim();
+    return this.users().filter((user) => user.username.toLowerCase().includes(filterValue));
+  });
+
+  selectionFilteredUsernames = computed<string[]>(() => this.selectionFilteredUsers().map((user) => user.username));
+
+  displayUser(user: UserData | string): string {
+    if (typeof user === "string") {
+      return user;
+    }
+    return user ? user.username : "";
+  }
+
+  /**
+   * The users of one realm, or of every realm when none is given, and how many of them own a token.
+   * Unlike {@link usersResource} this is not bound to the globally selected realm. Unreachable
+   * resolvers are named in the response detail.
+   */
+  fetchUserCount(realm?: string): Observable<PiResponse<UserCount, UserListResponseDetail | undefined>> {
+    return this.http.get<PiResponse<UserCount, UserListResponseDetail | undefined>>(this.baseUrl + "count", {
+      headers: this.authService.getHeaders(),
+      params: realm ? { realm } : {}
+    });
+  }
+
+  setUserAttribute(key: string, value: string) {
+    const params: Record<string, string> = {
+      user: this.detailsUser().username,
+      realm: this.selectedUserRealm(),
+      key,
+      value
+    };
+    return this.http
+      .post<PiResponse<number>>(this.baseUrl + "attribute", null, {
+        headers: this.authService.getHeaders(),
+        params
+      })
+      .pipe(
+        catchError((error) => {
+          console.error("Failed to set user attribute.", error);
+          const message = error.error?.result?.error?.message || "";
+          this.notificationService.error(
+            $localize`:@@user.failedSetUser:Failed to set user attribute. ${message}:MESSAGE:`
+          );
+          return of(undefined);
+        })
+      );
+  }
+
+  deleteUserAttribute(key: string) {
+    const username = this.detailsUser().username;
+    const realm = this.selectedUserRealm();
+    const url =
+      this.baseUrl +
+      `attribute/${encodeURIComponent(key)}/${encodeURIComponent(username)}/${encodeURIComponent(realm)}`;
+    return this.http.delete<PiResponse<number>>(url, { headers: this.authService.getHeaders() }).pipe(
+      catchError((error) => {
+        console.error("Failed to delete user attribute.", error);
+        const message = error.error?.result?.error?.message || "";
+        this.notificationService.error(
+          $localize`:@@user.failedDeleteUserAttribute:Failed to delete user attribute. ${message}:MESSAGE:`
+        );
+        return of(undefined);
+      })
+    );
+  }
+
+  createUser(resolver: string, userData: EditUserData) {
+    const { username, ...rest } = userData;
+    const payload: UserPayload = { ...rest, user: username, resolver };
+    return this.http
+      .post<PiResponse<number>>(this.baseUrl, payload, {
+        headers: this.authService.getHeaders()
+      })
+      .pipe(
+        map((response) => response.result?.status || false),
+        catchError((error) => {
+          console.warn("Failed to create user", error);
+          const message = error.error?.result?.error?.message || "";
+          this.notificationService.error(
+            $localize`:@@user.failedCreateUser:Failed to create user ${userData.username}:USERNAME:. ${message}:MESSAGE:`
+          );
+          return of(false);
+        })
+      );
+  }
+
+  editUser(resolver: string, userData: EditUserData) {
+    const { username, ...rest } = userData;
+    const payload: UserPayload = { ...rest, user: username, resolver };
+    return this.http.put<PiResponse<number>>(this.baseUrl, payload, { headers: this.authService.getHeaders() }).pipe(
+      map((response) => response.result?.status || false),
+      catchError((error) => {
+        console.warn("Failed to update user", error);
+        const message = error.error?.result?.error?.message || "";
+        this.notificationService.error(
+          $localize`:@@user.failedUpdateUser:Failed to update user ${userData.username}:USERNAME:. ${message}:MESSAGE:`
+        );
+        return of(false);
+      })
+    );
+  }
+
+  deleteUser(resolver: string, username: string): Observable<boolean> {
+    const url = this.baseUrl + encodeURIComponent(resolver) + "/" + encodeURIComponent(username);
+    return this.http.delete<PiResponse<number>>(url, { headers: this.authService.getHeaders() }).pipe(
+      map((response) => response.result?.status || false),
+      catchError((error) => {
+        console.warn("Failed to delete user", error);
+        const message = error.error?.result?.error?.message || "";
+        this.notificationService.error(
+          $localize`:@@user.failedDeleteUser:Failed to delete user ${username}:USERNAME:. ${message}:MESSAGE:`
+        );
+        return of(false);
+      })
+    );
+  }
+}

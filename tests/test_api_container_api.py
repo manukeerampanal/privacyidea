@@ -1,0 +1,1122 @@
+# SPDX-FileCopyrightText: 2024 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+from privacyidea.lib.container import (delete_container_by_serial)
+from privacyidea.lib.container import (init_container, find_container_by_serial, add_token_to_container)
+from privacyidea.lib.containers.container_info import PI_INTERNAL, TokenContainerInfoData, RegistrationState
+from privacyidea.lib.error import Error
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.policy import set_policy, SCOPE, delete_policy
+from privacyidea.lib.realm import delete_realm, set_default_realm, set_realm
+from privacyidea.lib.resolver import save_resolver
+from privacyidea.lib.token import init_token
+from privacyidea.lib.user import User
+from privacyidea.models import Realm
+
+from .api_container_common import (
+    APIContainerTest,
+)
+
+
+class APIContainer(APIContainerTest):
+
+    def test_00_init_delete_container_success(self):
+        # Init container
+        payload = {"type": "Smartphone", "description": "test description!!"}
+        res = self.request_assert_success('/container/init', payload, self.at, 'POST')
+        cserial = res["result"]["value"]["container_serial"]
+        self.assert_audit_entry('POST /container/init', success=1, container_serial=cserial)
+        self.assertTrue(len(cserial) > 1)
+
+        # Check creation date is set
+        container = find_container_by_serial(cserial)
+        self.assertIn("creation_date", list(container.get_container_info_dict().keys()))
+
+        # Delete the container
+        result = self.request_assert_success(f"container/{cserial}", {}, self.at, 'DELETE')
+        self.assert_audit_entry('DELETE /container/<string:container_serial>', success=1,
+                                container_serial=cserial)
+        self.assertTrue(result["result"]["value"])
+
+    def test_01_init_container_fail(self):
+        # Init with non-existing type
+        payload = {"type": "wrongType", "description": "test description!!"}
+        self.request_assert_error(400, '/container/init', payload, self.at, 'POST',
+                                  error_code=404,
+                                  error_message="ERR404: Type 'wrongType' is not a valid type!")
+        self.assert_audit_entry('POST /container/init', success=0, info=self.contains('ERR404'))
+
+        # Init without type
+        self.request_assert_error(400, '/container/init', {}, self.at, 'POST',
+                                  error_code=404,
+                                  error_message="ERR404: Type parameter is required!")
+        self.assert_audit_entry('POST /container/init', success=0, info=self.contains('ERR404'))
+
+        # Init without auth token
+        payload = {"type": "Smartphone", "description": "test description!!"}
+        self.request_assert_error(401, '/container/init',
+                                  payload, None, 'POST',
+                                  error_code=4033,
+                                  error_message="Authentication failure. Missing Authorization header.")
+        self.assert_no_audit_entry('POST /container/init')
+
+    def test_02_delete_container_fail(self):
+        # Delete non-existing container
+        self.request_assert_error(404, '/container/wrong_serial',
+                                  {}, self.at, 'DELETE',
+                                  error_code=601,
+                                  error_message="Unable to find container with serial wrong_serial.")
+        self.assert_audit_entry('DELETE /container/<string:container_serial>', success=0,
+                                container_serial="wrong_serial", info=self.NOT_EMPTY)
+
+        # Call without serial
+        self.request_assert_405('/container/', {}, self.at, 'DELETE')
+        self.assert_audit_log_empty()
+
+    def test_03_assign_user_fail(self):
+        # Arrange
+        container_serial = init_container({"type": "generic"})["container_serial"]
+
+        # Assign without realm
+        payload = {"user": "hans"}
+        self.request_assert_error(400, f'/container/{container_serial}/assign',
+                                  payload, self.at, 'POST',
+                                  error_code=904,
+                                  error_message="ERR904: The user can not be found in any resolver in this realm!")
+        self.assert_audit_entry('POST /container/<string:container_serial>/assign', success=0,
+                                container_serial=container_serial, info=self.contains('ERR904'))
+
+        # Assign user with non-existing realm
+        payload = {"user": "hans", "realm": "non_existing"}
+        self.request_assert_error(400, f'/container/{container_serial}/assign',
+                                  payload, self.at, 'POST',
+                                  error_code=904,
+                                  error_message="ERR904: The user can not be found in any resolver in this realm!")
+        self.assert_audit_entry('POST /container/<string:container_serial>/assign', success=0,
+                                info=self.contains('ERR904'))
+
+        # Assign without user
+        self.setUp_user_realm2()
+        payload = {"realm": self.realm2}
+        self.request_assert_error(400, f'/container/{container_serial}/assign',
+                                  payload, self.at, 'POST',
+                                  error_code=905,
+                                  error_message="ERR905: Missing parameter: user")
+        self.assert_audit_entry('POST /container/<string:container_serial>/assign', success=0,
+                                info=self.contains('ERR905'))
+
+        delete_container_by_serial(container_serial)
+
+    def test_04_assign_multiple_users_fails(self):
+        # Arrange
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        self.setUp_user_realms()
+        payload = {"user": "hans", "realm": self.realm1}
+
+        # Assign with user and realm
+        result = self.request_assert_success(f'/container/{container_serial}/assign', payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/assign', success=1,
+                                container_serial=container_serial)
+        self.assertTrue(result["result"]["value"])
+
+        # Assign another user fails
+        payload = {"user": "cornelius", "realm": self.realm1}
+        self.request_assert_error(400, f'/container/{container_serial}/assign',
+                                  payload, self.at, 'POST',
+                                  error_code=301,
+                                  error_message="ERR301: This container is already assigned to another user.")
+        self.assert_audit_entry('POST /container/<string:container_serial>/assign', success=0,
+                                info=self.contains('ERR301'))
+
+        delete_container_by_serial(container_serial)
+
+    def test_05_assign_unassign_user_success(self):
+        # Arrange
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        self.setUp_user_realms()
+        payload = {"user": "hans", "realm": self.realm1}
+
+        # Assign with user and realm
+        result = self.request_assert_success(f'/container/{container_serial}/assign', payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/assign', success=1,
+                                container_serial=container_serial)
+        self.assertTrue(result["result"]["value"])
+
+        # Unassign
+        result = self.request_assert_success(f'/container/{container_serial}/unassign',
+                                             payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=1,
+                                container_serial=container_serial)
+        self.assertTrue(result["result"]["value"])
+
+        delete_container_by_serial(container_serial)
+
+    def test_06_assign_without_realm(self):
+        # If no realm is passed the default realm is set in before_request
+        # Arrange
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        self.setUp_user_realm2()
+        self.setUp_user_realm3()
+        payload = {"user": "hans"}
+
+        # Assign
+        result = self.request_assert_success(f'/container/{container_serial}/assign',
+                                             payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/assign', success=1)
+        self.assertTrue(result["result"]["value"])
+        # Used default realm is correct
+        container = find_container_by_serial(container_serial)
+        owner = container.get_users()[0]
+        self.assertTrue(owner.login == "hans")
+        self.assertTrue(owner.realm == self.realm2)
+
+        # Assign without realm where default realm is not correct
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        payload = {"user": "root"}
+        self.request_assert_error(400, f'/container/{container_serial}/assign',
+                                  payload, self.at, 'POST',
+                                  error_code=904,
+                                  error_message="ERR904: The user can not be found in any resolver in this realm!")
+        self.assert_audit_entry('POST /container/<string:container_serial>/assign', success=0,
+                                info=self.contains('ERR904'))
+
+        container.delete()
+
+    def test_07a_unassign_success(self):
+        # Arrange
+        self.setUp_user_realms()
+        self.setUp_user_realm3()
+        set_default_realm(self.realm1)
+        user = User("hans", self.realm1)
+        container_serial = init_container({"type": "generic", "user": user.login, "realm": user.realm})[
+            "container_serial"]
+        container = find_container_by_serial(container_serial)
+
+        # Unassign only with username works if user is in default realm
+        payload = {"user": "hans"}
+        result = self.request_assert_success(f'/container/{container_serial}/unassign', payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=1,
+                                container_serial=container_serial)
+        self.assertTrue(result["result"].get("value"))
+        self.assertEqual(0, len(container.get_users()))
+
+        # username + realm
+        container.add_user(user)
+        payload = {"user": user.login, "realm": user.realm}
+        result = self.request_assert_success(f'/container/{container_serial}/unassign', payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=1,
+                                container_serial=container_serial)
+        self.assertTrue(result["result"].get("value"))
+        self.assertEqual(0, len(container.get_users()))
+
+        # username + resolver
+        container.add_user(user)
+        payload = {"user": user.login, "resolver": user.resolver}
+        result = self.request_assert_success(f'/container/{container_serial}/unassign', payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=1,
+                                container_serial=container_serial)
+        self.assertTrue(result["result"].get("value"))
+        self.assertEqual(0, len(container.get_users()))
+
+        # uid
+        container.add_user(user)
+        payload = {"user_id": user.uid}
+        result = self.request_assert_success(f'/container/{container_serial}/unassign', payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=1,
+                                container_serial=container_serial)
+        self.assertTrue(result["result"].get("value"))
+        self.assertEqual(0, len(container.get_users()))
+
+        # uid + realm + resolver
+        container.add_user(user)
+        payload = {"user_id": user.uid, "realm": user.realm, "resolver": user.resolver}
+        result = self.request_assert_success(f'/container/{container_serial}/unassign', payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=1,
+                                container_serial=container_serial)
+        self.assertTrue(result["result"].get("value"))
+        self.assertEqual(0, len(container.get_users()))
+
+        container.delete()
+
+    def test_07b_unassign_fail(self):
+        # Arrange
+        self.setUp_user_realms()
+        self.setUp_user_realm3()
+        set_default_realm(self.realm1)
+        user = User("corny", self.realm3)
+        container_serial = init_container({"type": "generic", "user": user.login, "realm": user.realm})[
+            "container_serial"]
+
+        # Missing input parameters
+        # No parameters
+        self.request_assert_error(400, f'/container/{container_serial}/unassign', {}, self.at, 'POST',
+                                  error_code=905,
+                                  error_message="ERR905: Missing one of the following parameters: ['user', 'user_id']")
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=0,
+                                info=self.contains('ERR905'))
+
+        # Only username, realm / resolver / uid missing (if user is not in defrealm)
+        payload = {"user": user.login}
+        self.request_assert_error(400, f'/container/{container_serial}/unassign',
+                                  payload, self.at, 'POST',
+                                  error_code=904,
+                                  error_message="ERR904: The user can not be found in any resolver in this realm!")
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=0,
+                                info=self.contains('ERR904'))
+        # If no default realm exists, another error is raised
+        set_default_realm()
+        self.request_assert_error(400, f'/container/{container_serial}/unassign',
+                                  payload, self.at, 'POST',
+                                  error_code=905,
+                                  error_message="ERR905: Missing parameter 'realm', 'resolver', and/or 'user_id'")
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=0,
+                                info=self.contains('ERR905'))
+
+        # Only realm: user / user_id missing
+        payload = {"realm": self.realm3}
+        self.request_assert_error(400, f'/container/{container_serial}/unassign',
+                                  payload, self.at, 'POST',
+                                  error_code=905,
+                                  error_message="ERR905: Missing one of the following parameters: ['user', 'user_id']")
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=0,
+                                info=self.contains('ERR905'))
+
+        # Unassign user with non-existing realm
+        payload = {"user": user.login, "realm": "non_existing"}
+        self.request_assert_error(400, f'/container/{container_serial}/unassign',
+                                  payload, self.at, 'POST',
+                                  error_code=904,
+                                  error_message="ERR904: The user can not be found in any resolver in this realm!")
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=0,
+                                info=self.contains('ERR904'))
+
+        # Unassign not assigned user
+        payload = {"user": "hans", "realm": self.realm1}
+        result = self.request_assert_success(f'/container/{container_serial}/unassign',
+                                             payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=0)
+        self.assertFalse(result["result"]["value"])
+
+        delete_container_by_serial(container_serial)
+
+    def test_07c_unassign_non_existing_user(self):
+        # Arrange
+        self.setUp_user_realms()
+        self.setUp_user_realm3()
+        set_default_realm(self.realm1)
+        invalid_user = User("invalid", self.realm1, self.resolvername1, "123")
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+        container.add_user(invalid_user)
+        self.assertEqual(1, len(container.get_users()))
+
+        # --- Fail ---
+        # Only with username and realm
+        payload = {"user": "invalid", "realm": self.realm1}
+        self.request_assert_error(400, f'/container/{container_serial}/unassign',
+                                  payload, self.at, 'POST',
+                                  error_code=904,
+                                  error_message="ERR904: The user can not be found in any resolver in this realm!")
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=0,
+                                info=self.contains('ERR904'))
+
+        # Remove non-existing not assigned user
+        payload = {"user": "another_invalid", "realm": self.realm1, "user_id": "987"}
+        self.request_assert_error(400, f'/container/{container_serial}/unassign',
+                                  payload, self.at, 'POST',
+                                  error_code=904,
+                                  error_message="ERR904: The user can not be found in any resolver in this realm!")
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=0,
+                                info=self.contains('ERR904'))
+
+        # --- Success ---
+        # Only with user_id should work as long as the container can only have one user
+        payload = {"user_id": invalid_user.uid}
+        result = self.request_assert_success(f'/container/{container_serial}/unassign',
+                                             payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=1)
+        self.assertTrue(result["result"].get("value"))
+        self.assertEqual(0, len(container.get_users()))
+
+        # With user_id and resolver success
+        container.add_user(invalid_user)
+        payload = {"user_id": invalid_user.uid, "resolver": invalid_user.resolver}
+        result = self.request_assert_success(f'/container/{container_serial}/unassign',
+                                             payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=1)
+        self.assertTrue(result["result"].get("value"))
+        self.assertEqual(0, len(container.get_users()))
+
+        # Provide realm and user_id should work
+        container.add_user(invalid_user)
+        payload = {"realm": invalid_user.realm, "user_id": invalid_user.uid}
+        result = self.request_assert_success(f'/container/{container_serial}/unassign',
+                                             payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=1)
+        self.assertTrue(result["result"].get("value"))
+        self.assertEqual(0, len(container.get_users()))
+
+        # Provide everything
+        container.add_user(invalid_user)
+        payload = {"user": invalid_user.login, "realm": invalid_user.realm, "resolver": invalid_user.resolver,
+                   "user_id": invalid_user.uid}
+        result = self.request_assert_success(f'/container/{container_serial}/unassign',
+                                             payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=1)
+        self.assertTrue(result["result"].get("value"))
+        self.assertEqual(0, len(container.get_users()))
+
+        # ---- Invalid realm ---
+        user = User("corny", self.realm3)
+        container.add_user(user)
+        Realm.query.filter_by(name=self.realm3).first().delete()
+        # Success if providing everything (realm does not exist, hence realm_id is not set)
+        payload = {"user": "corny", "realm": self.realm3, "user_id": user.uid, "resolver": user.resolver}
+        result = self.request_assert_success(f'/container/{container_serial}/unassign', payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=1)
+        self.assertTrue(result["result"].get("value"))
+        self.assertEqual(0, len(container.get_users()))
+        self.setUp_user_realm3()
+        user = User("corny", self.realm3)
+        container.add_user(user)
+        Realm.query.filter_by(name=self.realm3).first().delete()
+        # Also fails if not providing realm (sets default realm)
+        payload = {"user": "corny", "user_id": user.uid, "resolver": user.resolver}
+        self.request_assert_error(400, f'/container/{container_serial}/unassign',
+                                  payload, self.at, 'POST',
+                                  error_code=904,
+                                  error_message="ERR904: The user can not be found in any resolver in this realm!")
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=0,
+                                info=self.contains('ERR904'))
+        # Success when providing only user_id and resolver, even if realm does not exist
+        payload = {"user_id": user.uid, "resolver": user.resolver}
+        result = self.request_assert_success(f'/container/{container_serial}/unassign', payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/unassign', success=1)
+        self.assertTrue(result["result"].get("value"))
+        self.assertEqual(0, len(container.get_users()))
+
+        container.delete()
+
+    def test_08_set_realms_success(self):
+        # Arrange
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+        container_serial = init_container({"type": "generic"})["container_serial"]
+
+        # Set existing realms
+        payload = {"realms": self.realm1 + "," + self.realm2}
+        result = self.request_assert_success(f'/container/{container_serial}/realms', payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/realms', success=1,
+                                container_serial=container_serial, action_detail="realms=realm1,realm2",
+                                info="attached=['realm1', 'realm2']")
+        result = result["result"]
+        self.assertTrue(result["value"])
+        self.assertFalse(result["value"]["deleted"])
+        self.assertTrue(result["value"]["realms"][self.realm1])
+        self.assertTrue(result["value"]["realms"][self.realm2])
+
+        # Set no realm shall remove all realms for the container
+        payload = {"realms": ""}
+        result = self.request_assert_success(f'/container/{container_serial}/realms', payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/realms', success=1,
+                                container_serial=container_serial, action_detail="realms=",
+                                info="removed=['realm1', 'realm2']")
+        result = result["result"]
+        self.assertTrue(result["value"])
+        self.assertTrue(result["value"]["deleted"])
+        self.assertNotIn(self.realm1, result["value"]["realms"])
+        self.assertNotIn(self.realm2, result["value"]["realms"])
+
+        delete_container_by_serial(container_serial)
+
+        # The user's realm can not be removed, so it stays although not requested: the requested realm set
+        # is not fully applied and it is reported in not_removed.
+        container_serial = init_container({"type": "generic", "user": "hans", "realm": self.realm1})["container_serial"]
+        payload = {"realms": self.realm2}
+        result = self.request_assert_success(f'/container/{container_serial}/realms', payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/realms', success=0,
+                                container_serial=container_serial, action_detail="realms=realm2",
+                                info="attached=['realm1', 'realm2']; not removed=['realm1']")
+        self.assertTrue(result["result"]["value"]["realms"][self.realm2])
+        # the user's realm can not be removed, so it stays attached (True) although not requested
+        self.assertTrue(result["result"]["value"]["realms"][self.realm1])
+
+        delete_container_by_serial(container_serial)
+
+    def test_08a_set_realms_realm_named_like_a_status_key(self):
+        # A realm may be named like one of the status keys of the response. Its per-realm status
+        # lives in its own dictionary, so it stays readable and independent of the status keys.
+        self.setUp_user_realms()
+        set_realm("deleted", [{"name": self.resolvername1}])
+        container_serial = init_container({"type": "generic"})["container_serial"]
+
+        # Attaching the realm succeeds, and nothing was removed
+        result = self.request_assert_success(f'/container/{container_serial}/realms', {"realms": "deleted"},
+                                             self.at, 'POST')
+        value = result["result"]["value"]
+        self.assertTrue(value["realms"]["deleted"])
+        self.assertFalse(value["deleted"])
+
+        # Removing it again is reported as a removal, and the realm is no longer attached
+        result = self.request_assert_success(f'/container/{container_serial}/realms', {"realms": ""},
+                                             self.at, 'POST')
+        value = result["result"]["value"]
+        self.assertNotIn("deleted", value["realms"])
+        self.assertTrue(value["deleted"])
+
+        delete_container_by_serial(container_serial)
+        delete_realm("deleted")
+
+    def test_09_set_realms_fail(self):
+        # Arrange
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+        container_serial = init_container({"type": "generic"})["container_serial"]
+
+        # Missing realm parameter
+        self.request_assert_error(400, f'/container/{container_serial}/realms',
+                                  {}, self.at, 'POST',
+                                  error_code=905,
+                                  error_message="ERR905: Missing parameter: realms")
+        self.assert_audit_entry('POST /container/<string:container_serial>/realms', success=0,
+                                container_serial=container_serial, info=self.contains('ERR905'))
+
+        # Set non-existing realm
+        payload = {"realms": "nonexistingrealm"}
+        result = self.request_assert_success(f'/container/{container_serial}/realms', payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/realms', success=0,
+                                container_serial=container_serial, action_detail="realms=nonexistingrealm",
+                                info="not added=['nonexistingrealm']")
+        result = result.get("result")
+        self.assertFalse(result["value"]["realms"]["nonexistingrealm"])
+
+        # Missing container serial
+        self.request_assert_405('/container/realms', {"realms": [self.realm1]}, self.at, 'POST')
+        self.assert_audit_log_empty()
+
+        delete_container_by_serial(container_serial)
+
+    def test_10_set_description_success(self):
+        # Arrange
+        container_serial = init_container({"type": "generic", "description": "test container"})["container_serial"]
+
+        # Set description
+        payload = {"description": "new description"}
+        result = self.request_assert_success(f'/container/{container_serial}/description',
+                                             payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/description', success=1,
+                                action_detail="description=new description")
+        self.assertTrue(result["result"]["value"])
+
+        # Set empty description
+        payload = {"description": ""}
+        result = self.request_assert_success(f'/container/{container_serial}/description',
+                                             payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/description', success=1,
+                                action_detail="description=")
+        self.assertTrue(result["result"]["value"])
+
+        delete_container_by_serial(container_serial)
+
+    def test_11_set_description_fail(self):
+        # Arrange
+        container_serial = init_container({"type": "generic", "description": "test container"})["container_serial"]
+
+        # Missing description parameter
+        self.request_assert_error(400, f'/container/{container_serial}/description',
+                                  {}, self.at, 'POST',
+                                  error_code=905,
+                                  error_message="ERR905: Missing parameter: description")
+        self.assert_audit_entry('POST /container/<string:container_serial>/description', success=0,
+                                info=self.contains('ERR905'))
+
+        # Description parameter is None
+        self.request_assert_error(400, f'/container/{container_serial}/description',
+                                  {"description": None}, self.at, 'POST',
+                                  error_code=905,
+                                  error_message="ERR905: Missing parameter: description")
+        self.assert_audit_entry('POST /container/<string:container_serial>/description', success=0,
+                                info=self.contains('ERR905'))
+
+        # Missing container serial
+        self.request_assert_405('/container/description', {"description": "new description"},
+                                self.at, 'POST')
+        self.assert_audit_log_empty()
+
+        delete_container_by_serial(container_serial)
+
+    def test_12_set_states_success(self):
+        # Arrange
+        container_serial = init_container({"type": "generic", "description": "test container"})["container_serial"]
+
+        # Set states
+        payload = {"states": "active,damaged,lost"}
+        result = self.request_assert_success(f'/container/{container_serial}/states',
+                                             payload, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/states', success=1,
+                                action_detail="states=['active', 'damaged', 'lost']")
+        self.assertTrue(result["result"]["value"])
+        self.assertTrue(result["result"]["value"]["active"])
+        self.assertTrue(result["result"]["value"]["damaged"])
+        self.assertTrue(result["result"]["value"]["lost"])
+
+        delete_container_by_serial(container_serial)
+
+    def test_13_set_states_fail(self):
+        # Arrange
+        container_serial = init_container({"type": "generic", "description": "test container"})["container_serial"]
+
+        # Missing states parameter
+        self.request_assert_error(400, f'/container/{container_serial}/states',
+                                  {}, self.at, 'POST',
+                                  error_code=905,
+                                  error_message="ERR905: Missing parameter: states")
+        self.assert_audit_entry('POST /container/<string:container_serial>/states', success=0,
+                                info=self.contains('ERR905'))
+
+        # Missing container serial
+        self.request_assert_405('/container/states', {"states": "active,damaged,lost"},
+                                self.at, 'POST')
+        self.assert_audit_log_empty()
+
+        # Set exclusive states
+        payload = {"states": "active,disabled"}
+        self.request_assert_error(400, f'/container/{container_serial}/states',
+                                  payload, self.at, 'POST',
+                                  error_code=905,
+                                  error_message="ERR905: The state list ['active', 'disabled'] contains exclusive "
+                                                "states!")
+        self.assert_audit_entry('POST /container/<string:container_serial>/states', success=0,
+                                info=self.contains('ERR905'))
+
+        delete_container_by_serial(container_serial)
+
+    def test_14_set_container_info_success(self):
+        # Arrange
+        container_serial = init_container({"type": "generic", "description": "test container"})["container_serial"]
+
+        # Set info
+        self.request_assert_success(f'/container/{container_serial}/info/key1',
+                                    {"value": "value1"}, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/info/<key>', success=1,
+                                container_serial=container_serial, action_detail="key=key1")
+
+        delete_container_by_serial(container_serial)
+
+    def test_15_set_container_info_fail(self):
+        # Arrange
+        container_serial = init_container({"type": "generic"})["container_serial"]
+
+        # Missing value parameter
+        self.request_assert_error(400, f'/container/{container_serial}/info/key1',
+                                  {}, self.at, 'POST',
+                                  error_code=905,
+                                  error_message="ERR905: Missing parameter: value")
+        self.assert_audit_entry('POST /container/<string:container_serial>/info/<key>', success=0,
+                                info=self.contains('ERR905'))
+
+        # Missing container serial
+        self.request_assert_404_no_result('/container/info/key1', {"value": "value1"}, self.at, 'POST')
+        self.assert_audit_log_empty()
+
+        # Missing key
+        self.request_assert_404_no_result(f'/container/{container_serial}/info/',
+                                          {"value": "value1"}, self.at, 'POST')
+        self.assert_audit_log_empty()
+
+        delete_container_by_serial(container_serial)
+
+    def test_16_add_remove_token_success(self):
+        # Arrange
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        hotp_01 = init_token({"genkey": "1"})
+        hotp_01_serial = hotp_01.get_serial()
+        hotp_02 = init_token({"genkey": "1"})
+        hotp_02_serial = hotp_02.get_serial()
+        hotp_03 = init_token({"genkey": "1"})
+        hotp_03_serial = hotp_03.get_serial()
+
+        # Add single token
+        result = self.request_assert_success(f'/container/{container_serial}/add',
+                                             {"serial": hotp_01_serial}, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/add', success=1,
+                                container_serial=container_serial, serial=hotp_01_serial)
+        self.assertTrue(result["result"]["value"])
+
+        # Remove single token
+        result = self.request_assert_success(f'/container/{container_serial}/remove',
+                                             {"serial": hotp_01_serial}, self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/remove', success=1,
+                                container_serial=container_serial, serial=hotp_01_serial)
+        self.assertTrue(result["result"]["value"])
+
+        # Add multiple tokens
+        result = self.request_assert_success(f'/container/{container_serial}/addall',
+                                             {"serial": f"{hotp_01_serial},{hotp_02_serial},{hotp_03_serial}"},
+                                             self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/addall', success=1,
+                                container_serial=container_serial,
+                                serial=self.NOT_EMPTY)  # addall/removeall log serials in a non-deterministic order
+        self.assertTrue(result["result"]["value"][hotp_01_serial])
+        self.assertTrue(result["result"]["value"][hotp_02_serial])
+        self.assertTrue(result["result"]["value"][hotp_03_serial])
+
+        # Remove multiple tokens with spaces in list
+        result = self.request_assert_success(f'/container/{container_serial}/removeall',
+                                             {"serial": f"{hotp_01_serial}, {hotp_02_serial}, {hotp_03_serial}"},
+                                             self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/removeall', success=1,
+                                container_serial=container_serial,
+                                serial=self.NOT_EMPTY)  # addall/removeall log serials in a non-deterministic order
+        self.assertTrue(result["result"]["value"][hotp_01_serial])
+        self.assertTrue(result["result"]["value"][hotp_02_serial])
+        self.assertTrue(result["result"]["value"][hotp_03_serial])
+
+        # Add multiple tokens with spaces in list
+        result = self.request_assert_success(f'/container/{container_serial}/addall',
+                                             {"serial": f"{hotp_01_serial}, {hotp_02_serial}, {hotp_03_serial}"},
+                                             self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/addall', success=1,
+                                container_serial=container_serial,
+                                serial=self.NOT_EMPTY)  # addall/removeall log serials in a non-deterministic order
+        self.assertTrue(result["result"]["value"][hotp_01_serial])
+        self.assertTrue(result["result"]["value"][hotp_02_serial])
+        self.assertTrue(result["result"]["value"][hotp_03_serial])
+
+        # Remove multiple tokens
+        result = self.request_assert_success(f'/container/{container_serial}/removeall',
+                                             {"serial": f"{hotp_01_serial},{hotp_02_serial},{hotp_03_serial}"},
+                                             self.at, 'POST')
+        self.assert_audit_entry('POST /container/<string:container_serial>/removeall', success=1,
+                                container_serial=container_serial,
+                                serial=self.NOT_EMPTY)  # addall/removeall log serials in a non-deterministic order
+        self.assertTrue(result["result"]["value"][hotp_01_serial])
+        self.assertTrue(result["result"]["value"][hotp_02_serial])
+        self.assertTrue(result["result"]["value"][hotp_03_serial])
+
+        delete_container_by_serial(container_serial)
+
+    def test_17_add_token_fail(self):
+        # Arrange
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        hotp_01 = init_token({"genkey": "1"})
+        hotp_01_serial = hotp_01.get_serial()
+
+        # Add token without serial
+        self.request_assert_error(400, f'/container/{container_serial}/add',
+                                  {}, self.at, 'POST',
+                                  error_code=905,
+                                  error_message="ERR905: Missing parameter: 'serial' or 'serials'")
+        self.assert_audit_entry('POST /container/<string:container_serial>/add', success=0,
+                                info=self.contains('ERR905'))
+
+        # Add token without container serial
+        self.request_assert_405('/container/add', {"serial": hotp_01_serial}, self.at, 'POST')
+        self.assert_audit_log_empty()
+
+        delete_container_by_serial(container_serial)
+
+    def test_18_remove_token_fail(self):
+        # Arrange
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        hotp_01 = init_token({"genkey": "1"})
+        hotp_01_serial = hotp_01.get_serial()
+        add_token_to_container(container_serial, hotp_01_serial)
+
+        # Remove token without serial
+        self.request_assert_error(400, f'/container/{container_serial}/remove',
+                                  {}, self.at, 'POST',
+                                  error_code=905,
+                                  error_message="ERR905: Missing parameter: 'serial' or 'serials'")
+        self.assert_audit_entry('POST /container/<string:container_serial>/remove', success=0,
+                                info=self.contains('ERR905'))
+
+        # Remove token without container serial
+        self.request_assert_405('/container/remove', {"serial": hotp_01_serial}, self.at, 'POST')
+        self.assert_audit_log_empty()
+
+        delete_container_by_serial(container_serial)
+
+    def test_19_get_state_types(self):
+        result = self.request_assert_success('/container/statetypes', {}, self.at, 'GET')
+        self.assert_audit_entry('GET /container/statetypes', success=1)
+        self.assertTrue(result["result"]["value"])
+        self.assertIn("active", result["result"]["value"].keys())
+        self.assertIn("disabled", result["result"]["value"]["active"])
+        self.assertIn("lost", result["result"]["value"].keys())
+
+    def test_20_get_types(self):
+        result = self.request_assert_success('/container/types', {}, self.at, 'GET')
+        self.assert_audit_entry('GET /container/types', success=1)
+        self.assertTrue(result["result"]["value"])
+        # Check that all container types are included
+        self.assertIn("smartphone", result["result"]["value"])
+        self.assertIn("generic", result["result"]["value"])
+        self.assertIn("yubikey", result["result"]["value"])
+        # Check that all properties are set
+        self.assertIn("description", result["result"]["value"]["generic"])
+        self.assertIn("token_types", result["result"]["value"]["generic"])
+
+    def test_21_get_all_containers_paginate(self):
+        # Arrange
+        self.setUp_user_realms()
+        # Create containers
+        types = ["Smartphone", "generic", "Yubikey", "Smartphone", "generic", "Yubikey"]
+        container_serials = []
+        for t in types:
+            serial = init_container({"type": t, "description": "test container"})["container_serial"]
+            container_serials.append(serial)
+        # Add token to container 1
+        container = find_container_by_serial(container_serials[1])
+        token = init_token({"genkey": "1"}, user=User("shadow", self.realm1))
+        token_serial = token.get_serial()
+        add_token_to_container(container_serials[1], token_serial)
+        # Assign user to container 1
+        user_hans = User(login="hans", realm=self.realm1)
+        container.add_user(user_hans)
+        # Add second realm
+        self.setUp_user_realm2()
+        container.set_realms([self.realm2], add=True)
+        # Add info
+        container.update_container_info([TokenContainerInfoData(key="key1", value="value1")])
+
+        # Filter for type
+        result = self.request_assert_success('/container/',
+                                             {"type": "generic", "pagesize": 15},
+                                             self.at, 'GET')
+        self.assert_audit_entry('GET /container/', success=1)
+        for container in result["result"]["value"]["containers"]:
+            self.assertEqual(container["type"], "generic")
+
+        # Filter for type wildcard
+        result = self.request_assert_success('/container/',
+                                             {"type": "gen*", "pagesize": 15},
+                                             self.at, 'GET')
+        self.assert_audit_entry('GET /container/', success=1)
+        for container in result["result"]["value"]["containers"]:
+            self.assertEqual(container["type"], "generic")
+
+        # Filter for assigned containers
+        result = self.request_assert_success('/container/',
+                                             {"assigned": True, "pagesize": 15},
+                                             self.at, 'GET')
+        self.assert_audit_entry('GET /container/', success=1)
+        self.assertEqual(1, result["result"]["value"]["count"])
+
+        # filter for realm the admin is not allowed to manage (only get the container that is also in realm 1)
+        container_serial = init_container({"type": "generic", "realm": self.realm2})["container_serial"]
+        set_policy("policy", scope=SCOPE.ADMIN, action=PolicyAction.CONTAINER_LIST, realm=self.realm1)
+        result = self.request_assert_success('/container/',
+                                             {"container_realm": self.realm2, "pagesize": 15},
+                                             self.at, 'GET')
+        self.assert_audit_entry('GET /container/', success=1)
+        self.assertEqual(1, result["result"]["value"]["count"])
+        self.assertEqual(container_serials[1], result["result"]["value"]["containers"][0]["serial"])
+        delete_policy("policy")
+        delete_container_by_serial(container_serial)
+
+        # Filter for token serial
+        result = self.request_assert_success('/container/',
+                                             {"token_serial": token_serial, "pagesize": 15},
+                                             self.at, 'GET')
+        self.assert_audit_entry('GET /container/', success=1)
+        self.assertTrue(container_serials[1], result["result"]["value"]["containers"][0]["serial"])
+        self.assertEqual(result["result"]["value"]["count"], 1)
+
+        # Set hide_container_info_policy
+        set_policy("hide_info", scope=SCOPE.ADMIN,
+                   action=f"{PolicyAction.HIDE_CONTAINER_INFO}=encrypt_algorithm device,{PolicyAction.CONTAINER_LIST}")
+        container3 = find_container_by_serial(container_serials[3])
+        container3.set_container_info([TokenContainerInfoData(key="encrypt_algorithm", value="AES"),
+                                       TokenContainerInfoData(key="encrypt_mode", value="GCM"),
+                                       TokenContainerInfoData(key="device", value="ABC1234"),
+                                       TokenContainerInfoData(key=RegistrationState.get_key(),
+                                                              value=RegistrationState.REGISTERED.value)])
+        # Filter for container serial
+        result = self.request_assert_success('/container/',
+                                             {"container_serial": container_serials[3], "pagesize": 15},
+                                             self.at, 'GET')
+        self.assert_audit_entry('GET /container/', success=1)
+        result_container = result["result"]["value"]["containers"][0]
+        self.assertTrue(container_serials[3], result_container["serial"])
+        self.assertSetEqual({"encrypt_mode", RegistrationState.get_key(), "creation_date"},
+                            set(result_container["info"].keys()))
+        # Get all containers
+        result = self.request_assert_success('/container/', {"pagesize": 15}, self.at, 'GET')
+        self.assert_audit_entry('GET /container/', success=1)
+        result_containers = result["result"]["value"]["containers"]
+        for container in result_containers:
+            info_keys = container["info"].keys()
+            self.assertNotIn("encrypt_algorithm", info_keys)
+            self.assertNotIn("device", info_keys)
+        delete_policy("hide_info")
+
+        # Test output
+        result = self.request_assert_success('/container/',
+                                             {"container_serial": container_serials[1], "pagesize": 15, "page": 1},
+                                             self.at, 'GET')
+        self.assert_audit_entry('GET /container/', success=1)
+        containerdata = result["result"]["value"]
+        # Pagination
+        self.assertEqual(1, containerdata["count"])
+        self.assertIn("prev", containerdata.keys())
+        self.assertIn("next", containerdata.keys())
+        self.assertIn("current", containerdata.keys())
+        self.assertEqual(1, len(containerdata["containers"]))
+        # Container data
+        res_container = containerdata["containers"][0]
+        self.assertEqual("generic", res_container["type"])
+        self.assertEqual(container_serials[1], res_container["serial"])
+        self.assertEqual("test container", res_container["description"])
+        self.assertIn("last_authentication", res_container.keys())
+        self.assertIn("last_synchronization", res_container.keys())
+        self.assertIn("active", res_container["states"])
+        # Tokens
+        self.assertEqual(1, len(res_container["tokens"]))
+        # User
+        self.assertEqual(1, len(res_container["users"]))
+        self.assertEqual(user_hans.login, res_container["users"][0]["user_name"])
+        self.assertEqual(user_hans.realm, res_container["users"][0]["user_realm"])
+        self.assertEqual(user_hans.resolver, res_container["users"][0]["user_resolver"])
+        self.assertEqual(user_hans.uid, res_container["users"][0]["user_id"])
+        # Realms
+        self.assertIn(self.realm1, res_container["realms"])
+        self.assertIn(self.realm2, res_container["realms"])
+        # Info
+        self.assertIn("key1", res_container["info"].keys())
+        self.assertEqual("value1", res_container["info"]["key1"])
+
+    def test_21b_get_all_containers_filter_by_type_list(self):
+        # Arrange: one container of each type. Other test methods in this class
+        # leave containers around, so we never assert on absolute counts — only
+        # that our newly-created serials are returned and the response only
+        # contains containers of the filtered types.
+        smartphone_serial = init_container({"type": "smartphone"})["container_serial"]
+        generic_serial = init_container({"type": "generic"})["container_serial"]
+        yubikey_serial = init_container({"type": "yubikey"})["container_serial"]
+
+        def serials_and_types(query):
+            result = self.request_assert_success('/container/',
+                                                 {**query, "pagesize": 100},
+                                                 self.at, 'GET')
+            self.assert_audit_entry('GET /container/', success=1)
+            containers = result["result"]["value"]["containers"]
+            return {c["serial"] for c in containers}, {c["type"] for c in containers}
+
+        try:
+            # type_list: comma-separated list returns containers matching any listed type
+            serials, types = serials_and_types({"type_list": "smartphone,yubikey"})
+            self.assertIn(smartphone_serial, serials)
+            self.assertIn(yubikey_serial, serials)
+            self.assertNotIn(generic_serial, serials)
+            self.assertTrue(types.issubset({"smartphone", "yubikey"}))
+
+            # Case-insensitive on each entry
+            serials, types = serials_and_types({"type_list": "Smartphone,Generic"})
+            self.assertIn(smartphone_serial, serials)
+            self.assertIn(generic_serial, serials)
+            self.assertNotIn(yubikey_serial, serials)
+            self.assertTrue(types.issubset({"smartphone", "generic"}))
+
+            # Whitespace around entries is tolerated
+            serials, types = serials_and_types({"type_list": " yubikey , generic "})
+            self.assertIn(yubikey_serial, serials)
+            self.assertIn(generic_serial, serials)
+            self.assertNotIn(smartphone_serial, serials)
+            self.assertTrue(types.issubset({"yubikey", "generic"}))
+
+            # type_list takes precedence over a scalar type
+            serials, types = serials_and_types({"type": "generic", "type_list": "smartphone,yubikey"})
+            self.assertIn(smartphone_serial, serials)
+            self.assertIn(yubikey_serial, serials)
+            self.assertNotIn(generic_serial, serials)
+            self.assertTrue(types.issubset({"smartphone", "yubikey"}))
+
+            # List containing only unknown types returns no results
+            result = self.request_assert_success('/container/',
+                                                 {"type_list": "nope,still-nope", "pagesize": 100},
+                                                 self.at, 'GET')
+            self.assert_audit_entry('GET /container/', success=1)
+            self.assertEqual(0, result["result"]["value"]["count"])
+
+            # Unknown types in a list are ignored, known ones still match
+            serials, types = serials_and_types({"type_list": "smartphone,nope"})
+            self.assertEqual(types, {"smartphone"})
+        finally:
+            delete_container_by_serial(smartphone_serial)
+            delete_container_by_serial(generic_serial)
+            delete_container_by_serial(yubikey_serial)
+
+    def test_21c_get_all_containers_filter_by_type_wildcard(self):
+        # Arrange: verify scalar type wildcard filtering independent of type_list.
+        smartphone_serial = init_container({"type": "smartphone"})["container_serial"]
+        generic_serial = init_container({"type": "generic"})["container_serial"]
+
+        try:
+            result = self.request_assert_success('/container/',
+                                                 {"type": "smart*", "pagesize": 100},
+                                                 self.at, 'GET')
+            self.assert_audit_entry('GET /container/', success=1)
+            containers = result["result"]["value"]["containers"]
+            serials = {c["serial"] for c in containers}
+            types = {c["type"] for c in containers}
+
+            self.assertIn(smartphone_serial, serials)
+            self.assertNotIn(generic_serial, serials)
+            self.assertTrue(types.issubset({"smartphone"}))
+        finally:
+            delete_container_by_serial(smartphone_serial)
+            delete_container_by_serial(generic_serial)
+
+    def test_21d_get_all_containers_filter_by_user_realm(self):
+        # Arrange: two containers with owners in different realms. Other test methods in this class leave
+        # containers around, so we only assert on the serials created here.
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+        realm1_serial = init_container({"type": "generic"})["container_serial"]
+        find_container_by_serial(realm1_serial).add_user(User(login="hans", realm=self.realm1))
+        realm2_serial = init_container({"type": "generic"})["container_serial"]
+        find_container_by_serial(realm2_serial).add_user(User(login="cornelius", realm=self.realm2))
+        unassigned_serial = init_container({"type": "generic", "realm": self.realm1})["container_serial"]
+
+        try:
+            # The realm of the assigned user is filtered without a username
+            result = self.request_assert_success('/container/',
+                                                 {"realm": self.realm1, "pagesize": 100},
+                                                 self.at, 'GET')
+            serials = {c["serial"] for c in result["result"]["value"]["containers"]}
+            self.assertIn(realm1_serial, serials)
+            self.assertNotIn(realm2_serial, serials)
+            # A container in the realm without an owner is not a match
+            self.assertNotIn(unassigned_serial, serials)
+
+            # The realm is matched case-insensitive
+            result = self.request_assert_success('/container/',
+                                                 {"realm": self.realm1.upper(), "pagesize": 100},
+                                                 self.at, 'GET')
+            self.assertIn(realm1_serial, {c["serial"] for c in result["result"]["value"]["containers"]})
+
+            # container_realm matches the realm of the container itself, hence it also returns the
+            # container without an owner
+            result = self.request_assert_success('/container/',
+                                                 {"container_realm": self.realm1, "pagesize": 100},
+                                                 self.at, 'GET')
+            serials = {c["serial"] for c in result["result"]["value"]["containers"]}
+            self.assertIn(realm1_serial, serials)
+            self.assertIn(unassigned_serial, serials)
+
+            # Combined with a username: only the containers of that user in that realm
+            result = self.request_assert_success('/container/',
+                                                 {"user": "hans", "realm": self.realm1, "pagesize": 100},
+                                                 self.at, 'GET')
+            serials = {c["serial"] for c in result["result"]["value"]["containers"]}
+            self.assertIn(realm1_serial, serials)
+            self.assertNotIn(realm2_serial, serials)
+            self.assertNotIn(unassigned_serial, serials)
+            for container in result["result"]["value"]["containers"]:
+                self.assertEqual("hans", container["users"][0]["user_name"])
+                self.assertEqual(self.realm1, container["users"][0]["user_realm"])
+
+            # Combined with a wildcard resolver
+            result = self.request_assert_success('/container/',
+                                                 {"realm": self.realm1, "resolver": f"{self.resolvername1[:-1]}*",
+                                                  "pagesize": 100},
+                                                 self.at, 'GET')
+            self.assertIn(realm1_serial, {c["serial"] for c in result["result"]["value"]["containers"]})
+
+            # A realm that does not exist matches nothing
+            result = self.request_assert_success('/container/',
+                                                 {"realm": "non_existing_realm", "pagesize": 100},
+                                                 self.at, 'GET')
+            self.assertEqual(0, result["result"]["value"]["count"])
+
+            # A username that can not be resolved is rejected
+            self.request_assert_error(400, '/container/', {"user": "non_existing_user", "realm": self.realm1,
+                                                          "pagesize": 100},
+                                      self.at, 'GET', error_code=Error.USER)
+
+            # The realm is evaluated first, hence an unknown user in an unknown realm matches nothing
+            result = self.request_assert_success('/container/',
+                                                 {"user": "non_existing_user", "realm": "non_existing_realm",
+                                                  "pagesize": 100},
+                                                 self.at, 'GET')
+            self.assertEqual(0, result["result"]["value"]["count"])
+        finally:
+            delete_container_by_serial(realm1_serial)
+            delete_container_by_serial(realm2_serial)
+            delete_container_by_serial(unassigned_serial)
+
+    def test_22_get_all_containers_paginate_invalid_params(self):
+        init_container({"type": "generic", "description": "test container"})
+
+        # Filter for non-existing type
+        result = self.request_assert_success('/container/',
+                                             {"type": "non-existing", "pagesize": 15},
+                                             self.at, 'GET')
+        self.assert_audit_entry('GET /container/', success=1)
+        self.assertEqual(0, result["result"]["value"]["count"])
+
+        # Filter for non existing token serial
+        result = self.request_assert_success('/container/',
+                                             {"token_serial": "non-existing", "pagesize": 15},
+                                             self.at, 'GET')
+        self.assert_audit_entry('GET /container/', success=1)
+        self.assertEqual(result["result"]["value"]["count"], 0)
+
+    def test_23_delete_container_info_success(self):
+        # Arrange
+        container_serial = init_container({"type": "generic", "description": "test container"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+        container.update_container_info([TokenContainerInfoData(key="test", value="1234")])
+
+        # Delete info
+        self.request_assert_success(f"/container/{container_serial}/info/delete/test",
+                                    {}, self.at, "DELETE")
+        self.assert_audit_entry('DELETE /container/<string:container_serial>/info/delete/<key>', success=1,
+                                action_detail="key=test")
+
+    def test_24_delete_container_info_fail(self):
+        # Arrange
+        container_serial = init_container({"type": "generic", "description": "test container"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+        container.update_container_info([TokenContainerInfoData(key="test", value="1234"),
+                                         TokenContainerInfoData(key="internal_test", value="abcd",
+                                                                info_type=PI_INTERNAL)])
+
+        # Try to delete internal key
+        result = self.request_assert_error(403, f"/container/{container_serial}/info/delete/internal_test",
+                                           {}, self.at, "DELETE", 303,
+                                           "The key 'internal_test' is reserved for internal use "
+                                           "and cannot be deleted.")
+        self.assert_audit_entry('DELETE /container/<string:container_serial>/info/delete/<key>', success=0,
+                                info=self.NOT_EMPTY)
+
+        # Deleting a non-existing key is a no-op that returns False, not an internal-key error
+        result = self.request_assert_success(f"/container/{container_serial}/info/delete/does_not_exist",
+                                             {}, self.at, "DELETE")
+        self.assertFalse(result["result"]["value"])
+        self.assert_audit_entry('DELETE /container/<string:container_serial>/info/delete/<key>', success=0,
+                                action_detail="key=does_not_exist")
+
+    def test_25_broken_user_resolver(self):
+        # Arrange
+        self.setUp_user_realms()
+        container_serial = init_container({"type": "generic",
+                                           "description": "test container",
+                                           "user": "hans",
+                                           "realm": self.realm1})["container_serial"]
+        # Get all containers with assigned user
+        result = self.request_assert_success('/container/', {}, self.at, 'GET')
+        self.assert_audit_entry('GET /container/', success=1)
+        # Get the current container
+        container = [x for x in result["result"]["value"]["containers"] if x["serial"] == container_serial][0]
+        self.assertEqual(container["users"][0]["user_name"], "hans", result["result"])
+        # Break the resolver
+        save_resolver({"resolver": self.resolvername1,
+                       "type": "passwdresolver",
+                       "fileName": "/unknown/file"})
+        # And check the container again
+        result = self.request_assert_success('/container/', {}, self.at, 'GET')
+        self.assert_audit_entry('GET /container/', success=1)
+        container = [x for x in result["result"]["value"]["containers"] if x["serial"] == container_serial][0]
+        self.assertEqual(container["users"][0]["user_name"], "**resolver error**", result["result"])

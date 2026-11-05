@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 # http://www.privacyidea.org
 # (c) cornelius kölbel, privacyidea.org
 #
@@ -30,35 +28,88 @@ Other html code is dynamically loaded via angularJS and located in
 """
 __author__ = "Cornelius Kölbel <cornelius@privacyidea.org>"
 
+import logging
+import os
+
 from flask import (Blueprint, render_template, request,
-                   current_app, g)
-from privacyidea.api.lib.utils import send_html
+                   current_app, g, redirect, abort, Response)
+from markupsafe import escape
+
 from privacyidea.api.lib.prepolicy import is_remote_user_allowed
+from privacyidea.api.lib.postpolicy import hide_version
+from privacyidea.api.lib.utils import (send_html, send_result, verify_auth_token,
+                                       get_auth_token_from_request, logged_in_user_from_token)
+from privacyidea.lib.config import get_from_config, SYSCONF, get_privacyidea_node
+from privacyidea.lib.error import HSMException
 from privacyidea.lib.framework import get_app_config_value
 from privacyidea.lib.passwordreset import is_password_reset
-from privacyidea.lib.error import HSMException
+from privacyidea.lib.policies.actions import PolicyAction, PasskeyLoginButtonOptions
+from privacyidea.lib.policy import PolicyClass, SCOPE, Match, REMOTE_USER
 from privacyidea.lib.realm import get_realms
-from privacyidea.lib.policy import PolicyClass, ACTION, SCOPE, Match, REMOTE_USER
 from privacyidea.lib.subscriptions import subscription_status
-from privacyidea.lib.utils import get_client_ip
-from privacyidea.lib.config import get_from_config, SYSCONF, get_privacyidea_node
-from privacyidea.lib.queue import has_job_queue
+from privacyidea.lib.utils import get_client_ip, get_version_number, get_plugin_info_from_useragent
+
+log = logging.getLogger(__name__)
 
 DEFAULT_THEME = "/static/contrib/css/bootstrap-theme.css"
-DEFAULT_LANGUAGE_LIST = ['en', 'de', 'nl', 'zh_Hant', 'fr', 'es', 'tr']
+# Layout of the compiled WebUI below the static folder. It mirrors "outputPath" in
+# static/angular.json, and the locale directory below it mirrors the i18n "subPath".
+WEBUI_DIST_PATH = ("dist", "privacyidea-webui", "browser")
+# note: the empty comment in the following line allows to include it in the docs
+DEFAULT_LANGUAGE_LIST = ['en', 'de', 'nl', 'zh_Hant', 'fr', 'es', 'tr', 'cs',
+                         'it', 'ta', 'pt', 'ru', 'uk']  #:
+
+# Cookie that records an explicit UI language choice (set by the WebUI language switcher).
+# It is consulted before the browser's Accept-Language header when resolving the locale.
+LOCALE_COOKIE_NAME = "pi_ui_locale"
+
+# Meta tag carrying the WSGI SCRIPT_NAME prefix to the served WebUI bundle.
+# Keep the name in sync with scriptRoot() in the WebUI's core/locale.ts.
+SCRIPT_ROOT_META_NAME = "pi-script-root"
+
+# Case-insensitive, separator-insensitive lookup: normalized key → canonical BCP 47 locale
+_LOCALE_CANONICAL = {lang.replace("_", "-").lower(): lang.replace("_", "-") for lang in DEFAULT_LANGUAGE_LIST}
+
+
+def _canonical_locale(locale: str, lang_list: list[str] | None = None) -> str | None:
+    """Return the canonical BCP 47 locale for a given input, or None if unknown."""
+    lookup = _LOCALE_CANONICAL
+    if lang_list is not None:
+        lookup = {lang.replace("_", "-").lower(): lang.replace("_", "-") for lang in lang_list}
+    return lookup.get(locale.replace("_", "-").lower())
+
 
 login_blueprint = Blueprint('login_blueprint', __name__)
 
 
-def get_accepted_language(req):
-    # if we are not in the request context, return None to use the default locale
-    if not req:
+def get_accepted_language():
+    """Return the accepted language from the request"""
+    # If we are not in the request context, return None to use the default locale
+    if not request:
         return None
     # read pi.cfg and checks if preferred language is set. Otherwise, default list is selected.
     pi_lang_list = get_app_config_value("PI_PREFERRED_LANGUAGE", default=DEFAULT_LANGUAGE_LIST)
     # try to match the language from the users accept header the browser transmits.
     # (The best match wins)
-    return req.accept_languages.best_match(pi_lang_list, default=pi_lang_list[0])
+    return request.accept_languages.best_match(pi_lang_list, default=pi_lang_list[0])
+
+
+def get_preferred_language() -> str | None:
+    """Resolve the preferred UI locale: an explicit choice stored in the locale cookie
+    takes precedence, otherwise fall back to the browser's Accept-Language header and
+    finally the configured default. Returns a canonical locale code or None outside a
+    request context."""
+    if not request:
+        return None
+    pi_lang_list = get_app_config_value("PI_PREFERRED_LANGUAGE", default=DEFAULT_LANGUAGE_LIST)
+    # An explicit choice (set by the language switcher) wins over the browser preference.
+    cookie_locale = request.cookies.get(LOCALE_COOKIE_NAME)
+    if cookie_locale:
+        canonical = _canonical_locale(cookie_locale, pi_lang_list)
+        if canonical:
+            return canonical
+    return request.accept_languages.best_match(pi_lang_list, default=pi_lang_list[0])
+
 
 @login_blueprint.before_request
 def before_request():
@@ -66,13 +117,47 @@ def before_request():
     This is executed before the request
     """
     g.policy_object = PolicyClass()
-    g.audit_object = None
     # access_route contains the ip addresses of all clients, hops and proxies.
     g.client_ip = get_client_ip(request, get_from_config(SYSCONF.OVERRIDECLIENT))
+    # Populate the user agent so that policies restricted by user agent (e.g. a
+    # user-agent-scoped hide_version policy) match consistently with the API
+    # blueprints, which set g.user_agent in their before_request handlers.
+    ua_name, _ua_version, _ua_comment = get_plugin_info_from_useragent(request.user_agent.string)
+    g.user_agent = ua_name
+    # Resolve the logged-in user from a presented JWT. This lets the
+    # hide_version policy still expose the version number to authenticated
+    # WebUI requests (e.g. the /config call made after login or on reload),
+    # while it stays hidden for the anonymous login page.
+    g.logged_in_user = {}
+    auth_token = get_auth_token_from_request()
+    if auth_token:
+        try:
+            user = verify_auth_token(auth_token, ["user", "admin"])
+            g.logged_in_user = logged_in_user_from_token(user)
+        except Exception as error:
+            log.debug(f"No valid auth token presented to the login blueprint: {error}")
 
 
-@login_blueprint.route('/', methods=['GET'])
-def single_page_application():
+@login_blueprint.after_request
+def after_request(response):
+    """
+    Lightweight after_request for the WebUI login blueprint.
+
+    Unlike the shared after_request in before_after.py this does NOT sign the
+    response: the login page and the /config endpoint are anonymous and were
+    never signed, so there is no reason to load the audit private key on every
+    page view. We only set cache-control headers and apply the optional
+    version stripping.
+    """
+    response.headers['Cache-Control'] = 'no-cache'
+    response = hide_version(request, response)
+    return response
+
+
+def get_render_context():
+    """
+    Provides a dictionary with configurations for the web ui.
+    """
     instance = request.script_root
     if instance == "/":
         instance = ""
@@ -81,7 +166,7 @@ def single_page_application():
 
     if current_app.config.get("PI_UI_DEACTIVATED"):
         # Do not provide the UI
-        return send_html(render_template("deactivated.html"))
+        return {}
 
     # The default theme. We can change this later
     theme = current_app.config.get("PI_CSS", DEFAULT_THEME)
@@ -102,27 +187,28 @@ def single_page_application():
     translation_warning = current_app.config.get("PI_TRANSLATION_WARNING", False)
     # Get the logo file
     logo = current_app.config.get("PI_LOGO", "privacyIDEA1.png")
-    browser_lang = get_accepted_language(request)
+    browser_lang = get_accepted_language()
     # The page title can be configured in pi.cfg
     page_title = current_app.config.get("PI_PAGE_TITLE", "privacyIDEA Authentication System")
     # check if login with REMOTE_USER is allowed.
     remote_user = ""
+    force_remote_user = False
     password_reset = False
     if not hasattr(request, "all_data"):
         request.all_data = {}
     # Depending on displaying the realm dropdown, we fill realms or not.
     realms = ""
-    realm_dropdown = Match.action_only(g, scope=SCOPE.WEBUI, action=ACTION.REALMDROPDOWN) \
-        .policies(write_to_audit_log=False)
+    realm_dropdown = Match.action_only(g, scope=SCOPE.WEBUI, action=PolicyAction.REALMDROPDOWN).policies(
+        write_to_audit_log=False)
     show_node = get_privacyidea_node() \
-        if Match.generic(g, scope=SCOPE.WEBUI, action=ACTION.SHOW_NODE).any(write_to_audit_log=False) else ""
+        if Match.generic(g, scope=SCOPE.WEBUI, action=PolicyAction.SHOW_NODE).any(write_to_audit_log=False) else ""
     if realm_dropdown:
         try:
-            realm_dropdown_values = Match.action_only(g, scope=SCOPE.WEBUI, action=ACTION.REALMDROPDOWN) \
+            realm_dropdown_values = Match.action_only(g, scope=SCOPE.WEBUI, action=PolicyAction.REALMDROPDOWN) \
                 .action_values(unique=False, write_to_audit_log=False)
             # Use the realms from the policy.
             realms = ",".join(realm_dropdown_values)
-        except AttributeError as _e:
+        except AttributeError:
             # The policy is still a boolean realm_dropdown action
             # Thus we display ALL realms
             realms = ",".join(get_realms())
@@ -140,7 +226,7 @@ def single_page_application():
     # Use policies to determine the customization of menu
     # and baseline. get_action_values returns an array!
     sub_state = subscription_status()
-    customization_menu_file = Match.action_only(g, action=ACTION.CUSTOM_MENU,
+    customization_menu_file = Match.action_only(g, action=PolicyAction.CUSTOM_MENU,
                                                 scope=SCOPE.WEBUI) \
         .action_values(unique=True, allow_white_space_in_action=True, write_to_audit_log=False)
     if len(customization_menu_file) and list(customization_menu_file)[0] \
@@ -148,7 +234,7 @@ def single_page_application():
         customization_menu_file = list(customization_menu_file)[0]
     else:
         customization_menu_file = "templates/menu.html"
-    customization_baseline_file = Match.action_only(g, action=ACTION.CUSTOM_BASELINE,
+    customization_baseline_file = Match.action_only(g, action=PolicyAction.CUSTOM_BASELINE,
                                                     scope=SCOPE.WEBUI) \
         .action_values(unique=True, allow_white_space_in_action=True, write_to_audit_log=False)
     if len(customization_baseline_file) and list(customization_baseline_file)[0] \
@@ -157,21 +243,38 @@ def single_page_application():
     else:
         customization_baseline_file = "templates/baseline.html"
 
-    login_text = Match.action_only(g, action=ACTION.LOGIN_TEXT, scope=SCOPE.WEBUI) \
+    login_text = Match.action_only(g, action=PolicyAction.LOGIN_TEXT, scope=SCOPE.WEBUI) \
         .action_values(unique=True, allow_white_space_in_action=True, write_to_audit_log=False)
     if len(login_text) and list(login_text)[0] and sub_state not in [1, 2]:
         login_text = list(login_text)[0]
     else:
         login_text = ""
 
-    gdpr_link = Match.action_only(g, action=ACTION.GDPR_LINK, scope=SCOPE.WEBUI) \
+    gdpr_link = Match.action_only(g, action=PolicyAction.GDPR_LINK, scope=SCOPE.WEBUI) \
         .action_values(unique=True, allow_white_space_in_action=True, write_to_audit_log=False)
     if len(gdpr_link) and list(gdpr_link)[0] and sub_state not in [1, 2]:
         gdpr_link = list(gdpr_link)[0]
     else:
         gdpr_link = ""
 
-    render_context = {
+    otp_pin_set_random_user = Match.action_only(g, scope=SCOPE.USER, action=PolicyAction.OTPPINSETRANDOM).policies(
+        write_to_audit_log=False)
+
+    passkey_login_policy = Match.action_only(g, scope=SCOPE.WEBUI, action=PolicyAction.PASSKEY_LOGIN).action_values(
+        unique=True, write_to_audit_log=False)
+    passkey_login = list(passkey_login_policy)[0] if len(
+        passkey_login_policy) else PasskeyLoginButtonOptions.SHOW
+
+    # The version number is injected into the rendered login HTML, which the
+    # hide_version postpolicy cannot strip (it only rewrites JSON responses).
+    # Blank it here for the anonymous login page when the hide_version policy
+    # is active. Authenticated requests (valid JWT) still receive it.
+    hide_version_active = Match.action_only(g, scope=SCOPE.HARDENING,
+                                            action=PolicyAction.HIDE_VERSION).policies(write_to_audit_log=False)
+    show_version = bool(getattr(g, "logged_in_user", None)) or not hide_version_active
+    version_number = get_version_number() if show_version else ""
+
+    render_context: dict = {
         'instance': instance,
         'backendUrl': backend_url,
         'browser_lang': browser_lang,
@@ -181,7 +284,6 @@ def single_page_application():
         'translation_warning': translation_warning,
         'password_reset': password_reset,
         'hsm_ready': hsm_ready,
-        'has_job_queue': str(has_job_queue()),
         'customization': customization,
         'custom_css': custom_css,
         'customization_menu_file': customization_menu_file,
@@ -192,8 +294,95 @@ def single_page_application():
         'login_text': login_text,
         'gdpr_link': gdpr_link,
         'logo': logo,
-        'page_title': page_title
+        'page_title': page_title,
+        'otp_pin_set_random_user': otp_pin_set_random_user,
+        'privacyideaVersionNumber': version_number,
+        'passkey_login': passkey_login,
     }
+    return render_context
 
+
+def _serve_locale(locale: str) -> Response | None:
+    pi_lang_list = get_app_config_value("PI_PREFERRED_LANGUAGE", default=DEFAULT_LANGUAGE_LIST)
+    canonical = _canonical_locale(locale, pi_lang_list)
+    if not canonical:
+        return None
+    dist = os.path.join(current_app.static_folder, *WEBUI_DIST_PATH, canonical)
+    index_file = os.path.join(dist, "index.html")
+    if not os.path.isfile(index_file):
+        return None
+    # The bundle's <base href> and asset/API URLs are baked in at build time as
+    # absolute, root-relative paths. Behind a reverse-proxy sub-path mount
+    # (Apache WSGIScriptAlias, uwsgi mount-point, ...) those need the WSGI
+    # SCRIPT_NAME prefix prepended per request, so this is templated here
+    # rather than served as a static file.
+    script_root = request.script_root
+    with open(index_file, encoding="utf-8") as f:
+        content = f.read()
+    content = content.replace('<base href="/', f'<base href="{script_root}/', 1)
+    # A meta tag rather than an inline script: the app's CSP allows only
+    # script-src 'self', so an inline script would be blocked and the frontend
+    # would fall back to an empty prefix on exactly the mounts this supports.
+    content = content.replace(
+        "</head>",
+        f'<meta name="{SCRIPT_ROOT_META_NAME}" content="{escape(script_root)}"></head>',
+        1
+    )
+    return send_html(content)
+
+
+@login_blueprint.route('/', methods=['GET'])
+def single_page_application() -> Response:
+    if current_app.config.get("PI_UI_DEACTIVATED"):
+        # Do not provide the UI
+        return send_html(render_template("deactivated.html"))
+    # New UI: if a localized build is present, redirect to its locale entrypoint
+    # under /app/v2/ so the Angular router runs with the correct base href.
+    locale = get_preferred_language()
+    if locale and locale != "en":
+        url_locale = locale.replace("_", "-")
+        dist = os.path.join(current_app.static_folder, *WEBUI_DIST_PATH, url_locale)
+        if os.path.isfile(os.path.join(dist, "index.html")):
+            return redirect(f"{request.script_root}/app/v2/{url_locale}/")
+    en_dist = os.path.join(current_app.static_folder, *WEBUI_DIST_PATH, "en")
+    if os.path.isfile(os.path.join(en_dist, "index.html")):
+        return redirect(f"{request.script_root}/app/v2/")
+    # Fallback to the classic AngularJS UI: no new-UI build exists, so render the
+    # legacy index template from the server.
+    render_context = get_render_context()
     index_page = current_app.config.get("PI_INDEX_HTML") or "index.html"
     return send_html(render_template(index_page, **render_context))
+
+
+@login_blueprint.route('/app/v2/<locale>', methods=['GET'])
+@login_blueprint.route('/app/v2/<locale>/', defaults={'subpath': ''}, methods=['GET'])
+@login_blueprint.route('/app/v2/<locale>/<path:subpath>', methods=['GET'])
+def single_page_application_locale(locale: str, subpath: str | None = None) -> Response:
+    pi_lang_list = get_app_config_value("PI_PREFERRED_LANGUAGE", default=DEFAULT_LANGUAGE_LIST)
+    canonical = _canonical_locale(locale, pi_lang_list)
+    if not canonical:
+        # The first segment is not a known locale (e.g. an app route like
+        # /app/v2/login). Serve the SPA shell for the user's preferred locale
+        # (cookie set by the language switcher, then Accept-Language, then the
+        # configured default) instead of always defaulting to English.
+        if request.accept_mimetypes.accept_html:
+            preferred = get_preferred_language() or "en"
+            return _serve_locale(preferred) or _serve_locale("en") or abort(404)
+        abort(404)
+    if canonical != locale or subpath is None:
+        path = f"{request.script_root}/app/v2/{canonical}/" + (subpath or "")
+        qs = request.query_string.decode()
+        if qs:
+            path += "?" + qs
+        return redirect(path)
+    return _serve_locale(locale) or abort(404)
+
+
+@login_blueprint.route('/config', methods=['GET'])
+def get_ui_config():
+    render_context = get_render_context()
+    # For the new UI we do not define a default logo
+    logo = current_app.config.get("PI_LOGO", "")
+    render_context['logo'] = logo
+    return send_result(render_context)
+

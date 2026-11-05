@@ -1,28 +1,36 @@
+# SPDX-FileCopyrightText: 2024 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """
 This test file tests the lib.tokens.certificatetoken
 """
-
-from .base import MyTestCase, FakeFlaskG, FakeAudit
-from privacyidea.models import Token
-from privacyidea.lib.caconnector import save_caconnector
-from privacyidea.lib.token import get_tokens, remove_token
-from privacyidea.lib.error import ParameterError, privacyIDEAError
-from privacyidea.lib.utils import int_to_hex
-from privacyidea.lib.tokens.certificatetoken import (parse_chainfile, verify_certificate_path, ACTION,
-                                                     CertificateTokenClass)
-from privacyidea.lib.policy import set_policy, delete_policy, PolicyClass, SCOPE
-import os
+import base64
 import unittest
-import mock
-from OpenSSL import crypto
+
+from unittest import mock
+import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives.serialization import pkcs12
+from testfixtures import LogCapture
+
+from privacyidea.lib.caconnector import save_caconnector
 from privacyidea.lib.caconnectors.baseca import AvailableCAConnectors
-from privacyidea.lib.caconnectors.msca import MSCAConnector
-from .mscamock import (MyTemplateReply, MyCAReply, MyCSRReply,
-                       MyCertReply, MyCertificateReply, MyCSRStatusReply, CAServiceMock)
+from privacyidea.lib.caconnectors.localca import \
+    LocalCAConnector  # noqa: F401  registers "local" in AvailableCAConnectors
 from privacyidea.lib.caconnectors.msca import ATTR as MS_ATTR
+from privacyidea.lib.caconnectors.msca import MSCAConnector
+from privacyidea.lib.error import ParameterError, PrivacyIDEAError
+from privacyidea.lib.policy import set_policy, delete_policy, PolicyClass, SCOPE
+from privacyidea.lib.token import get_tokens, remove_token, import_tokens
 from privacyidea.lib.token import init_token
-from privacyidea.lib.tokenclass import ROLLOUTSTATE
+from privacyidea.lib.tokenrolloutstate import RolloutState
+from privacyidea.lib.tokens.certificatetoken import (parse_chainfile, ACTION,
+                                                     verify_certificate_path,
+                                                     CertificateTokenClass)
 from privacyidea.lib.user import User
+from privacyidea.lib.utils import int_to_hex
+from privacyidea.models import Token
+from .base import MyTestCase, FakeFlaskG, FakeAudit
+from .mscamock import CAServiceMock
 
 CERT = """-----BEGIN CERTIFICATE-----
 MIIGXDCCBUSgAwIBAgITYwAAAA27DqXl0fVdOAAAAAAADTANBgkqhkiG9w0BAQsF
@@ -61,10 +69,6 @@ S/IreZ58alclwJJRIGTuOTKSCd+uE7QMALztDty7cjtpMANGrz1k/uUWg9T+UgQs
 czZ68tF258iaWLPbsdRWqO160iy7eDSKWFFMR4HnfLHX/UPRSpBNGSHmvT1hbkUr
 -----END CERTIFICATE-----"""
 
-CAKEY = "cakey.pem"
-CACERT = "cacert.pem"
-OPENSSLCNF = "openssl.cnf"
-WORKINGDIR = "tests/testdata/ca"
 REQUEST = """-----BEGIN CERTIFICATE REQUEST-----
 MIICmTCCAYECAQAwVDELMAkGA1UEBhMCREUxDzANBgNVBAgMBkhlc3NlbjEUMBIG
 A1UECgwLcHJpdmFjeWlkZWExHjAcBgNVBAMMFXJlcXVlc3Rlci5sb2NhbGRvbWFp
@@ -253,7 +257,6 @@ ub8B4Q4BtcXwyX1IjkSRVGhpmBKc+cykTR1GGR0L0JihMK85qWF/8vyYiwBq3z08
 TdIfRtrzkM5Zw/U/p2/LWzbe/fCkqSC6SheI+/FDR7Bjz7xNxIZHonk=
 -----END CERTIFICATE-----"""
 
-
 # Mock for certificate from MSCA
 MY_CA_NAME = "192.168.47.11"
 
@@ -297,18 +300,19 @@ WYx05kOaYFFvb1u8ub+qSExyHGX9Lh6w32RCoM8kJP7F6YCepKJRboka1/BY3GbF
 17qsUVtb+0YLznMdHEFtWc51SpzA0h3a7w==
 -----END CERTIFICATE-----"""
 
-
-CONF = {MS_ATTR.HOSTNAME: MY_CA_NAME,
-        MS_ATTR.PORT: 50061,
-        MS_ATTR.HTTP_PROXY: "0",
-        MS_ATTR.CA: "CA03.nilsca.com\\nilsca-CA03-CA"}
+CONF = {
+    MS_ATTR.HOSTNAME: MY_CA_NAME,
+    MS_ATTR.PORT: 50061,
+    MS_ATTR.HTTP_PROXY: "0",
+    MS_ATTR.CA: "CA03.nilsca.com\\nilsca-CA03-CA",
+}
 
 
 class CertificateTokenTestCase(MyTestCase):
-
     serial1 = "CRT0001"
     serial2 = "CRT0002"
     serial3 = "CRT0003"
+    serial4 = "CRT0004"
 
     def test_001_parse_cert_chain(self):
         chain = parse_chainfile("tests/testdata/attestation/yubico.pem")
@@ -318,13 +322,26 @@ class CertificateTokenTestCase(MyTestCase):
 
     def test_002_verify(self):
         # Verify an attestation certificate against trusted CA chain path.
-        r = verify_certificate_path(YUBIKEY_ATTEST, ["tests/testdata/attestation",
-                                                     "tests/testdata/feitian_non_exist"])
+        r = verify_certificate_path(x509.load_pem_x509_certificate(YUBIKEY_ATTEST.encode()),
+                                    ["tests/testdata/attestation",
+                                     "tests/testdata/feitian_non_exist"])
         self.assertTrue(r)
 
         # Verification against an empty chain, due to misconfiguration fails.
-        r = verify_certificate_path(YUBIKEY_ATTEST, ["tests/testdata/feitian_non_exist"])
+        r = verify_certificate_path(x509.load_pem_x509_certificate(YUBIKEY_ATTEST.encode()),
+                                    ["tests/testdata/feitian_non_exist"])
         self.assertFalse(r)
+
+        # Verification of bogus certificate against a trusted chain
+        with LogCapture() as log_capture:
+            r = verify_certificate_path(x509.load_pem_x509_certificate(BOGUS_ATTESTATION.encode()),
+                                        ["tests/testdata/attestation"])
+            self.assertFalse(r)
+        log_capture.check(("privacyidea.lib.tokens.certificatetoken",
+                           "INFO",
+                           "Can not verify attestation certificate against chain "
+                           "in tests/testdata/attestation/yubico.pem"))
+        # TODO: Check verification with a broken chain (need to construct one)
 
     def test_01_create_token_from_certificate(self):
         db_token = Token(self.serial1, tokentype="certificate")
@@ -343,19 +360,12 @@ class CertificateTokenTestCase(MyTestCase):
 
         detail = token.get_init_detail()
         self.assertEqual(detail.get("certificate"), CERT)
+        # Check that the certificate is available in the token details
+        cert = token.get_tokeninfo("certificate")
+        self.assertEqual(cert, CERT)
 
+    @pytest.mark.usefixtures("setup_local_ca")
     def test_02_create_token_from_request(self):
-        cwd = os.getcwd()
-        # setup ca connector
-        r = save_caconnector({"cakey": CAKEY,
-                              "cacert": CACERT,
-                              "type": "local",
-                              "caconnector": "localCA",
-                              "openssl.cnf": OPENSSLCNF,
-                              "CSRDir": "",
-                              "CertificateDir": "",
-                              "WorkingDir": cwd + "/" + WORKINGDIR})
-
         db_token = Token(self.serial2, tokentype="certificate")
         db_token.save()
         token = CertificateTokenClass(db_token)
@@ -374,63 +384,35 @@ class CertificateTokenTestCase(MyTestCase):
         detail = token.get_init_detail()
         certificate = detail.get("certificate")
         # At each testrun, the certificate might get another serial number!
-        x509obj = crypto.load_certificate(crypto.FILETYPE_PEM, certificate)
-        self.assertEqual("{0!r}".format(x509obj.get_issuer()),
-                         "<X509Name object '/C=DE/ST=Hessen"
-                         "/O=privacyidea/CN=CA001'>")
-        self.assertEqual("{0!r}".format(x509obj.get_subject()),
-                         "<X509Name object '/C=DE/ST=Hessen"
-                         "/O=privacyidea/CN=requester.localdomain'>")
+        x509obj = x509.load_pem_x509_certificate(certificate.encode())
+        self.assertEqual(f"{x509obj.issuer!r}",
+                         "<Name(CN=CA001,O=privacyidea,ST=Hessen,C=DE)>")
+        self.assertEqual(f"{x509obj.subject!r}",
+                         "<Name(CN=requester.localdomain,O=privacyidea,ST=Hessen,C=DE)>")
 
         # Test, if the certificate is also completely stored in the tokeninfo
         # and if we can retrieve it from the tokeninfo
         token = get_tokens(serial=self.serial2)[0]
-        certificate = token.get_tokeninfo("certificate")
-        x509obj = crypto.load_certificate(crypto.FILETYPE_PEM, certificate)
-        self.assertEqual("{0!r}".format(x509obj.get_issuer()),
-                         "<X509Name object '/C=DE/ST=Hessen"
-                         "/O=privacyidea/CN=CA001'>")
-        self.assertEqual("{0!r}".format(x509obj.get_subject()),
-                         "<X509Name object '/C=DE/ST=Hessen"
-                         "/O=privacyidea/CN=requester.localdomain'>")
+        tokeninfo_certificate = token.get_tokeninfo("certificate")
+        self.assertEqual(tokeninfo_certificate, certificate)
         remove_token(self.serial2)
 
+    @pytest.mark.usefixtures("setup_local_ca")
     def test_02a_fail_request_with_attestation(self):
-        cwd = os.getcwd()
-        # setup ca connector
-        r = save_caconnector({"cakey": CAKEY,
-                              "cacert": CACERT,
-                              "type": "local",
-                              "caconnector": "localCA",
-                              "openssl.cnf": OPENSSLCNF,
-                              "CSRDir": "",
-                              "CertificateDir": "",
-                              "WorkingDir": cwd + "/" + WORKINGDIR})
-
         db_token = Token(self.serial2, tokentype="certificate")
         db_token.save()
         token = CertificateTokenClass(db_token)
 
         # A cert request will fail, since the attestation certificate does not match
-        self.assertRaises(privacyIDEAError,
+        self.assertRaises(PrivacyIDEAError,
                           token.update,
                           {"ca": "localCA",
                            "attestation": BOGUS_ATTESTATION,
                            "request": REQUEST})
         remove_token(self.serial2)
 
-    def test_02b_success_request_with_attestation(self):
-        cwd = os.getcwd()
-        # setup ca connector
-        r = save_caconnector({"cakey": CAKEY,
-                              "cacert": CACERT,
-                              "type": "local",
-                              "caconnector": "localCA",
-                              "openssl.cnf": OPENSSLCNF,
-                              "CSRDir": "",
-                              "CertificateDir": "",
-                              "WorkingDir": cwd + "/" + WORKINGDIR})
-
+    @pytest.mark.usefixtures("setup_local_ca")
+    def test_02b_fail_request_with_broken_attestation_path(self):
         db_token = Token(self.serial2, tokentype="certificate")
         db_token.save()
         token = CertificateTokenClass(db_token)
@@ -447,12 +429,15 @@ class CertificateTokenTestCase(MyTestCase):
         detail = token.get_init_detail()
         certificate = detail.get("certificate")
         # At each testrun, the certificate might get another serial number!
-        x509obj = crypto.load_certificate(crypto.FILETYPE_PEM, certificate)
-        self.assertEqual("{0!r}".format(x509obj.get_issuer()),
-                         "<X509Name object '/C=DE/ST=Hessen"
-                         "/O=privacyidea/CN=CA001'>")
-        self.assertEqual("{0!r}".format(x509obj.get_subject()),
-                         "<X509Name object '/CN=cn=cornelius'>")
+        x509obj = x509.load_pem_x509_certificate(certificate.encode())
+        self.assertEqual(f"{x509obj.issuer!r}",
+                         "<Name(CN=CA001,O=privacyidea,ST=Hessen,C=DE)>")
+        self.assertEqual(f"{x509obj.subject!r}",
+                         "<Name(CN=cn=cornelius)>")
+
+        # Check that the certificate is available in the tokeninfo as well
+        token = get_tokens(serial=self.serial2)[0]
+        self.assertEqual(token.get_tokeninfo("certificate"), certificate)
         remove_token(self.serial2)
 
     def test_03_class_methods(self):
@@ -460,24 +445,14 @@ class CertificateTokenTestCase(MyTestCase):
         token = CertificateTokenClass(db_token)
 
         info = token.get_class_info()
-        self.assertTrue(info.get("title") == "Certificate Token", info)
+        self.assertEqual(info.get("title"), "Certificate Token", info)
 
         info = token.get_class_info("title")
-        self.assertTrue(info == "Certificate Token", info)
+        self.assertEqual(info, "Certificate Token", info)
 
+    @pytest.mark.usefixtures("setup_local_ca")
     def test_04_create_token_on_server(self):
         self.setUp_user_realms()
-        cwd = os.getcwd()
-        # setup ca connector
-        r = save_caconnector({"cakey": CAKEY,
-                              "cacert": CACERT,
-                              "type": "local",
-                              "caconnector": "localCA",
-                              "openssl.cnf": OPENSSLCNF,
-                              "CSRDir": "",
-                              "CertificateDir": "",
-                              "WorkingDir": cwd + "/" + WORKINGDIR})
-
         db_token = Token(self.serial3, tokentype="certificate")
         db_token.save()
         token = CertificateTokenClass(db_token)
@@ -493,36 +468,34 @@ class CertificateTokenTestCase(MyTestCase):
         self.assertEqual(token.type, "certificate")
 
         detail = token.get_init_detail()
+        # Check for pkcs12
+        self.assertIn("pkcs12", detail, detail)
+        self.assertIn("pkcs12_password", detail, detail)
+
         certificate = detail.get("certificate")
         # At each testrun, the certificate might get another serial number!
-        x509obj = crypto.load_certificate(crypto.FILETYPE_PEM, certificate)
-        self.assertEqual("{0!r}".format(x509obj.get_issuer()),
-                         "<X509Name object '/C=DE/ST=Hessen"
-                         "/O=privacyidea/CN=CA001'>")
+        x509obj = x509.load_pem_x509_certificate(certificate.encode())
+        self.assertEqual(f"{x509obj.issuer!r}",
+                         "<Name(CN=CA001,O=privacyidea,ST=Hessen,C=DE)>")
         # No Email Address in the subject!
-        subject = x509obj.get_subject()
-        self.assertEqual("{0!s}".format(subject), "<X509Name object '/CN=cornelius'>")
+        self.assertEqual(f"{x509obj.subject!r}",
+                         "<Name(CN=cornelius)>")
 
         # Test, if the certificate is also completely stored in the tokeninfo
         # and if we can retrieve it from the tokeninfo
         token = get_tokens(serial=self.serial3)[0]
-        certificate = token.get_tokeninfo("certificate")
-        x509obj = crypto.load_certificate(crypto.FILETYPE_PEM, certificate)
-        self.assertEqual("{0!r}".format(x509obj.get_issuer()),
-                         "<X509Name object '/C=DE/ST=Hessen"
-                         "/O=privacyidea/CN=CA001'>")
-        self.assertEqual("{0!r}".format(x509obj.get_subject()), "<X509Name object '/CN=cornelius'>")
+        self.assertEqual(token.get_tokeninfo("certificate"), certificate)
 
+        # Make sure there is no private key in the token info after rollout
         privatekey = token.get_tokeninfo("privatekey")
-        self.assertTrue(privatekey.startswith("-----BEGIN PRIVATE KEY-----"))
-
-        # check for pkcs12
-        self.assertTrue(detail.get("pkcs12"))
+        self.assertIsNone(privatekey)
+        # And there is no pkcs12_password in the tokeninfo
+        self.assertIsNone(token.get_tokeninfo("pkcs12_password"))
 
         # revoke the token
         r = token.revoke()
-        self.assertEqual(r, int_to_hex(x509obj.get_serial_number()))
-        remove_token(self.serial3)
+        self.assertEqual(r, int_to_hex(x509obj.serial_number))
+        remove_token(token.get_serial())
 
         # Now create a new token again and also check for subjects with email and realm
         db_token = Token(self.serial3, tokentype="certificate")
@@ -533,10 +506,41 @@ class CertificateTokenTestCase(MyTestCase):
                       "user": "cornelius"})
         detail = token.get_init_detail()
         certificate = detail.get("certificate")
-        x509obj = crypto.load_certificate(crypto.FILETYPE_PEM, certificate)
-        self.assertEqual("{0!r}".format(x509obj.get_subject()),
-                         "<X509Name object '/OU=realm1/CN=cornelius/emailAddress=user@localhost.localdomain'>")
+        x509obj = x509.load_pem_x509_certificate(certificate.encode())
+        # cryptography uses the dotted notation for the email address component
+        self.assertEqual(f"{x509obj.subject!r}",
+                         f"<Name({x509.oid.NameOID.EMAIL_ADDRESS.dotted_string}=user@localhost.localdomain,"
+                         f"CN=cornelius,OU=realm1)>")
         remove_token(self.serial3)
+
+        # Check that we can use the PIN as password for the PKCS12 container
+        # Also check that the insufficient keysize is updated
+        db_token = Token(self.serial3, tokentype="certificate")
+        db_token.save()
+        token = CertificateTokenClass(db_token)
+        token.update({"ca": "localCA",
+                      "genkey": 1,
+                      "keysize": 1024,
+                      "pin": "123456",
+                      "user": "cornelius"})
+        detail = token.get_init_detail()
+        # Check for pkcs12
+        self.assertIn("pkcs12", detail, detail)
+        self.assertNotIn("pkcs12_password", detail, detail)
+        token_dict = token.get_as_dict()
+        self.assertIn("pkcs12", token_dict.get("info"), token_dict)
+        pkcs12_b64 = token_dict.get("info").get("pkcs12")
+        self.assertEqual(pkcs12_b64, detail["pkcs12"])
+        self.assertEqual("123456", token.token.get_pin())
+        # Decrypt the PKCS12 container with the token PIN
+        pkcs12_container = pkcs12.load_key_and_certificates(base64.b64decode(pkcs12_b64),
+                                                            b"123456")
+        self.assertIsNotNone(pkcs12_container)
+        # Check that the key size was adjusted
+        self.assertEqual(2048, pkcs12_container[0].key_size)
+        # Check that the certificate from the container matches the returned one
+        self.assertEqual(x509.load_pem_x509_certificate(detail["certificate"].encode()),
+                         pkcs12_container[1])
 
     def test_05_get_default_settings(self):
         params = {}
@@ -547,7 +551,7 @@ class CertificateTokenTestCase(MyTestCase):
                             "realm": "default",
                             "role": "user"}
         set_policy("pol1", scope=SCOPE.USER,
-                   action="{0!s}=tests/testdata/attestation/".format(ACTION.TRUSTED_CA_PATH))
+                   action=f"{ACTION.TRUSTED_CA_PATH!s}=tests/testdata/attestation/")
         g.policy_object = PolicyClass()
         p = CertificateTokenClass.get_default_settings(g, params)
         self.assertEqual(["tests/testdata/attestation/"],
@@ -558,7 +562,7 @@ class CertificateTokenTestCase(MyTestCase):
                             "realm": "super",
                             "role": "admin"}
         set_policy("pol1", scope=SCOPE.ADMIN,
-                   action="{0!s}=tests/testdata/attestation/".format(ACTION.TRUSTED_CA_PATH))
+                   action=f"{ACTION.TRUSTED_CA_PATH!s}=tests/testdata/attestation/")
         g.policy_object = PolicyClass()
         p = CertificateTokenClass.get_default_settings(g, params)
         self.assertEqual(["tests/testdata/attestation/"],
@@ -569,6 +573,70 @@ class CertificateTokenTestCase(MyTestCase):
         p = CertificateTokenClass.get_default_settings(g, params)
         self.assertEqual(["/etc/privacyidea/trusted_attestation_ca"],
                          p.get(ACTION.TRUSTED_CA_PATH))
+
+    def test_06_certificate_token_export(self):
+        # Set up the certificate token for testing
+        db_token = Token(self.serial4, tokentype="certificate")
+        db_token.save()
+        token = CertificateTokenClass(db_token)
+        token.update({"certificate": CERT, "description": "this is a certificate token export test"})
+
+        # Test that all expected keys are present in the exported dictionary
+        exported_data = token.export_token()
+        expected_keys = [
+            "serial", "type", "description", "otpkey", "issuer",
+        ]
+        self.assertTrue(set(expected_keys).issubset(exported_data.keys()))
+
+        expected_tokeninfo_keys = ["tokenkind", "certificate"]
+        self.assertTrue(set(expected_tokeninfo_keys).issubset(exported_data["info_list"].keys()))
+
+        # Test that the exported values match the token's data
+        exported_data = token.export_token()
+        self.assertEqual(exported_data["serial"], self.serial4)
+        self.assertEqual(exported_data["type"], "certificate")
+        self.assertEqual(exported_data["description"], "this is a certificate token export test")
+        self.assertEqual(exported_data["otpkey"], '')
+        self.assertEqual(exported_data["info_list"]["tokenkind"], "software")
+        self.assertEqual(exported_data["issuer"], "privacyIDEA")
+        self.assertEqual(exported_data["info_list"]["certificate"], CERT)
+
+        # Clean up
+        remove_token(token.token.serial)
+
+    def test_07_certificate_token_import(self):
+        # Define the token data to be imported
+        token_data = [{
+            "serial": "CRT0001",
+            "type": "certificate",
+            "description": "this is a certificate token export test",
+            "issuer": "privacyIDEA",
+            "info_list": {"certificate": CERT, "tokenkind": "software"}
+        }]
+
+        # Import the token
+        import_tokens(token_data)
+
+        # Retrieve the imported token
+        token = get_tokens(serial=token_data[0]["serial"])[0]
+
+        # Verify that the token data matches the imported data
+        self.assertTrue(token.token.serial == self.serial1, token)
+        self.assertTrue(token.token.tokentype == "certificate",
+                        token.token.tokentype)
+        self.assertTrue(token.type == "certificate", token)
+        class_prefix = token.get_class_prefix()
+        self.assertTrue(class_prefix == "CRT", class_prefix)
+        self.assertEqual(token.get_class_type(), "certificate")
+
+        detail = token.get_init_detail()
+        self.assertEqual(detail.get("certificate"), CERT)
+        # Check that the certificate is available in the token details
+        cert = token.get_tokeninfo("certificate")
+        self.assertEqual(cert, CERT)
+
+        # Clean up
+        remove_token(token.token.serial)
 
 
 class MSCACertTestCase(MyTestCase):
@@ -602,25 +670,25 @@ class MSCACertTestCase(MyTestCase):
                                    "realm": self.realm1
                                    }, User("cornelius", self.realm1))
             self.assertEqual("certificate", cert_tok.type)
-            self.assertEqual(ROLLOUTSTATE.PENDING, cert_tok.rollout_state)
+            self.assertEqual(RolloutState.PENDING, cert_tok.rollout_state)
 
             # Fetch the rolloutstate from the CA
             r = cert_tok._update_rollout_state()
             # Still pending
             self.assertEqual(5, r)
-            self.assertEqual(ROLLOUTSTATE.PENDING, cert_tok.rollout_state)
+            self.assertEqual(RolloutState.PENDING, cert_tok.rollout_state)
             # Enroll the certificated
             mock_conncect_worker.return_value.disposition = 3
 
             # Fetch the rolloutstate again
             r = cert_tok._update_rollout_state()
             self.assertEqual(3, r)
-            self.assertEqual(ROLLOUTSTATE.ENROLLED, cert_tok.rollout_state)
+            self.assertEqual(RolloutState.ENROLLED, cert_tok.rollout_state)
 
             # Fet the rollout state again, but the cert is not pending anymore
             r = cert_tok._update_rollout_state()
             self.assertEqual(-1, r)
-            self.assertEqual(ROLLOUTSTATE.ENROLLED, cert_tok.rollout_state)
+            self.assertEqual(RolloutState.ENROLLED, cert_tok.rollout_state)
 
     @unittest.skipUnless("privacyidea.lib.caconnectors.msca.MSCAConnector" in AvailableCAConnectors,
                          "Can not test MSCA. grpc module seems not available.")
@@ -641,25 +709,25 @@ class MSCACertTestCase(MyTestCase):
                                    "realm": self.realm1
                                    }, User("cornelius", self.realm1))
             self.assertEqual("certificate", cert_tok.type)
-            self.assertEqual(ROLLOUTSTATE.PENDING, cert_tok.rollout_state)
+            self.assertEqual(RolloutState.PENDING, cert_tok.rollout_state)
 
             # Fetch the rolloutstate from the CA
             r = cert_tok._update_rollout_state()
             # Still pending
             self.assertEqual(5, r)
-            self.assertEqual(ROLLOUTSTATE.PENDING, cert_tok.rollout_state)
+            self.assertEqual(RolloutState.PENDING, cert_tok.rollout_state)
             # Enroll the certificated
             mock_conncect_worker.return_value.disposition = 2
 
             # Fetch the rolloutstate again
             r = cert_tok._update_rollout_state()
             self.assertEqual(2, r)
-            self.assertEqual(ROLLOUTSTATE.DENIED, cert_tok.rollout_state)
+            self.assertEqual(RolloutState.DENIED, cert_tok.rollout_state)
 
             # Fet the rollout state again, but the cert is not pending anymore
             r = cert_tok._update_rollout_state()
             self.assertEqual(-1, r)
-            self.assertEqual(ROLLOUTSTATE.DENIED, cert_tok.rollout_state)
+            self.assertEqual(RolloutState.DENIED, cert_tok.rollout_state)
 
     @unittest.skipUnless("privacyidea.lib.caconnectors.msca.MSCAConnector" in AvailableCAConnectors,
                          "Can not test MSCA. grpc module seems not available.")
@@ -680,17 +748,17 @@ class MSCACertTestCase(MyTestCase):
                                    "realm": self.realm1
                                    }, User("cornelius", self.realm1))
             self.assertEqual("certificate", cert_tok.type)
-            self.assertEqual(ROLLOUTSTATE.PENDING, cert_tok.rollout_state)
+            self.assertEqual(RolloutState.PENDING, cert_tok.rollout_state)
 
             # Fetch the rolloutstate from the CA
             r = cert_tok._update_rollout_state()
             # Still pending
             self.assertEqual(5, r)
-            self.assertEqual(ROLLOUTSTATE.PENDING, cert_tok.rollout_state)
+            self.assertEqual(RolloutState.PENDING, cert_tok.rollout_state)
             # turn the certificate token to be broken
-            cert_tok.del_tokeninfo("requestId")
+            cert_tok.remove_tokeninfo("requestId")
 
             # Fetch the rolloutstate again, it will fail, since no requestId available
             r = cert_tok._update_rollout_state()
             self.assertEqual(-1, r)
-            self.assertEqual(ROLLOUTSTATE.PENDING, cert_tok.rollout_state)
+            self.assertEqual(RolloutState.PENDING, cert_tok.rollout_state)

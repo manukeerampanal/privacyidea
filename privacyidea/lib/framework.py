@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2018-11-15   Friedrich Weber <friedrich.weber@netknights.it>
 #               Add a framework module to reduce the coupling to flask
 #
@@ -16,9 +14,12 @@
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-from flask import current_app, g
+from flask import current_app, g, has_request_context
 # We import the gettext function here and export it as ``_``.
 from flask_babel import gettext as _
+
+from privacyidea.config import ConfigKey
+from privacyidea.lib.error import ConfigAdminError
 
 
 def get_app_local_store():
@@ -27,8 +28,6 @@ def get_app_local_store():
     but shared among all threads.
     :return: a Python dict
     """
-    # We can use ``setdefault`` here because starting from
-    # Python 2.7.3 and 3.2.3, it is guaranteed to be atomic.
     return current_app.config.setdefault('_app_local_store', {})
 
 
@@ -41,6 +40,20 @@ def get_request_local_store():
     if '_request_local_store' not in g:
         g._request_local_store = {}
     return g._request_local_store
+
+
+def is_request_context() -> bool:
+    """
+    Check whether the current code runs while a request is being handled.
+
+    The request-local store of :py:func:`get_request_local_store` is also available in a
+    bare application context (``pi-manage``, a cron job, a background thread), but nothing
+    tears such a context down at the end of a request. Code that defers work to a finalizer
+    needs to know the difference.
+
+    :return: True if a request is being handled
+    """
+    return has_request_context()
 
 
 def get_app_config():
@@ -61,5 +74,36 @@ def get_app_config_value(key, default=None):
     return get_app_config().get(key, default)
 
 
-__all__ = ['get_app_local_store', 'get_request_local_store',
-           'get_app_config', 'get_app_config_value', '_']
+def get_base_url(required=False):
+    """
+    Return the trusted public base URL of this privacyIDEA server.
+
+    This is used to build user-facing links that are sent out of band (the
+    password-recovery link, the ``{url}`` notification tag, ...). Such links are
+    never derived from the inbound HTTP ``Host`` header.
+    The value is taken solely from the ``PI_BASE_URL`` app configuration (set in ``pi.cfg``).
+
+    If ``PI_BASE_URL`` is not configured:
+
+    * with ``required=True`` a :class:`~privacyidea.lib.error.ConfigAdminError`
+      is raised. This is used for security-critical links such as the
+      password-recovery link.
+    * otherwise an empty string is returned. The missing configuration is announced once at
+      startup (see ``app.py``).
+
+    :param required: if True, raise instead of returning an empty base URL
+    :return: the trusted base URL (without a trailing slash), or ``""`` if unset
+    """
+    base_url = get_app_config_value(ConfigKey.BASE_URL)
+    if base_url:
+        return base_url.rstrip("/")
+    if required:
+        raise ConfigAdminError(
+            "PI_BASE_URL is not configured. Refusing to build a user-facing link "
+            "without a trusted base URL. Set PI_BASE_URL in pi.cfg to the public URL of "
+            "this privacyIDEA server.")
+    return ""
+
+
+__all__ = ['get_app_local_store', 'get_request_local_store', 'is_request_context',
+           'get_app_config', 'get_app_config_value', 'get_base_url', '_']

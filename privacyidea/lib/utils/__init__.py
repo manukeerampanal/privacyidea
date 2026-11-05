@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2017-11-24 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Use HSM to generate Salt for PasswordHash
 #  2017-07-18 Cornelius Kölbel <cornelius.koelbel@netknights.it>
@@ -26,28 +24,34 @@ This is the library with base functions for privacyIDEA.
 
 This module is tested in tests/test_lib_utils.py
 """
-import six
-import logging
-from importlib import import_module
-import binascii
+
 import base64
-import sqlalchemy
-import string
+import binascii
+import hashlib
+import html
+import logging
 import re
-from datetime import timedelta, datetime
+import string
+import threading
+import time
+import traceback
+from dataclasses import dataclass, field, replace
 from datetime import time as dt_time
+from datetime import timedelta, datetime
+from enum import StrEnum
+from importlib import import_module
+from importlib import metadata
+
+import segno
+import sqlalchemy
 from dateutil.parser import parse as parse_date_string
 from dateutil.tz import tzlocal, tzutc
 from netaddr import IPAddress, IPNetwork, AddrFormatError
-import hashlib
-import traceback
-import threading
-import importlib_metadata
-import time
-import html
-import segno
 
+from privacyidea.config import ConfigKey
 from privacyidea.lib.error import ParameterError, ResourceNotFoundError, PolicyError
+from privacyidea.lib.conditional_access.authentication_event_types import strip_internal_classification
+from privacyidea.lib.framework import get_app_config_value, get_base_url
 
 log = logging.getLogger(__name__)
 
@@ -56,9 +60,21 @@ BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 ALLOWED_SERIAL = r"^[0-9a-zA-Z\-_]+$"
 
 # character lists for the identifiers in the pin content policy
-CHARLIST_CONTENTPOLICY = {"c": string.ascii_letters, # characters
-                          "n": string.digits,        # numbers
-                          "s": string.punctuation}   # special
+CHARLIST_CONTENTPOLICY = {"c": string.ascii_letters,  # characters
+                          "n": string.digits,  # numbers
+                          "s": string.punctuation}  # special
+
+
+class AUTH_RESPONSE:
+    __doc__ = """The return value in "result->authentication".
+    CHALLENGE indicates the start of a challenge and
+    DECLINED indicates a declined challenge, which e.g. happens with PUSH tokens, if the user declines the
+    authentication request.
+    """
+    ACCEPT = "ACCEPT"
+    REJECT = "REJECT"
+    CHALLENGE = "CHALLENGE"
+    DECLINED = "DECLINED"
 
 
 def check_time_in_range(time_range, check_time=None):
@@ -78,8 +94,8 @@ def check_time_in_range(time_range, check_time=None):
 
     :param time_range: The timerange
     :type time_range: basestring
-    :param time: The time to check
-    :type time: datetime
+    :param check_time: The time to check
+    :type check_time: datetime.datetime
     :return: True, if time is within time_range.
     """
     time_match = False
@@ -93,40 +109,46 @@ def check_time_in_range(time_range, check_time=None):
 
     check_time = check_time or datetime.now()
     check_day = check_time.isoweekday()
-    check_hour =dt_time(check_time.hour, check_time.minute)
+    check_hour = dt_time(check_time.hour, check_time.minute)
     # remove whitespaces
     time_range = ''.join(time_range.split())
     # split into list of time ranges
     time_ranges = time_range.split(",")
-    try:
-        for tr in time_ranges:
-            # tr is something like: Mon-Tue:09:30-17:30
-            dow, t = [x.lower() for x in tr.split(":", 1)]
-            if "-" in dow:
-                dow_start, dow_end = dow.split("-")
-            else:
-                dow_start = dow_end = dow
-            t_start, t_end = t.split("-")
-            # determine if we have times like 9:00-15:00 or 9-15
-            ts = [int(x) for x in t_start.split(":")]
-            te = [int(x) for x in t_end.split(":")]
-            if len(ts) == 2:
-                time_start =dt_time(ts[0], ts[1])
-            else:
-                time_start =dt_time(ts[0])
-            if len(te) == 2:
-                time_end =dt_time(te[0], te[1])
-            else:
-                time_end =dt_time(te[0])
 
-            # check the day and the time
-            if (dow_index.get(dow_start) <= check_day <= dow_index.get(dow_end)
-                    and
-                    time_start <= check_hour <= time_end):
-                time_match = True
-    except ValueError:
-        log.error("Wrong time range format: <dow>-<dow>:<hh:mm>-<hh:mm>")
-        log.debug("{0!s}".format(traceback.format_exc()))
+    for tr in time_ranges:
+        # tr is something like: Mon-Tue:09:30-17:30
+        dow, t = [x.lower() for x in tr.split(":", 1)]
+        if "-" in dow:
+            dow_start, dow_end = dow.split("-")
+        else:
+            dow_start = dow_end = dow
+        # check for valid day of the week
+        if dow_start not in dow_index or dow_end not in dow_index:
+            log.error(f"Invalid day of the week '{dow}'. Allowed values are: {dow_index.keys()}")
+            raise ParameterError("Invalid time format!")
+
+        t_start, t_end = t.split("-")
+        # determine if we have times like 9:00-15:00 or 9-15
+        ts = [int(x) for x in t_start.split(":")]
+        te = [int(x) for x in t_end.split(":")]
+        if len(ts) == 2:
+            time_start = dt_time(ts[0], ts[1])
+        else:
+            time_start = dt_time(ts[0])
+        if len(te) == 2:
+            time_end = dt_time(te[0], te[1])
+        else:
+            time_end = dt_time(te[0])
+
+        if time_start > time_end:
+            log.error(f"Invalid time range. Start time is greater than end time: {t}")
+            raise ParameterError("Invalid time format!")
+
+        # check the day and the time
+        if (dow_index.get(dow_start) <= check_day <= dow_index.get(dow_end)
+                and
+                time_start <= check_hour <= time_end):
+            time_match = True
 
     return time_match
 
@@ -134,6 +156,7 @@ def check_time_in_range(time_range, check_time=None):
 def to_utf8(password):
     """
     Convert a password to utf8
+
     :param password: A password that should be converted to utf8
     :type password: str or bytes
     :return: a utf8 encoded password
@@ -146,14 +169,14 @@ def to_utf8(password):
         except (UnicodeDecodeError, AttributeError) as _exx:
             # In case the password is already an encoded string, we fail to
             # encode it again...
-            log.debug("Failed to convert password: {0!s}".format(type(password)))
+            log.debug(f"Failed to convert password: {type(password)!s}")
     return password
 
 
 def to_unicode(s, encoding="utf-8"):
     """
     Converts the string s to unicode if it is of type bytes.
-    
+
     :param s: the string to convert
     :type s: bytes or str
     :param encoding: the encoding to use (default utf8)
@@ -161,7 +184,7 @@ def to_unicode(s, encoding="utf-8"):
     :return: unicode string
     :rtype: str
     """
-    if isinstance(s, six.text_type):
+    if isinstance(s, str):
         return s
     elif isinstance(s, bytes):
         return s.decode(encoding)
@@ -180,7 +203,7 @@ def to_bytes(s):
     """
     if isinstance(s, bytes):
         return s
-    elif isinstance(s, six.text_type):
+    elif isinstance(s, str):
         return s.encode('utf8')
     # TODO: warning? Exception?
     return s
@@ -196,7 +219,7 @@ def to_byte_string(value):
     :return: byte string representing the value
     :rtype: bytes
     """
-    if not isinstance(value, (bytes, six.string_types)):
+    if not isinstance(value, (bytes, str)):
         value = str(value)
     value = to_bytes(value)
     return value
@@ -211,7 +234,7 @@ def hexlify_and_unicode(s):
     :rtype: str
     """
 
-    res = to_unicode(binascii.hexlify(to_bytes(s)))
+    res = binascii.hexlify(to_bytes(s)).decode('utf-8')
     return res
 
 
@@ -219,12 +242,13 @@ def b32encode_and_unicode(s):
     """
     Base32-encode a str (which is first encoded to UTF-8)
     or a byte string and return the result as a str.
+
     :param s: str or bytes to base32-encode
     :type s: str or bytes
     :return: base32-encoded string converted to unicode
     :rtype: str
     """
-    res = to_unicode(base64.b32encode(to_bytes(s)))
+    res = base64.b32encode(to_bytes(s)).decode('utf-8')
     return res
 
 
@@ -232,12 +256,13 @@ def b64encode_and_unicode(s):
     """
     Base64-encode a str (which is first encoded to UTF-8)
     or a byte string and return the result as a str.
+
     :param s: str or bytes to base32-encode
     :type s: str or bytes
     :return: base64-encoded string converted to unicode
     :rtype: str
     """
-    res = to_unicode(base64.b64encode(to_bytes(s)))
+    res = base64.b64encode(to_bytes(s)).decode('utf-8')
     return res
 
 
@@ -245,12 +270,13 @@ def urlsafe_b64encode_and_unicode(s):
     """
     Base64-urlsafe-encode a str (which is first encoded to UTF-8)
     or a byte string and return the result as a str.
+
     :param s: str or bytes to base32-encode
     :type s: str or bytes
     :return: base64-encoded string converted to unicode
     :rtype: str
     """
-    res = to_unicode(base64.urlsafe_b64encode(to_bytes(s)))
+    res = base64.urlsafe_b64encode(to_bytes(s)).decode('utf-8')
     return res
 
 
@@ -286,7 +312,7 @@ def modhex_encode(s):
     :return: the encoded string
     :rtype: str
     """
-    return u''.join([hex2ModDict[c] for c in hexlify_and_unicode(s)])
+    return ''.join([hex2ModDict[c] for c in hexlify_and_unicode(s)])
 
 
 def modhex_decode(m):
@@ -311,7 +337,7 @@ def checksum(msg):
     :rtype: int
     """
     crc = 0xffff
-    for b in six.iterbytes(msg):
+    for b in msg:
         crc = crc ^ (b & 0xff)
         for _j in range(0, 8):
             n = crc & 1
@@ -328,6 +354,7 @@ def decode_base32check(encoded_data, always_upper=True):
         strip_padding(base32(sha1(payload)[:4] + payload))
 
     Raise a ParameterError if the encoded payload is malformed.
+
     :param encoded_data: The base32 encoded data.
     :type encoded_data: str
     :param always_upper: If we should convert lowercase to uppercase
@@ -341,19 +368,17 @@ def decode_base32check(encoded_data, always_upper=True):
     encoded_length = len(encoded_data)
     if encoded_length % 8 != 0:
         encoded_data += "=" * (8 - (encoded_length % 8))
-    assert len(encoded_data) % 8 == 0
     # Decode as base32
     try:
         decoded_data = base64.b32decode(encoded_data)
-    except (TypeError, binascii.Error, OverflowError):
-        # Python 3.6.7: b32decode throws a binascii.Error when the padding is wrong
-        # Python 3.6.3 (travis): b32decode throws an OverflowError when the padding is wrong
+    except (TypeError, binascii.Error):
+        # b32decode throws a binascii.Error when the padding is wrong
         raise ParameterError("Malformed base32check data: Invalid base32")
     # Extract checksum and payload
     if len(decoded_data) < 4:
         raise ParameterError("Malformed base32check data: Too short")
     checksum, payload = decoded_data[:4], decoded_data[4:]
-    payload_hash = hashlib.sha1(payload).digest()
+    payload_hash = hashlib.sha1(payload).digest()  # nosec B324 # used as checksum for 2step enrollment
     if payload_hash[:4] != checksum:
         raise ParameterError("Malformed base32check data: Incorrect checksum")
     return hexlify_and_unicode(payload)
@@ -369,7 +394,7 @@ def sanity_name_check(name, name_exp=r"^[A-Za-z0-9_\-\.]+$"):
     """
     if re.match(name_exp, name) is None:
         raise Exception("non conformant characters in the name"
-                        ": %r (not in %s)" % (name, name_exp))
+                        f": {name!r} (not in {name_exp})")
     return True
 
 
@@ -412,8 +437,8 @@ def get_data_from_params(params, exclude_params, config_description, module,
                 if k in config_description:
                     types[k] = config_description.get(k)
                 else:
-                    log.warning("the passed key '{0!s}' is not a parameter for "
-                                "the {1!s} type '{2!s}'".format(k, module, type))
+                    log.warning(f"the passed key '{k!s}' is not a parameter for "
+                                f"the {module!s} type '{type!s}'")
 
     # Check that there is no type or desc without the data itself.
     # i.e. if there is a type.BindPW=password, then there must be a
@@ -427,7 +452,7 @@ def get_data_from_params(params, exclude_params, config_description, module,
             _missing = True
     if _missing:
         raise Exception("type or description without necessary data!"
-                        " {0!s}".format(params))
+                        f" {params!s}")
 
     return data, types, desc
 
@@ -440,6 +465,7 @@ def parse_timelimit(limit):
     one in three hours.
 
     It returns a tuple the number and the timedelta.
+
     :param limit: a timelimit
     :type limit: basestring
     :return: tuple of number and timedelta
@@ -449,14 +475,14 @@ def parse_timelimit(limit):
     time_specifier = limit[-1].lower()
     if time_specifier not in ["m", "s", "h"]:
         raise Exception("Invalid time specifier")
-    l = limit[:-1].split("/")
-    count = int(l[0])
-    time = int(l[1])
-    td = timedelta(minutes=time)
+    time_limit = limit[:-1].split("/")
+    count = int(time_limit[0])
+    time_delta = int(time_limit[1])
+    td = timedelta(minutes=time_delta)
     if time_specifier == "s":
-        td = timedelta(seconds=time)
+        td = timedelta(seconds=time_delta)
     if time_specifier == "h":
-        td = timedelta(hours=time)
+        td = timedelta(hours=time_delta)
 
     return count, td
 
@@ -473,7 +499,7 @@ def parse_date(date_string):
     in the future.
 
     It can also parse fixed date_strings like
-    
+
       23.12.2016 23:30
       23.12.2016
       2016/12/23 11:30pm
@@ -510,12 +536,114 @@ def parse_date(date_string):
         d = parse_date_string(date_string,
                               dayfirst=re.match(r"^\d\d[/.]", date_string))
     except ValueError:
-        log.debug("Dateformat {0!s} could not be parsed".format(date_string))
+        log.debug(f"Dateformat {date_string!s} could not be parsed")
 
     return d
 
 
-def parse_proxy(proxy_settings):
+def _is_port(port: str) -> bool:
+    """
+    Whether *port* is a TCP port number as a proxy writes it after a hop's address.
+
+    :param port: the text after the address's port colon
+    :return: True for up to five ASCII digits up to 65535
+    """
+    return port.isascii() and port.isdigit() and len(port) <= 5 and int(port) <= 65535
+
+
+def _parse_hop_address(hop_ip: str) -> IPAddress | None:
+    """
+    Parse one claimed client-IP hop into an :class:`IPAddress`, tolerating the spellings
+    that reverse proxies actually write into ``X-Forwarded-For`` and that a bare
+    :class:`netaddr.IPAddress` call rejects:
+
+    * ``a.b.c.d:port`` -- some proxies append the client's source port to an IPv4 hop.
+      Only this unambiguous form is stripped, and only for a valid port: a suffix such
+      as ``:junk`` leaves the hop unparsed, so a malformed hop cuts the chain. A bare
+      IPv6 address (which contains colons itself) is never mistaken for this form.
+    * ``[2001:db8::1]`` and ``[2001:db8::1]:4711`` -- bracketed IPv6 addresses, with
+      or without a port. A bracketed IPv4 address is not a spelling any proxy writes
+      and is rejected.
+    * ``fe80::1%eth0`` -- a scoped IPv6 address, as the operating system reports a
+      link-local peer. The zone names an interface of this host, not a part of the
+      address, so it is dropped.
+
+    An IPv4-mapped IPv6 address (``::ffff:10.0.0.1``) keeps its spelling here:
+    :func:`_ip_in_network` matches it against IPv4 networks as well, and
+    :func:`canonical_client_ip` converts it once it is the client IP.
+
+    Anything that still does not parse is reported as ``None`` rather than raising:
+    the caller decides how far the chain is still trustworthy.
+
+    :param hop_ip: one hop as claimed by the request, verbatim
+    :return: the parsed address, or None if it is not a recognizable IP address
+    """
+    if not hop_ip:
+        return None
+    candidate = hop_ip.strip()
+    bracketed = candidate.startswith("[") and "]" in candidate
+    if bracketed:
+        # "[...]" or "[...]:port"; a malformed suffix is left for IPAddress to reject.
+        address, _, suffix = candidate[1:].partition("]")
+        if not suffix or (suffix.startswith(":") and _is_port(suffix[1:])):
+            candidate = address
+    elif candidate.count(":") == 1 and not candidate.startswith(":"):
+        # "a.b.c.d:port": a bare IPv6 address has no colon or more than one.
+        host, _, port = candidate.rpartition(":")
+        if _is_port(port):
+            candidate = host
+    address_part, _, zone = candidate.partition("%")
+    if zone and ":" in address_part:
+        candidate = address_part
+    try:
+        address = IPAddress(candidate)
+    except AddrFormatError:
+        return None
+    if bracketed and address.version == 4:
+        return None
+    return address
+
+
+IPV4_MAPPED_NETWORK = IPNetwork("::ffff:0:0/96")
+
+
+def _ip_in_network(address: IPAddress, network: IPNetwork) -> bool:
+    """
+    Whether *network* contains *address* in either of its spellings: an IPv4 address and
+    its IPv4-mapped IPv6 form (``10.0.0.1`` and ``::ffff:10.0.0.1``) are the same host, as
+    a dual-stack listener reports an IPv4 peer in the mapped form.
+
+    The spellings are only translated within the IPv4 address space, i.e. for an IPv4
+    network or a network in the mapped form. Any other IPv6 network is matched literally:
+    ``::/0`` contains ``::ffff:10.0.0.1`` but not ``10.0.0.1``, so it does not admit IPv4
+    peers or clients that were not reported in the mapped form.
+
+    :param address: a hop of the path to client or a client IP
+    :param network: a network of a proxy path or a policy
+    :return: True if the network contains the address in either spelling
+    """
+    if address in network:
+        return True
+    if address.is_ipv4_mapped():
+        return address.ipv4() in network
+    if address.version == 4 and network in IPV4_MAPPED_NETWORK:
+        return address.ipv6(ipv4_compatible=False) in network
+    return False
+
+
+def canonical_client_ip(address: IPAddress) -> str:
+    """
+    The spelling of *address* as a client IP. An IPv4-mapped IPv6 address (``::ffff:10.0.0.1``) is the IPv4
+    address it stands for (``10.0.0.1``): a dual-stack listener reports an IPv4 peer in the mapped form, but
+    the connection is IPv4. Every other address is rendered by ``netaddr``.
+
+    :param address: the address of a client
+    :return: the client IP as a string
+    """
+    return str(address.ipv4() if address.is_ipv4_mapped() else address)
+
+
+def parse_proxy(proxy_settings: str) -> set[tuple[IPNetwork, ...]]:
     """
     This parses the string of the system settings OverrideAuthorizationClient into a set of "proxy paths",
     which are tuples of IPNetwork objects.
@@ -537,13 +665,16 @@ def parse_proxy(proxy_settings):
         This is parsed to a proxy path ``(IPNetwork("10.0.0.12/32"), IPNetwork("192.168.0.0/24"))``.
     172.16.0.0/16
         Hosts in 172.16.x.x may rewrite to any client IP
-        This is parsed to a proxy path ``(IPNetwork("172.16.0.0/16"), IPNetwork("0.0.0.0/0"))``.
+        This is parsed to one proxy path per address family:
+        ``(IPNetwork("172.16.0.0/16"), IPNetwork("0.0.0.0/0"))`` and
+        ``(IPNetwork("172.16.0.0/16"), IPNetwork("::/0"))`` - whatever the entry's own
+        family, a bare entry may mask as any client IP of either family.
 
     Multiple such settings may be separated by comma.
 
     :param proxy_settings: The OverrideAuthorizationClient config string
-    :type proxy_settings: basestring
     :return: A set of tuples of IPNetwork objects. Each tuple has at least two elements.
+    :raises AddrFormatError: if an entry is not a valid address or network
     """
     proxy_set = set()
     if proxy_settings.strip():
@@ -551,16 +682,22 @@ def parse_proxy(proxy_settings):
         for proxy in proxies_list:
             p_list = proxy.split(">")
             if len(p_list) > 1:
-                proxypath = tuple(IPNetwork(proxynet) for proxynet in p_list)
+                proxypath = tuple(IPNetwork(proxynet.strip()) for proxynet in p_list)
+                proxy_set.add(proxypath)
             else:
-                # No mapping client, so we take the whole network
-                proxypath = (IPNetwork(p_list[0]), IPNetwork("0.0.0.0/0"))
-            proxy_set.add(proxypath)
+                # No mapping client, so we take the whole network. A bare entry is
+                # documented as "may mask as any arbitrary client IP", which covers
+                # IPv6 clients as well: an IPv6 address is not contained in an IPv4
+                # network, so the entry expands to one proxy path per address family,
+                # whatever the entry's own family.
+                proxynet = IPNetwork(p_list[0])
+                proxy_set.add((proxynet, IPNetwork("0.0.0.0/0")))
+                proxy_set.add((proxynet, IPNetwork("::/0")))
 
     return proxy_set
 
 
-def check_proxy(path_to_client, proxy_settings):
+def check_proxy_index(path_to_client: "list[IPAddress]", proxy_settings: str) -> int:
     """
     This function takes a list of IPAddress objects, the so-called "path to client",
     along with the proxy settings from OverrideAuthorizationClient, and determines
@@ -576,16 +713,16 @@ def check_proxy(path_to_client, proxy_settings):
                            it originated at 10.0.0.1, then passed a proxy at 10.1.2.3, then passed a proxy at
                            192.168.1.3 before finally reaching privacyIDEA.
     :param proxy_settings: The proxy settings from OverrideAuthorizationClient
-    :return: an item from ``path_to_client``
+    :return: the index into ``path_to_client`` of the effective client IP
     """
     try:
         proxy_dict = parse_proxy(proxy_settings)
     except AddrFormatError:
         log.error("Error parsing the OverrideAuthorizationClient setting: "
-                  "{0!s}! The IP addresses need to be comma separated. Fix "
-                  "this. The client IP will not be mapped!".format(proxy_settings))
-        log.debug("{0!s}".format(traceback.format_exc()))
-        return path_to_client[0]
+                  f"{proxy_settings!s}! The IP addresses need to be comma separated. Fix "
+                  "this. The client IP will not be mapped!")
+        log.debug(f"{traceback.format_exc()!s}")
+        return 0
 
     # We extract the IP from ``path_to_client`` that should be considered the "real" client IP by privacyIDEA.
     # This client IP is an item of ``path_to_client``. The problem is that parts of ``path_to_client`` may
@@ -601,14 +738,13 @@ def check_proxy(path_to_client, proxy_settings):
     #   as the proxy path does not match completely because 10.2.3.4 is not allowed to map to 192.168.1.1.
     # After having processed all paths in the proxy settings, we return the "deepest" IP from ``path_to_client`` that
     # is allowed according to any proxy path of the proxy settings.
-    log.debug(u"Determining the mapped IP from {!r} given the proxy settings {!r} ...".format(
-        path_to_client, proxy_settings))
+    log.debug(f"Determining the mapped IP from {path_to_client!r} given the proxy settings {proxy_settings!r} ...")
     max_idx = 0
     for proxy_path in proxy_dict:
-        log.debug(u"Proxy path: {!r}".format(proxy_path))
+        log.debug(f"Proxy path: {proxy_path!r}")
         # If the proxy path contains more subnets than the path to the client, we already know that it cannot match.
         if len(proxy_path) > len(path_to_client):
-            log.debug(u"... ignored because it is longer than the path to the client")
+            log.debug("... ignored because it is longer than the path to the client")
             continue
         # Hence, we can now be sure that len(path_to_client) >= len(proxy_path).
         current_max_idx = 0
@@ -616,9 +752,9 @@ def check_proxy(path_to_client, proxy_settings):
         # Hence, we ignore any additional proxy hops that the client may send, which is what we want.
         for idx, (proxy_path_ip, client_path_ip) in enumerate(zip(proxy_path, path_to_client)):
             # We check if the network in the proxy path contains the IP from path_to_client.
-            if client_path_ip not in proxy_path_ip:
+            if not _ip_in_network(client_path_ip, proxy_path_ip):
                 # If not, the current proxy path does not match and we do not have to keep checking it.
-                log.debug(u"... ignored because {!r} is not in subnet {!r}".format(client_path_ip, proxy_path_ip))
+                log.debug(f"... ignored because {client_path_ip!r} is not in subnet {proxy_path_ip!r}")
                 break
             else:
                 current_max_idx = idx
@@ -626,78 +762,239 @@ def check_proxy(path_to_client, proxy_settings):
             # This branch is only executed if we did *not* break out of the loop. This means that the proxy path
             # completely matches the path to client, so the mapped client IP is a viable candidate.
             if current_max_idx >= max_idx:
-                log.debug(u"... setting new candidate for client IP: {!r}".format(path_to_client[current_max_idx]))
+                log.debug(f"... setting new candidate for client IP: {path_to_client[current_max_idx]!r}")
             max_idx = max(max_idx, current_max_idx)
 
-    log.debug(u"Determined mapped client IP: {!r}".format(path_to_client[max_idx]))
-    return path_to_client[max_idx]
+    log.debug(f"Determined mapped client IP: {path_to_client[max_idx]!r}")
+    return max_idx
+
+
+def check_proxy(path_to_client: "list[IPAddress]", proxy_settings: str) -> "IPAddress":
+    """
+    The mapped client IP for *path_to_client*, i.e. the item :func:`check_proxy_index` selected. See there for
+    what is selected and why.
+
+    :param path_to_client: a list of :class:`IPAddress` objects, the peer first and the claimed origin last
+    :param proxy_settings: The proxy settings from OverrideAuthorizationClient
+    :return: an item from ``path_to_client``
+    """
+    return path_to_client[check_proxy_index(path_to_client, proxy_settings)]
+
+
+class ClientIpSource(StrEnum):
+    """
+    Where a request's effective client IP was taken from.
+
+    :attr:`REMOTE_ADDR` is the TCP peer, used because no ``OverrideAuthorizationClient`` is configured.
+    :attr:`REMOTE_ADDR_UNMAPPED` is the same address, but chosen *despite* an override being configured -
+    this peer is not permitted to map the client any further, which is what distinguishes "we do not map" from
+    "we tried and this peer may not". :attr:`X_FORWARDED_FOR` and :attr:`CLIENT_PARAM` are a hop the override
+    admitted, from the header resp. the ``client`` request parameter.
+    """
+    REMOTE_ADDR = "REMOTE_ADDR"
+    REMOTE_ADDR_UNMAPPED = "REMOTE_ADDR_UNMAPPED"
+    X_FORWARDED_FOR = "X_FORWARDED_FOR"
+    CLIENT_PARAM = "CLIENT_PARAM"
+
+
+# X-Forwarded-For is attacker-controlled and unbounded, so the recorded chain is capped rather than trusted to
+# be short. 50 matches authentication_log.source_ip, which is wide enough for an IPv4-mapped IPv6 address.
+MAX_IP_CHAIN_HOPS = 16
+MAX_IP_CHAIN_HOP_LENGTH = 50
+
+
+@dataclass(frozen=True)
+class ClientIpHop:
+    """One hop of the path to the client: the address, and where that address was claimed."""
+    ip: str
+    source: str
+
+
+@dataclass(frozen=True)
+class ClientIpInfo:
+    """
+    How a request's client IP was derived: the effective address, the TCP peer it arrived from, which of the
+    two (or which claimed hop) was chosen, and the whole path that was considered.
+
+    ``chain`` is recorded even when no override is configured and the header is therefore ignored: the point is
+    to keep the forensic record of what the request claimed, not to widen what is trusted. Everything past the
+    peer is client-supplied and must never gate a decision.
+    """
+    ip: str | None
+    peer_ip: str | None
+    source: str | None
+    chain: list["ClientIpHop"] = field(default_factory=list)
+    # Which hop of ``chain`` ``ip`` came from; None when there is no effective hop.
+    effective_index: int | None = None
+    # Hops cut by MAX_IP_CHAIN_HOPS.
+    dropped_hops: int = 0
+
+
+def _path_to_client(request) -> "list[ClientIpHop]":
+    """
+    The path from privacyIDEA to the claimed client, peer first: the TCP peer, then the X-Forwarded-For hops in
+    reverse (the header lists them origin-first), then the ``client`` request parameter where the endpoint
+    accepts one. Each hop is tagged with where it was claimed.
+
+    Built regardless of the override setting, so the chain is recorded even for a request whose header
+    privacyIDEA does not honour.
+    """
+    peer = request.remote_addr
+    hops = [ClientIpHop(peer, str(ClientIpSource.REMOTE_ADDR))] if peer else []
+    access_route = list(request.access_route or [])
+    if access_route and access_route != [peer]:
+        hops += [ClientIpHop(ip, str(ClientIpSource.X_FORWARDED_FOR)) for ip in reversed(access_route)]
+    if (not hasattr(request, "blueprint")
+            or request.blueprint in ["validate_blueprint", "ttype_blueprint", "jwtauth"]):
+        client_param = (request.all_data or {}).get("client")
+        # Only a non-empty string is recorded as a hop. The parameter is untyped request data: a
+        # non-string value (e.g. a JSON number or boolean) is not an address spelling that any proxy
+        # writes, so it cannot be parsed - but it also must not reach _cap_chain, whose hop-length cap
+        # would raise on a value without len(). A request must not 500 over a client-supplied parameter
+        # just because it arrived as the wrong JSON type.
+        if isinstance(client_param, str) and client_param:
+            hops.append(ClientIpHop(client_param, str(ClientIpSource.CLIENT_PARAM)))
+    return hops
+
+
+def _undetermined_client_ip(peer: str | None, hops: "list[ClientIpHop]") -> "ClientIpInfo":
+    """
+    The :class:`ClientIpInfo` of a request whose client IP cannot be determined although an
+    ``OverrideAuthorizationClient`` is configured: the path to the client does not start with an address.
+
+    Logged as a warning, as it is a matter of the setup rather than of a single client: the first hop is the
+    peer, or, without a peer (e.g. a Unix socket), the entry the nearest proxy added to ``X-Forwarded-For``.
+
+    :param peer: the TCP peer of the request
+    :param hops: the path to the client, peer first
+    :return: a :class:`ClientIpInfo` without a client IP
+    """
+    first_hop = hops[0].ip[:MAX_IP_CHAIN_HOP_LENGTH] if hops else None
+    log.warning(f"Could not determine the client IP although OverrideAuthorizationClient is set: the "
+                f"connection address is {peer!r} and the first address of the path is {first_hop!r}. Check "
+                "that the proxy in front of privacyIDEA adds the client address to X-Forwarded-For.")
+    return _cap_chain(ClientIpInfo(ip=None, peer_ip=peer, source=None, chain=hops))
+
+
+def get_client_ip_info(request, proxy_settings) -> "ClientIpInfo":
+    """
+    Determine the client IP of *request* **and how it was derived**.
+
+    The selection is exactly :func:`get_client_ip`'s - which is expressed in terms of this function, so the
+    address written to the authentication log and the address the engine counts and blocks on cannot drift
+    apart. What is added is the record: the TCP peer, which hop was chosen, and the full path that was
+    considered, including the hops an unconfigured or non-matching override caused to be ignored.
+
+    :param request: the Flask request
+    :param proxy_settings: the ``OverrideAuthorizationClient`` system setting
+    :return: a :class:`ClientIpInfo`
+    """
+    peer = request.remote_addr
+    hops = _path_to_client(request)
+    if not proxy_settings:
+        # No mapping is configured, so the peer is the client. The chain is still recorded. The peer is read like a
+        # hop, so it gets the same client IP as through an override: a scoped link-local peer ("fe80::1%eth0")
+        # loses its zone, which netaddr cannot parse, and an IPv4-mapped peer is its IPv4 address. A peer that
+        # is not an address at all is kept as it is.
+        peer_address = _parse_hop_address(peer)
+        ip = canonical_client_ip(peer_address) if peer_address is not None else peer
+        info = ClientIpInfo(ip=ip, peer_ip=peer, source=str(ClientIpSource.REMOTE_ADDR) if peer else None,
+                            chain=hops, effective_index=0 if hops else None)
+        return _cap_chain(info)
+    if not request.access_route:
+        # No route at all: get_client_ip has always returned None here, and there is nothing to derive from.
+        return _undetermined_client_ip(peer, hops)
+    # Kept as (hops-index, hop) pairs so the effective hop can be recovered by position: the same
+    # (ip, source) can legitimately appear more than once in the chain, and a value-based lookup back into
+    # ``hops`` would then return the first match rather than the hop actually chosen.
+    addressable = []
+    addresses = []
+    for i, hop in enumerate(hops):
+        # An unparseable hop cuts the chain instead of being skipped: skipping would shift the later hops
+        # one position up, onto the networks configured for the skipped one. The hops after the cut stay
+        # recorded in ``chain``, they are just not mapped.
+        address = _parse_hop_address(hop.ip)
+        if address is None:
+            log.debug(
+                f"Cutting the client IP chain at the unparseable hop "
+                f"{hop.ip[:MAX_IP_CHAIN_HOP_LENGTH]!r}: the "
+                "hops after it are recorded but no longer mapped."
+            )
+            break
+        addresses.append(address)
+        addressable.append((i, hop))
+    if not addressable:
+        # The first hop is unparseable, or there is no hop at all (an empty REMOTE_ADDR, e.g. a Unix socket,
+        # gives an access_route of [""] but no peer hop): nothing to map from, and check_proxy_index() would
+        # raise on an empty list.
+        return _undetermined_client_ip(peer, hops)
+    index = check_proxy_index(addresses, proxy_settings)
+    effective_index, chosen = addressable[index]
+    # Index 0 is the peer: an override is configured, but this peer may not map the client any further.
+    source = str(ClientIpSource.REMOTE_ADDR_UNMAPPED) if index == 0 else chosen.source
+    # The parsed address rather than the raw hop, so a non-canonical spelling is normalized.
+    return _cap_chain(ClientIpInfo(ip=canonical_client_ip(addresses[index]), peer_ip=peer, source=source,
+                                   chain=hops, effective_index=effective_index))
+
+
+def _cap_chain(info: "ClientIpInfo") -> "ClientIpInfo":
+    """
+    Cap the recorded chain at :data:`MAX_IP_CHAIN_HOPS` and each hop at :data:`MAX_IP_CHAIN_HOP_LENGTH`. The
+    cap is a hard bound - an attacker padding X-Forwarded-For to push the effective hop past it must not be
+    able to grow what gets stored, so this never keeps more than :data:`MAX_IP_CHAIN_HOPS` hops even where
+    that drops the effective one from the recorded chain (the effective address itself is still on the row
+    via ``ip``/``source``, only its highlighting in the chain is lost in that edge case). An over-long chain
+    is a client claiming one, so it is truncated rather than stored.
+    """
+    keep = min(MAX_IP_CHAIN_HOPS, len(info.chain))
+    if len(info.chain) <= keep and all(len(hop.ip) <= MAX_IP_CHAIN_HOP_LENGTH for hop in info.chain):
+        return info
+    chain = [ClientIpHop(hop.ip[:MAX_IP_CHAIN_HOP_LENGTH], hop.source) for hop in info.chain[:keep]]
+    return replace(info, chain=chain, dropped_hops=len(info.chain) - len(chain))
 
 
 def get_client_ip(request, proxy_settings):
     """
     Take the request and the proxy_settings and determine the new client IP.
 
+    This is :func:`get_client_ip_info` reduced to the address it selects. The two share one implementation on
+    purpose: the IP written to the authentication log and the IP the conditional-access engine counts and
+    blocks on must be the same address, and two implementations of "the client IP" would eventually disagree.
+
     :param request:
     :param proxy_settings: The proxy settings from OverrideAuthorizationClient
     :return: IP address as string
     """
-    # This is not so easy, because we want to support the X-Forwarded-For protocol header set by proxies,
-    # but also want to prevent rogue clients from spoofing their IP address, while also supporting the
-    # "client" request parameter.
-    # From the X-Forwarded-For header, we determine the path to the actual client, i.e. the list of proxy servers
-    # that the HTTP response will pass through, including the final client IP:
-    # If a client C talks to a proxy P1, which in turn talks to a proxy P2, which talks to privacyIDEA,
-    # X-Forwarded-For will be "C, P1", the HTTP client IP will be P2, and path_to_client
-    # consequently will be [P2, P1, C].
-    # However, if we get such a request, we cannot be sure if the X-Forwarded-For header is correct,
-    # or if it was sent by a rogue client in order to spoof its IP address.
-    # To prevent IP spoofing, privacyIDEA allows to configure a list of proxies that are allowed to override the
-    # authentication client. See ``check_proxy`` for more details.
-    # If we are handling a /validate/ or /auth/ endpoint and a "client" parameter is provided,
-    # it is appended to the path to the client.
-    if proxy_settings:
-        if not request.access_route:
-            # This is the case for tests
-            return None
-        elif request.access_route == [request.remote_addr]:
-            # This is the case if no X-Forwarded-For header is provided
-            path_to_client = [request.remote_addr]
-        else:
-            # This is the case if a X-Forwarded-For header is provided.
-            path_to_client = [request.remote_addr] + list(reversed(request.access_route))
-        # A possible ``client`` parameter is appended to the *end* of the path to client.
-        if (not hasattr(request, "blueprint") or
-            request.blueprint in ["validate_blueprint", "ttype_blueprint",
-                                  "jwtauth"]) \
-                and "client" in request.all_data:
-            path_to_client.append(request.all_data["client"])
-        # We now refer to ``check_proxy`` to extract the mapped IP from ``path_to_client``.
-        return str(check_proxy([IPAddress(ip) for ip in path_to_client], proxy_settings))
-    else:
-        # If no proxy settings are defined, we do not map any IPs anyway.
-        return request.remote_addr
+    return get_client_ip_info(request, proxy_settings).ip
 
-def check_ip_in_policy(client_ip, policy):
+
+def check_ip_in_policy(client_ip: str, policy: list[str]) -> tuple[bool, bool]:
     """
     This checks, if the given client IP is contained in a list like
 
        ["10.0.0.2", "192.168.2.1/24", "!192.168.2.12", "-172.16.200.1"]
 
+    An IPv4 address and its IPv4-mapped IPv6 form match the same entries, see :func:`_ip_in_network`.
+
     :param client_ip: The IP address in question
-    :param policy: A string of single IP addresses, negated IP address and subnets.
+    :param policy: A list of single IP addresses, negated IP addresses and subnets.
     :return: tuple of (found, excluded)
+    :raises AddrFormatError: if the client IP or an entry is not a valid address or network
     """
     client_found = False
     client_excluded = False
     # Remove empty strings from the list
     policy = list(filter(None, policy))
+    if not policy:
+        return client_found, client_excluded
+    address = IPAddress(client_ip)
     for ipdef in policy:
         if ipdef[0] in ['-', '!']:
             # exclude the client?
-            if IPAddress(client_ip) in IPNetwork(ipdef[1:]):
-                log.debug(u"the client {0!s} is excluded by {1!s}".format(client_ip, ipdef))
+            if _ip_in_network(address, IPNetwork(ipdef[1:])):
+                log.debug(f"the client {client_ip!s} is excluded by {ipdef!s}")
                 client_excluded = True
-        elif IPAddress(client_ip) in IPNetwork(ipdef):
+        elif _ip_in_network(address, IPNetwork(ipdef)):
             client_found = True
     return client_found, client_excluded
 
@@ -741,7 +1038,7 @@ def reduce_realms(all_realms, policies):
     """
     This function reduces the realm list based on the policies
     If there is a policy, that acts for all realms, all realms are returned.
-    Otherwise only realms are returned, that are contained in the policies.
+    Otherwise, only realms are returned, that are contained in the policies.
     """
     realms = {}
     if not policies:
@@ -765,124 +1062,12 @@ def reduce_realms(all_realms, policies):
 
 def is_true(value):
     """
-    Returns True is the value is 1, "1", True or "true"
+    Returns True if the value is 1, "1", True,"True", "true" or "TRUE"
+
     :param value: string or integer
     :return: Boolean
     """
     return value in [1, "1", True, "True", "true", "TRUE"]
-
-
-def compare_condition(condition, value):
-    """
-    This function checks, if the 'value' complies the 'condition'.
-    The condition can start with '<', '=' or '>' and contain a number like:
-    <100
-    >1000
-    =123
-    123 is interpreted as =123
-
-    :param condition: A string like <100
-    :type condition: basestring
-    :param value: the value to check
-    :type value: int
-    :return: True or False
-    """
-    condition = condition.replace(" ", "")
-    if not condition:
-        # No condition to match!
-        return False
-
-    try:
-        if condition[0:2] in ["==", "!=", ">=", "=>", "<=", "=<"]:
-            return compare_value_value(value, condition[0:2], int(condition[2:]))
-        elif condition[0] in ["=", "<", ">"]:
-            return compare_value_value(value, condition[0], int(condition[1:]))
-        else:
-            return value == int(condition)
-
-    except ValueError:
-        log.warning(u"Invalid condition {0!s}. Needs to contain an integer.".format(condition))
-        return False
-
-
-def compare_value_value(value1, comparator, value2):
-    """
-    This function compares value1 and value2 with the comparator.
-    The comparator may be "==", "=", "!=", ">", "<", ">=", "=>", "<=" or "=<".
-    
-    If the values can be converted to integers or dates, they are compared as such,
-    otherwise as strings.
-
-    In case of dates make sure they can be parsed by 'parse_date()', otherwise
-    they will be compared as strings.
-
-    :param value1: First value 
-    :param value2: Second value
-    :param comparator: The comparator
-    :return: True or False
-    """
-    try:
-        int1 = int(value1)
-        int2 = int(value2)
-        # We only converts BOTH values if possible
-        value1 = int1
-        value2 = int2
-    except Exception:
-        log.debug("can not compare values as integers.")
-
-    if type(value1) != int and type(value2) != int:
-        # try to convert both values to a timestamp
-        try:
-            date1 = parse_date(value1)
-            date2 = parse_date(value2)
-            if date1 and date2:
-                # Only use dates, if both values can be converted to dates
-                value1 = date1
-                value2 = date2
-        except Exception:
-            log.debug("error during date conversion.")
-
-    if comparator in ["==", "="]:
-        return value1 == value2
-    elif comparator == ">":
-        return value1 > value2
-    elif comparator == "<":
-        return value1 < value2
-    elif comparator in ['>=', '=>']:
-        return value1 >= value2
-    elif comparator in ['<=', '=<']:
-        return value1 <= value2
-    elif comparator == '!=':
-        return value1 != value2
-    else:
-        raise Exception("Unknown comparator: {0!s}".format(comparator))
-
-
-def compare_generic_condition(cond, key_method, warning):
-    """
-    Compares a condition like "tokeninfoattribute == value".
-    It uses the "key_method" to determine the value of "tokeninfoattribute".
-
-    If the value does not match, it returns False.
-
-    :param cond: A condition containing a comparator like "==", ">", "<"
-    :param key_method: A function call, that get the value from the key
-    :param warning: A warning message to be written to the log file.
-    :return: True of False
-    """
-    key = value = None
-    for comparator in ["==", ">", "<"]:
-        if len(cond.split(comparator)) == 2:
-            key, value = [x.strip() for x in cond.split(comparator)]
-            break
-    if value:
-        res = compare_value_value(key_method(key), comparator, value)
-        log.debug("Comparing {0!s} {1!s} {2!s} with result {3!s}.".format(key, comparator, value, res))
-        return res
-    else:
-        # There is a condition, but we do not know it!
-        log.warning(warning.format(cond))
-        raise Exception("Condition not parsable.")
 
 
 def int_to_hex(serial):
@@ -896,7 +1081,7 @@ def int_to_hex(serial):
     """
     serial_hex = hex(int(serial)).upper()
     serial_hex = serial_hex.split("X")[1]
-    if len(serial_hex)%2 != 0:
+    if len(serial_hex) % 2 != 0:
         serial_hex = "0" + serial_hex
     return serial_hex
 
@@ -905,15 +1090,16 @@ def parse_legacy_time(ts, return_date=False):
     """
     The new timestrings are of the format YYYY-MM-DDThh:mm+oooo.
     They contain the timezone offset!
-    
-    Old legacy time strings are of format DD/MM/YY hh:mm without time zone 
+
+    Old legacy time strings are of format DD/MM/YY hh:mm without time zone
     offset.
-    
-    This function parses string and returns the new formatted time string 
+
+    This function parses string and returns the new formatted time string
     including the timezone offset.
-    :param timestring: 
+
+    :param ts:
     :param return_date: If set to True a date is returned instead of a string
-    :return: 
+    :return:
     """
     from privacyidea.lib.tokenclass import DATE_FORMAT
     d = parse_date_string(ts)
@@ -921,7 +1107,7 @@ def parse_legacy_time(ts, return_date=False):
         # we need to reparse the string
         d = parse_date_string(ts,
                               dayfirst=re.match(r"^\d\d[/\.]", ts)).replace(
-                                  tzinfo=tzlocal())
+            tzinfo=tzlocal())
     if return_date:
         return d
     else:
@@ -932,9 +1118,9 @@ def parse_timedelta(s):
     """
     parses a string like +5d or -30m and returns a timedelta.
     Allowed identifiers are s, m, h, d, y.
-    
+
     :param s: a string like +30m or -5d
-    :return: timedelta 
+    :return: timedelta
     """
     seconds = 0
     minutes = 0
@@ -942,8 +1128,8 @@ def parse_timedelta(s):
     days = 0
     m = re.match(r"\s*([+-]?)\s*(\d+)\s*([smhdy])\s*$", s)
     if not m:
-        log.warning("Unsupported timedelta: {0!r}".format(s))
-        raise Exception("Unsupported timedelta")
+        log.warning(f"Unsupported timedelta: {s!r}")
+        raise TypeError(f"Unsupported timedelta {s!r}")
     count = int(m.group(2))
     if m.group(1) == "-":
         count = - count
@@ -962,19 +1148,38 @@ def parse_timedelta(s):
     return td
 
 
+def parse_time_sec_int(s):
+    """
+    parses a string like 5d or 24h into an int with gives the time in sec. You can use y, d, h, m and s.
+
+    :param s: time string like 5d or 24h
+    :type s: str or int
+    :return: time in seconds as an integer value
+    :rtype: int
+    """
+    try:
+        td = parse_timedelta(s)
+        ret = abs(td).total_seconds()
+    except TypeError as _e:
+        # parse_timedelta() does not accept int values
+        ret = s
+    return int(ret)
+
+
 def parse_time_offset_from_now(s):
     """
     Parses a string as used in the token event handler
         "New date {now}+5d. Some {other} {tags}" or
         "New date {now}-30m! Some {other} {tags}".
-    This returns the string "New date {now}. Some {other} {tags}" and the 
+    This returns the string "New date {now}. Some {other} {tags}" and the
     timedelta of 5 days.
-    Allowed tags are {now} and {current_time}. Only one tag of {now} or {
-    current_time} is allowed.
+    Allowed tags are {now} and {current_time}. {now} is the canonical tag,
+    {current_time} is a deprecated alias for it. At most one offset expression
+    is parsed; if both are present, {current_time} takes precedence.
     Allowed offsets are "s": seconds, "m": minutes, "h": hours, "d": days.
-        
+
     :param s: The string to be parsed.
-    :return: tuple of modified string and timedelta 
+    :return: tuple of modified string and timedelta
     """
     td = timedelta()
     m1 = re.search(r"(^.*{current_time})([+-]\d+[smhd])(.*$)", s)
@@ -1018,21 +1223,65 @@ def convert_column_to_unicode(value):
     """
     Helper function for models. If ``value`` is None or a unicode object, do nothing.
     Otherwise, convert it to a unicode object.
+
     :param value: the string to convert
     :type value: str
     :return: a unicode object or None
     """
-    if value is None or isinstance(value, six.text_type):
+    if value is None or isinstance(value, str):
         return value
     elif isinstance(value, bytes):
         return value.decode('utf8')
     else:
-        return six.text_type(value)
+        return str(value)
+
+
+#: Escape character used for SQL ``LIKE``/``ILIKE`` patterns built from user input.
+#: Matches the character SQLAlchemy uses for ``autoescape`` and is portable across
+#: SQLite, MySQL, PostgreSQL and Oracle.
+SQL_LIKE_ESCAPE = "/"
+
+
+def escape_sql_like(value: str) -> str:
+    """
+    Escape the SQL ``LIKE``/``ILIKE`` metacharacters ``%`` and ``_`` (and the
+    escape character itself) so that ``value`` matches literally. The result must
+    be used with ``escape=SQL_LIKE_ESCAPE``, e.g. ``column.like(escape_sql_like(v),
+    escape=SQL_LIKE_ESCAPE)``. Use this when the value carries no wildcard at all;
+    use ``convert_wildcard_to_sql_like`` when a ``*`` wildcard should be honored.
+
+    :param value: the value to escape
+    :return: the escaped value
+    """
+    return (value.replace(SQL_LIKE_ESCAPE, SQL_LIKE_ESCAPE * 2)
+            .replace("%", f"{SQL_LIKE_ESCAPE}%")
+            .replace("_", f"{SQL_LIKE_ESCAPE}_"))
+
+
+def convert_wildcard_to_sql_like(value: str, wildcard: str = "*") -> str:
+    """
+    Turn a user supplied search pattern into a SQL ``LIKE`` pattern.
+
+    The user wildcard (``*`` by default) is converted to the SQL wildcard ``%``.
+    Literal ``%`` and ``_`` in the input are escaped so they match literally
+    instead of acting as SQL wildcards. The resulting pattern must be used with
+    ``escape=SQL_LIKE_ESCAPE``, e.g. ``column.like(convert_wildcard_to_sql_like(v),
+    escape=SQL_LIKE_ESCAPE)``.
+
+    :param value: the user supplied search pattern
+    :param wildcard: the character used as a wildcard in the user input
+    :return: an escaped SQL LIKE pattern
+    """
+    # Escape each literal segment, then join with the SQL wildcard. Splitting on
+    # the user wildcard first means it can never collide with the escaping, so any
+    # wildcard character (including '%' or '_') is handled correctly.
+    return "%".join(escape_sql_like(part) for part in value.split(wildcard))
 
 
 def convert_timestamp_to_utc(timestamp):
     """
     Convert a timezone-aware datetime object to a naive UTC datetime.
+
     :param timestamp: datetime object that should be converted
     :type timestamp: timezone-aware datetime object
     :return: timezone-naive datetime object
@@ -1063,7 +1312,7 @@ def fetch_one_resource(table, **query):
     try:
         return table.query.filter_by(**query).one()
     except sqlalchemy.orm.exc.NoResultFound:
-        raise ResourceNotFoundError(u"The requested {!s} could not be found.".format(table.__name__))
+        raise ResourceNotFoundError(f"The requested {table.__name__!s} could not be found.")
 
 
 def truncate_comma_list(data, max_len):
@@ -1079,20 +1328,29 @@ def truncate_comma_list(data, max_len):
     :return: shortened string
     """
     data = data.split(",")
+    original = ",".join(data)
+
+    def cut_the_list():
+        """Keep the beginning of the list and mark it as shortened."""
+        return f"{original[:max_len][:-1]!s}+"
+
     # if there are more entries than the maximum length, we do an early exit
     if len(data) >= max_len:
-        r = ",".join(data)[:max_len]
-        # Also mark this string
-        r = u"{0!s}+".format(r[:-1])
-        return r
+        return cut_the_list()
 
     while len(",".join(data)) > max_len:
-        new_data = []
         longest = max(data, key=len)
+        if len(longest) <= 1:
+            # Every entry is shortened to its marker already, so the list has more entries
+            # than the maximum length can hold. Shortening them further is not possible, so
+            # the list is cut instead: whole entries at the beginning say more than a row of
+            # markers, and without this the loop would not terminate.
+            return cut_the_list()
+        new_data = []
         for d in data:
             if d == longest:
                 # Shorten the longest and mark with "+"
-                d = u"{0!s}+".format(d[:-2])
+                d = f"{d[:-2]!s}+"
             new_data.append(d)
         data = new_data
     return ",".join(data)
@@ -1168,7 +1426,7 @@ def check_pin_contents(pin, policy):
 
     # check for not allowed characters
     for char in pin:
-        if not char in charlists_dict["base"]:
+        if char not in charlists_dict["base"]:
             ret = False
     if not ret:
         comment.append("Not allowed character in PIN!")
@@ -1177,9 +1435,62 @@ def check_pin_contents(pin, policy):
     for str in charlists_dict["requirements"]:
         if not re.search(re.compile('[' + re.escape(str) + ']'), pin):
             ret = False
-            comment.append("Missing character in PIN: {0!s}".format(str))
+            comment.append(f"Missing character in PIN: {str!s}")
 
     return ret, ",".join(comment)
+
+
+# Classes whose absence from the allowlist has already been logged in this process.
+_module_allowlist_warned = set()
+
+
+def check_module_allowed(class_name: str, shipped: list[str], config_key: str, description: str) -> None:
+    """
+    Check that a python class privacyIDEA is about to import is one it is meant to import.
+
+    The class is named by configuration that is written through the API - an SMS gateway
+    definition, a policy action - rather than by ``pi.cfg``, so it is worth being explicit
+    about which classes an installation actually uses. The name is checked before the import,
+    because importing is what runs the module.
+
+    Writing an own class is a supported thing to do, so the list is extensible: the classes
+    that ship with privacyIDEA are allowed, plus everything named in ``config_key``.
+
+    What happens to a class on neither list is decided by ``PI_MODULE_ALLOWLIST_MODE``:
+
+    * ``warn`` (the default) logs it and imports it anyway. An installation that upgrades
+      into this check keeps working, and the log says what to declare in ``pi.cfg``.
+    * ``enforce`` rejects it.
+
+    The default is deliberately the permissive one. This runs on configuration that already
+    exists in the database of an installation being upgraded, and an upgrade must not stop a
+    gateway or a pin handler from working because a class was never declared in a file that
+    did not read it before.
+
+    :param class_name: the dotted path of the class that is about to be imported
+    :param shipped: the dotted paths of the classes that ship with privacyIDEA
+    :param config_key: the ``pi.cfg`` key that names additional allowed classes
+    :param description: what kind of class this is, for the message
+    :raises ParameterError: in ``enforce`` mode, if the class is on neither list
+    """
+    # to_list, so that a single class written as a plain string rather than as a one-element
+    # list is read as that class and not as its characters.
+    declared = to_list(get_app_config_value(config_key) or [])
+    if class_name in list(shipped) + declared:
+        return
+
+    message = (f"The {description} '{class_name}' is not one of the classes that ship with "
+               f"privacyIDEA. Add it to {config_key} in pi.cfg to declare that this "
+               f"installation uses it.")
+    if (get_app_config_value(ConfigKey.MODULE_ALLOWLIST_MODE) or "warn").lower() == "enforce":
+        raise ParameterError(message)
+    # Warned once per class per process: this runs on every use of the class - for a pin handler
+    # that is every enrollment - and the same line repeated per request buries the signal it
+    # carries rather than carrying it.
+    if class_name not in _module_allowlist_warned:
+        _module_allowlist_warned.add(class_name)
+        log.warning(f"{message} It is used anyway, because {ConfigKey.MODULE_ALLOWLIST_MODE} is "
+                    f"not set to 'enforce'.")
 
 
 def get_module_class(package_name, class_name, check_method=None):
@@ -1187,11 +1498,7 @@ def get_module_class(package_name, class_name, check_method=None):
     helper method to load the Module class from a given
     package in literal.
 
-    :param package_name: literal of the Module
-    :param class_name: Name of the class in the module
-    :param check_method: Name of the method to check, if this would be the right class
-
-    example:
+    example::
 
         get_module_class("privacyidea.lib.auditmodules.sqlaudit", "Audit", "log")
 
@@ -1201,15 +1508,18 @@ def get_module_class(package_name, class_name, check_method=None):
         checks, if the method exists
         if not an error is thrown
 
+    :param package_name: literal of the Module
+    :param class_name: Name of the class in the module
+    :param check_method: Name of the method to check, if this would be the right class
     """
     mod = import_module(package_name)
     if not hasattr(mod, class_name):
-        raise ImportError(u"{0} has no attribute {1}".format(package_name, class_name))
+        raise ImportError(f"{package_name} has no attribute {class_name}")
     klass = getattr(mod, class_name)
-    log.debug("klass: {0!s}".format(klass))
+    log.debug(f"klass: {klass!s}")
     if check_method and not hasattr(klass, check_method):
-        raise NameError(u"Class AttributeError: {0}.{1} "
-                        u"instance has no attribute '{2}'".format(package_name, class_name, check_method))
+        raise NameError(f"Class AttributeError: {package_name}.{class_name} "
+                        f"instance has no attribute '{check_method}'")
     return klass
 
 
@@ -1219,35 +1529,38 @@ def get_version_number():
     """
     version = "unknown"
     try:
-        version = importlib_metadata.version("privacyidea")
-    except:
-        log.info("We are not able to determine the privacyidea version number.")
+        version = metadata.version("privacyidea")
+    except metadata.PackageNotFoundError as e:
+        log.info(f"We are not able to determine the privacyidea version number: {e}")
     return version
 
 
 def get_version():
     """
     This returns the version, that is displayed in the WebUI and
-    self service portal.
+    self-service portal.
     """
     version = get_version_number()
-    return "privacyIDEA {0!s}".format(version)
+    return f"privacyIDEA {version!s}"
 
 
-def prepare_result(obj, rid=1, details=None):
+def prepare_result(obj, rid=1, details=None, **kwargs):
     """
     This is used to preformat the dictionary to be sent by the API response
 
-    :param obj: simple result object like dict, sting or list
-    :type obj: dict or list or string/unicode
+    :param obj: simple result object like dict, string or list
+    :type obj: dict or list or string/Unicode
     :param rid: id value, for future versions
     :type rid: int
     :param details: optional parameter, which allows to provide more detail
-    :type  details: None or simple type like dict, list or string/unicode
+    :type  details: None or simple type like dict, list or string/Unicode
+    :param kwargs: additional key-value pairs to be added to the root of the response
 
     :return: json rendered sting result
     :rtype: string
     """
+    # TODO this function has to be reworked or removed. We do not need to calculate the value of authentication here
+    # TODO when the caller already knows it. A function for formatting the response is fine.
     res = {"jsonrpc": "2.0",
            "result": {"status": True,
                       "value": obj},
@@ -1255,22 +1568,26 @@ def prepare_result(obj, rid=1, details=None):
            "versionnumber": get_version_number(),
            "id": rid,
            "time": time.time()}
-
+    res.update(kwargs)
     if details is not None and len(details) > 0:
+        # The lib layer hands its classification to the api layer in this very dict (see
+        # INTERNAL_CLASSIFICATION_KEYS); a view reads it by popping, and whatever a view forgot is dropped here
+        # rather than answered with.
+        strip_internal_classification(details)
         details["threadid"] = threading.current_thread().ident
         res["detail"] = details
 
-    # Fix for sending an information about challenge response
-    # TODO: Make this default, when we move from the binary result->value to
-    #       more states in version 4.0
     if rid > 1:
-        if obj:
-            r_authentication = "ACCEPT"
-        elif not obj and details.get("multi_challenge"):
-            # We have a challenge authentication
-            r_authentication = "CHALLENGE"
+        if obj and obj != AUTH_RESPONSE.CHALLENGE and not details.get("multi_challenge"):
+            r_authentication = AUTH_RESPONSE.ACCEPT
+        elif obj and obj == AUTH_RESPONSE.CHALLENGE:
+            r_authentication = AUTH_RESPONSE.CHALLENGE
+        elif details.get("multi_challenge") or details.get("passkey"):
+            r_authentication = AUTH_RESPONSE.CHALLENGE
+        elif not obj and (details.get("challenge_status") in ("declined", "cancelled")):
+            r_authentication = AUTH_RESPONSE.DECLINED
         else:
-            r_authentication = "REJECT"
+            r_authentication = AUTH_RESPONSE.REJECT
         res["result"]["authentication"] = r_authentication
 
     return res
@@ -1279,8 +1596,9 @@ def prepare_result(obj, rid=1, details=None):
 def split_pin_pass(passw, otplen, prependpin):
     """
     Split a given password based on the otp length and prepend pin
+
     :param passw: The password like test123456 or 123456test
-    :type pass: str
+    :type passw: str
     :param otplen: The length of the otp value
     :param prependpin: The password is either in front or after the otp value
     :return:
@@ -1288,13 +1606,11 @@ def split_pin_pass(passw, otplen, prependpin):
     if prependpin:
         pin = passw[0:-otplen]
         otpval = passw[-otplen:]
-        log.debug("PIN prepended. PIN length is {0!s}, OTP length is {0!s}.".format(len(pin),
-                                                                                    len(otpval)))
+        log.debug(f"PIN prepended. PIN length is {len(pin)}, OTP length is {len(otpval)}.")
     else:
         pin = passw[otplen:]
         otpval = passw[0:otplen]
-        log.debug("PIN appended. PIN length is {0!s}, OTP length is {0!s}.".format(len(pin),
-                                                                                   len(otpval)))
+        log.debug(f"PIN appended. PIN length is {len(pin)}, OTP length is {len(otpval)}.")
     return pin, otpval
 
 
@@ -1303,17 +1619,26 @@ def create_tag_dict(logged_in_user=None,
                     serial=None,
                     tokenowner=None,
                     tokentype=None,
+                    tokendescription=None,
                     recipient=None,
                     registrationcode=None,
                     googleurl_value=None,
+                    googleurl_img=None,
+                    pushurl_value=None,
+                    pushurl_img=None,
                     client_ip=None,
                     pin=None,
-                    escape_html=False):
+                    challenge=None,
+                    escape_html=False,
+                    container_serial=None,
+                    container_url_value=None,
+                    container_url_img=None,
+                    time_offset=None):
     """
     This helper function creates a dictionary with tags to be used in sending emails
     either with email tokens or within the notification handler
 
-    :param logged_in_user: The acting logged in user (admin)
+    :param logged_in_user: The acting logged-in user (admin)
     :param request: The HTTP request object
     :param serial: The serial number of the token
     :param tokenowner: The owner of the token
@@ -1322,41 +1647,84 @@ def create_tag_dict(logged_in_user=None,
     :param recipient: The recipient
     :type recipient: dictionary with "givenname" and "surname"
     :param registrationcode: The registration code of a token
+    :param tokendescription: The description of the token
     :param googleurl_value: The URL for the QR code during token enrollemnt
+    :param googleurl_img: The image data blob of the QR-code during token enrollment
+    :param pushurl_value: The URL for the Push-Token enrollment
+    :param pushurl_img: The image data blob of the Push-Token enrollment QR-code
     :param client_ip: The IP of the client
-    :param pin: the PIN of a token
+    :param pin: The PIN of a token
+    :param challenge: The challenge data
     :param escape_html: Whether the values for the tags should be html escaped
-    :return: The tag dictionary
+    :param container_serial: The serial number of the container
+    :param container_url_value: The URL for the container registration
+    :param container_url_img: The URL as QR code for the container registration
+    :param time_offset: An optional offset that is added to the current time before
+        it is rendered into the ``now`` and ``current_time`` tags. This is used to
+        support offsets like ``{now}+2h`` together with
+        :func:`parse_time_offset_from_now`.
+    :type time_offset: datetime.timedelta or None
+    :return: The tag dictionary, with the keys admin, realm, action, serial, url, user,
+        surname, givenname, username, userrealm, tokentype, tokendescription,
+        registrationcode, recipient_givenname, recipient_surname, googleurl_value,
+        googleurl_img, pushurl_value, pushurl_img, time, date, now, current_time,
+        client_ip, pin, ua_browser, ua_string, challenge, container_serial,
+        container_url_value and container_url_img.
+        A tag whose value is not available is set to an empty string.
+        The ``now`` and ``current_time`` tags are aliases for the same timestamp;
+        ``now`` is the canonical tag, ``current_time`` is kept as a deprecated alias.
     """
-    time = datetime.now().strftime("%H:%M:%S")
-    date = datetime.now().strftime("%Y-%m-%d")
+    base_dt = datetime.now(tzlocal())
+    time = base_dt.strftime("%H:%M:%S")
+    date = base_dt.strftime("%Y-%m-%d")
+    from privacyidea.lib.tokenclass import AUTH_DATE_FORMAT
+    now = (base_dt + (time_offset or timedelta())).strftime(AUTH_DATE_FORMAT)
     recipient = recipient or {}
+    user_info = {}
+    if tokenowner:
+        try:
+            user_info = tokenowner.get_specific_info(["givenname", "surname"])
+        except Exception as e:
+            # The user store may be unavailable. A tag that can not be determined is
+            # empty, it must not fail the request that the tags are created for.
+            log.warning(f"Could not read the user information of {tokenowner!r}: {e!r}")
     tags = dict(admin=logged_in_user.get("username") if logged_in_user else "",
                 realm=logged_in_user.get("realm") if logged_in_user else "",
                 action=request.path if request else "",
                 serial=serial,
-                url=request.url_root if request else "",
-                user=tokenowner.info.get("givenname") if tokenowner else "",
-                surname=tokenowner.info.get("surname") if tokenowner else "",
-                givenname=recipient.get("givenname"),
+                # Never derive an out-of-band link from the requests host header
+                url=get_base_url(),
+                user=user_info.get("givenname", ""),
+                surname=user_info.get("surname", ""),
+                givenname=user_info.get("givenname", ""),
                 username=tokenowner.login if tokenowner else "",
                 userrealm=tokenowner.realm if tokenowner else "",
                 tokentype=tokentype,
+                tokendescription=tokendescription,
                 registrationcode=registrationcode,
                 recipient_givenname=recipient.get("givenname"),
                 recipient_surname=recipient.get("surname"),
                 googleurl_value=googleurl_value,
+                googleurl_img=googleurl_img,
+                pushurl_value=pushurl_value,
+                pushurl_img=pushurl_img,
                 time=time,
                 date=date,
+                now=now,
+                current_time=now,
                 client_ip=client_ip,
                 pin=pin,
-                ua_browser=request.user_agent.browser if request else "",
-                ua_string=request.user_agent.string if request else "")
+                ua_browser=get_useragent_name(request),
+                ua_string=request.user_agent.string if request else "",
+                challenge=challenge if challenge else "",
+                container_serial=container_serial,
+                container_url_value=container_url_value,
+                container_url_img=container_url_img)
+    # A tag that is not available must not be displayed as the string "None" in a message
+    tags = {key: "" if value is None else value for key, value in tags.items()}
+
     if escape_html:
-        escaped_tags = {}
-        for key, value in tags.items():
-            escaped_tags[key] = html.escape(value) if value is not None else None
-        tags = escaped_tags
+        tags = {key: html.escape(value) for key, value in tags.items()}
 
     return tags
 
@@ -1370,7 +1738,7 @@ def check_serial_valid(serial):
     :return: True or Exception
     """
     if not re.match(ALLOWED_SERIAL, serial):
-        raise ParameterError("Invalid serial number. Must comply to {0!s}.".format(ALLOWED_SERIAL))
+        raise ParameterError(f"Invalid serial number. Must comply to {ALLOWED_SERIAL!s}.")
     return True
 
 
@@ -1381,14 +1749,14 @@ def determine_logged_in_userparams(logged_in_user, params):
 
     If an administrator is acting, the "adminuser" and "adminrealm" are set from the logged_in_user
     information and the user parameters are taken from the request parameters.
-    Thus an admin can act on a user.
+    Thus, an admin can act on a user.
 
     If a user is acting, the adminuser and adminrealm are None, the username and userrealm are taken from
     the logged_in_user information.
 
-    :param logged_in_user: Logged in user dictionary.
+    :param logged_in_user: Logged-in user dictionary.
     :param params: Request parameters (all_data)
-    :return: Tupe of (scope, username, realm, adminuser, adminrealm)
+    :return: Tuple of (scope, username, realm, adminuser, adminrealm)
     """
     role = logged_in_user.get("role")
     username = logged_in_user.get("username")
@@ -1403,7 +1771,7 @@ def determine_logged_in_userparams(logged_in_user, params):
     elif role == "user":
         pass
     else:
-        raise PolicyError(u"Unknown role: {}".format(role))
+        raise PolicyError(f"Unknown role: {role}")
 
     return role, username, realm, admin_user, admin_realm
 
@@ -1450,39 +1818,91 @@ def parse_string_to_dict(s, split_char=":"):
     return d
 
 
-def replace_function_event_handler(text, token_serial=None, tokenowner=None, logged_in_user=None):
-    if logged_in_user is not None:
-        login = logged_in_user.login
-        realm = logged_in_user.realm
-    else:
-        login = ""
-        realm = ""
+ua_re = re.compile(r'^(?P<agent>[a-zA-Z0-9_-]+)(/(?P<version>\d+[\d.]*))?(\s(?P<comment>.*))?')
 
-    if tokenowner is not None:
-        surname = tokenowner.info.get("surname")
-        givenname = tokenowner.info.get("givenname")
-        userrealm = tokenowner.realm
-    else:
-        surname = ""
-        givenname = ""
-        userrealm = ""
 
-    if token_serial is not None:
-        token_serial = token_serial
-    else:
-        token_serial = ""
+def get_plugin_info_from_useragent(useragent):
+    """
+    This gives you the plugin name and version from an useragent string.
+    See https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/User-Agent for
+    more information on the user-agent string
 
-    try:
-        attributes = {
-            "logged_in_user": login,
-            "realm": realm,
-            "surname": surname,
-            "token_owner": givenname,
-            "user_realm": userrealm,
-            "token_serial": token_serial
-        }
-        new_text = text.format(**attributes)
-        return new_text
-    except(ValueError, KeyError) as err:
-        log.warning("Unable to replace placeholder: ({0!s})! Please check the webhooks data option.".format(err))
-        return text
+    :param useragent: useragent string like 'NameOfPlugin/VersionOfPlugin NameOfApplication/VersionOfApplication'
+    :type useragent: str
+    :return: a tuple with (NameOfPlugin, VersionOfPlugin, Comment). For example: ('ExamplePlugin', 1.0, '')
+    :rtype: tuple
+    """
+    if not useragent:
+        log.info("No user-agent string given")
+        return "", None, None
+    ua_match = ua_re.match(useragent)
+    if ua_match:
+        return ua_match.group('agent'), ua_match.group('version'), ua_match.group('comment')
+    else:
+        log.info(f"Could not match user-agent string: {useragent}")
+        return "", None, None
+
+
+def get_useragent_name(request) -> str:
+    """
+    Return the name of the client application that sent the request.
+
+    This is the name from the user agent string, the same value that is used for the policy
+    condition on user agents and for the audit log. Clients like the privacyIDEA plugins send
+    their own name, browsers report "Mozilla".
+
+    :param request: The HTTP request object or None
+    :return: The name of the client application, "" if there is no user agent
+    """
+    if not request or not request.user_agent.string:
+        return ""
+    return get_plugin_info_from_useragent(request.user_agent.string)[0]
+
+
+def get_computer_name_from_user_agent(user_agent: str) -> str | None:
+    """
+    Searches for entries in the user agent that could identify the machine.
+    Example: ComputerName/Laptop-3324231
+    The following keys are by default searched for in the user agent:
+    ["ComputerName", "Hostname", "MachineName", "Windows", "Linux", "Mac"]
+    The list can be extended with custom keys in pi.cfg with the entry OFFLINE_MACHINE_KEYS = ["CustomKey1", ...]
+    :param user_agent: The user agent string
+    :type user_agent: str or None
+    :return: The computer name or a generated computer name if no matching key was found in the user agent
+    :rtype: str or None
+    """
+    if not user_agent:
+        log.warning("No user agent provided to extract computer name from.")
+        return None
+    # TODO the input user_agent could be sanitized by removing all () and everything in between each of them
+    # Do not convert to set as the order of the keys should be preserved and iteration should be deterministic
+    keys: list = ["ComputerName", "Hostname", "MachineName", "Windows", "Linux", "Mac"]
+    config_keys: list = get_app_config_value("OFFLINE_MACHINE_KEYS", [])
+    keys.extend([key for key in config_keys if key not in keys])
+    log.debug(f"Keys to search for machine name in user agent: {keys}")
+    for key in keys:
+        if key in user_agent:
+            try:
+                return user_agent.split(key + "/")[1].split(" ")[0]
+            except Exception:
+                # This exception is likely to happen, because words/parts like "Mac" are common
+                # log.debug(f"Could not extract computer name from user agent: {ex} with key {key}")
+                pass
+    return None
+
+
+def redacted_email(email: str) -> str:
+    """
+    Censors an email address from 'example.mail@test.com' to 'ex********@t****.com'
+    """
+    name, domain = email.split('@') if '@' in email else ("**", email)
+    name_redacted = name[:2] + "*" * (10 - len(name[:2]))
+    domain_parts = domain.split('.') if '.' in domain else ["**", "***"]
+    return f'{name_redacted}@{domain_parts[0][0]}****.{domain_parts[-1]}'
+
+
+def redacted_phone_number(number: str) -> str:
+    """
+    Censors a phone number from 01234567890 to ****-******90
+    """
+    return f'****-******{number[-2:] or "**"}'

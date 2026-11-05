@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 # http://www.privacyidea.org
 # (c) cornelius kölbel, privacyidea.org
 #
@@ -56,32 +54,17 @@
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-from flask import (Blueprint, request, g, current_app)
-from ..lib.log import log_with
-from .lib.utils import optional, send_result, send_csv_result, required, getParam
-from ..lib.user import get_user_from_param
-from ..lib.token import (init_token, get_tokens_paginate, assign_token,
-                         unassign_token, remove_token, enable_token,
-                         revoke_token,
-                         reset_token, resync_token, set_pin_so, set_pin_user,
-                         set_pin, set_description, set_count_window,
-                         set_sync_window, set_count_auth,
-                         set_hashlib, set_max_failcount, set_realms,
-                         copy_token_user, copy_token_pin, lost_token,
-                         get_serial_by_otp, get_tokens,
-                         set_validity_period_end, set_validity_period_start, add_tokeninfo,
-                         delete_tokeninfo, import_token,
-                         assign_tokengroup, unassign_tokengroup, set_tokengroups)
-from werkzeug.datastructures import FileStorage
-from cgi import FieldStorage
-from privacyidea.lib.error import (ParameterError, TokenAdminError)
-from privacyidea.lib.importotp import (parseOATHcsv, parseSafeNetXML,
-                                       parseYubicoCSV, parsePSKCdata, GPGImport)
 import logging
-from privacyidea.lib.utils import to_unicode
-from privacyidea.lib.policy import ACTION
-from privacyidea.lib.challenge import get_challenges_paginate
-from privacyidea.api.lib.prepolicy import (prepolicy, check_base_action,
+
+from flask import (Blueprint, request, g, current_app)
+from flask_babel import _
+from werkzeug.datastructures import FileStorage
+
+from privacyidea.api.auth import admin_required
+from privacyidea.api.lib.postpolicy import (save_pin_change, check_verify_enrollment,
+                                            postpolicy)
+from privacyidea.api.lib.prepolicy import (prepolicy, check_base_action, check_token_action,
+                                           check_copy_token_action,
                                            check_token_init, check_token_upload,
                                            check_max_token_user,
                                            check_max_token_realm,
@@ -92,41 +75,94 @@ from privacyidea.api.lib.prepolicy import (prepolicy, check_base_action,
                                            check_external, init_token_defaults,
                                            enroll_pin, papertoken_count,
                                            tantoken_count,
-                                           u2ftoken_allowed, u2ftoken_verify_cert,
                                            twostep_enrollment_activation,
                                            twostep_enrollment_parameters,
                                            sms_identifiers, pushtoken_add_config,
-                                           check_admin_tokenlist,
                                            verify_enrollment,
                                            indexedsecret_force_attribute,
-                                           check_admin_tokenlist, webauthntoken_enroll, webauthntoken_allowed,
+                                           check_admin_tokenlist, fido2_enroll, webauthntoken_allowed,
                                            webauthntoken_request, required_piv_attestation,
                                            hide_tokeninfo, init_ca_connector, init_ca_template,
-                                           init_subject_components)
-from privacyidea.api.lib.postpolicy import (save_pin_change, check_verify_enrollment,
-                                            postpolicy)
+                                           init_subject_components, require_description_on_edit, require_description,
+                                           check_container_action, check_user_params,
+                                           resolver_realm_access,
+                                           force_server_generate_key)
+from privacyidea.lib.challenge import (cancel_challenge, get_challenges, get_challenges_for_user,
+                                       get_challenges_paginate, cleanup_expired_challenges)
+from privacyidea.lib.error import (ParameterError, TokenAdminError,
+                                   ResourceNotFoundError, PolicyError, Error)
 from privacyidea.lib.event import event
-from privacyidea.api.auth import admin_required
+from privacyidea.lib.importotp import (parseOATHcsv, parseSafeNetXML,
+                                       parseYubicoCSV, parsePSKCdata, GPGImport)
 from privacyidea.lib.subscriptions import CheckSubscription
+from privacyidea.lib.tokenrolloutstate import RolloutState
+from .lib.utils import send_result, send_csv_result, get_optional, get_required
+from privacyidea.lib.params import get_pagination_params
+from ..lib.container import find_container_by_serial, add_token_to_container
+from ..lib.crypto import CENSORED
+from ..lib.fido2.util import get_credential_ids_for_user
+from ..lib.log import log_with
+from ..lib.policies.actions import PolicyAction
+from ..lib.policy import Match
+from ..models.audit import audit_column_length
+from ..lib.token import (init_token, get_tokens_paginate, assign_token,
+                         unassign_token, remove_token, enable_token,
+                         revoke_token,
+                         reset_token, resync_token, set_pin_so, set_pin_user,
+                         set_pin, set_description, set_count_window,
+                         set_sync_window, set_count_auth,
+                         set_hashlib, set_max_failcount, set_realms,
+                         copy_token_user, copy_token_pin, lost_token,
+                         get_serial_by_otp, get_tokens,
+                         set_validity_period_end, set_validity_period_start, add_tokeninfo,
+                         delete_tokeninfo, import_token, set_token_type_info, get_settable_tokeninfo_keys,
+                         assign_tokengroup, unassign_tokengroup, set_tokengroups, get_one_token)
+from ..lib.tokens.passkeytoken import PasskeyTokenClass
+from ..lib.tokens.webauthntoken import WebAuthnTokenClass
+from ..lib.policydecorators import check_admin_allowed_for_token_owner
+from ..lib.user import get_user_from_param, User
 
 token_blueprint = Blueprint('token_blueprint', __name__)
 log = logging.getLogger(__name__)
 
+# The fields POST /token/set writes through their own setter. Some of them are token info entries a token class
+# maintains, so they would otherwise be written a second time as a settable token info entry.
+HANDLED_SET_FIELDS = frozenset({"serial", "user", "realm", "resolver", "description", "count_window",
+                                "sync_window", "hashlib", "max_failcount", "count_auth_max",
+                                "count_auth_success_max", "validity_period_start", "validity_period_end"})
+
 __doc__ = """
-The token API can be accessed via /token.
+The token REST API manages the lifecycle of authentication tokens -
+enrollment, listing, assignment to users, PIN management, realm
+membership, tokengroup membership, token info, lost-token handling,
+bulk import, and admin-only attribute editing.
 
-You need to authenticate to gain access to these token
-functions.
-If you are authenticated as administrator, you can manage all tokens.
-If you are authenticated as normal user, you can only manage your own tokens.
-Some API calls are only allowed to be accessed by administrators.
+All endpoints require authentication. Admins may operate on any token
+that their realm-scoped admin policies permit; regular users may only
+operate on their own tokens (the request hooks force the
+``user`` / ``realm`` / ``resolver`` parameters to the calling user's
+identity for non-admin callers). Per-action authorization is enforced
+by the token-scope policies (``enroll<TOKENTYPE>``, ``assign``,
+``unassign``, ``revoke``, ``enable``, ``disable``, ``delete``,
+``reset``, ``resync``, ``setpin``, ``setrandompin``,
+``setdescription``, ``set``, ``tokenrealms``, ``losttoken``,
+``getserial``, ``getchallenges``, ``settokeninfo``, ``tokengroups``,
+``copytokenpin``, ``copytokenuser``, ``import``).
 
-To see how to authenticate read :ref:`rest_auth`.
+Many endpoints operate on either a single token (via ``serial``) or
+on a user's full set of tokens (when ``user`` and ``realm`` are
+supplied without a serial); the
+:func:`~privacyidea.api.lib.prepolicy.check_token_action` decorator
+expands the user-only call to every token the user owns.
+
+See :ref:`rest_auth` for authentication and :ref:`policies` for the
+overall policy concept.
 """
 
 
 @token_blueprint.route('/init', methods=['POST'])
 @prepolicy(check_max_token_realm, request)
+@prepolicy(require_description, request)
 @prepolicy(check_max_token_user, request)
 @prepolicy(check_token_init, request)
 @prepolicy(init_tokenlabel, request)
@@ -145,15 +181,14 @@ To see how to authenticate read :ref:`rest_auth`.
 @prepolicy(papertoken_count, request)
 @prepolicy(sms_identifiers, request)
 @prepolicy(tantoken_count, request)
-@prepolicy(u2ftoken_allowed, request)
-@prepolicy(u2ftoken_verify_cert, request)
 @prepolicy(pushtoken_add_config, request)
 @prepolicy(indexedsecret_force_attribute, request)
 @prepolicy(webauthntoken_allowed, request)
 @prepolicy(webauthntoken_request, request)
-@prepolicy(webauthntoken_enroll, request)
+@prepolicy(fido2_enroll, request)
 @prepolicy(required_piv_attestation, request)
 @prepolicy(verify_enrollment, request)
+@prepolicy(force_server_generate_key, request)
 @postpolicy(save_pin_change, request)
 @event("token_init", request, g)
 @postpolicy(check_verify_enrollment, request)
@@ -161,38 +196,61 @@ To see how to authenticate read :ref:`rest_auth`.
 @log_with(log, log_entry=False)
 def init():
     """
-    create a new token.
+    Create or roll over a token. The token type drives both the
+    request shape (each token class accepts its own parameters; see
+    the corresponding ``TokenClass.update`` method) and the response
+    shape (each token class returns its own enrollment payload -
+    typically QR codes, ``otpauth://`` URLs, seeds, etc.).
 
-    :jsonparam otpkey: required: the secret key of the token
-    :jsonparam genkey: set to =1, if key should be generated. We either
-                   need otpkey or genkey
-    :jsonparam keysize: the size (byte) of the key. Either 20 or 32. Default is 20
-    :jsonparam serial: the serial number/identifier of the token
-    :jsonparam description: A description for the token
-    :jsonparam pin: the pin of the token. "OTP PIN"
-    :jsonparam user: the login user name. This user gets the token assigned
-    :jsonparam realm: the realm of the user.
-    :jsonparam type: the type of the token
-    :jsonparam tokenrealm: additional realms, the token should be put into
-    :jsonparam otplen: length of the OTP value
-    :jsonparam hashlib: used hashlib sha1, sha256 or sha512
-    :jsonparam validity_period_start: The beginning of the validity period
-    :jsonparam validity_period_end: The end of the validity period
-    :jsonparam 2stepinit: set to =1 in conjunction with genkey=1 if you want
-                    a 2 step initialization process. Additional policies have to be set
-                    see :ref:`2step_enrollment`.
-    :jsonparam otpkeyformat: used to supply the OTP key in alternate formats, currently
-                            hex or base32check (see :ref:`2step_enrollment`)
-    :jsonparam rollover: Set this to 1 or true to indicate, that you want to rollover a token.
-                    This is mandatory to rollover tokens, that are in the clientwait state.
+    Requires authentication. Authorization is gated by the
+    ``enroll<TOKENTYPE>`` policy in the calling principal's scope
+    (admin or user); a request without an explicit ``type`` defaults
+    to ``HOTP`` and is therefore checked against ``enrollHOTP``.
 
-    :return: a json result with a boolean "result": true
+    For user callers, the ``user`` / ``realm`` / ``resolver`` fields
+    are bound to the calling user before the view runs; a regular
+    user can only enroll tokens for themselves.
 
-    Depending on the token type there can be additional parameters.
-    In the tokenclass you can see additional parameters in the method ``update``
-    when looking for ``getParam`` functions.
+    :jsonparam type: token type (e.g. ``hotp``, ``totp``, ``push``,
+        ``webauthn``, ``passkey``, ...). Defaults to ``hotp`` when
+        omitted.
+    :jsonparam serial: optional serial; auto-generated when omitted.
+    :jsonparam description: free-form description.
+    :jsonparam pin: the OTP PIN.
+    :jsonparam user: login name of the user to assign the token to.
+    :jsonparam realm: realm of the user; if no ``user`` is given,
+        the token is assigned to the realm directly.
+    :jsonparam tokenrealm: additional realms to add the token to.
+    :jsonparam otpkey: the token secret. Either ``otpkey`` or
+        ``genkey`` is required for OTP token types.
+    :jsonparam genkey: ``1`` to have the server generate the secret.
+    :jsonparam keysize: byte length of the generated key. The
+        accepted values depend on the token class.
+    :jsonparam otplen: length of the OTP value (typically ``6`` or
+        ``8``).
+    :jsonparam hashlib: HMAC hash algorithm - ``sha1``, ``sha256`` or
+        ``sha512``.
+    :jsonparam validity_period_start: start of the validity period.
+    :jsonparam validity_period_end: end of the validity period.
+    :jsonparam 2stepinit: ``1`` together with ``genkey=1`` to start
+        a two-step enrollment (see :ref:`2step_enrollment`).
+    :jsonparam otpkeyformat: alternate encoding for the supplied
+        ``otpkey`` (``hex`` or ``base32check``).
+    :jsonparam rollover: ``1`` or ``true`` to roll over a token that
+        is already in the ``clientwait`` state.
+    :jsonparam container_serial: optional, attach the new token to
+        this container. Requires the
+        :ref:`policy_container_add_token` policy on the caller; if
+        the policy is missing, the enrollment still succeeds but the
+        token is not added to the container.
+    :status 200: ``True`` in ``result.value`` plus a token-type-specific
+        enrollment payload in ``detail`` (QR codes, URLs, seeds,
+        challenge/verify hand-shake info, ...).
 
-    **Example response**:
+    Depending on the token type there can be additional parameters;
+    see each class' ``update`` method for the full list.
+
+    **Example response** (HOTP token):
 
        .. sourcecode:: http
 
@@ -200,66 +258,65 @@ def init():
            Content-Type: application/json
 
            {
-              "detail": {
-                "googleurl": {
-                  "description": "URL for google Authenticator",
-                  "img": "<img    width=250   src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAcIAAAHCAQAAAABUY/ToAAADsUlEQVR4nO2czY3bMBCF34QCfKSALcClyB2kpCAlpQOxlBQQgDwaoPBy4I+p9W4OSRaWF28OgizxgylgMJw/0oi/k/DlL0FApEiRIkWKFCnyeKRVmdrjNAFh3srTMuSS2qjLg2cr8pDkQpKMgF3SBITz1QA4YolVfQA4kiT35CNmK/JQZLM8aQaWH+3pEkEgTZlhBojksgGAAS7/83+K/ORkOF/NLtismiCfYXbOd+AxZivygCTXdCLCDJRLfTbhTo4wW5FHIJtyeAJIAJb4AobLBIP/ZQRAwMcyakxIPtd3ivw4EqObXJzody9t1EKS63N9p8iPI4sO3QTwGSSbA1Q0x+cWunWRDolsUjSnxvau6VB0xMIMrp4EPAnAkWsjpEMiu+ysD1mUZomuKk1/i6WtedIhkXupS1MEsMRmaVafh7dVfXwGV0D+kMj3yXDOsIsngXQiV59R0tZIE7jC0b4VA3WE2Yo8CtkTPy7b8sPA8HWbWML6dCKAqxG4GgADw+weOVuRRyTHuGztbk+PwdqQPIzTWibyDbJWVdOJQDLj9xkod4yOCK2gbzZvVpyip/xOkR9B4maCbnF8c53vHGuuLVaTHRLZpBgYgweAVP0hLPElA+mFtVrvf3W/aTM+brYij0j23o8JthAweNc1J5cCmSFNYDCAS5wfOVuRRyT7QpVL9F6XLN/zjhG4ZSAHj1trmcgmLcfoWoq6/B4LZLeqBxmVpxb5WobYfl8vaxfU7DSA4mdLh0S+TW5W2xXTiaWZ0WbALqiXmi5KU/n5tN8p8r+TzaqUH936MKNW6/2uIkvZIZF/IEleDfAZZnYi1zSB/DmVpa2YJZtVLxP5JmnfWCutty5qwNcFrWSsV2xGxs3+03+K/Cxk74WtTWflDr652L0XtoZuylOLvJNb9H7XPzQ0DOX9RTokcpAhAzRYpN4LO5TsI1rQLx0SOci4z7VcSuvQZgxWX1gfbfBX1ctEvhLupbZSe5bNQK0Jv/dTe9U6RL6WtoIBqDs33NA7Xdey3SYzrWUi99L8IfJW4cC4pYNjg+Ow/+O5vlPkx5OpnSsUzler2cbS29g8pmBmWH6elGMU+UqaFwS0NBBa9O45Rmhr26Mof0jkTt440MNlC9aOGQqzA8McaQs34xJfsv3rf4r8XOTduR+lezHN5fyh0sdY76qz/cDZijwwGcxqs0c9gNFx5w9t7e18hNmKPBRZ7NDtXKF6V1qp2e9qtZ7DkOf6TpEiRYoUKVKkyPfkNyq7YXtdjZCIAAAAAElFTkSuQmCC\"/>",
-                  "value": "otpauth://hotp/mylabel?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&counter=0"
-                },
-                "oathurl": {
-                  "description": "URL for OATH token",
-                  "img": "<img    width=250   src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAcIAAAHCAQAAAABUY/ToAAADfElEQVR4nO2cTYrjMBCFX40EvZRvkKPIN5gz9c3so/QBBqxlwObNQpIlp2cYaBI6zrxamDjyhywo6leyEV+T+ccXQUCkSJEiRYoUKfL5SCviy7+zmZWBAbARmwGpPjXeZU6RL0ZGkuQCAMkMCCTmqlJ8HwAb4UiSPJJfn1Pki5Fpty8AED/MEBeAU/JoA52pOuk6Rd6f9H/60xBWbwCMyG7Mg0j3mlPky5OOiB9v5AQACCQnONr4yDlFnpisdigQQAIM4WpE2oyAWy0umyfCku1QX5A81zpFPo5EHybDEXH566U+FUlyOtc6RT6OzHao2RfOgwMQVqBYJADz5WrFVN1jTpGvRRY7FLmCExwR8y3JKbAm84HkFFawieyQyCpFJRagaMniikqRK4C9KpSVa3GULxN5lGZp8n3kinrr2H5xCmsZlQ6JPEiLqbPzKh5sRefL4uJILq4MyJeJPEjzZb2jQnFopQmSH3FZw2SHRB6lC3bQeatDiI2wghOAaoykQyKb7L2OzQPpjZjNEUgDDNiMSAMAOFpchjvNKfK1yGqHlkNetofYxclVs5RzNfkykZ/J4rc+So+++S2zy1ofDVezMXmURtoZ1ynyEeRuh1xXSiwJPtCFRyUygupDIm+l5fa9Q+Na0rT8yCG3lw6JPEqtMZaCUNfmyPWhBajtMx46Iedap8jHkV2/DK0cDWBXqapczY0ptxd5kFZjLEqzlJi6C4WyHYJjHZAOieyk2aGsSNyjoF2l0Jsg9TpE/oVMHpgvK8wupRZkIwDMQy0S5QMfbVfsOdcp8v5kF1M3N9ZaGrX/sbf2g+yQyFtpPdW2/75pTtGX5tWCcnuRt9L1OtguLcFve9DazmrpkMheOn3Ju4aA4tX6gVopiurbi7yV3Lc3IJ+vh0VuHoBbAWyeSH41hF+fzzKea50iH012QdE8OPJ92MzG9HY4NJRDpqt9+9uKfEayffeDU/J7z3UzG8PVSlqfPMrlm99W5FOSsUY8Noarmdkb+T7UTSF7Wv8kbyvyqcguL+u23k/7cDvdmm9Vpxb5LzLbobErObbc/lFzijw3eZtvcR4WAtjKx2Lmn1djztBAWN5ZPX3X24p8RrI719HcWNnsEVoz1vWPyJeJ7KXYoTln7A4Wcz6/eQL7xxxyRr95IlwNskMiezF941ykSJEiRYoU+Z+TvwF49nApsKFZZAAAAABJRU5ErkJggg==\"/>",
-                  "value": "oathtoken:///addToken?name=mylabel&lockdown=true&key=3132333435363738393031323334353637383930"
-                },
-                "otpkey": {
-                  "description": "OTP seed",
-                  "img": "<img    width=200   src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAUoAAAFKAQAAAABTUiuoAAAB70lEQVR4nO2aTY6jQAyFPw9IWYI0B+ijwNHhKH0DWLZU6PXCVYSOZkF6xM/CXkQkfIsnWRU/22ViZ4x/9pIQaKCBBhpooEeilqPGrAWzdjGYy8/94QICfQftJEkTAIsBlYBKkqSf6DECAn0HnfMRkj4fnjfrATOrzxEQ6I6oX74bYGJuzxIQ6H9kqySqSjCfISDQX6CNpKE8mX18lT9GpXMEBLofHc3M7WA/19B9PgQsbgnPEBDonrCXyZMB/HMaFZOnu6DWz2aMZqaBZ79Vw9gu0W/dBsU7qm4CL16aKq9geonhcq2BlqR4jirRSYImoaF8eO8c2boeXR38YnRavIwJkNFUsg1xudZAy5ywreSFyqcabgxr8lE7XECgu8JPjpj/Ao2AJtXAYoIEYzsVi3i51kBz3Rq8O658RFhKVn4Rdesu6MYTemZoEm468kh+TejlWgNdjXoeMGVjOJXXnVJk6zboa1uFb7Wm1csTZ+tu6HN3TKcEYwvZIlLJ+sMFBPoO+twdjz7GXQy8Mf6Kqe7t0HV37FaDSp630R7Rb90WtR6ytxiaFPute6Gvu2OY6wRzC92EtguUy7UGWvqtzWgX8DtPZZ8cnvAuKNs7aH4v7ZnBPH6PWcZd0DInLPHjqSTvSAGBBhpooIEG+gb6DeDWV0l+Ofz2AAAAAElFTkSuQmCC\"/>",
-                  "value": "seed://3132333435363738393031323334353637383930"
-                },
-                "serial": "OATH00096020"
-              },
-              "id": 1,
-              "jsonrpc": "2.0",
-              "result": {
-                "status": true,
-                "value": true
-              },
-              "version": "privacyIDEA unknown"
-            }
-            
+             "detail": {
+               "googleurl": {
+                 "description": "URL for google Authenticator",
+                 "img": "<img width=250 src=\\"data:image/png;base64,...\\"/>",
+                 "value": "otpauth://hotp/mylabel?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&counter=0"
+               },
+               "otpkey": {
+                 "description": "OTP seed",
+                 "img": "<img width=200 src=\\"data:image/png;base64,...\\"/>",
+                 "value": "seed://3132...3930"
+               },
+               "serial": "OATH00096020"
+             },
+             "id": 1,
+             "jsonrpc": "2.0",
+             "result": {
+               "status": true,
+               "value": true
+             },
+             "version": "privacyIDEA unknown"
+           }
+
+    The ``img`` fields carry inline base64-encoded PNGs (the QR codes
+    shown in the WebUI); they have been abbreviated above for
+    readability.
+
     **2 Step Enrollment**
-    
-    Some tokens might need a 2 step initialization process like a smartphone 
-    app. This way you can create a shared secret from a part generated by 
-    the privacyIDEA server and from a second part generated by the smartphone 
+
+    Some tokens might need a 2 step initialization process like a smartphone
+    app. This way you can create a shared secret from a part generated by
+    the privacyIDEA server and from a second part generated by the smartphone
     app/client.
-    
+
     The first API call would be
-    
+
        .. sourcecode:: http
-       
-           POST /token/init
-           
+
+           POST /token/init HTTP/1.1
+
            2stepinit=1
-           
-    The response would contain the otpkey generated by the server and the 
-    serial number of the token. At this point, the token is deactivated and 
-    marked as being in an enrollment state. The client 
-    would also generated a component of the key and send his component to the 
+
+    The response would contain the otpkey generated by the server and the
+    serial number of the token. At this point, the token is deactivated and
+    marked as being in an enrollment state. The client
+    would also generated a component of the key and send his component to the
     privacyIDEA server:
-     
+
     The second API call would be
-    
+
        .. sourcecode:: http
-           
-           POST /token/init
-           
+
+           POST /token/init HTTP/1.1
+
            serial=<serial from the previous response>
            otpkey=<key part generated by the client>
-    
-    Each tokenclass can define its own way to generate the secret key by 
+
+    Each tokenclass can define its own way to generate the secret key by
     overwriting the method ``generate_symmetric_key``. The
-    Base Tokenclass contains an extremely simple way by concatenating the 
+    Base Tokenclass contains an extremely simple way by concatenating the
     two parts. See
     :func:`~privacyidea.lib.tokenclass.TokenClass.generate_symmetric_key`
 
@@ -283,7 +340,7 @@ def init():
 
        .. sourcecode:: http
 
-           POST /token/init
+           POST /token/init HTTP/1.1
 
            serial=<serial from the previous response>
            verify=<e.g. the OTP value>
@@ -292,55 +349,56 @@ def init():
     authentication.
     """
     response_details = {}
-    tokenrealms = None
-    param = request.all_data
-
-    # check admin authorization
-    # user_tnum = len(getTokens4UserOrSerial(user))
-    # res = self.Policy.checkPolicyPre('admin', 'init', param, user=user,
-    #                                 options={'token_num': user_tnum})
-
-    # if no user is given, we put the token in all realms of the admin
-    # if user.login == "":
-    #    log.debug("setting tokenrealm %s" % res['realms'])
-    #    tokenrealm = res['realms']
+    param = request.all_data.copy()
+    param["policies"] = g.get("policies", {})
 
     user = request.User
-    tokenobject = init_token(param,
-                             user,
-                             tokenrealms=tokenrealms)
+    token = init_token(param, user)
 
-    if tokenobject:
+    if token:
         g.audit_object.log({"success": True})
-        # The token was created successfully, so we add token specific
-        # init details like the google URL to the response
-        init_details = tokenobject.get_init_detail(param, user)
-        response_details.update(init_details)
 
-    g.audit_object.log({'user': user.login,
-                        'realm': user.realm,
-                        'serial': tokenobject.token.serial,
-                        'token_type': tokenobject.token.tokentype})
+        # If the token is a fido2 token, find all enrolled fido2 token for the user
+        # to avoid registering the same authenticator multiple times
+        if (token.get_type().lower() in [PasskeyTokenClass.get_class_type(), WebAuthnTokenClass.get_class_type()]
+                and token.rollout_state == RolloutState.CLIENTWAIT):
+            param["registered_credential_ids"] = get_credential_ids_for_user(user)
 
-    # logTokenNum()
+        # The token was created successfully, so we add token specific init details like the Google URL to the response
+        try:
+            init_details = token.get_init_detail(param, user)
+            response_details.update(init_details)
+        except ParameterError as e:
+            if e.id == Error.PARAMETER_USER_MISSING:
+                remove_token(serial=token.get_serial())
+            raise e
 
-    # setting the random PIN
-    # randomPINLength = self.Policy.getRandomOTPPINLength(user)
-    # if randomPINLength > 0:
-    #    newpin = self.Policy.getRandomPin(randomPINLength)
-    #    log.debug("setting random pin for token with serial "
-    #              "%s and user: %s" % (serial, user))
-    #    setPin(newpin, None, serial)
-        
-    # finally we render the info as qr immage, if the qr parameter
-    # is provided and if the token supports this
-    # if 'qr' in param and tokenobject is not None:
-    #    (rdata, hparam) = tokenobject.getQRImageData(response_detail)
-    #    hparam.update(response_detail)
-    #    hparam['qr'] = param.get('qr') or 'html'
-    #    return sendQRImageResult(response, rdata, hparam)
-    # else:
-    #    return sendResult(response, ret, opt=response_detail)
+        # Check if a container_serial is set and assign the token to the container
+        container_serial = param.get("container_serial", {})
+        if container_serial:
+            # Check if user is allowed to add tokens to containers
+            try:
+                container_add_token_right = check_container_action(request, action=PolicyAction.CONTAINER_ADD_TOKEN)
+            except PolicyError:
+                container_add_token_right = False
+                log.info(f"User {user.login} is not allowed to add token {token.get_serial()} to container "
+                         f"{container_serial}.")
+            if container_add_token_right:
+                # The enrollment will not be blocked if there is problem adding the new token to a container
+                # there will just be a warning in the log
+                try:
+                    add_token_to_container(container_serial, token.get_serial())
+                    response_details.update({"container_serial": container_serial})
+                    container = find_container_by_serial(container_serial)
+                    g.audit_object.log({"container_serial": container_serial, "container_type": container.type})
+                except ResourceNotFoundError:
+                    log.warning(f"Container with serial {container_serial} not found while enrolling token "
+                                f"{token.get_serial()}.")
+
+        g.audit_object.log({"user": user.login,
+                            "realm": user.realm,
+                            "serial": token.token.serial,
+                            "token_type": token.token.tokentype})
 
     return send_result(True, details=response_details)
 
@@ -348,92 +406,369 @@ def init():
 @token_blueprint.route('/challenges/', methods=['GET'])
 @token_blueprint.route('/challenges/<serial>', methods=['GET'])
 @admin_required
-@prepolicy(check_base_action, request, action=ACTION.GETCHALLENGES)
+@prepolicy(check_base_action, request, action=PolicyAction.GETCHALLENGES)
 @event("token_getchallenges", request, g)
 @log_with(log)
 def get_challenges_api(serial=None):
     """
-    This endpoint returns the active challenges in the database or returns
-    the challenges for a single token by its serial number
+    Return the open challenges.
 
-    :query serial: The optional serial number of the token for which the
-        challenges should be returned
-    :query sortby: sort the output by column
-    :query sortdir: asc/desc
-    :query page: request a certain page
-    :query pagesize: limit the number of returned tokens
-    :query transaction_id: only returns challenges for this
-        transaction_id. This is useful when working with push or tiqr tokens.
-    :return: json
+    Three filter modes (mutually exclusive):
+
+    * ``<serial>`` path component -> challenges for that token (paginated).
+    * ``?user=<name>[&realm=<realm>]`` query -> every challenge across all
+      tokens owned by that user. Used by the user-detail view.
+    * neither -> all open challenges across the server, paginated.
+
+    Requires admin authentication and the policy action
+    :ref:`policy_getchallenges`. Realm-scoping is enforced against the
+    target's owning user when a serial or user filter is given.
+
+    :param serial: optional path component, the token serial.
+    :query user: optional username - switches to user-aggregation mode.
+    :query realm: optional realm for the user lookup.
+    :query sortby: sort column, one of ``timestamp`` (default), ``serial``,
+        ``transaction_id``, ``expiration``, ``received_count``, ``otp_valid``
+        or ``session`` (paginated mode only). Any other value sorts by
+        ``timestamp``.
+    :query sortdir: ``asc`` (default) or ``desc``.
+    :query page: 1-indexed page number; values below 1 are treated as 1.
+    :query pagesize: page size (default ``15``), capped at ``1000``.
+    :query transaction_id: restrict to challenges with this transaction id.
+    :status 200: challenge list in ``result.value``. The ``challenge`` of a
+        passkey or WebAuthn token that waits for its registration is
+        returned as ``__CENSORED__``.
     """
     param = request.all_data
-    page = int(getParam(param, "page", optional, default=1))
-    sort = getParam(param, "sortby", optional, default="timestamp")
-    sdir = getParam(param, "sortdir", optional, default="asc")
-    psize = int(getParam(param, "pagesize", optional, default=15))
-    transaction_id = getParam(param, "transaction_id", optional)
+    # user-aggregation mode kicks in only when the caller explicitly passes
+    # the ``user`` query param. An empty string is rejected so the absence
+    # of an actual username can never be mistaken for "every user".
+    if "user" in param:
+        if serial is not None:
+            # The three filter modes (path serial / ?user= / list-all) are
+            # mutually exclusive. Reject the ambiguous combination loudly.
+            raise ParameterError("Specify either a path serial or the 'user' query parameter, not both.")
+        user = get_user_from_param(param, optional_or_required=False)
+        if user.is_empty():
+            raise ParameterError("user is required")
+        g.audit_object.log({"user": user.login, "realm": user.realm})
+        # @prepolicy(check_base_action, ...) confirms the admin has the
+        # action *somewhere*. Re-match against the target user so that an
+        # admin whose getchallenges policy is scoped to realm A cannot
+        # read challenges of users in realm B. .allowed() honors the
+        # default-allow-when-no-policies semantic.
+        if not Match.admin(g, action=PolicyAction.GETCHALLENGES, user_obj=user).allowed():
+            raise PolicyError(f"You are not allowed to view challenges for user "
+                              f"{user.login!s}@{user.realm!s}.")
+        from privacyidea.lib.cache import redis_feature_enabled
+        challenges = get_challenges_for_user(user)
+        payload = {
+            "challenges": _censor_registration_nonces([c.get() for c in challenges]),
+            "count": len(challenges),
+            "redis_cache_enabled": redis_feature_enabled("challenges"),
+        }
+        g.audit_object.log({"success": True})
+        return send_result(payload)
+
+    page, psize = get_pagination_params(param)
+    sort = get_optional(param, "sortby", default="timestamp")
+    sdir = get_optional(param, "sortdir", default="asc")
+    transaction_id = get_optional(param, "transaction_id")
     g.audit_object.log({"serial": serial})
+    # Realm-scope check when a specific serial is targeted, so a realm-
+    # restricted admin can't read challenges of tokens outside their realm.
+    # The list-all variants - serial is None, or a wildcard pattern like
+    # ``*`` or ``**`` that the WebUI uses to populate the global challenges
+    # table - preserve existing behavior. They predate this PR and should
+    # be revisited separately. A wildcard pattern can't be reduced to a
+    # single owning realm without resolving every match first.
+    if serial and "*" not in serial:
+        # Missing serial here is a real 404: the resource the admin
+        # addressed (the token) doesn't exist.
+        token = get_one_token(serial=serial)
+        check_admin_allowed_for_token_owner(g, token, PolicyAction.GETCHALLENGES,
+                                            "view challenges for")
     challenges = get_challenges_paginate(serial=serial, sortby=sort,
                                          transaction_id=transaction_id,
                                          sortdir=sdir, page=page, psize=psize)
+    _censor_registration_nonces(challenges["challenges"])
     g.audit_object.log({"success": True})
     return send_result(challenges)
 
 
+def _censor_registration_nonces(challenges: list[dict]) -> list[dict]:
+    """
+    Censor the nonce of the challenges that wait for the registration of a passkey or WebAuthn token. The nonce of a
+    pending registration is only meant for the client that enrolls the token, so the challenge listing leaves it out.
+
+    :param challenges: the challenges as their ``get()`` representation, changed in place
+    :return: the same list
+    """
+    serials = sorted({challenge["serial"] for challenge in challenges if challenge.get("serial")})
+    if not serials:
+        return challenges
+    # Serials cannot contain a comma, so get_tokens looks them up as a list
+    registering_serials = {token.get_serial() for token in
+                           get_tokens(serial=",".join(serials),
+                                      token_type_list=[PasskeyTokenClass.get_class_type(),
+                                                       WebAuthnTokenClass.get_class_type()],
+                                      rollout_state=RolloutState.CLIENTWAIT, all_nodes=True)}
+    for challenge in challenges:
+        if challenge.get("serial") in registering_serials:
+            challenge["challenge"] = CENSORED
+    return challenges
+
+
+def _pack_serials(serials: list, limit: int) -> tuple:
+    """
+    Comma-join whole serials up to ``limit`` characters.
+
+    Returns ``(packed, dropped)`` where ``dropped`` is the number of serials
+    that did not fit. Packing whole serials avoids a mid-serial chop that
+    would corrupt forensic detail when written into a fixed-width audit
+    column (which is hard-cut by the audit module).
+    """
+    packed = ""
+    for index, serial in enumerate(serials):
+        candidate = f"{packed},{serial}" if packed else serial
+        if len(candidate) > limit:
+            return packed, len(serials) - index
+        packed = candidate
+    return packed, 0
+
+
+@token_blueprint.route('/challenges/transaction/<transaction_id>', methods=['DELETE'])
+@admin_required
+@prepolicy(check_base_action, request, action=PolicyAction.CANCELCHALLENGE)
+@event("token_cancelchallenge", request, g)
+@log_with(log)
+def cancel_challenge_api(transaction_id):
+    """
+    Cancel (delete) a single active challenge by its transaction ID. Removes
+    it from both the Redis cache (when active) and the database.
+
+    :param transaction_id: The transaction ID of the challenge to cancel.
+    :return: json with ``deleted`` count.
+    """
+    # Look up the serial before deletion so the audit row carries it.
+    # The lookup goes through the same cache+DB path as the deletion,
+    # so worst case it's the same I/O the cancel itself would make.
+    existing = get_challenges(transaction_id=transaction_id)
+    serials = sorted({c.serial for c in existing if getattr(c, 'serial', None)})
+    # Realm-scope each affected token. If the admin lacks cancelchallenge
+    # for any of the target realms, deny the whole call rather than
+    # partially cancelling - atomicity matters for an action with audit
+    # impact. We deliberately do NOT log the target serials before the
+    # realm check passes - otherwise a realm-A admin could probe arbitrary
+    # transaction_ids and observe realm-B token serials in the audit log.
+    #
+    # ``serials`` can legitimately be empty in two cases - both allowed by
+    # design under the base CANCELCHALLENGE policy:
+    #   1. Usernameless passkey challenges, which are written with
+    #      serial="" (cache_challenge skips the serial set for these) and
+    #      filtered out by the truthy-comprehension above. There is no
+    #      realm to scope against - the base-action policy is the only gate.
+    #   2. The challenge already evaporated (TTL expired or concurrent
+    #      cancel). cancel_challenge below is a safe no-op in this case.
+    # Both fall under "no realm context exists to enforce against."
+    #
+    # Per-serial token resolution is wrapped in try/except: an orphan
+    # transaction (token already deleted, cache entry surviving) is
+    # exactly what an admin would call this endpoint to clean up, so a
+    # missing token here is not a reason to refuse the cancel.
+    for s in serials:
+        try:
+            token = get_one_token(serial=s)
+        except ResourceNotFoundError:
+            continue
+        check_admin_allowed_for_token_owner(g, token, PolicyAction.CANCELCHALLENGE,
+                                            "cancel challenges for")
+    result = cancel_challenge(transaction_id)
+    # Build a single audit entry now that the realm check passed and the
+    # cancel result is known. The `serial` column is 200 chars by default -
+    # plenty for the common case (one transaction -> one token, with
+    # default 8-char serials, over 20 still fit comma-joined). Pack whole
+    # serials in arrival order up to the column budget; if some had to be
+    # dropped, also record the list in `info` (500 chars) so the forensic
+    # detail isn't lost. `info` is hard-cut by the audit module, so pack it
+    # to whole serials here too rather than risk a mid-serial chop, and
+    # summarise any that still overflow with a trailing "+N more".
+    serial_limit = audit_column_length.get("serial")
+    info_limit = audit_column_length.get("info")
+    packed_serials, serial_dropped = _pack_serials(serials, serial_limit)
+    info = f"Cancelled {result.removed} challenge(s) for transaction {transaction_id}"
+    if serial_dropped:
+        prefix, suffix = f"{info} (serials: ", ")"
+        # Reserve room for a worst-case "+<count> more" marker so the closing
+        # state always fits regardless of how many serials are dropped.
+        marker_reserve = len(f",+{len(serials)} more")
+        packed_info, info_dropped = _pack_serials(
+            serials, info_limit - len(prefix) - len(suffix) - marker_reserve)
+        if info_dropped:
+            packed_info += f"{',' if packed_info else ''}+{info_dropped} more"
+        info = f"{prefix}{packed_info}{suffix}"
+    g.audit_object.log({
+        "success": True,
+        "serial": packed_serials or None,
+        "info": info,
+    })
+    payload = {"status": True, "deleted": result.removed}
+    if not result.cache_available:
+        # The worker handling this request is in its Redis retry cooldown,
+        # so the cache eviction did not run. Other workers still have a
+        # live Redis client and may continue serving this challenge from
+        # cache until its TTL expires (typically minutes). Surfacing the
+        # warning lets the operator know the cancel may not have propagated
+        # cluster-wide yet.
+        payload["warning"] = ("Redis cache unreachable on this worker; the "
+                              "challenge may still be served from cache by "
+                              "other nodes until its TTL expires.")
+    return send_result(payload)
+
+
+@token_blueprint.route("/challenges/expired", methods=['DELETE'])
+@admin_required
+@log_with(log)
+def delete_expired_challenges_api():
+    """
+    Remove all expired entries from the challenge table. Useful as a
+    periodic-task target on busy installations.
+
+    Requires admin authentication.
+
+    :reqheader PI-Authorization: authentication token.
+    :status 200: ``{"status": True, "deleted": <n>}`` in
+        ``result.value``, where ``n`` is the number of removed rows.
+
+    **Example response**:
+
+    .. sourcecode:: http
+
+       HTTP/1.1 200 OK
+       Content-Type: application/json
+
+       {
+         "id": 1,
+         "jsonrpc": "2.0",
+         "result": {
+           "status": true,
+           "value": {"status": true, "deleted": 42}
+         },
+         "version": "privacyIDEA unknown"
+       }
+    """
+    row_count = cleanup_expired_challenges(chunk_size=None, age=None)
+    g.audit_object.log({"success": True, "info": f"Deleted {row_count} entries from challenges"})
+    return send_result({"status": True, "deleted": row_count})
+
+
 @token_blueprint.route('/', methods=['GET'])
-@prepolicy(check_admin_tokenlist, request)
+@prepolicy(check_admin_tokenlist, request, PolicyAction.TOKENLIST)
 @prepolicy(hide_tokeninfo, request)
 @event("token_list", request, g)
 @log_with(log)
 def list_api():
     """
-    Display the list of tokens. Using different parameters you can choose,
-    which tokens you want to get and also in which format you want to get the
-    information (*outform*).
+    Return tokens, paginated and filtered by the supplied query
+    parameters. Realm-admins are restricted by their policies; user
+    callers always see only their own tokens regardless of the
+    ``user`` / ``realm`` parameters (the request hooks bind those
+    fields to the calling user).
 
-    :query serial: Display the token data of this single token. You can do a
-        not strict matching by specifying a serial like "*OATH*".
-    :query type: Display only token of type. You ca do a non strict matching by
-        specifying a tokentype like "*otp*", to file hotp and totp tokens.
-    :query user: display tokens of this user
-    :query tokenrealm: takes a realm, only the tokens in this realm will be
-        displayed
-    :query basestring description: Display token with this kind of description
-    :query sortby: sort the output by column
-    :query sortdir: asc/desc
-    :query page: request a certain page
-    :query assigned: Only return assigned (True) or not assigned (False) tokens
-    :query active: Only return active (True) or inactive (False) tokens
-    :query pagesize: limit the number of returned tokens
-    :query outform: if set to "csv", than the token list will be given in CSV
-    :query rollout_state: only list tokens with the given rollout_state
-    :query infokey: only list tokens, where the infokey has the given infovalue
-    :query infovalue: only list tokens, where the infokey has the given infovalue
+    Requires authentication and the policy action ``tokenlist``. The
+    ``hide_tokeninfo`` policy may strip configured token-info keys
+    from the response.
 
-    :return: a json result with the data being a list of token dictionaries::
-
-        { "data": [ { <token1> }, { <token2> } ]}
-
-    :rtype: json
+    :query serial: filter by serial. Substring match via ``*``
+        (e.g. ``*OATH*``); comma-separated list of serials also
+        supported.
+    :query type: filter by token type. Substring match via ``*``
+        (e.g. ``*otp*`` matches hotp and totp).
+    :query type_list: comma-separated list of token types.
+    :query user: **admin only** - filter by this user. Accepts
+        ``user@realm`` syntax. If both ``user`` and ``realm`` are
+        given, ``realm`` wins. Ignored for user-role callers.
+    :query realm: **admin only** - filter by realm of the assigned
+        user. Without a ``user`` parameter, returns every token
+        assigned to any user in this realm. Ignored for user-role
+        callers.
+    :query resolver: filter by the resolver of the assigned user.
+        Case-insensitive, substring match via ``*``. Only tokens that
+        are assigned to a user can match.
+    :query userid: filter by the user id of the assigned user.
+        Substring match via ``*``. Only tokens that are assigned to a
+        user can match.
+    :query tokenrealm: filter to tokens that belong to this realm
+        (independent of the user's realm). Substring match via ``*``;
+        comma-separated list of realm names also supported, where each
+        entry may contain wildcards
+        (e.g. ``realm1,realm2,realm3`` or ``staff*,students*``).
+    :query description: filter by description.
+    :query assigned: ``True`` or ``False`` to limit to assigned or
+        unassigned tokens.
+    :query active: ``True`` or ``False`` to limit to active or
+        inactive tokens.
+    :query rollout_state: filter by rollout state (e.g.
+        ``clientwait``).
+    :query infokey: filter by token-info key (combine with
+        ``infovalue``).
+    :query infovalue: filter by token-info value (combine with
+        ``infokey``).
+    :query container_serial: filter to tokens attached to the given
+        container; pass an empty string to limit to tokens without
+        any container.
+    :query hidden_tokeninfo: list of token-info keys to strip from
+        the response. Overridden by the ``hide_tokeninfo`` policy if
+        active.
+    :query sortby: sort column, default ``serial``.
+    :query sortdir: ``asc`` (default) or ``desc``.
+    :query page: 1-indexed page number, default ``1``; values below 1 are treated as 1.
+    :query pagesize: page size, default ``15``, capped at ``1000``.
+    :query outform: ``csv`` to return ``text/csv`` instead of JSON.
+        Pagination still applies.
+    :status 200: paginated token list in ``result.value`` (or as a
+        CSV body when ``outform=csv``). Each token carries
+        ``readonly_info_keys`` and ``undeletable_info_keys``, the
+        subsets of its ``info`` entries that the token info
+        endpoints refuse to change respectively to remove because
+        the token itself maintains them, and ``settable_info_keys``,
+        the subset of those that :http:post:`/token/set` accepts.
     """
     param = request.all_data
-    user = request.User
-    serial = getParam(param, "serial", optional)
-    page = int(getParam(param, "page", optional, default=1))
-    tokentype = getParam(param, "type", optional)
-    description = getParam(param, "description", optional)
-    sort = getParam(param, "sortby", optional, default="serial")
-    sdir = getParam(param, "sortdir", optional, default="asc")
-    psize = int(getParam(param, "pagesize", optional, default=15))
-    realm = getParam(param, "tokenrealm", optional)
-    userid = getParam(param, "userid", optional)
-    resolver = getParam(param, "resolver", optional)
-    output_format = getParam(param, "outform", optional)
-    assigned = getParam(param, "assigned", optional)
-    active = getParam(param, "active", optional)
-    tokeninfokey = getParam(param, "infokey", optional)
-    tokeninfovalue = getParam(param, "infovalue", optional)
-    rollout_state = getParam(param, "rollout_state", optional)
+    serial = get_optional(param, "serial")
+    page, psize = get_pagination_params(param)
+    tokentype = get_optional(param, "type")
+    token_type_list = get_optional(param, "type_list")
+    if token_type_list:
+        token_type_list = token_type_list.replace(" ", "").split(",")
+    description = get_optional(param, "description")
+    sort = get_optional(param, "sortby", default="serial")
+    sdir = get_optional(param, "sortdir", default="asc")
+    realm = get_optional(param, "tokenrealm")
+    userid = get_optional(param, "userid")
+    resolver = get_optional(param, "resolver")
+
+    # Only admins may use the "user" and "realm" query parameters to query
+    # tokens of arbitrary users or realms. For callers with role "user" we
+    # always use request.User (which resolve_logged_in_user already forced to
+    # their own identity) so that a regular user can never see other users'
+    # tokens via these params.
+    is_admin = g.logged_in_user.get("role") == "admin"
+    user_param = get_optional(param, "user")
+    realm_param = get_optional(param, "realm")
+    if is_admin and user_param:
+        user = get_user_from_param(param)
+    elif is_admin and realm_param:
+        user = User(login="", realm=realm_param)
+    else:
+        user = request.User
+    output_format = get_optional(param, "outform")
+    assigned = get_optional(param, "assigned")
+    active = get_optional(param, "active")
+    tokeninfokey = get_optional(param, "infokey")
+    tokeninfovalue = get_optional(param, "infovalue")
+    rollout_state = get_optional(param, "rollout_state")
+    container_serial = get_optional(param, "container_serial")
     tokeninfo = None
     if tokeninfokey and tokeninfovalue:
         tokeninfo = {tokeninfokey: tokeninfovalue}
@@ -445,22 +780,20 @@ def list_api():
     # allowed_realms determines, which realms the admin would be allowed to see
     # In certain cases like for users, we do not have allowed_realms
     allowed_realms = getattr(request, "pi_allowed_realms", None)
-    g.audit_object.log({'info': "realm: {0!s}".format((allowed_realms))})
+    g.audit_object.log({'info': f"realm: {allowed_realms!s}"})
 
     # get hide_tokeninfo setting from all_data
-    hidden_tokeninfo = getParam(request.all_data, 'hidden_tokeninfo', default=None)
+    hidden_tokeninfo = get_optional(param, 'hidden_tokeninfo', default=None)
 
     # get list of tokens as a dictionary
     tokens = get_tokens_paginate(serial=serial, realm=realm, page=page,
                                  user=user, assigned=assigned, psize=psize,
                                  active=active, sortby=sort, sortdir=sdir,
-                                 tokentype=tokentype,
-                                 resolver=resolver,
+                                 tokentype=tokentype, token_type_list=token_type_list, resolver=resolver,
                                  description=description,
                                  userid=userid, allowed_realms=allowed_realms,
-                                 tokeninfo=tokeninfo,
-                                 rollout_state=rollout_state,
-                                 hidden_tokeninfo=hidden_tokeninfo)
+                                 tokeninfo=tokeninfo, rollout_state=rollout_state,
+                                 hidden_tokeninfo=hidden_tokeninfo, container_serial=container_serial)
     g.audit_object.log({"success": True})
     if output_format == "csv":
         return send_csv_result(tokens)
@@ -471,7 +804,9 @@ def list_api():
 @token_blueprint.route('/assign', methods=['POST'])
 @prepolicy(check_max_token_realm, request)
 @prepolicy(check_max_token_user, request)
-@prepolicy(check_base_action, request, action=ACTION.ASSIGN)
+@prepolicy(check_token_action, request, action=PolicyAction.ASSIGN)
+@prepolicy(resolver_realm_access, request, action=PolicyAction.ASSIGN)
+@prepolicy(check_user_params, request, action=PolicyAction.ASSIGN)
 @prepolicy(encrypt_pin, request)
 @prepolicy(check_otp_pin, request)
 @prepolicy(check_external, request, action="assign")
@@ -480,73 +815,131 @@ def list_api():
 @log_with(log)
 def assign_api():
     """
-    Assign a token to a user.
+    Assign a token to a user. The user's realm is added to the
+    token's realm list; existing realms are preserved. An optional
+    PIN may be set on the same call.
 
-    :jsonparam serial: The token, which should be assigned to a user
-    :jsonparam user: The username of the user
-    :jsonparam realm: The realm of the user
-    :return: In case of success it returns "value": True.
-    :rtype: json object
+    Requires authentication and the policy action ``assign``.
+    User-role callers can only assign tokens to themselves.
+
+    :jsonparam serial: token serial (required, must be non-empty).
+    :jsonparam user: login name of the user (required).
+    :jsonparam realm: realm of the user (required if not the default
+        realm).
+    :jsonparam pin: optional OTP PIN to set in the same call.
+    :jsonparam encryptpin: ``True`` to store the PIN encrypted (the
+        default behavior is governed by the ``encrypt_pin`` policy).
+    :status 200: ``True`` on success in ``result.value``.
     """
-    user = get_user_from_param(request.all_data, required)
-    serial = getParam(request.all_data, "serial", required, allow_empty=False)
-    pin = getParam(request.all_data, "pin")
-    encrypt_pin = getParam(request.all_data, "encryptpin")
+    user = get_user_from_param(request.all_data, False)
+    serial = get_required(request.all_data, "serial", allow_empty=False)
+    pin = get_optional(request.all_data, "pin")
+    encrypt_pin_param = get_optional(request.all_data, "encryptpin")
     if g.logged_in_user.get("role") == "user":
         err_message = "Token already assigned to another user."
     else:
         err_message = None
-    res = assign_token(serial, user, pin=pin, encrypt_pin=encrypt_pin, err_message=err_message)
+    res = assign_token(serial, user, pin=pin, encrypt_pin=encrypt_pin_param,
+                       error_message=err_message)
     g.audit_object.log({"success": True})
     return send_result(res)
 
 
 @token_blueprint.route('/unassign', methods=['POST'])
-@prepolicy(check_base_action, request, action=ACTION.UNASSIGN)
+@prepolicy(check_token_action, request, action=PolicyAction.UNASSIGN)
 @event("token_unassign", request, g)
 @log_with(log)
 def unassign_api():
     """
-    Unssign a token from a user.
-    You can either provide "serial" as an argument to unassign this very
-    token or you can provide user and realm, to unassign all tokens of a user.
+    Remove the user assignment from a token. Three call shapes are
+    supported:
 
-    :return: In case of success it returns the number of unassigned tokens in "value".
-    :rtype: JSON object
+    * ``serial=...`` (single, or comma-separated list) - operate on
+      these tokens.
+    * ``serials=[...]`` - operate on this list of tokens.
+    * ``user=...&realm=...`` (no serial) - operate on every token
+      currently assigned to that user.
+
+    Requires authentication and the policy action ``unassign``.
+    Tokens the caller is not authorized to manage are silently
+    skipped and reported back; missing serials are reported in
+    ``failed``.
+
+    :jsonparam serial: single serial or comma-separated list.
+    :jsonparam serials: list of serials.
+    :jsonparam user: user name (only when ``serial`` / ``serials``
+        is omitted; requires ``realm``).
+    :jsonparam realm: realm name (only when ``serial`` / ``serials``
+        is omitted; requires ``user``).
+    :status 200: for a single-serial call the response is ``True``
+        in ``result.value``; for any multi-serial call (or any case
+        with skipped tokens), the response value is
+        ``{"count_success": <n>, "failed": [...], "unauthorized": [...]}``.
     """
     user = request.User
-    serial = getParam(request.all_data, "serial", optional)
-    g.audit_object.log({"serial": serial})
+    serial_list = get_optional(request.all_data, "serials")
 
-    res = unassign_token(serial, user=user)
+    # check_token_action will raise an error if no processable token are given. So at this point we can assume that
+    # serial_list at least contains one serial.
+    # check_token_action will also put the serials of all token of the users in the serial_list
+    # if just the user was given as parameter, so we do not need to check that here - just use the serial_list
+
+    g.audit_object.log({"serial": serial_list if len(serial_list) != 1 else serial_list[0]})
+
+    not_authorized_serials = get_optional(request.all_data, "not_authorized_serials", [])
+    not_found_serials = get_optional(request.all_data, "not_found_serials", [])
+    # If only one serial is given, the value in the send result is expected to be a boolean (old API behavior).
+    if len(serial_list) == 1 and not not_authorized_serials and not not_found_serials:
+        res = unassign_token(serial_list[0], user=user)
+        g.audit_object.log({"success": True})
+        return send_result(res)
+
+    count_success = 0
+    failed = get_optional(request.all_data, "not_found_serials", [])
+    for serial in serial_list:
+        try:
+            tmp = unassign_token(serial, user=user)
+            count_success += tmp
+        except Exception as ex:
+            log.error(f"Error unassigning token {serial}: {ex}")
+            failed.append(serial)
+    res = {
+        "count_success": count_success,
+        "failed": failed,
+        "unauthorized": not_authorized_serials
+    }
     g.audit_object.log({"success": True})
     return send_result(res)
 
 
 @token_blueprint.route('/revoke', methods=['POST'])
 @token_blueprint.route('/revoke/<serial>', methods=['POST'])
-@prepolicy(check_base_action, request, action=ACTION.REVOKE)
+@prepolicy(check_token_action, request, action=PolicyAction.REVOKE)
 @event("token_revoke", request, g)
 @log_with(log)
 def revoke_api(serial=None):
     """
-    Revoke a single token or all the tokens of a user.
-    A revoked token will usually be locked. A locked token can not be used
-    anymore.
-    For certain token types additional actions might occur when revoking a
-    token.
+    Revoke a token. A revoked token is locked and can no longer
+    authenticate; some token types perform additional teardown
+    (e.g. push tokens unsubscribe, certificate tokens revoke their
+    cert).
 
-    :jsonparam basestring serial: the serial number of the single token to
-        revoke
-    :jsonparam basestring user: The login name of the user
-    :jsonparam basestring realm: the realm name of the user
-    :return: In case of success it returns the number of revoked
-        tokens in "value".
-    :rtype: JSON object
+    Without ``serial`` and with ``user`` set, every token of that
+    user is revoked.
+
+    Requires authentication and the policy action ``revoke``.
+
+    :param serial: optional path component, the token serial.
+    :jsonparam serial: token serial (alternative to the path
+        component).
+    :jsonparam user: login name (only when no serial is given -
+        revokes every token of the user).
+    :jsonparam realm: realm of the user.
+    :status 200: number of revoked tokens in ``result.value``.
     """
     user = request.User
     if not serial:
-        serial = getParam(request.all_data, "serial", optional)
+        serial = get_optional(request.all_data, "serial")
     g.audit_object.log({"serial": serial})
 
     res = revoke_token(serial, user=user)
@@ -554,28 +947,31 @@ def revoke_api(serial=None):
     return send_result(res)
 
 
-
 @token_blueprint.route('/enable', methods=['POST'])
 @token_blueprint.route('/enable/<serial>', methods=['POST'])
 @prepolicy(check_max_token_user, request)
-@prepolicy(check_base_action, request, action=ACTION.ENABLE)
+@prepolicy(check_token_action, request, action=PolicyAction.ENABLE)
 @event("token_enable", request, g)
 @log_with(log)
 def enable_api(serial=None):
     """
-    Enable a single token or all the tokens of a user.
+    Enable a token. Without ``serial`` and with ``user`` set, every
+    token of that user is enabled.
 
-    :jsonparam basestring serial: the serial number of the single token to
-        enable
-    :jsonparam basestring user: The login name of the user
-    :jsonparam basestring realm: the realm name of the user
-    :return: In case of success it returns the number of enabled
-        tokens in "value".
-    :rtype: json object
+    Requires authentication and the policy action ``enable``. Subject
+    to the per-user token-count limit (``check_max_token_user``).
+
+    :param serial: optional path component, the token serial.
+    :jsonparam serial: token serial (alternative to the path
+        component).
+    :jsonparam user: login name (only when no serial is given -
+        enables every token of the user).
+    :jsonparam realm: realm of the user.
+    :status 200: number of enabled tokens in ``result.value``.
     """
     user = request.User
     if not serial:
-        serial = getParam(request.all_data, "serial", optional)
+        serial = get_optional(request.all_data, "serial")
     g.audit_object.log({"serial": serial})
 
     res = enable_token(serial, enable=True, user=user)
@@ -585,27 +981,28 @@ def enable_api(serial=None):
 
 @token_blueprint.route('/disable', methods=['POST'])
 @token_blueprint.route('/disable/<serial>', methods=['POST'])
-@prepolicy(check_base_action, request, action=ACTION.DISABLE)
+@prepolicy(check_token_action, request, action=PolicyAction.DISABLE)
 @event("token_disable", request, g)
 @log_with(log)
 def disable_api(serial=None):
     """
-    Disable a single token or all the tokens of a user either by providing
-    the serial number of the single token or a username and realm.
+    Disable a token. Disabled tokens cannot authenticate but can be
+    re-enabled later. Without ``serial`` and with ``user`` set,
+    every token of that user is disabled.
 
-    Disabled tokens can not be used to authenticate but can be enabled again.
+    Requires authentication and the policy action ``disable``.
 
-    :jsonparam basestring serial: the serial number of the single token to
-        disable
-    :jsonparam basestring user: The login name of the user
-    :jsonparam basestring realm: the realm name of the user
-    :return: In case of success it returns the number of disabled
-        tokens in "value".
-    :rtype: json object
+    :param serial: optional path component, the token serial.
+    :jsonparam serial: token serial (alternative to the path
+        component).
+    :jsonparam user: login name (only when no serial is given -
+        disables every token of the user).
+    :jsonparam realm: realm of the user.
+    :status 200: number of disabled tokens in ``result.value``.
     """
     user = request.User
     if not serial:
-        serial = getParam(request.all_data, "serial", optional)
+        serial = get_optional(request.all_data, "serial")
     g.audit_object.log({"serial": serial})
 
     res = enable_token(serial, enable=False, user=user)
@@ -613,47 +1010,92 @@ def disable_api(serial=None):
     return send_result(res)
 
 
-
+@token_blueprint.route('/', methods=['DELETE'])
 @token_blueprint.route('/<serial>', methods=['DELETE'])
-@prepolicy(check_base_action, request, action=ACTION.DELETE)
+@prepolicy(check_token_action, request, action=PolicyAction.DELETE)
 @event("token_delete", request, g)
 @log_with(log)
-def delete_api(serial):
+def delete_api(serial=None):
     """
-    Delete a token by its serial number.
+    Delete tokens. Three call shapes are supported, mirroring
+    :http:post:`/token/unassign`:
 
-    :jsonparam serial: The serial number of a single token.
+    * single serial via the ``<serial>`` path component, or
+      ``serial=...`` (or comma-separated list);
+    * ``serials=[...]`` list;
+    * ``user=...&realm=...`` (no serial) - delete every token of
+      that user.
 
-    :return: In case of success it return the number of deleted tokens in
-        "value"
-    :rtype: json object
+    Requires authentication and the policy action ``delete``.
+    Tokens the caller is not authorized to manage are silently
+    skipped and reported back; missing serials are reported in
+    ``failed``.
+
+    :param serial: optional path component, the token serial.
+    :jsonparam serial: single serial or comma-separated list.
+    :jsonparam serials: list of serials.
+    :jsonparam user: login name.
+    :jsonparam realm: realm of the user.
+    :status 200: for a single-serial call the response is the
+        number of deleted tokens in ``result.value``; for any
+        multi-serial call (or any case with skipped tokens), the
+        response value is
+        ``{"count_success": <n>, "failed": [...], "unauthorized": [...]}``.
     """
-    # If the API is called by a user, we pass the User Object to the function
-    g.audit_object.log({"serial": serial})
     user = request.User
-    res = remove_token(serial, user=user)
+    serial_list = get_optional(request.all_data, "serials")
+    not_authorized_serials = get_optional(request.all_data, "not_authorized_serials") or []
+
+    g.audit_object.log({"serial": serial_list[0] if len(serial_list) == 1 else serial_list})
+
+    # If only one serial is given, the value in the send result is expected to be a boolean (old API behavior).
+    if len(serial_list) == 1 and not not_authorized_serials:
+        res = remove_token(serial_list[0], user=user)
+        g.audit_object.log({"success": True})
+        return send_result(res)
+
+    count_success = 0
+    failed = get_optional(request.all_data, "not_found_serials", [])
+    for serial in serial_list:
+        try:
+            tmp = remove_token(serial, user=user)
+            count_success += tmp
+        except Exception as ex:
+            log.exception(f"Error deleting token {serial}: {ex}")
+            failed.append(serial)
+
+    res = {
+        "count_success": count_success,
+        "failed": failed,
+        "unauthorized": not_authorized_serials
+    }
     g.audit_object.log({"success": True})
     return send_result(res)
 
 
 @token_blueprint.route('/reset', methods=['POST'])
 @token_blueprint.route('/reset/<serial>', methods=['POST'])
-@prepolicy(check_base_action, request, action=ACTION.RESET)
+@prepolicy(check_token_action, request, action=PolicyAction.RESET)
 @event("token_reset", request, g)
 @log_with(log)
 def reset_api(serial=None):
     """
-    Reset the failcounter of a single token or of all tokens of a user.
+    Reset the fail counter of a token. Without ``serial`` and with
+    ``user`` set, every token of that user is reset.
 
-    :jsonparam basestring serial: the serial number of the single token to reset
-    :jsonparam basestring user: The login name of the user
-    :jsonparam basestring realm: the realm name of the user
-    :return: In case of success it returns "value"=True
-    :rtype: json object
+    Requires authentication and the policy action ``reset``.
+
+    :param serial: optional path component, the token serial.
+    :jsonparam serial: token serial (alternative to the path
+        component).
+    :jsonparam user: login name (only when no serial is given -
+        resets every token of the user).
+    :jsonparam realm: realm of the user.
+    :status 200: ``True`` on success in ``result.value``.
     """
     user = request.User
     if not serial:
-        serial = getParam(request.all_data, "serial", optional)
+        serial = get_optional(request.all_data, "serial")
     g.audit_object.log({"serial": serial})
 
     res = reset_token(serial, user=user)
@@ -663,25 +1105,32 @@ def reset_api(serial=None):
 
 @token_blueprint.route('/resync', methods=['POST'])
 @token_blueprint.route('/resync/<serial>', methods=['POST'])
-@prepolicy(check_base_action, request, action=ACTION.RESYNC)
+@prepolicy(check_token_action, request, action=PolicyAction.RESYNC)
 @event("token_resync", request, g)
 @log_with(log)
 def resync_api(serial=None):
     """
-    Resync the OTP token by providing two consecutive OTP values.
+    Resynchronize an OTP token by submitting two consecutive OTP
+    values it produced. Used when an event-based token (HOTP) has
+    drifted out of sync with the server's counter, or when a
+    time-based token (TOTP) is on a clock the server cannot reach.
 
-    :jsonparam basestring serial: the serial number of the single token to reset
-    :jsonparam basestring otp1: First OTP value
-    :jsonparam basestring otp2: Second OTP value
-    :return: In case of success it returns "value"=True
-    :rtype: json object
+    Requires authentication and the policy action ``resync``.
+
+    :param serial: optional path component, the token serial.
+    :jsonparam serial: token serial (required if not in the path).
+    :jsonparam otp1: first OTP value (required).
+    :jsonparam otp2: second OTP value, immediately following ``otp1``
+        (required).
+    :status 200: ``True`` if the token resynchronized, ``False``
+        otherwise.
     """
     user = request.User
     if not serial:
-        serial = getParam(request.all_data, "serial", required)
+        serial = get_required(request.all_data, "serial")
     g.audit_object.log({"serial": serial})
-    otp1 = getParam(request.all_data, "otp1", required)
-    otp2 = getParam(request.all_data, "otp2", required)
+    otp1 = get_required(request.all_data, "otp1")
+    otp2 = get_required(request.all_data, "otp2")
 
     res = resync_token(serial, otp1, otp2, user=user)
     g.audit_object.log({"success": bool(res)})
@@ -690,36 +1139,43 @@ def resync_api(serial=None):
 
 @token_blueprint.route('/setpin', methods=['POST'])
 @token_blueprint.route('/setpin/<serial>', methods=['POST'])
-@prepolicy(check_base_action, request, action=ACTION.SETPIN)
+@prepolicy(check_token_action, request, action=PolicyAction.SETPIN)
 @prepolicy(encrypt_pin, request)
-@prepolicy(check_otp_pin, request, action=ACTION.SETPIN)
+@prepolicy(check_otp_pin, request, action=PolicyAction.SETPIN)
 @postpolicy(save_pin_change, request)
 @event("token_setpin", request, g)
 @log_with(log)
 def setpin_api(serial=None):
     """
-    Set the the user pin or the SO PIN of the specific token.
-    Usually these are smartcard or token specific PINs.
-    E.g. the userpin is used with mOTP tokens to store the mOTP PIN.
+    Set one or more PINs on a token. Three PIN slots are supported:
 
-    The token is identified by the unique serial number.
+    * ``userpin`` - the user PIN of a smartcard, also used by mOTP
+      tokens to store the mOTP PIN.
+    * ``sopin`` - the security-officer PIN of a smartcard.
+    * ``otppin`` - the regular OTP PIN that gates token use.
 
-    :jsonparam basestring serial: the serial number of the single
-        token to reset
-    :jsonparam basestring userpin: The user PIN of a smartcard
-    :jsonparam basestring sopin: The SO PIN of a smartcard
-    :jsonparam basestring otppin: The OTP PIN of a token
-    :return: In "value" returns the number of PINs set.
-    :rtype: json object
+    Each supplied field is set independently; omitted fields are
+    untouched.
+
+    Requires authentication and the policy action ``setpin``.
+
+    :param serial: optional path component, the token serial.
+    :jsonparam serial: token serial (required if not in the path).
+    :jsonparam userpin: smartcard user PIN.
+    :jsonparam sopin: smartcard SO PIN.
+    :jsonparam otppin: OTP PIN.
+    :jsonparam encryptpin: ``True`` to store the OTP PIN encrypted
+        (default behavior is governed by the ``encrypt_pin`` policy).
+    :status 200: number of PINs set in ``result.value``.
     """
     if not serial:
-        serial = getParam(request.all_data, "serial", required)
+        serial = get_required(request.all_data, "serial")
     g.audit_object.log({"serial": serial})
-    userpin = getParam(request.all_data, "userpin")
-    sopin = getParam(request.all_data, "sopin")
-    otppin = getParam(request.all_data, "otppin")
+    userpin = get_optional(request.all_data, "userpin")
+    sopin = get_optional(request.all_data, "sopin")
+    otppin = get_optional(request.all_data, "otppin")
     user = request.User
-    encrypt_pin = getParam(request.all_data, "encryptpin")
+    encrypt_pin_param = get_optional(request.all_data, "encryptpin")
 
     res = 0
     if userpin is not None:
@@ -732,7 +1188,7 @@ def setpin_api(serial=None):
 
     if otppin is not None:
         g.audit_object.add_to_log({'action_detail': "otppin, "})
-        res += set_pin(serial, otppin, user=user, encrypt_pin=encrypt_pin)
+        res += set_pin(serial, otppin, user=user, encrypt_pin=encrypt_pin_param)
 
     g.audit_object.log({"success": True})
     return send_result(res)
@@ -740,7 +1196,7 @@ def setpin_api(serial=None):
 
 @token_blueprint.route('/setrandompin', methods=['POST'])
 @token_blueprint.route('/setrandompin/<serial>', methods=['POST'])
-@prepolicy(check_base_action, request, action=ACTION.SETRANDOMPIN)
+@prepolicy(check_token_action, request, action=PolicyAction.SETRANDOMPIN)
 @prepolicy(set_random_pin, request)
 @prepolicy(encrypt_pin, request)
 @postpolicy(save_pin_change, request)
@@ -748,52 +1204,67 @@ def setpin_api(serial=None):
 @log_with(log)
 def setrandompin_api(serial=None):
     """
-    Set the OTP PIN for a specific token to a random value.
+    Generate a random OTP PIN and set it on the token. The PIN
+    length and content rules come from the ``otp_pin_set_random``
+    policy; if that policy is not configured the call fails.
 
-    The token is identified by the unique serial number.
+    The freshly generated PIN is included in the response under
+    ``detail.pin`` so that the calling principal can show or relay
+    it once. Treat the response body accordingly - do not log or
+    persist it past handing it to the user.
 
-    :jsonparam basestring serial: the serial number of the single
-        token to reset
-    :return: In "value" returns the number of PINs set.
-        The detail-section contains the key "pin" with the set PIN.
-    :rtype: json object
+    Requires authentication and the policy action ``setrandompin``.
+
+    :param serial: optional path component, the token serial.
+    :jsonparam serial: token serial (required if not in the path).
+    :jsonparam encryptpin: ``True`` to store the PIN encrypted
+        (default behavior is governed by the ``encrypt_pin`` policy).
+    :status 200: number of PINs set in ``result.value``; the
+        generated PIN is in ``detail.pin``.
     """
     if not serial:
-        serial = getParam(request.all_data, "serial", required)
+        serial = get_required(request.all_data, "serial")
     g.audit_object.log({"serial": serial})
     user = request.User
-    encrypt_pin = getParam(request.all_data, "encryptpin")
-    pin = getParam(request.all_data, "pin")
+    encrypt_pin_param = get_optional(request.all_data, "encryptpin")
+    pin = get_optional(request.all_data, "pin")
     if not pin:
-        raise TokenAdminError("We have an empty PIN. Please check your policy 'otp_pin_set_random'.")
+        raise TokenAdminError(
+            "We have an empty PIN. Please check your policy 'otp_pin_set_random'.")
 
-    g.audit_object.add_to_log({'action_detail': "otppin, "})
-    res = set_pin(serial, pin, user=user, encrypt_pin=encrypt_pin)
+    g.audit_object.add_to_log({'action_detail': "otppin (random), "})
+    res = set_pin(serial, pin, user=user, encrypt_pin=encrypt_pin_param)
     g.audit_object.log({"success": True})
     return send_result(res, details={"pin": pin})
 
 
 @token_blueprint.route('/description', methods=['POST'])
 @token_blueprint.route('/description/<serial>', methods=['POST'])
-@prepolicy(check_base_action, request, action=ACTION.SETDESCRIPTION)
+@prepolicy(check_token_action, request, action=PolicyAction.SETDESCRIPTION)
 @event("token_set", request, g)
 @log_with(log)
 def set_description_api(serial=None):
     """
-    This endpoint can be used by the user or by the admin to set
-    the description of a token.
+    Set the description of a token. May be required by the
+    ``require_description_on_edit`` policy.
 
-    :jsonparam basestring description: The description for the token
-    :param serial:
-    :return:
+    Requires authentication and the policy action ``setdescription``.
+
+    :param serial: optional path component, the token serial.
+    :jsonparam serial: token serial (required if not in the path).
+    :jsonparam description: new description (required).
+    :status 200: ``True`` on success in ``result.value``.
     """
     user = request.User
     if not serial:
-        serial = getParam(request.all_data, "serial", required)
+        serial = get_required(request.all_data, "serial")
     g.audit_object.log({"serial": serial})
-    description = getParam(request.all_data, "description", optional=required)
-    g.audit_object.add_to_log({'action_detail': u"description={0!r}".format(description)})
-    res = set_description(serial, description, user=user)
+    description = get_required(request.all_data, "description", allow_empty=True)
+    g.audit_object.add_to_log({'action_detail': f"description={description!r}"})
+    token = get_one_token(serial=serial, user=user)
+    request.all_data["type"] = token.type
+    require_description_on_edit(request)
+    res = set_description(serial, description, user=user, token=token)
     g.audit_object.log({"success": True})
     return send_result(res)
 
@@ -801,101 +1272,117 @@ def set_description_api(serial=None):
 @token_blueprint.route('/set', methods=['POST'])
 @token_blueprint.route('/set/<serial>', methods=['POST'])
 @admin_required
-@prepolicy(check_base_action, request, action=ACTION.SET)
+@prepolicy(check_token_action, request, action=PolicyAction.SET)
 @event("token_set", request, g)
 @log_with(log)
 def set_api(serial=None):
     """
-    This API is only to be used by the admin!
-    This can be used to set token specific attributes like
+    Admin-only. Set one or more low-level token attributes on a
+    token (or on every token of a user). Each supplied field is
+    applied independently; omitted fields are untouched.
 
-        * description
-        * count_window
-        * sync_window
-        * count_auth_max
-        * count_auth_success_max
-        * hashlib,
-        * max_failcount
-        * validity_period_start
-        * validity_period_end
+    Requires admin authentication and the policy action ``set``.
 
-    The token is identified by the unique serial number or by the token owner.
-    In the later case all tokens of the owner will be modified.
-    
-    The validity period needs to be provided in the format
-    YYYY-MM-DDThh:mm+oooo
-
-    :jsonparam basestring serial: the serial number of the single token to reset
-    :jsonparam basestring user: The username of the token owner
-    :jsonparam basestring realm: The realm name of the token owner
-    :return: returns the number of attributes set in "value"
-    :rtype: json object
+    :param serial: optional path component, the token serial.
+    :jsonparam serial: token serial (alternative to the path
+        component). Either ``serial`` or ``user`` is required; with
+        ``user`` and no serial, every token of that user is
+        modified.
+    :jsonparam user: login name.
+    :jsonparam realm: realm of the user.
+    :jsonparam description: free-form description.
+    :jsonparam count_window: counter look-ahead window (HOTP).
+    :jsonparam sync_window: synchronization window.
+    :jsonparam count_auth_max: maximum authentication count before
+        the token is locked.
+    :jsonparam count_auth_success_max: maximum number of successful
+        authentications before the token is locked.
+    :jsonparam hashlib: HMAC hash algorithm (``sha1``, ``sha256``,
+        ``sha512``).
+    :jsonparam max_failcount: maximum allowed failed authentications.
+    :jsonparam validity_period_start: ISO 8601 start of validity
+        (``YYYY-MM-DDThh:mm+oooo``).
+    :jsonparam validity_period_end: ISO 8601 end of validity.
+    :jsonparam <tokentype>.<key>: a token type specific token-info
+        entry, e.g. ``remote.user`` on a remote token. The prefix
+        has to name a known token type and the entry is only
+        written to tokens of that type, so a parameter cannot
+        reach the namespace of another token type. These entries
+        are maintained by the token, so the generic token-info
+        endpoints refuse them.
+    :status 200: number of attribute updates applied in
+        ``result.value``.
     """
     if not serial:
-        serial = getParam(request.all_data, "serial", required)
+        serial = get_required(request.all_data, "serial")
     g.audit_object.log({"serial": serial})
     user = request.User
 
-    description = getParam(request.all_data, "description")
-    count_window = getParam(request.all_data, "count_window")
-    sync_window = getParam(request.all_data, "sync_window")
-    hashlib = getParam(request.all_data, "hashlib")
-    max_failcount = getParam(request.all_data, "max_failcount")
-    count_auth_max = getParam(request.all_data, "count_auth_max")
-    count_auth_success_max = getParam(request.all_data, "count_auth_success_max")
-    validity_period_start = getParam(request.all_data, "validity_period_start")
-    validity_period_end = getParam(request.all_data, "validity_period_end")
+    description = get_optional(request.all_data, "description")
+    count_window = get_optional(request.all_data, "count_window")
+    sync_window = get_optional(request.all_data, "sync_window")
+    hashlib = get_optional(request.all_data, "hashlib")
+    max_failcount = get_optional(request.all_data, "max_failcount")
+    count_auth_max = get_optional(request.all_data, "count_auth_max")
+    count_auth_success_max = get_optional(request.all_data, "count_auth_success_max")
+    validity_period_start = get_optional(request.all_data, "validity_period_start")
+    validity_period_end = get_optional(request.all_data, "validity_period_end")
 
     res = 0
 
     if description is not None:
-        g.audit_object.add_to_log({'action_detail': "description=%r, "
-                                                    "" % description})
+        g.audit_object.add_to_log({'action_detail': f"description={description!r}, "})
         res += set_description(serial, description, user=user)
 
     if count_window is not None:
-        g.audit_object.add_to_log({'action_detail': "count_window=%r, "
-                                                    "" % count_window})
+        g.audit_object.add_to_log({'action_detail': f"count_window={count_window!r}, "})
         res += set_count_window(serial, count_window, user=user)
 
     if sync_window is not None:
-        g.audit_object.add_to_log({'action_detail': "sync_window=%r, "
-                                                    "" % sync_window})
+        g.audit_object.add_to_log({'action_detail': f"sync_window={sync_window!r}, "})
         res += set_sync_window(serial, sync_window, user=user)
 
     if hashlib is not None:
-        g.audit_object.add_to_log({'action_detail': "hashlib=%r, "
-                                                    "" % hashlib})
+        g.audit_object.add_to_log({'action_detail': f"hashlib={hashlib!r}, "})
         res += set_hashlib(serial, hashlib, user=user)
 
     if max_failcount is not None:
-        g.audit_object.add_to_log({'action_detail': "max_failcount=%r, "
-                                                    "" % max_failcount})
+        g.audit_object.add_to_log({'action_detail': f"max_failcount={max_failcount!r}, "})
         res += set_max_failcount(serial, max_failcount, user=user)
 
     if count_auth_max is not None:
-        g.audit_object.add_to_log({'action_detail': "count_auth_max=%r, "
-                                                    "" % count_auth_max})
+        g.audit_object.add_to_log({'action_detail': f"count_auth_max={count_auth_max!r}, "})
         res += set_count_auth(serial, count_auth_max, user=user, max=True)
 
     if count_auth_success_max is not None:
         g.audit_object.add_to_log({'action_detail':
-                                       "count_auth_success_max={0!r}, ".format(
-                                       count_auth_success_max)})
+                                       f"count_auth_success_max={count_auth_success_max!r}, "})
         res += set_count_auth(serial, count_auth_success_max, user=user,
                               max=True, success=True)
 
     if validity_period_end is not None:
         g.audit_object.add_to_log({'action_detail':
-                                       "validity_period_end={0!r}, ".format(
-                                       validity_period_end)})
+                                       f"validity_period_end={validity_period_end!r}, "})
         res += set_validity_period_end(serial, user, validity_period_end)
 
     if validity_period_start is not None:
         g.audit_object.add_to_log({'action_detail':
-                                       "validity_period_start={0!r}, ".format(
-                                       validity_period_start)})
+                                       f"validity_period_start={validity_period_start!r}, "})
         res += set_validity_period_start(serial, user, validity_period_start)
+
+    # Token info entries a token class maintains but that change over the lifetime of a token, e.g.
+    # "remote.user" or "phone". A parameter counts as one when some token class declares it settable, so the
+    # fixed fields above and any framework parameter are unaffected.
+    settable_keys = get_settable_tokeninfo_keys(set(request.all_data) - HANDLED_SET_FIELDS)
+    settable_info = {key: value for key, value in request.all_data.items() if key in settable_keys}
+    if settable_info:
+        # A key one token type declares settable is not written to a token of another type, so the audit
+        # follows the write and names the entries that were actually written
+        written_keys = set_token_type_info(serial, settable_info, user=user)
+        for key in sorted(set(written_keys)):
+            # The value can be a secret, e.g. the shared secret of a RADIUS server, so only the key is audited
+            g.audit_object.add_to_log({'action_detail': f"{key!s} set, "})
+        res += len(written_keys)
 
     g.audit_object.log({"success": True})
     return send_result(res)
@@ -905,32 +1392,46 @@ def set_api(serial=None):
 @admin_required
 @log_with(log)
 @prepolicy(check_max_token_realm, request)
-@prepolicy(check_base_action, request, action=ACTION.TOKENREALMS)
+@prepolicy(check_admin_tokenlist, request, action=PolicyAction.TOKENREALMS)
+@prepolicy(check_token_action, request, action=PolicyAction.TOKENREALMS)
 @event("token_realm", request, g)
 def tokenrealm_api(serial=None):
     """
-    Set the realms of a token.
-    The token is identified by the unique serial number
+    Replace the realms a token belongs to. The full set of realms is
+    replaced - realms not listed in the request are removed. For
+    realm-admin callers, the call is restricted to realms the
+    caller's policies cover.
 
-    You can call the function like this:
-        POST /token/realm?serial=<serial>&realms=<something>
-        POST /token/realm/<serial>?realms=<hash>
+    Requires admin authentication and the policy action
+    :ref:`policy_tokenrealms`. Subject to the per-realm token-count
+    limit (``check_max_token_realm``).
 
+    :param serial: path component, the token serial.
+    :jsonparam realms: comma-separated string or JSON list of realm
+        names (required; empty list removes all realms).
+    :status 200: ``True`` on success in ``result.value``.
 
-    :jsonparam basestring serial: the serial number of the single token to reset
-    :jsonparam basestring realms: The realms the token should be assigned to.
-        Comma separated
-    :return: returns value=True in case of success
-    :rtype: bool
+    **Example request**:
+
+    .. sourcecode:: http
+
+       POST /token/realm/<serial> HTTP/1.1
+       Host: example.com
+       Content-Type: application/json
+
+       {"realms": "realm1,realm2"}
     """
-    realms = getParam(request.all_data, "realms", required)
-    if type(realms) == list:
+    realms = get_required(request.all_data, "realms")
+    if isinstance(realms, list):
         realm_list = realms
     else:
         realm_list = [r.strip() for r in realms.split(",")]
     g.audit_object.log({"serial": serial})
 
-    set_realms(serial, realms=realm_list)
+    allowed_realms = getattr(request, "pi_allowed_realms", None)
+
+    set_realms(serial, realms=realm_list, allowed_realms=allowed_realms)
+    g.audit_object.add_to_log({'action_detail': f"realms={realm_list}, "})
     g.audit_object.log({"success": True})
     return send_result(True)
 
@@ -942,125 +1443,165 @@ def tokenrealm_api(serial=None):
 @event("token_load", request, g)
 def loadtokens_api(filename=None):
     """
-    The call imports the given file containing token definitions.
-    The file can be an OATH CSV file, an aladdin XML file or a Yubikey CSV file
-    exported from the yubikey initialization tool.
+    Bulk-import tokens from a file. Accepts OATH CSV, Aladdin XML,
+    Yubikey CSV (as exported by the Yubikey initialization tool) and
+    PSKC. PGP-encrypted files (``-----BEGIN PGP MESSAGE-----``
+    header) are decrypted in-place using the configured GPG keyring
+    before parsing.
 
-    The function is called as a POST request with the file upload.
+    The request body must be ``multipart/form-data`` with the file in
+    the ``file`` field; the path component ``filename`` is used only
+    for logging.
 
-    :jsonparam filename: The name of the token file, that is imported
-    :jsonparam type: The file type. Can be "aladdin-xml",
-        "oathcsv" or "yubikeycsv".
-    :jsonparam tokenrealms: comma separated list of realms.
-    :jsonparam psk: Pre Shared Key, when importing PSKC
-    :jsonparam pskcValidateMAC: Determines how invalid MACs should be handled when importing PSKC.
-               Allowed values are 'no_check', 'check_fail_soft' and 'check_fail_hard'.
-    :return: The number of the imported tokens
-    :rtype: int
+    Requires admin authentication and the import policy in scope
+    ADMIN. The check honors the supplied ``tokenrealms``: the admin
+    must be allowed to import into every named realm.
+
+    :param filename: path component, used as a log/audit label for
+        the imported file.
+    :reqheader Content-Type: ``multipart/form-data`` (required).
+    :formparam file: the file contents (required).
+    :jsonparam type: file format - ``aladdin-xml``, ``oathcsv``
+        (alias ``OATH CSV``), ``yubikeycsv`` (alias ``Yubikey CSV``),
+        or ``pskc`` (required).
+    :jsonparam tokenrealms: comma-separated list of realms to assign
+        the imported tokens to.
+    :jsonparam psk: Pre-Shared Key for PSKC import (32 hex
+        characters / 128 bits).
+    :jsonparam password: passphrase for PSKC import when keys are
+        password-derived.
+    :jsonparam pskcValidateMAC: PSKC MAC handling - ``no_check``
+        skips MAC verification, ``check_fail_soft`` warns,
+        ``check_fail_hard`` (default) rejects on bad MAC.
+    :status 200: ``{"n_imported": <int>, "n_not_imported": <int>}``
+        in ``result.value``.
+    :status 400: empty file, undecodable file, unknown ``type``, or
+        bad pre-shared-key length.
     """
     if not filename:
-        filename = getParam(request.all_data, "filename", required)
+        filename = get_required(request.all_data, "filename")
     known_types = ['aladdin-xml', 'oathcsv', "OATH CSV", 'yubikeycsv',
                    'Yubikey CSV', 'pskc']
-    file_type = getParam(request.all_data, "type", required)
-    aes_validate_mac = getParam(request.all_data, "pskcValidateMAC", default='check_fail_hard')
-    aes_psk = getParam(request.all_data, "psk")
-    aes_password = getParam(request.all_data, "password")
+    file_type = get_required(request.all_data, "type")
+    aes_validate_mac = get_optional(request.all_data, "pskcValidateMAC", default='check_fail_hard')
+    aes_psk = get_optional(request.all_data, "psk")
+    aes_password = get_optional(request.all_data, "password")
     if aes_psk and len(aes_psk) != 32:
-        raise TokenAdminError("The Pre Shared Key must be 128 Bit hex "
-                              "encoded. It must be 32 characters long!")
-    trealms = getParam(request.all_data, "tokenrealms") or ""
+        raise TokenAdminError(_("The Pre Shared Key must be 128 Bit hex "
+                                "encoded. It must be 32 characters long!"))
+    trealms = get_optional(request.all_data, "tokenrealms") or ""
     tokenrealms = []
     if trealms:
         tokenrealms = trealms.split(",")
 
     not_imported_serials = []
-    TOKENS = {}
     token_file = request.files['file']
-    file_contents = ""
-    # In case of form post requests, it is a "instance" of FieldStorage
-    # i.e. the Filename is selected in the browser and the data is
-    # transferred
-    # in an iframe. see: http://jquery.malsup.com/form/#sample4
-    #
-    if type(token_file) == FieldStorage:  # pragma: no cover
-        log.debug("Field storage file: %s", token_file)
-        file_contents = token_file.value
-    elif type(token_file) == FileStorage:
-        log.debug("Werkzeug File storage file: %s", token_file)
+    if isinstance(token_file, FileStorage):
+        log.debug(f"Werkzeug File storage file: {token_file}")
         file_contents = token_file.read()
     else:  # pragma: no cover
+        # TODO: is that even possible? We might just throw an error here
         file_contents = token_file
 
-    file_contents = to_unicode(file_contents)
+    try:
+        if isinstance(file_contents, bytes):
+            file_contents = file_contents.decode()
+    except UnicodeDecodeError as e:
+        log.error(f"Unable to convert contents of file '{filename}' to unicode: {e}")
+        raise ParameterError(_("Unable to convert file contents. Binary data is not supported"))
 
     if file_contents == "":
-        log.error("Error loading/importing token file. file {0!s} empty!".format(
-                  filename))
-        raise ParameterError("Error loading token file. File empty!")
+        log.error(f"Error loading/importing token file. File {filename} is empty!")
+        raise ParameterError(_("Error loading token file. File empty!"))
 
     if file_type not in known_types:
-        log.error("Unknown file type: >>{0!s}<<. We only know the types: {1!s}".format(file_type, ', '.join(known_types)))
-        raise TokenAdminError("Unknown file type: >>%s<<. We only know the "
-                              "types: %s" % (file_type,
-                                             ', '.join(known_types)))
+        log.error(f"Unknown file type: '{file_type}'. Supported types are: "
+                  f"{', '.join(known_types)}")
+        raise TokenAdminError(
+            _("Unknown file type: '{file_type}'. Supported file types are: {known_types}")
+            .format(file_type=file_type, known_types=', '.join(known_types))
+        )
 
     # Decrypt file, if necessary
     if file_contents.startswith("-----BEGIN PGP MESSAGE-----"):
-        GPG = GPGImport(current_app.config)
-        file_contents = GPG.decrypt(file_contents)
+        gpg = GPGImport(current_app.config)
+        file_contents = gpg.decrypt(file_contents)
 
     # Parse the tokens from file and get dictionary
     if file_type == "aladdin-xml":
-        TOKENS = parseSafeNetXML(file_contents)
+        import_tokens = parseSafeNetXML(file_contents)
     elif file_type in ["oathcsv", "OATH CSV"]:
-        TOKENS = parseOATHcsv(file_contents)
+        import_tokens = parseOATHcsv(file_contents)
     elif file_type in ["yubikeycsv", "Yubikey CSV"]:
-        TOKENS = parseYubicoCSV(file_contents)
+        import_tokens = parseYubicoCSV(file_contents)
     elif file_type in ["pskc"]:
-        TOKENS, not_imported_serials = parsePSKCdata(file_contents, preshared_key_hex=aes_psk,
-                                                   password=aes_password, validate_mac=aes_validate_mac)
+        import_tokens, not_imported_serials = parsePSKCdata(
+            file_contents,
+            preshared_key_hex=aes_psk,
+            password=aes_password,
+            validate_mac=aes_validate_mac)
+    else:
+        import_tokens = {}
 
     # Now import the Tokens from the dictionary
-    ret = ""
-    for serial in TOKENS:
-        log.debug("importing token {0!s}".format(TOKENS[serial]))
-
-        log.info("initialize token. serial: {0!s}, realm: {1!s}".format(serial,
-                                                              tokenrealms))
-
+    for serial in import_tokens:
+        log.debug(f"importing token {import_tokens[serial]}")
+        log.info(f"initialize token. serial: {serial}, realm: {tokenrealms}")
         import_token(serial,
-                     TOKENS[serial],
+                     import_tokens[serial],
                      tokenrealms=tokenrealms)
 
-    g.audit_object.log({'info': u"{0!s}, {1!s} (imported: {2:d})".format(file_type,
-                                                           token_file,
-                                                           len(TOKENS)),
-                        'serial': ', '.join(TOKENS),
+    g.audit_object.log({'info': f"{file_type}, {token_file} (imported: {len(import_tokens)})",
+                        'serial': ', '.join(import_tokens),
                         'success': True})
-    # logTokenNum()
 
-    return send_result({'n_imported': len(TOKENS), 'n_not_imported': len(not_imported_serials)})
+    return send_result(
+        {'n_imported': len(import_tokens), 'n_not_imported': len(not_imported_serials)})
+
+
+_copy_endpoint_deprecation_warned = set()
+
+
+def _warn_copy_endpoint_deprecated(endpoint: str):
+    """
+    Log the deprecation of a token copy endpoint once per process, so a deployment that still
+    calls it is nudged toward /token/lost without spamming the log on every request.
+    """
+    if endpoint not in _copy_endpoint_deprecation_warned:
+        _copy_endpoint_deprecation_warned.add(endpoint)
+        log.warning(f"The endpoint '{endpoint}' is deprecated and will be removed in a future release. "
+                    f"Use 'POST /token/lost/<serial>' to replace a token instead.")
 
 
 @token_blueprint.route('/copypin', methods=['POST'])
 @admin_required
 @log_with(log)
-@prepolicy(check_base_action, request, action=ACTION.COPYTOKENPIN)
+@prepolicy(check_copy_token_action, request, action=PolicyAction.COPYTOKENPIN)
 @event("token_copypin", request, g)
 def copypin_api():
     """
-    Copy the token PIN from one token to the other.
+    Copy the OTP PIN of one token onto another.
 
-    :jsonparam basestring from: the serial number of the token, from where you
-        want to copy the pin.
-    :jsonparam basestring to: the serial number of the token, from where you
-        want to copy the pin.
-    :return: returns value=True in case of success
-    :rtype: bool
+    Requires admin authentication and the policy action
+    :ref:`policy_copytokenpin` for **both** tokens, so an admin
+    restricted to certain realms can only copy between tokens in
+    those realms.
+
+    .. deprecated:: 3.14
+        This endpoint is deprecated and will be removed in a future
+        release. It exposes one raw step of the lost-token workflow;
+        use :http:post:`/token/lost/(serial)`, which performs the
+        whole replacement, instead.
+
+    :jsonparam from: serial of the source token (required).
+    :jsonparam to: serial of the destination token (required).
+    :status 200: ``True`` on success in ``result.value``.
+    :status 403: the calling admin is not authorized for one of the
+        two tokens.
     """
-    serial_from = getParam(request.all_data, "from", required)
-    serial_to = getParam(request.all_data, "to", required)
+    _warn_copy_endpoint_deprecated("POST /token/copypin")
+    serial_from = get_required(request.all_data, "from")
+    serial_to = get_required(request.all_data, "to")
     res = copy_token_pin(serial_from, serial_to)
     g.audit_object.log({"success": True})
     return send_result(res)
@@ -1068,45 +1609,64 @@ def copypin_api():
 
 @token_blueprint.route('/copyuser', methods=['POST'])
 @admin_required
-@prepolicy(check_base_action, request, action=ACTION.COPYTOKENUSER)
+@prepolicy(check_copy_token_action, request, action=PolicyAction.COPYTOKENUSER)
 @event("token_copyuser", request, g)
 @log_with(log)
 def copyuser_api():
     """
-    Copy the token user from one token to the other.
+    Copy the user assignment of one token onto another. The
+    destination token is unassigned first, and the source token's
+    realms are copied along with the owner.
 
-    :jsonparam basestring from: the serial number of the token, from where you
-        want to copy the pin.
-    :jsonparam basestring to: the serial number of the token, from where you
-        want to copy the pin.
-    :return: returns value=True in case of success
-    :rtype: bool
+    Requires admin authentication and the policy action
+    :ref:`policy_copytokenuser` for **both** tokens, so an admin
+    restricted to certain realms can only copy between tokens in
+    those realms.
+
+    .. deprecated:: 3.14
+        This endpoint is deprecated and will be removed in a future
+        release. It exposes one raw step of the lost-token workflow;
+        use :http:post:`/token/lost/(serial)`, which performs the
+        whole replacement, instead.
+
+    :jsonparam from: serial of the source token (required).
+    :jsonparam to: serial of the destination token (required).
+    :status 200: ``True`` on success in ``result.value``.
+    :status 403: the calling admin is not authorized for one of the
+        two tokens.
     """
-    serial_from = getParam(request.all_data, "from", required)
-    serial_to = getParam(request.all_data, "to", required)
+    _warn_copy_endpoint_deprecated("POST /token/copyuser")
+    serial_from = get_required(request.all_data, "from")
+    serial_to = get_required(request.all_data, "to")
     res = copy_token_user(serial_from, serial_to)
     g.audit_object.log({"success": True})
     return send_result(res)
 
 
 @token_blueprint.route('/lost/<serial>', methods=['POST'])
-@prepolicy(check_base_action, request, action=ACTION.LOSTTOKEN)
+@admin_required
+@prepolicy(check_token_action, request, action=PolicyAction.LOSTTOKEN)
 @event("token_lost", request, g)
 @log_with(log)
 def lost_api(serial=None):
     """
-    Mark the specified token as lost and create a new temporary token.
-    This new token gets the new serial number "lost<old-serial>" and
-    a certain validity period and the PIN of the lost token.
+    Mark a token as lost and issue a temporary replacement. The
+    replacement is a newly created password token carrying a derived
+    serial (``lost<original-serial>``, with a counted suffix if that
+    serial is already taken), a generated password, the original
+    token's PIN, and a limited validity period. The original token is
+    disabled.
 
-    This method can be called by either the admin or the user on his own tokens.
+    The PIN is copied as a hash, so the replacement keeps the PIN the
+    user already knows without the calling admin learning it.
 
-    You can call the function like this:
-        POST /token/lost/serial
+    Requires admin authentication and the policy action ``losttoken``,
+    which is checked against the realms of the lost token. If a ``user``
+    is passed as well, it has to be the owner of the token.
 
-    :jsonparam basestring serial: the serial number of the lost token.
-    :return: returns value=dictionary in case of success
-    :rtype: bool
+    :param serial: path component, the serial of the lost token.
+    :status 200: dict carrying the new serial, the temporary
+        password, and the validity window in ``result.value``.
     """
     # check if a user is given, that the user matches the token owner.
     g.audit_object.log({"serial": serial})
@@ -1114,7 +1674,7 @@ def lost_api(serial=None):
     if userobj:
         toks = get_tokens(serial=serial, user=userobj)
         if not toks:
-            raise TokenAdminError("The user {0!r} does not own the token {1!s}".format(
+            raise TokenAdminError(_("The user {0!r} does not own the token {1!s}").format(
                 userobj, serial))
 
     options = {"g": g,
@@ -1127,32 +1687,36 @@ def lost_api(serial=None):
 
 @token_blueprint.route('/getserial/<otp>', methods=['GET'])
 @admin_required
-@prepolicy(check_base_action, request, action=ACTION.GETSERIAL)
+@prepolicy(check_base_action, request, action=PolicyAction.GETSERIAL)
 @event("token_getserial", request, g)
 @log_with(log)
 def get_serial_by_otp_api(otp=None):
     """
-    Get the serial number for a given OTP value.
-    If the administrator has a token, he does not know to whom it belongs,
-    he can type in the OTP value and gets the serial number of the token, that
-    generates this very OTP value.
+    Identify a token by an OTP value. Useful when an admin holds an
+    unlabeled token and wants to know which token (and therefore
+    which user) it belongs to.
 
-    :query otp: The given OTP value
-    :query type: Limit the search to this token type
-    :query unassigned: If set=1, only search in unassigned tokens
-    :query assigned: If set=1, only search in assigned tokens
-    :query count: if set=1, only return the number of tokens, that will be
-        searched
-    :query serial: This can be a substring of serial numbers to search in.
-    :query window: The number of OTP look ahead (default=10)
-    :return: The serial number of the token found
+    Requires admin authentication and the policy action
+    :ref:`policy_getserial`.
+
+    :param otp: path component, the observed OTP value.
+    :query type: limit the search to this token type.
+    :query serial: substring filter against token serials (e.g.
+        ``OATH``).
+    :query unassigned: ``1`` to search only unassigned tokens.
+    :query assigned: ``1`` to search only assigned tokens.
+    :query count: ``1`` to return only the number of tokens that
+        would be searched, without performing the OTP check.
+    :query window: OTP look-ahead window, default ``10``.
+    :status 200: ``{"serial": <serial-or-null>, "count": <int>}`` in
+        ``result.value``.
     """
-    ttype = getParam(request.all_data, "type")
-    unassigned_param = getParam(request.all_data, "unassigned")
-    assigned_param = getParam(request.all_data, "assigned")
-    serial_substr = getParam(request.all_data, "serial")
-    count_only = getParam(request.all_data, "count")
-    window = int(getParam(request.all_data, "window", default=10))
+    ttype = get_optional(request.all_data, "type")
+    unassigned_param = get_optional(request.all_data, "unassigned")
+    assigned_param = get_optional(request.all_data, "assigned")
+    serial_substr = get_optional(request.all_data, "serial")
+    count_only = get_optional(request.all_data, "count")
+    window = int(get_optional(request.all_data, "window", default=10))
 
     serial_substr = serial_substr or ""
 
@@ -1163,39 +1727,81 @@ def get_serial_by_otp_api(otp=None):
     if assigned_param:
         assigned = True
 
-    count = get_tokens(tokentype=ttype, serial_wildcard="*{0!s}*".format(
-            serial_substr), assigned=assigned, count=True)
+    count = get_tokens(tokentype=ttype, serial_wildcard=f"*{serial_substr!s}*", assigned=assigned, count=True)
     if not count_only:
         tokenobj_list = get_tokens(tokentype=ttype,
-                                   serial_wildcard="*{0!s}*".format(serial_substr),
+                                   serial_wildcard=f"*{serial_substr!s}*",
                                    assigned=assigned)
         serial = get_serial_by_otp(tokenobj_list, otp=otp, window=window)
 
     g.audit_object.log({"success": True,
-                        "info": u"get {0!s} by OTP. {1!s} tokens".format(
-                            serial, count)})
+                        "info": f"get {serial!s} by OTP. {count!s} tokens"})
 
     return send_result({"serial": serial,
                         "count": count})
 
 
+@token_blueprint.route('/sshkey/<serial>', methods=['GET'])
+@prepolicy(check_token_action, request, action=PolicyAction.SSHKEY_READ)
+@event("token_sshkey", request, g)
+@log_with(log)
+def get_sshkey_api(serial=None):
+    """
+    Return the decrypted public SSH key of an SSH key token.
+
+    The public key of an SSH key token is stored encrypted in the database
+    and is therefore not returned in the token list. This endpoint returns
+    the assembled public key (``<type> <key> [<comment>]``) so that it can
+    be imported into an ``authorized_keys`` file.
+
+    Before returning, the integrity checksum of the token is verified, so a
+    manipulation of the SSH key data in the database is detected.
+
+    Only active tokens are returned. Disabling or revoking an SSH key token
+    stops its key from being handed out here, just like it stops the key from
+    appearing in the authorized keys of a machine.
+
+    Requires authentication and the policy action ``sshkey_read``. Admins
+    are restricted by the realms of their policies, users can only read the
+    SSH key of their own tokens.
+
+    :param serial: path component, the serial of the SSH key token.
+    :status 200: ``{"sshkey": "<type> <key> <comment>"}`` in
+        ``result.value``.
+    """
+    user = request.User
+    toks = get_tokens(serial=serial, user=user if user and not user.is_empty() else None,
+                      tokentype="sshkey", active=True)
+    if not toks:
+        raise ResourceNotFoundError(f"No active SSH key token with serial {serial!s} found.")
+    token = toks[0]
+
+    sshkey = token.get_sshkey()
+    g.audit_object.log({"serial": serial,
+                        "token_type": "sshkey",
+                        "success": True})
+    return send_result({"sshkey": sshkey})
+
+
 @token_blueprint.route('/info/<serial>/<key>', methods=['POST'])
 @admin_required
-@prepolicy(check_base_action, request, action=ACTION.SETTOKENINFO)
+@prepolicy(check_token_action, request, action=PolicyAction.SETTOKENINFO)
 @event("token_info", request, g)
 @log_with(log)
 def set_tokeninfo_api(serial, key):
     """
-    Add a specific tokeninfo entry to a token. Already existing entries
-    with the same key are overwritten.
+    Set a single tokeninfo entry on a token. If an entry with this
+    key already exists, the value is overwritten.
 
-    :param serial: the serial number/identifier of the token
-    :param key: token info key that should be set
-    :query value: token info value that should be set
-    :return: returns value=True in case the token info could be set
-    :rtype: bool
+    Requires admin authentication and the policy action
+    ``settokeninfo``.
+
+    :param serial: path component, the token serial.
+    :param key: path component, the tokeninfo key.
+    :jsonparam value: tokeninfo value to set (required).
+    :status 200: ``True`` on success in ``result.value``.
     """
-    value = getParam(request.all_data, "value", required)
+    value = get_required(request.all_data, "value")
     g.audit_object.log({"serial": serial})
     count = add_tokeninfo(serial, key, value)
     success = count > 0
@@ -1205,18 +1811,21 @@ def set_tokeninfo_api(serial, key):
 
 @token_blueprint.route('/info/<serial>/<key>', methods=['DELETE'])
 @admin_required
-@prepolicy(check_base_action, request, action=ACTION.SETTOKENINFO)
+@prepolicy(check_token_action, request, action=PolicyAction.SETTOKENINFO)
 @event("token_info", request, g)
 @log_with(log)
 def delete_tokeninfo_api(serial, key):
     """
-    Delete a specific tokeninfo entry of a token.
+    Delete a tokeninfo entry from a token.
 
-    :param serial: the serial number/identifier of the token
-    :param key: token info key that should be deleted
-    :return: returns value=True in case a matching token was found, which does not necessarily mean
-    that the matching token had a tokeninfo value set in the first place.
-    :rtype: bool
+    Requires admin authentication and the policy action
+    ``settokeninfo``.
+
+    :param serial: path component, the token serial.
+    :param key: path component, the tokeninfo key.
+    :status 200: ``True`` if a matching token existed (which does
+        not necessarily mean the key was set on it), ``False``
+        otherwise.
     """
     g.audit_object.log({"serial": serial})
     count = delete_tokeninfo(serial, key)
@@ -1228,30 +1837,38 @@ def delete_tokeninfo_api(serial, key):
 @token_blueprint.route('/group/<serial>/<groupname>', methods=['POST'])
 @token_blueprint.route('/group/<serial>', methods=['POST'])
 @admin_required
-@prepolicy(check_base_action, request, ACTION.TOKENGROUPS)
+@prepolicy(check_token_action, request, PolicyAction.TOKENGROUPS)
 @event("token_assign_group", request, g)
 @log_with(log)
 def assign_tokengroup_api(serial, groupname=None):
     """
-    Assigns a token to a given tokengroup.
+    Modify the tokengroup membership of a token. The endpoint has
+    two shapes:
 
-    If no groupname is given, we expect a body data "groups", that
-    contains a list of tokengroups. tokengroups that are
-    not contained in this list, will be removed.
+    * with the ``<groupname>`` path component, the named tokengroup
+      is added to the token (additive, single membership).
+    * without the path component, the body must carry ``groups`` -
+      the token's membership is **replaced** with that list, so any
+      tokengroup not in ``groups`` is removed.
 
-    :jsonparam basestring serial: the serial number of the token
-    :jsonparam basestring groupname: The name of the tokengroup
-    :jsonparam list groups: A list of tokengroups
-    :return:
-    :rtype: json object
+    Requires admin authentication and the policy action
+    ``tokengroups``.
+
+    :param serial: path component, the token serial.
+    :param groupname: optional path component - if present, add this
+        tokengroup; if absent, replace membership from ``groups``.
+    :jsonparam groups: list (or comma-separated string) of
+        tokengroup names. Required when ``groupname`` is omitted;
+        ignored otherwise.
+    :status 200: ``1`` in ``result.value``.
     """
     g.audit_object.log({"serial": serial})
     if groupname:
         g.audit_object.add_to_log({'action_detail': groupname})
         assign_tokengroup(serial, tokengroup=groupname)
     else:
-        groups = getParam(request.all_data, "groups", required)
-        if type(groups) == list:
+        groups = get_required(request.all_data, "groups")
+        if isinstance(groups, list):
             group_list = groups
         else:
             group_list = [r.strip() for r in groups.split(",")]
@@ -1263,19 +1880,21 @@ def assign_tokengroup_api(serial, groupname=None):
 
 @token_blueprint.route('/group/<serial>/<groupname>', methods=['DELETE'])
 @admin_required
-@prepolicy(check_base_action, request, ACTION.TOKENGROUPS)
+@prepolicy(check_token_action, request, PolicyAction.TOKENGROUPS)
 @event("token_unassign_group", request, g)
 @log_with(log)
 def unassign_tokengroup_api(serial, groupname):
     """
-    Unassigned a token from a tokengroup.
+    Remove a single tokengroup from a token.
 
-    :jsonparam basestring serial: the serial number of the token
-    :jsonparam basestring groupname: The name of the tokengroup
-    :return:
-    :rtype: json object
+    Requires admin authentication and the policy action
+    ``tokengroups``.
+
+    :param serial: path component, the token serial.
+    :param groupname: path component, the tokengroup name.
+    :status 200: ``1`` in ``result.value``.
     """
     g.audit_object.add_to_log({'action_detail': groupname})
     unassign_tokengroup(serial, tokengroup=groupname)
-    g.audit_object.add_to_log({'success': True})
+    g.audit_object.log({'success': True})
     return send_result(1)

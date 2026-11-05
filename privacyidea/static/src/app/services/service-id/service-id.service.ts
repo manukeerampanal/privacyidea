@@ -1,0 +1,138 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { HttpClient, httpResource, HttpResourceRef } from "@angular/common/http";
+import { computed, inject, Injectable, linkedSignal, Signal, WritableSignal } from "@angular/core";
+import { PiResponse } from "@app/app.component";
+import { environment } from "@env/environment";
+import { AuthService, AuthServiceInterface } from "@services/auth/auth.service";
+import { ContentService, ContentServiceInterface } from "@services/content/content.service";
+import { NotificationService, NotificationServiceInterface } from "@services/notification/notification.service";
+import { lastValueFrom } from "rxjs";
+
+type ServiceIds = Record<string, _ServiceId>;
+
+interface _ServiceId {
+  description: string;
+  id: number;
+}
+
+export interface ServiceId {
+  servicename: string;
+  description: string;
+  id?: number;
+}
+
+export interface ServiceIdServiceInterface {
+  serviceIdResource: HttpResourceRef<PiResponse<ServiceIds> | undefined>;
+  serviceIds: WritableSignal<ServiceId[]>;
+  readonly canListServiceIds: Signal<boolean>;
+  readonly serviceIdsUnavailableReason: Signal<string | null>;
+
+  postServiceId(serviceId: ServiceId): Promise<void>;
+
+  deleteServiceId(servicename: string): Promise<void>;
+}
+
+@Injectable()
+export class ServiceIdService implements ServiceIdServiceInterface {
+  private readonly authService: AuthServiceInterface = inject(AuthService);
+  private readonly contentService: ContentServiceInterface = inject(ContentService);
+  private readonly notificationService: NotificationServiceInterface = inject(NotificationService);
+  private readonly http = inject(HttpClient);
+
+  private readonly serviceIdBaseUrl = environment.proxyUrl + "/serviceid/";
+
+  readonly canListServiceIds = computed<boolean>(() => this.authService.actionAllowed("serviceid_list"));
+  readonly serviceIdsUnavailableReason = computed<string | null>(() =>
+    this.canListServiceIds()
+      ? null
+      : $localize`:@@serviceId.unavailableNeedsListRight:Application specific password tokens cannot be enrolled: selecting the service ID needs the serviceid_list right.`
+  );
+
+  serviceIdResource = httpResource<PiResponse<ServiceIds>>(() => {
+    // On the enrollment pages only the application specific password token uses the list.
+    const onPageUsingTheList =
+      this.contentService.onExternalServiceIds() ||
+      (this.contentService.onTokenEnrollmentLikely() && this.authService.actionAllowed("enrollAPPLSPEC"));
+    if (!onPageUsingTheList || !this.canListServiceIds()) {
+      return undefined;
+    }
+    return {
+      url: this.serviceIdBaseUrl,
+      method: "GET",
+      headers: this.authService.getHeaders()
+    };
+  });
+
+  serviceIds: WritableSignal<ServiceId[]> = linkedSignal({
+    source: () => ({
+      value: this.serviceIdResource.hasValue() ? this.serviceIdResource.value() : undefined,
+      isLoading: this.serviceIdResource.isLoading(),
+      error: this.serviceIdResource.error()
+    }),
+    computation: (source, previous) => {
+      if (source.error) return [];
+      const value = source.value?.result?.value;
+      if (!value) return source.isLoading ? (previous?.value ?? []) : [];
+      return Object.entries(value).map(([servicename, { description, id }]) => ({
+        servicename,
+        description,
+        id
+      }));
+    }
+  });
+
+  async postServiceId(serviceId: ServiceId): Promise<void> {
+    const url = `${this.serviceIdBaseUrl}${encodeURIComponent(serviceId.servicename)}`;
+    const request = this.http.post<PiResponse<number>>(url, serviceId, { headers: this.authService.getHeaders() });
+
+    return lastValueFrom(request)
+      .then(() => {
+        this.notificationService.success($localize`:@@serviceId.successfullySaved:Successfully saved service ID.`);
+        this.serviceIdResource.reload();
+      })
+      .catch((error) => {
+        const message = error.error?.result?.error?.message || "";
+        this.notificationService.error(
+          $localize`:@@serviceId.failedSaveService:Failed to save service ID. ${message}:MESSAGE:`
+        );
+        throw new Error("post-failed");
+      });
+  }
+
+  async deleteServiceId(servicename: string): Promise<void> {
+    const request = this.http.delete<PiResponse<number>>(`${this.serviceIdBaseUrl}${encodeURIComponent(servicename)}`, {
+      headers: this.authService.getHeaders()
+    });
+    return lastValueFrom(request)
+      .then(() => {
+        this.notificationService.success(
+          $localize`:@@serviceId.successfullyDeleted:Successfully deleted service ID: ${servicename}:SERVICE:.`
+        );
+        this.serviceIdResource.reload();
+      })
+      .catch((error) => {
+        const message = error.error?.result?.error?.message || "";
+        this.notificationService.error(
+          $localize`:@@serviceId.failedDeleteService:Failed to delete service ID. ${message}:MESSAGE:`
+        );
+        throw new Error("delete-failed");
+      });
+  }
+}

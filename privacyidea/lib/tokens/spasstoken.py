@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  privacyIDEA is a fork of LinOTP
 #  May 08, 2014 Cornelius Kölbel
 #  License:  AGPLv3
@@ -28,9 +26,9 @@
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-__doc__="""This is the implementation of the simple pass token.
+"""This is the implementation of the simple pass token.
 The simple pass token always returns TRUE as far as the checkOTP is concerned.
-Thus a user with a simple pass token can authenticate by just providing the
+Thus, a user with a simple pass token can authenticate by just providing the
 OTP PIN of the token.
 
 This code is tested in tests/test_lib_tokens_spass
@@ -39,12 +37,11 @@ This code is tested in tests/test_lib_tokens_spass
 import logging
 from privacyidea.lib import _
 from privacyidea.lib.log import log_with
-from privacyidea.lib.tokenclass import TokenClass
+from privacyidea.lib.tokenclass import TokenClass, AuthenticationMode
 from privacyidea.lib.decorators import check_token_locked
-from privacyidea.lib.policy import SCOPE, ACTION, GROUP
+from privacyidea.lib.policy import SCOPE, GROUP
+from privacyidea.lib.policies.actions import PolicyAction
 
-optional = True
-required = False
 
 log = logging.getLogger(__name__)
 
@@ -55,10 +52,11 @@ class SpassTokenClass(TokenClass):
     It does have no OTP component. The OTP checking will always
     succeed. Of course, an OTP PIN can be used.
     """
+    mode = [AuthenticationMode.AUTHENTICATE]
+
     def __init__(self, db_token):
         TokenClass.__init__(self, db_token)
-        self.set_type(u"spass")
-        self.mode = ['authenticate']
+        self.set_type("spass")
 
     @staticmethod
     def get_class_type():
@@ -82,8 +80,8 @@ class SpassTokenClass(TokenClass):
         :return: subsection if key exists or user defined
         :rtype: dict
         """
-        res = {'type' :'spass',
-               'title' :'Simple Pass Token',
+        res = {'type': 'spass',
+               'title': 'Simple Pass Token',
                'description': _('SPass: Simple Pass token. Static passwords.'),
                'config': {},
                'user': ['enroll'],
@@ -94,12 +92,12 @@ class SpassTokenClass(TokenClass):
                'pin_scopes': [SCOPE.ADMIN, SCOPE.USER],
                'policy': {
                    SCOPE.ENROLL: {
-                       ACTION.MAXTOKENUSER: {
+                       PolicyAction.MAXTOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of SPASS tokens assigned."),
                            'group': GROUP.TOKEN
                        },
-                       ACTION.MAXACTIVETOKENUSER: {
+                       PolicyAction.MAXACTIVETOKENUSER: {
                            'type': 'int',
                            'desc': _(
                                "The user may only have this maximum number of active SPASS tokens assigned."),
@@ -145,7 +143,7 @@ class SpassTokenClass(TokenClass):
         """
         return 0
 
-    @log_with(log)
+    @log_with(log, hide_args=[1])
     @check_token_locked
     def authenticate(self, passw, user=None, options=None):
         """
@@ -157,4 +155,3 @@ class SpassTokenClass(TokenClass):
         if pin_match is True:
             otp_count = 0
         return pin_match, otp_count, None
-

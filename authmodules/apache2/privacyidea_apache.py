@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 # 2015-06-04 Cornelius Kölbel  <cornelius.koelbel@netknights.it>
 #            Initial writeup
 #
@@ -28,7 +26,7 @@ To protect an Apache directory or Location add this to your apache config::
         AuthType Basic
         AuthName "Protected Area"
         AuthBasicProvider wsgi
-        WSGIAuthUserScript /usr/share/pyshared/privacyidea_apache.py
+        WSGIAuthUserScript /path/to/privacyidea_apache.py
         Require valid-user
     </Directory>
 
@@ -40,7 +38,7 @@ import requests
 import syslog
 import traceback
 import passlib.hash
-from six.moves import configparser
+import configparser
 
 OK = True
 UNAUTHORIZED = False

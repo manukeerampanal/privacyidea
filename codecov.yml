@@ -1,0 +1,100 @@
+# Codecov configuration.
+#
+# Backend (Python) and frontend (Angular) coverage are tracked as separate
+# flags and components so one does not dilute the other when aggregated.
+#
+# Flags are set by the uploading workflows:
+#   - backend:  .github/workflows/unit-tests-mariadb.yml (DB path) and
+#               .github/workflows/unit-tests-redis.yml (Redis cache path);
+#               Codecov unions both uploads into the backend flag.
+#   - frontend: .github/workflows/webui-test.yml
+
+coverage:
+  status:
+    project:
+      # Disable the default mixed-pool status so PRs are not judged by a
+      # combined backend+frontend percentage (which moves whenever either
+      # side grows, independent of actual coverage change).
+      default: false
+      # Both project statuses are informational: they report the coverage
+      # trend but never fail a PR. The flags are only uploaded on PRs that
+      # touch their own paths and no workflow uploads on push to master, so
+      # the baseline is carried forward. With `target: auto` a stale
+      # carryforward baseline reads as a coverage drop and red-flags PRs
+      # that never touched that flag's code (e.g. a backend-only PR failing
+      # codecov/project/frontend). `patch` below is the real enforced gate.
+      backend:
+        flags:
+          - backend
+        target: auto
+        threshold: 1%
+        informational: true
+      frontend:
+        flags:
+          - frontend
+        target: auto
+        threshold: 1%
+        informational: true
+    patch:
+      default: false
+      backend:
+        flags:
+          - backend
+        # Same reasoning as for the frontend below. Two things make a bare
+        # `target: auto` bite here: a patch that adds error branches and guard
+        # clauses is held to the average of code that has few of them, and the
+        # import-time lines of a module that is imported before coverage starts
+        # in the test worker are reported as missed however well the patch is
+        # tested. Neither says the new code is untested, so allow some slack
+        # while the target still keeps new code at the level of the existing.
+        target: auto
+        threshold: 5%
+      frontend:
+        flags:
+          - frontend
+        # `target: auto` requires the patch to be covered as well as the flag
+        # already is. With a small patch that bar has no tolerance: at ~85%
+        # flag coverage a six-line patch fails on a single uncovered line,
+        # which is usually a guard clause or an error branch rather than
+        # untested logic. The threshold allows that much slack while the
+        # target keeps new frontend code at the level of the existing code.
+        target: auto
+        threshold: 5%
+
+flag_management:
+  default_rules:
+    # carryforward keeps the last known coverage for a flag when a PR does
+    # not re-upload it (e.g. a backend-only PR won't re-run webui tests).
+    carryforward: true
+  individual_flags:
+    - name: backend
+      paths:
+        - "privacyidea/"
+    - name: frontend
+      paths:
+        - "privacyidea/static/"
+
+component_management:
+  individual_components:
+    - component_id: backend
+      name: backend
+      paths:
+        - "privacyidea/**"
+        - "!privacyidea/static/**"
+        - "!privacyidea/static_old/**"
+    - component_id: frontend
+      name: frontend
+      paths:
+        - "privacyidea/static/**"
+
+comment:
+  layout: "header, diff, flags, components, files"
+  require_changes: false
+
+# Migration scripts are one-shot, version-pinned artifacts with many
+# dialect-specific branches (MariaDB/Postgres/Oracle). The coverage suite is run
+# with `-m "not migration"`, so their bodies are never executed in the uploaded
+# report and would otherwise count as pure misses. They are still exercised by
+# the migration test suite (test_migrations.py, test_sequence_ddl.py).
+ignore:
+  - "privacyidea/migrations/**"

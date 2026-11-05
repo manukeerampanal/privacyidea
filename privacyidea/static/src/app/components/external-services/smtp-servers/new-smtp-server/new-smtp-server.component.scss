@@ -1,0 +1,26 @@
+@use "styles";
+@use "@angular/material" as mat;
+
+.smtp-page-layout {
+  display: flex;
+  justify-content: center;
+}
+
+.smtp-page-container {
+  @include styles.main-component-style;
+  min-width: calc(var(--config-form-width) + 32px);
+  display: grid;
+  position: relative;
+}
+
+.smtp-dialog-content {
+  min-width: var(--config-form-width);
+  margin-left: 16px;
+}
+
+.checkbox-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}

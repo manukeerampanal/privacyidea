@@ -1,0 +1,15 @@
+@use "styles";
+
+.token-type-config-container {
+  @include styles.main-component-style;
+
+  h2 {
+    margin-bottom: 20px;
+  }
+
+  .actions-container {
+    margin-top: 20px;
+    display: flex;
+    justify-content: center;
+  }
+}

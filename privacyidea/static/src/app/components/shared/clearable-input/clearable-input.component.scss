@@ -1,0 +1,28 @@
+.input-container {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+}
+
+.input-container button {
+  top: 0px;
+  position: absolute;
+  right: -6px;
+  color: var(--grey-light-active);
+  height: 24px;
+  width: 24px;
+  padding: 0;
+}
+
+.input-container button mat-icon {
+  font-size: 24px;
+}
+
+.input-container button:not(:disabled):hover {
+  color: var(--red-light);
+  cursor: pointer;
+}
+
+.input-container button:disabled {
+  display: none;
+}

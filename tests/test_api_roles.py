@@ -1,4 +1,3 @@
-# coding: utf-8
 """
 This file tests the authentication of admin users and normal user (
 selfservice) on the REST API.
@@ -8,20 +7,21 @@ implementation is contained in api/auth.py, api/token.py api/audit.py
 import datetime
 import json
 
-from . import ldap3mock
-from .test_api_validate import LDAPDirectory
-from .base import MyApiTestCase
+from privacyidea.api.lib.postpolicy import DEFAULT_POLICY_TEMPLATE_URL
+from privacyidea.api.lib.utils import GENERIC_AUTH_FAILURE
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.policy import (SCOPE, set_policy, delete_policy,
+                                    LOGINMODE, ACTIONVALUE)
+from privacyidea.lib.realm import (set_realm, delete_realm, set_default_realm)
+from privacyidea.lib.resolver import save_resolver
 from privacyidea.lib.token import (get_tokens, remove_token, enable_token,
                                    assign_token, init_token)
-from privacyidea.lib.user import User
 from privacyidea.lib.tokenclass import AUTH_DATE_FORMAT
-from privacyidea.lib.resolver import save_resolver
-from privacyidea.models import Token
-from privacyidea.lib.realm import (set_realm, delete_realm, set_default_realm)
-from privacyidea.api.lib.postpolicy import DEFAULT_POLICY_TEMPLATE_URL
-from privacyidea.lib.policy import (ACTION, SCOPE, set_policy, delete_policy,
-                                    LOGINMODE, ACTIONVALUE)
-
+from privacyidea.lib.user import User
+from privacyidea.models import Token, db
+from . import ldap3mock
+from .base import MyApiTestCase
+from .test_api_validate import LDAPDirectory
 
 PWFILE = "tests/testdata/passwords"
 
@@ -75,8 +75,7 @@ class APIAuthTestCase(MyApiTestCase):
 
     def test_02_REMOTE_USER(self):
         # Allow remote user
-        set_policy(name="remote", scope=SCOPE.WEBUI, action="{0!s}=allowed".format(
-                                                            ACTION.REMOTE_USER))
+        set_policy(name="remote", scope=SCOPE.WEBUI, action=f"{PolicyAction.REMOTE_USER!s}=allowed")
 
         # Admin remote user
         with self.app.test_request_context('/auth', method='POST',
@@ -117,7 +116,7 @@ class APIAuthTestCase(MyApiTestCase):
 
         # Define the superuser_realm: "adminrealm"
         (added, failed) = set_realm("adminrealm",
-                                    [self.resolvername1])
+                                    [{'name': self.resolvername1}])
         self.assertTrue(len(failed) == 0)
         self.assertTrue(len(added) == 1)
 
@@ -126,7 +125,7 @@ class APIAuthTestCase(MyApiTestCase):
                                            data={"username":
                                                      "cornelius@adminrealm"},
                                            environ_base={"REMOTE_USER":
-                                                     "cornelius@adminrealm"}):
+                                                             "cornelius@adminrealm"}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
@@ -145,7 +144,7 @@ class APIAuthTestCase(MyApiTestCase):
         self.setUp_user_realm3()
         # testadmin is only allowed to view users in realm2
         set_policy(name="realmadmin", scope=SCOPE.ADMIN,
-                   action=ACTION.USERLIST, realm=self.realm3, user="testadmin")
+                   action=PolicyAction.USERLIST, realm=self.realm3, adminuser="testadmin")
 
         with self.app.test_request_context('/user/',
                                            method='GET',
@@ -161,17 +160,276 @@ class APIAuthTestCase(MyApiTestCase):
 
         delete_policy("realmadmin")
 
+    def test_03b_realmadmin_get_user_multi_realm_single_policy(self):
+        """A single policy granting userlist on multiple realms should return
+        users from all those realms when GET /user/ is called without an
+        explicit realm parameter."""
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+        self.setUp_user_realm3()
+        # Grant testadmin userlist on realm1 AND realm3
+        set_policy(name="realmadmin_multi", scope=SCOPE.ADMIN,
+                   action=PolicyAction.USERLIST,
+                   realm=[self.realm1, self.realm3],
+                   adminuser="testadmin")
+
+        with self.app.test_request_context('/user/',
+                                           method='GET',
+                                           data={},
+                                           headers={'Authorization':
+                                                        self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json.get("result")
+            realms_in_result = set(u.get("realm") for u in result.get("value"))
+            # Users from both realm1 and realm3 must appear
+            self.assertIn(self.realm1, realms_in_result)
+            self.assertIn(self.realm3, realms_in_result)
+            # But realm2 must NOT appear
+            self.assertNotIn(self.realm2, realms_in_result)
+
+        delete_policy("realmadmin_multi")
+
+    def test_03c_realmadmin_get_user_multi_policy(self):
+        """Multiple policies granting userlist on different realms should be
+        unioned — users from all granted realms should be returned."""
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+        self.setUp_user_realm3()
+        # Two separate policies, each granting one realm
+        set_policy(name="realmadmin_pol1", scope=SCOPE.ADMIN,
+                   action=PolicyAction.USERLIST,
+                   realm=self.realm1,
+                   adminuser="testadmin")
+        set_policy(name="realmadmin_pol2", scope=SCOPE.ADMIN,
+                   action=PolicyAction.USERLIST,
+                   realm=self.realm3,
+                   adminuser="testadmin")
+
+        with self.app.test_request_context('/user/',
+                                           method='GET',
+                                           data={},
+                                           headers={'Authorization':
+                                                        self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json.get("result")
+            realms_in_result = set(u.get("realm") for u in result.get("value"))
+            self.assertIn(self.realm1, realms_in_result)
+            self.assertIn(self.realm3, realms_in_result)
+            self.assertNotIn(self.realm2, realms_in_result)
+
+        # Remove the restrictive admin policies so the audit log is readable.
+        delete_policy("realmadmin_pol1")
+        delete_policy("realmadmin_pol2")
+
+        # The audit info must record the realms as a plain scalar, not a
+        # Python list-repr, even when several realms are in scope.
+        audit_entry = self.find_most_recent_audit_entry(action="GET /user/")
+        self.assertNotIn("[", audit_entry.get("info", ""), audit_entry)
+        self.assertIn(self.realm1, audit_entry.get("info", ""))
+        self.assertIn(self.realm3, audit_entry.get("info", ""))
+
+    def test_03d_realmadmin_no_realm_in_policy_means_all(self):
+        """A policy that restricts nothing should leave the realm parameter unset
+        so the endpoint queries all realms."""
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+        self.setUp_user_realm3()
+        # Policy with no target scope at all → every realm
+        set_policy(name="realmadmin_all", scope=SCOPE.ADMIN,
+                   action=PolicyAction.USERLIST,
+                   adminuser="testadmin")
+
+        try:
+            with self.app.test_request_context('/user/',
+                                               method='GET',
+                                               data={},
+                                               headers={'Authorization':
+                                                            self.at}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(res.status_code, 200, res)
+                result = res.json.get("result")
+                realms_in_result = set(u.get("realm") for u in result.get("value"))
+                # All three realms should be present
+                self.assertIn(self.realm1, realms_in_result)
+                self.assertIn(self.realm2, realms_in_result)
+                self.assertIn(self.realm3, realms_in_result)
+        finally:
+            delete_policy("realmadmin_all")
+
+    def test_03f_realmadmin_user_scoped_policy_does_not_list_every_realm(self):
+        """In an admin policy the `user` field names the user acted upon, not the acting admin.
+
+        Such a policy is a restriction a realm filter can not carry, so the listing is narrowed to the
+        named user instead: with or without a realm, the admin sees that user and nobody else, rather
+        than the whole installation.
+        """
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+        set_policy(name="realmadmin_user_scoped", scope=SCOPE.ADMIN,
+                   action=PolicyAction.USERLIST, user="cornelius")
+        try:
+            for query in ({}, {"realm": self.realm1}):
+                with self.app.test_request_context('/user/', method='GET', query_string=query,
+                                                   headers={'Authorization': self.at}):
+                    res = self.app.full_dispatch_request()
+                    self.assertEqual(200, res.status_code, res)
+                    listed = {user.get("username") for user in res.json["result"]["value"]}
+                self.assertEqual({"cornelius"}, listed, query)
+        finally:
+            delete_policy("realmadmin_user_scoped")
+
+    def test_03e_realmadmin_empty_realm_param_treated_as_absent(self):
+        # A literal empty ``realm=`` query parameter must be treated the same as
+        # omitting it entirely, so a realm-restricted admin still falls back to
+        # their granted realm(s) instead of being evaluated against realm "".
+        self.setUp_user_realms()
+        self.setUp_user_realm3()
+        set_policy(name="realmadmin_empty", scope=SCOPE.ADMIN,
+                   action=PolicyAction.USERLIST, realm=self.realm3, adminuser="testadmin")
+
+        with self.app.test_request_context('/user/',
+                                           method='GET',
+                                           data={"realm": ""},
+                                           headers={'Authorization':
+                                                        self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json.get("result")
+            for user in result.get("value"):
+                self.assertEqual(user.get("resolver"), self.resolvername3)
+
+        delete_policy("realmadmin_empty")
+
+    def test_04_auth_timelimit_maxfail(self):
+        # Test with local admin
+        set_policy(name="policy", scope=SCOPE.AUTHZ, action=f"{PolicyAction.AUTHMAXFAIL}=2/20s")
+        self.app_context.g.audit_object.clear()
+        for _ in range(2):
+            with self.app.test_request_context('/auth',
+                                               method='POST',
+                                               data={"username": self.testadmin,
+                                                     "password": "wrong"}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(res.status_code, 401)
+
+        # We now cannot authenticate even with the correct PIN
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={"username": self.testadmin,
+                                                 "password": self.testadminpw}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 401)
+            details = res.json.get("detail")
+            self.assertEqual(details.get("message"),
+                             "Only 2 failed authentications per 0:00:20 allowed.", details)
+
+        # Test with external admin
+        self.setUp_user_realms()
+        (added, failed) = set_realm("adminrealm", [{'name': self.resolvername1}])
+        self.assertTrue(len(failed) == 0)
+        self.assertTrue(len(added) == 1)
+
+        for _ in range(2):
+            with self.app.test_request_context('/auth',
+                                               method='POST',
+                                               data={"username": "selfservice@adminrealm",
+                                                     "password": "wrong"}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(res.status_code, 401)
+
+        # We now cannot authenticate even with the correct PIN
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={"username": "selfservice@adminrealm",
+                                                 "password": "test"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 401)
+            details = res.json.get("detail")
+            self.assertEqual(details.get("message"),
+                             "Only 2 failed authentications per 0:00:20 allowed.", details)
+
+        delete_policy("policy")
+        delete_realm("adminrealm")
+
+    def test_05_auth_timelimit_maxsuccess(self):
+        set_policy(name="policy", scope=SCOPE.AUTHZ, action=f"{PolicyAction.AUTHMAXSUCCESS}=2/20s")
+        self.app_context.g.audit_object.clear()
+        for _ in range(2):
+            with self.app.test_request_context('/auth',
+                                               method='POST',
+                                               data={"username": self.testadmin,
+                                                     "password": self.testadminpw}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(res.status_code, 200)
+
+        # We now cannot authenticate even with the correct PIN
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={"username": self.testadmin,
+                                                 "password": self.testadminpw}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 401)
+            details = res.json.get("detail")
+            self.assertEqual(details.get("message"),
+                             "Only 2 successful authentications per 0:00:20 allowed.", details)
+
+        # ... and not with the wrong PIN
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={"username": self.testadmin,
+                                                 "password": "wrong"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 401)
+
+        # Test with external admin
+        self.setUp_user_realms()
+        (added, failed) = set_realm("adminrealm", [{'name': self.resolvername1}])
+        self.assertTrue(len(failed) == 0)
+        self.assertTrue(len(added) == 1)
+
+        for _ in range(2):
+            with self.app.test_request_context('/auth',
+                                               method='POST',
+                                               data={"username": "selfservice",
+                                                     "password": "test"}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(res.status_code, 200)
+
+        # We now cannot authenticate even with the correct PIN
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={"username": "selfservice",
+                                                 "password": "test"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 401)
+            details = res.json.get("detail")
+            self.assertEqual(details.get("message"),
+                             "Only 2 successful authentications per 0:00:20 allowed.", details)
+
+        # ... and not with the wrong PIN
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={"username": "selfservice",
+                                                 "password": "wrong"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 401)
+
+        delete_policy("policy")
+        delete_realm("adminrealm")
+
 
 class APIAuthChallengeResponse(MyApiTestCase):
 
     def setUp(self):
         self.setUp_user_realms()
         # New token for the user "selfservice"
-        Token("hotp1", "hotp", otpkey=self.otpkey, userid=1004, resolver=self.resolvername1,
-              realm=self.realm1).save()
+        init_token({"type": "hotp", "serial": "hotp1", "otpkey": self.otpkey},
+                   user=User(uid="1004", realm=self.realm1, resolver=self.resolvername1))
         # Define HOTP token to be challenge response
-        set_policy(name="pol_cr", scope=SCOPE.AUTH, action="{0!s}=hotp".format(ACTION.CHALLENGERESPONSE))
-        set_policy(name="webuilog", scope=SCOPE.WEBUI, action="{0!s}=privacyIDEA".format(ACTION.LOGINMODE))
+        set_policy(name="pol_cr", scope=SCOPE.AUTH, action=f"{PolicyAction.CHALLENGERESPONSE!s}=hotp")
+        set_policy(name="webuilog", scope=SCOPE.WEBUI, action=f"{PolicyAction.LOGINMODE!s}=privacyIDEA")
         from privacyidea.lib.token import set_pin
         set_pin("hotp1", "pin")
 
@@ -186,9 +444,9 @@ class APIAuthChallengeResponse(MyApiTestCase):
                                            data={"username": "selfservice",
                                                  "password": "pin"}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 401, res)
+            self.assertTrue(res.status_code == 200, res)
             data = res.json
-            self.assertFalse(data.get("result").get("status"))
+            self.assertTrue(data.get("result").get("status"))
             detail = data.get("detail")
             self.assertTrue("enter otp" in detail.get("message"), detail.get("message"))
             transaction_id = detail.get("transaction_id")
@@ -206,16 +464,16 @@ class APIAuthChallengeResponse(MyApiTestCase):
 
     def test_02_auth_chal_resp_multi_token(self):
         # create another token
-        Token("hotp2", "hotp", otpkey=self.otpkey, userid=1004,
-              resolver=self.resolvername1, realm=self.realm1).save()
+        init_token({"type": "hotp", "serial": "hotp2", "otpkey": self.otpkey},
+                   user=User(uid="1004", realm=self.realm1, resolver=self.resolvername1))
         set_policy(name="pol_otppin", scope=SCOPE.AUTH,
-                   action="{0!s}={1!s}".format(ACTION.OTPPIN, ACTIONVALUE.USERSTORE))
+                   action=f"{PolicyAction.OTPPIN!s}={ACTIONVALUE.USERSTORE!s}")
         with self.app.test_request_context('/auth',
                                            method='POST',
                                            data={"username": "selfservice",
                                                  "password": 'test'}):
             res = self.app.full_dispatch_request()
-            self.assertEqual(res.status_code, 401, res)
+            self.assertEqual(res.status_code, 200, res)
             result = res.json.get('detail')
             self.assertTrue('multi_challenge' in result, result)
             self.assertEqual({'hotp1', 'hotp2'}, set([x['serial'] for x in result.get('multi_challenge')]))
@@ -229,7 +487,6 @@ class APIAuthChallengeResponse(MyApiTestCase):
 
 
 class APISelfserviceTestCase(MyApiTestCase):
-
     my_serial = "myToken"
     foreign_serial = "notMyToken"
 
@@ -238,11 +495,12 @@ class APISelfserviceTestCase(MyApiTestCase):
         For each test we need to initialize the self.at and the self.at_user
         members.
         """
+        # Clear session before each test to avoid side effects
+        db.session.expunge_all()
         self.setUp_user_realms()
-        Token(self.my_serial, tokentype="hotp", userid="1004",
-              resolver="resolver1", realm="realm1").save()
-        Token(self.foreign_serial, tokentype="hotp").save()
-
+        init_token({"type": "hotp", "serial": self.my_serial},
+                   user=User(uid="1004", realm=self.realm1, resolver="resolver1"))
+        init_token({"type": "hotp", "serial": self.foreign_serial})
 
     def tearDown(self):
         remove_token(self.my_serial)
@@ -255,7 +513,6 @@ class APISelfserviceTestCase(MyApiTestCase):
                                                  "password": "testpw"}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 401, res)
-
 
     def test_01_authenticate_admin(self):
         with self.app.test_request_context('/auth',
@@ -275,7 +532,7 @@ class APISelfserviceTestCase(MyApiTestCase):
     def test_01_authenticate_admin_from_realm(self):
         # Define an admin realm!
         (added, failed) = set_realm("adminrealm",
-                                    [self.resolvername1])
+                                    [{'name': self.resolvername1}])
         self.assertTrue(len(failed) == 0)
         self.assertTrue(len(added) == 1)
 
@@ -418,7 +675,7 @@ class APISelfserviceTestCase(MyApiTestCase):
         self.assertEqual(tokenobject.token.first_owner.resolver, "resolver1")
 
         # user can delete his own token
-        with self.app.test_request_context('/token/{0!s}'.format(serial),
+        with self.app.test_request_context(f'/token/{serial!s}',
                                            method='DELETE',
                                            headers={'Authorization':
                                                         self.at_user}):
@@ -434,7 +691,7 @@ class APISelfserviceTestCase(MyApiTestCase):
     def test_04_user_can_not_delete_another_token(self):
         self.authenticate_selfservice_user()
         assign_token(self.foreign_serial, User("cornelius", self.realm1))
-        with self.app.test_request_context('/token/{0!s}'.format(self.foreign_serial),
+        with self.app.test_request_context(f'/token/{self.foreign_serial!s}',
                                            method='DELETE',
                                            headers={'Authorization':
                                                         self.at_user}):
@@ -449,11 +706,10 @@ class APISelfserviceTestCase(MyApiTestCase):
     def test_04_user_can_not_disable_another_token(self):
         self.authenticate_selfservice_user()
         assign_token(self.foreign_serial, User("cornelius", self.realm1))
-        with self.app.test_request_context('/token/disable/{0!s}'.format(
-                                                   self.foreign_serial),
-                                           method='POST',
-                                           headers={'Authorization':
-                                                        self.at_user}):
+        with self.app.test_request_context(f'/token/disable/{self.foreign_serial!s}',
+                method='POST',
+                headers={'Authorization':
+                             self.at_user}):
             res = self.app.full_dispatch_request()
             self.assertEqual(res.status_code, 404)
             response = res.json
@@ -463,26 +719,29 @@ class APISelfserviceTestCase(MyApiTestCase):
         self.assertTrue(len(tokenobject_list) == 1, len(tokenobject_list))
         self.assertTrue(tokenobject_list[0].token.active)
 
-    def test_04_user_can_not_lost_another_token(self):
+    def test_04_user_can_not_use_lost_token(self):
+        # The lost token process is reserved for administrators, so a user is rejected for
+        # a foreign token as well as for their own one.
         self.authenticate_selfservice_user()
         assign_token(self.foreign_serial, User("cornelius", self.realm1))
-        with self.app.test_request_context('/token/lost/{0!s}'.format(
-                                                   self.foreign_serial),
-                                           method='POST',
-                                           headers={'Authorization':
-                                                        self.at_user}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 400, res)
-
+        own_token = init_token({"type": "hotp", "genkey": True},
+                               user=User("selfservice", self.realm1))
+        for serial in [self.foreign_serial, own_token.get_serial()]:
+            with self.app.test_request_context(f'/token/lost/{serial}',
+                    method='POST',
+                    headers={'Authorization':
+                                 self.at_user}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(401, res.status_code, res.json)
+        remove_token(own_token.get_serial())
 
     def test_05_user_can_disable_token(self):
         self.authenticate_selfservice_user()
         # User can not disable a token, that does not belong to him.
-        with self.app.test_request_context('/token/disable/{0!s}'.format(
-                                                   self.foreign_serial),
-                                           method='POST',
-                                           headers={'Authorization':
-                                                        self.at_user}):
+        with self.app.test_request_context(f'/token/disable/{self.foreign_serial!s}',
+                method='POST',
+                headers={'Authorization':
+                             self.at_user}):
             res = self.app.full_dispatch_request()
             self.assertEqual(res.status_code, 404)
             response = res.json
@@ -492,7 +751,7 @@ class APISelfserviceTestCase(MyApiTestCase):
         self.assertTrue(tokenobject.token.active, tokenobject.token.active)
 
         # User disables his token
-        with self.app.test_request_context('/token/disable/{0!s}'.format(self.my_serial),
+        with self.app.test_request_context(f'/token/disable/{self.my_serial!s}',
                                            method='POST',
                                            headers={'Authorization':
                                                         self.at_user}):
@@ -506,7 +765,7 @@ class APISelfserviceTestCase(MyApiTestCase):
         self.assertFalse(tokenobject.token.active, tokenobject.token.active)
 
         # User enables his token
-        with self.app.test_request_context('/token/enable/{0!s}'.format(self.my_serial),
+        with self.app.test_request_context(f'/token/enable/{self.my_serial!s}',
                                            method='POST',
                                            headers={'Authorization':
                                                         self.at_user}):
@@ -524,11 +783,10 @@ class APISelfserviceTestCase(MyApiTestCase):
         # Is token disabled?
         tokenobject = get_tokens(serial=self.foreign_serial)[0]
         self.assertFalse(tokenobject.token.active, tokenobject.token.active)
-        with self.app.test_request_context('/token/enable/{0!s}'.format(
-                                                   self.foreign_serial),
-                                           method='POST',
-                                           headers={'Authorization':
-                                                        self.at_user}):
+        with self.app.test_request_context(f'/token/enable/{self.foreign_serial!s}',
+                method='POST',
+                headers={'Authorization':
+                             self.at_user}):
             res = self.app.full_dispatch_request()
             self.assertEqual(res.status_code, 404)
             response = res.json
@@ -554,7 +812,7 @@ class APISelfserviceTestCase(MyApiTestCase):
 
         tokenobject = get_tokens(serial=self.foreign_serial)[0]
         self.assertTrue(tokenobject.token.first_owner.user_id == "1004",
-                         tokenobject.token.first_owner.user_id)
+                        tokenobject.token.first_owner.user_id)
 
         # User can unassign token
         with self.app.test_request_context('/token/unassign',
@@ -570,7 +828,6 @@ class APISelfserviceTestCase(MyApiTestCase):
 
         tokenobject = get_tokens(serial=self.foreign_serial)[0]
         self.assertEqual(tokenobject.token.first_owner, None)
-
 
         # User can not unassign token, which does not belong to him
         with self.app.test_request_context('/token/unassign',
@@ -668,7 +925,7 @@ class APISelfserviceTestCase(MyApiTestCase):
 
         set_policy(name="pol_add_info",
                    scope=SCOPE.AUTHZ,
-                   action=[ACTION.ADDUSERINRESPONSE, ACTION.ADDRESOLVERINRESPONSE],
+                   action=[PolicyAction.ADDUSERINRESPONSE, PolicyAction.ADDRESOLVERINRESPONSE],
                    realm="realm1")
 
         # Userinfo + realm/resolver are added to the response
@@ -710,17 +967,17 @@ class APISelfserviceTestCase(MyApiTestCase):
         set_policy("pol_lastauth",
                    scope=SCOPE.AUTHZ,
                    action={
-                       ACTION.LASTAUTH: "10m",
+                       PolicyAction.LASTAUTH: "10m",
                    })
         set_policy("pol_loginmode",
                    scope=SCOPE.WEBUI,
                    action={
-                       ACTION.LOGINMODE: LOGINMODE.PRIVACYIDEA,
+                       PolicyAction.LOGINMODE: LOGINMODE.PRIVACYIDEA,
                    })
         selfservice_token = init_token({"type": "spass", "pin": "somepin"},
                                        user=User("selfservice", "realm1"))
         # Last authentication was too long ago.
-        selfservice_token.add_tokeninfo(ACTION.LASTAUTH, "2016-10-10 10:10:10.000")
+        selfservice_token.write_tokeninfo(PolicyAction.LASTAUTH, "2016-10-10 10:10:10.000")
         with self.app.test_request_context('/auth',
                                            method='POST',
                                            data={"username": "selfservice@realm1",
@@ -732,7 +989,7 @@ class APISelfserviceTestCase(MyApiTestCase):
             self.assertFalse(result.get("status"), content)
             self.assertIn("long ago", content["detail"]["message"], content)
 
-        selfservice_token.add_tokeninfo(ACTION.LASTAUTH, datetime.datetime.now().strftime(AUTH_DATE_FORMAT))
+        selfservice_token.write_tokeninfo(PolicyAction.LASTAUTH, datetime.datetime.now().strftime(AUTH_DATE_FORMAT))
 
         # But now it works
         with self.app.test_request_context('/auth',
@@ -763,16 +1020,16 @@ class APISelfserviceTestCase(MyApiTestCase):
     def test_11_authz_tokentype(self):
         # Check TOKENTYPE policy action for /auth endpoint
         spass_token = init_token({"type": "spass", "pin": "somepin"},
-                                       user=User("selfservice", "realm1"))
+                                 user=User("selfservice", "realm1"))
         set_policy("pol_loginmode",
                    scope=SCOPE.WEBUI,
                    action={
-                       ACTION.LOGINMODE: LOGINMODE.PRIVACYIDEA,
+                       PolicyAction.LOGINMODE: LOGINMODE.PRIVACYIDEA,
                    })
         set_policy("pol_tokentype",
                    scope=SCOPE.AUTHZ,
                    action={
-                       ACTION.TOKENTYPE: "hotp",
+                       PolicyAction.TOKENTYPE: "hotp",
                    })
 
         # Cannot authenticate with SPASS token
@@ -791,7 +1048,7 @@ class APISelfserviceTestCase(MyApiTestCase):
         set_policy("pol_tokentype",
                    scope=SCOPE.AUTHZ,
                    action={
-                       ACTION.TOKENTYPE: "hotp spass",
+                       PolicyAction.TOKENTYPE: "hotp spass",
                    })
         with self.app.test_request_context('/auth',
                                            method='POST',
@@ -825,12 +1082,12 @@ class APISelfserviceTestCase(MyApiTestCase):
         set_policy("pol_loginmode",
                    scope=SCOPE.WEBUI,
                    action={
-                       ACTION.LOGINMODE: LOGINMODE.PRIVACYIDEA,
+                       PolicyAction.LOGINMODE: LOGINMODE.PRIVACYIDEA,
                    })
         set_policy("pol_tokeninfo",
                    scope=SCOPE.AUTHZ,
                    action={
-                       ACTION.TOKENINFO: "secure/yes/",
+                       PolicyAction.TOKENINFO: "secure/yes/",
                    })
 
         # Cannot authenticate with token that does not have a "secure" tokeninfo
@@ -879,12 +1136,12 @@ class APISelfserviceTestCase(MyApiTestCase):
         set_policy("pol_loginmode",
                    scope=SCOPE.WEBUI,
                    action={
-                       ACTION.LOGINMODE: LOGINMODE.PRIVACYIDEA,
+                       PolicyAction.LOGINMODE: LOGINMODE.PRIVACYIDEA,
                    })
         set_policy("pol_serial",
                    scope=SCOPE.AUTHZ,
                    action={
-                       ACTION.SERIAL: "GOOD.*"
+                       PolicyAction.SERIAL: "GOOD.*"
                    })
 
         # Cannot authenticate with token that does not have a "GOOD..." serial
@@ -902,7 +1159,7 @@ class APISelfserviceTestCase(MyApiTestCase):
 
         # Add a token with a suitable serial
         good_token = init_token({"type": "spass", "pin": "anotherpin", "serial": "GOOD1234"},
-                                 user=User("selfservice", "realm1"))
+                                user=User("selfservice", "realm1"))
         with self.app.test_request_context('/auth',
                                            method='POST',
                                            data={"username": "selfservice@realm1",
@@ -936,7 +1193,7 @@ class APISelfserviceTestCase(MyApiTestCase):
         set_policy("pol_loginmode",
                    scope=SCOPE.WEBUI,
                    action={
-                       ACTION.LOGINMODE: LOGINMODE.PRIVACYIDEA,
+                       PolicyAction.LOGINMODE: LOGINMODE.PRIVACYIDEA,
                    })
 
         # Without the policy, there are details in the response
@@ -954,7 +1211,7 @@ class APISelfserviceTestCase(MyApiTestCase):
         # With the policy, there aren't
         set_policy("pol_detail",
                    scope=SCOPE.AUTHZ,
-                   action=ACTION.NODETAILSUCCESS)
+                   action=PolicyAction.NODETAILSUCCESS)
         with self.app.test_request_context('/auth',
                                            method='POST',
                                            data={"username": "selfservice@realm1",
@@ -978,20 +1235,20 @@ class APISelfserviceTestCase(MyApiTestCase):
 
         # Can not set things
         with self.app.test_request_context('/token/set',
-                                            method="POST",
-                                            data={"serial": serial,
-                                                  "pin": "test"},
-                                            headers={'Authorization':
-                                                         self.at_user}):
+                                           method="POST",
+                                           data={"serial": serial,
+                                                 "pin": "test"},
+                                           headers={'Authorization':
+                                                        self.at_user}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 401, res)
 
         # Can not set token realm
-        with self.app.test_request_context('/token/realm/{0!s}'.format(serial),
-                                            method="POST",
-                                            data={"realms": "realm1"},
-                                            headers={'Authorization':
-                                                         self.at_user}):
+        with self.app.test_request_context(f'/token/realm/{serial!s}',
+                                           method="POST",
+                                           data={"realms": "realm1"},
+                                           headers={'Authorization':
+                                                        self.at_user}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 401, res)
 
@@ -999,43 +1256,40 @@ class APISelfserviceTestCase(MyApiTestCase):
         with self.app.test_request_context('/token/getserial/12345',
                                            method="GET",
                                            headers={'Authorization':
-                                                         self.at_user}):
+                                                        self.at_user}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 401, res)
 
         # Can not copy pin
         with self.app.test_request_context('/token/copypin',
-                                            method="POST",
-                                            headers={'Authorization':
-                                                         self.at_user}):
+                                           method="POST",
+                                           headers={'Authorization':
+                                                        self.at_user}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 401, res)
 
         # Can not copy user
         with self.app.test_request_context('/token/copyuser',
-                                            method="POST",
-                                            headers={'Authorization':
-                                                         self.at_user}):
+                                           method="POST",
+                                           headers={'Authorization':
+                                                        self.at_user}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 401, res)
 
         # Can not load tokens
         with self.app.test_request_context('/token/load/test.xml',
-                                            method="POST",
-                                            headers={'Authorization':
-                                                         self.at_user}):
+                                           method="POST",
+                                           headers={'Authorization':
+                                                        self.at_user}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 401, res)
 
     def test_41_webui_settings(self):
-        set_policy(name="webui1", scope=SCOPE.WEBUI, action="{0!s}={1!s}".format(
-            ACTION.TOKENPAGESIZE, 20))
-        set_policy(name="webui2", scope=SCOPE.WEBUI, action="{0!s}={1!s}".format(
-            ACTION.USERPAGESIZE, 20))
-        set_policy(name="webui3", scope=SCOPE.WEBUI, action="{0!s}={1!s}".format(
-            ACTION.LOGOUTTIME, 200))
-        set_policy(name="webui4", scope=SCOPE.WEBUI, action="{0!s}={1!s}".format(
-            ACTION.AUDITPAGESIZE, 20))
+        set_policy(name="webui1", scope=SCOPE.WEBUI, action=f"{PolicyAction.TOKENPAGESIZE!s}={20!s}")
+        set_policy(name="webui2", scope=SCOPE.WEBUI, action=f"{PolicyAction.USERPAGESIZE!s}={20!s}")
+        set_policy(name="webui3", scope=SCOPE.WEBUI, action=f"{PolicyAction.LOGOUTTIME!s}={200!s}")
+        set_policy(name="webui4", scope=SCOPE.WEBUI, action=f"{PolicyAction.AUDITPAGESIZE!s}={20!s}")
+        set_policy(name="webui5", scope=SCOPE.WEBUI, action=PolicyAction.DELETION_CONFIRMATION)
         with self.app.test_request_context('/auth',
                                            method='POST',
                                            data={"username": "selfservice@realm1",
@@ -1056,8 +1310,12 @@ class APISelfserviceTestCase(MyApiTestCase):
             self.assertTrue(result2.get("status"), res.data)
             # Test logout time
             self.assertEqual(result2.get("value").get("logout_time"), 200)
+            # check if value is True if deletion_confirmation is set
+            self.assertEqual(result.get("value").get("deletion_confirmation"), True)
 
-    def test_42_auth_timelimit_maxfail(self):
+        delete_policy("webui5")
+
+    def test_42_auth_timelimit_maxfail_auth(self):
         self.setUp_user_realm2()
         # check that AUTHMAXFAIL also takes effect for /auth with loginmode=privacyIDEA
         user = User("timelimituser", realm=self.realm2)
@@ -1067,10 +1325,10 @@ class APISelfserviceTestCase(MyApiTestCase):
 
         set_policy(name="pol_time1",
                    scope=SCOPE.AUTHZ,
-                   action="{0!s}=2/20s".format(ACTION.AUTHMAXFAIL))
+                   action=f"{PolicyAction.AUTHMAXFAIL!s}=2/20s")
         set_policy(name="pol_loginmode",
                    scope=SCOPE.WEBUI,
-                   action="{}={}".format(ACTION.LOGINMODE, LOGINMODE.PRIVACYIDEA))
+                   action=f"{PolicyAction.LOGINMODE}={LOGINMODE.PRIVACYIDEA}")
         for _ in range(2):
             with self.app.test_request_context('/auth',
                                                method='POST',
@@ -1083,12 +1341,12 @@ class APISelfserviceTestCase(MyApiTestCase):
         with self.app.test_request_context('/auth',
                                            method='POST',
                                            data={"username": "timelimituser@" + self.realm2,
-                                                 "pass": pin}):
+                                                 "password": pin}):
             res = self.app.full_dispatch_request()
             self.assertEqual(res.status_code, 401)
             details = res.json.get("detail")
             self.assertEqual(details.get("message"),
-                             "Only 2 failed authentications per 0:00:20",
+                             "Only 2 failed authentications per 0:00:20 allowed.",
                              details)
 
         # and even /validate/check does not work
@@ -1105,6 +1363,7 @@ class APISelfserviceTestCase(MyApiTestCase):
 
         delete_policy("pol_time1")
         delete_policy("pol_loginmode")
+        token.delete_token()
 
     def test_43_auth_timelimit_maxsuccess(self):
         self.setUp_user_realm2()
@@ -1116,10 +1375,10 @@ class APISelfserviceTestCase(MyApiTestCase):
 
         set_policy(name="pol_time1",
                    scope=SCOPE.AUTHZ,
-                   action="{0!s}=2/20s".format(ACTION.AUTHMAXSUCCESS))
+                   action=f"{PolicyAction.AUTHMAXSUCCESS!s}=2/20s")
         set_policy(name="pol_loginmode",
                    scope=SCOPE.WEBUI,
-                   action="{}={}".format(ACTION.LOGINMODE, LOGINMODE.PRIVACYIDEA))
+                   action=f"{PolicyAction.LOGINMODE}={LOGINMODE.PRIVACYIDEA}")
         for _ in range(2):
             with self.app.test_request_context('/auth',
                                                method='POST',
@@ -1137,7 +1396,7 @@ class APISelfserviceTestCase(MyApiTestCase):
             self.assertEqual(res.status_code, 401)
             details = res.json.get("detail")
             self.assertEqual(details.get("message"),
-                             "Only 2 successful authentications per 0:00:20",
+                             "Only 2 successful authentications per 0:00:20 allowed.",
                              details)
 
         # ... and not with the wrong PIN
@@ -1162,6 +1421,232 @@ class APISelfserviceTestCase(MyApiTestCase):
 
         delete_policy("pol_time1")
         delete_policy("pol_loginmode")
+        token.delete_token()
+
+    def test_44_auth_timelimit_maxfail_challenge_response(self):
+        # check with challenge response token
+        self.setUp_user_realm2()
+        user = User("timelimituser", realm=self.realm2)
+        pin = "spass"
+        # create a token
+        token = init_token({"type": "hotp", "genkey": True, "pin": pin}, user=user)
+        set_policy(name="policy", scope=SCOPE.AUTHZ, action=f"{PolicyAction.AUTHMAXFAIL}=2/20s")
+        set_policy(name="challenge_response", scope=SCOPE.AUTH, action=f"{PolicyAction.CHALLENGERESPONSE}=hotp")
+        self.app_context.g.audit_object.clear()
+
+        # only triggering challenges should not count for the policy
+        for _ in range(2):
+            with self.app.test_request_context('/validate/check',
+                                               method='POST',
+                                               data={"user": "timelimituser@" + self.realm2,
+                                                     "pass": pin}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(res.status_code, 200)
+                result = res.json.get("result")
+                self.assertTrue(result["status"], result)
+                self.assertFalse(result["value"], result)
+                self.assertEqual(result.get("authentication"), "CHALLENGE")
+                detail = res.json.get("detail")
+                transaction_id = detail.get("transaction_id")
+
+        # Answering the last challenge should work
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "timelimituser@" + self.realm2,
+                                                 "pass": token.get_otp()[2],
+                                                 "transaction_id": transaction_id}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200)
+            result = res.json.get("result")
+            self.assertTrue(result["status"], result)
+            self.assertTrue(result["value"], result)
+
+        # Trigger new challenge
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "timelimituser@" + self.realm2,
+                                                 "pass": pin}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200)
+            result = res.json.get("result")
+            self.assertTrue(result["status"], result)
+            self.assertFalse(result["value"], result)
+            self.assertEqual(result.get("authentication"), "CHALLENGE")
+            detail = res.json.get("detail")
+            transaction_id = detail.get("transaction_id")
+
+        # Sending wrong OTP values will block the authentication
+        for i in range(2):
+            with self.app.test_request_context('/validate/check',
+                                               method='POST',
+                                               data={"user": "timelimituser@" + self.realm2,
+                                                     "pass": "123",
+                                                     "transaction_id": transaction_id}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(res.status_code, 200)
+                result = res.json.get("result")
+                self.assertTrue(result["status"], result)
+                self.assertFalse(result["value"], result)
+                message = res.json.get("detail").get("message")
+                self.assertEqual("Response did not match the challenge.", message)
+
+        # Now sending correct OTP value also fails
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "timelimituser@" + self.realm2,
+                                                 "pass": token.get_otp()[2],
+                                                 "transaction_id": transaction_id}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200)
+            result = res.json.get("result")
+            self.assertTrue(result["status"], result)
+            self.assertFalse(result["value"], result)
+            message = res.json.get("detail").get("message")
+            self.assertEqual("Only 2 failed authentications per 0:00:20 allowed.", message)
+
+        delete_policy("policy")
+        delete_policy("challenge_response")
+
+    def test_45_auth_timelimit_maxfail_non_existing_user(self):
+        # Test that the policy also works for non-existing users
+        self.setUp_user_realm2()
+        pin = "spass"
+
+        set_policy(name="pol_time1",
+                   scope=SCOPE.AUTHZ,
+                   action=f"{PolicyAction.AUTHMAXFAIL!s}=2/20s")
+        set_policy(name="pol_loginmode",
+                   scope=SCOPE.WEBUI,
+                   action=f"{PolicyAction.LOGINMODE}={LOGINMODE.PRIVACYIDEA}")
+        for _ in range(2):
+            with self.app.test_request_context('/auth',
+                                               method='POST',
+                                               data={"username": "eve",
+                                                     "password": "wrong"}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(res.status_code, 401)
+
+        # We now cannot authenticate even with the correct PIN
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={"username": "eve",
+                                                 "password": pin}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 401)
+            details = res.json.get("detail")
+            self.assertEqual(details.get("message"),
+                             "Only 2 failed authentications per 0:00:20 allowed.",
+                             details)
+
+        # /validate/check does not work anyway, as the user does not exist
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "eve",
+                                                 "pass": pin}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 400)
+            error = res.json.get("result").get("error")
+            self.assertEqual(904, error.get("code"), error)
+            self.assertEqual("ERR904: User <eve@realm1> does not exist.", error.get("message"), error)
+
+        delete_policy("pol_time1")
+        delete_policy("pol_loginmode")
+
+    def test_46_auth_timelimit_maxfail_external_admin(self):
+        self.setUp_user_realms()
+        set_realm("adminrealm", resolvers=[{"name": self.resolvername1}])
+
+        set_policy(name="pol_time",
+                   scope=SCOPE.AUTHZ,
+                   action=f"{PolicyAction.AUTHMAXFAIL}=2/20s")
+
+        # failed auth
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={"username": "selfservice@adminrealm",
+                                                 "password": "wrong"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 401)
+
+        # failed validate check
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "selfservice@adminrealm",
+                                                 "pass": "wrong"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200)
+            result = res.json.get("result")
+            self.assertTrue(result["status"], result)
+            self.assertFalse(result["value"], result)
+
+        # We now cannot authenticate even with the correct PIN
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={"username": "selfservice@adminrealm",
+                                                 "password": "test"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 401)
+            details = res.json.get("detail")
+            self.assertEqual(details.get("message"),
+                             "Only 2 failed authentications per 0:00:20 allowed.",
+                             details)
+
+        delete_policy("pol_time")
+
+    def test_47_auth_timelimit_maxfail_webui_challenge_response(self):
+        # The two-step WebUI login (login_mode=privacyIDEA with a challenge
+        # response token) must not count the challenge-trigger step (correct
+        # password, challenge is returned) as a failed authentication.
+        self.setUp_user_realm2()
+        user = User("timelimituser", realm=self.realm2)
+        pin = "spass"
+        token = init_token({"type": "hotp", "genkey": True, "pin": pin}, user=user)
+        set_policy(name="pol_time1", scope=SCOPE.AUTHZ, action=f"{PolicyAction.AUTHMAXFAIL}=3/20s")
+        set_policy(name="pol_loginmode", scope=SCOPE.WEBUI,
+                   action=f"{PolicyAction.LOGINMODE}={LOGINMODE.PRIVACYIDEA}")
+        set_policy(name="challenge_response", scope=SCOPE.AUTH,
+                   action=f"{PolicyAction.CHALLENGERESPONSE}=hotp")
+        self.app_context.g.audit_object.clear()
+
+        # Use up all but one allowed failure with wrong passwords
+        for _ in range(2):
+            with self.app.test_request_context('/auth',
+                                               method='POST',
+                                               data={"username": "timelimituser@" + self.realm2,
+                                                     "password": "wrong"}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(res.status_code, 401)
+
+        # The correct PIN triggers the challenge (first step of the WebUI login)
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={"username": "timelimituser@" + self.realm2,
+                                                 "password": pin}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200)
+            result = res.json.get("result")
+            self.assertTrue(result["status"], result)
+            self.assertFalse(result["value"], result)
+            self.assertEqual(result.get("authentication"), "CHALLENGE")
+            transaction_id = res.json.get("detail").get("transaction_id")
+
+        # Answering the challenge with the correct OTP value must succeed:
+        # the challenge-trigger entry does not count as a failed authentication.
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={"username": "timelimituser@" + self.realm2,
+                                                 "password": token.get_otp()[2],
+                                                 "transaction_id": transaction_id}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res.json)
+            result = res.json.get("result")
+            self.assertTrue(result["status"], result)
+            self.assertTrue(result["value"], result)
+
+        delete_policy("pol_time1")
+        delete_policy("pol_loginmode")
+        delete_policy("challenge_response")
+        token.delete_token()
 
 
 class PolicyConditionsTestCase(MyApiTestCase):
@@ -1176,12 +1661,12 @@ class PolicyConditionsTestCase(MyApiTestCase):
                   'LDAPSEARCHFILTER': '(cn=*)',
                   'MULTIVALUEATTRIBUTES': '["groups"]',
                   'USERINFO': '{ "username": "cn",'
-                                  '"phone" : "telephoneNumber", '
-                                  '"mobile" : "mobile"'
-                                  ', "email" : "mail", '
-                                  '"surname" : "sn", '
-                                  '"groups": "memberOf", '
-                                  '"givenname" : "givenName" }',
+                              '"phone" : "telephoneNumber", '
+                              '"mobile" : "mobile"'
+                              ', "email" : "mail", '
+                              '"surname" : "sn", '
+                              '"groups": "memberOf", '
+                              '"givenname" : "givenName" }',
                   'UIDTYPE': 'DN',
                   "resolver": "ldapgroups",
                   "type": "ldapresolver"}
@@ -1189,7 +1674,7 @@ class PolicyConditionsTestCase(MyApiTestCase):
         r = save_resolver(params)
         self.assertTrue(r > 0)
 
-        r = set_realm("ldaprealm", resolvers=["ldapgroups"])
+        r = set_realm("ldaprealm", resolvers=[{'name': "ldapgroups"}])
         set_default_realm("ldaprealm")
         self.assertEqual(r, (["ldapgroups"], []))
 
@@ -1205,7 +1690,7 @@ class PolicyConditionsTestCase(MyApiTestCase):
 
         # disabled policy: by default, login is disabled
         with self.app.test_request_context('/policy/disabled',
-                                           json={'action': u"{}={}".format(ACTION.LOGINMODE, LOGINMODE.DISABLE),
+                                           json={'action': f"{PolicyAction.LOGINMODE}={LOGINMODE.DISABLE}",
                                                  'scope': SCOPE.WEBUI,
                                                  'realm': '',
                                                  'priority': 2,
@@ -1217,7 +1702,7 @@ class PolicyConditionsTestCase(MyApiTestCase):
 
         # userstore policy: for admins, require the userstore password
         with self.app.test_request_context('/policy/userstore',
-                                           json={'action': u"{}={}".format(ACTION.LOGINMODE, LOGINMODE.USERSTORE),
+                                           json={'action': f"{PolicyAction.LOGINMODE}={LOGINMODE.USERSTORE}",
                                                  'scope': SCOPE.WEBUI,
                                                  'realm': '',
                                                  'priority': 1,
@@ -1232,14 +1717,15 @@ class PolicyConditionsTestCase(MyApiTestCase):
 
         # privacyidea policy: for helpdesk users, require the token PIN
         with self.app.test_request_context('/policy/privacyidea',
-                                           json={'action': u"{}={}".format(ACTION.LOGINMODE, LOGINMODE.PRIVACYIDEA),
-                                                 'scope': SCOPE.WEBUI,
-                                                 'realm': '',
-                                                 'priority': 1,
-                                                 'conditions': [
-                                                     ["userinfo", "groups", "contains", "cn=helpdesk,o=test", True],
-                                                 ],
-                                                 'active': True},
+                                           json={
+                                               'action': f"{PolicyAction.LOGINMODE}={LOGINMODE.PRIVACYIDEA}",
+                                               'scope': SCOPE.WEBUI,
+                                               'realm': '',
+                                               'priority': 1,
+                                               'conditions': [
+                                                   ["userinfo", "groups", "contains", "cn=helpdesk,o=test", True],
+                                               ],
+                                               'active': True},
                                            method='POST',
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
@@ -1282,7 +1768,7 @@ class PolicyConditionsTestCase(MyApiTestCase):
             self.assertEqual(res.status_code, 401)
             result = res.json.get("result")
             self.assertFalse(result.get("status"))
-            self.assertIn("Wrong credentials", result["error"]["message"])
+            self.assertEqual(GENERIC_AUTH_FAILURE, result["error"]["message"])
 
         # manager can log in with the OTP PIN, because he is in the helpdesk group
         with self.app.test_request_context('/auth',
@@ -1301,12 +1787,12 @@ class PolicyConditionsTestCase(MyApiTestCase):
             self.assertEqual(res.status_code, 401)
             result = res.json.get("result")
             self.assertFalse(result.get("status"))
-            self.assertIn("Wrong credentials", result["error"]["message"])
+            self.assertEqual(GENERIC_AUTH_FAILURE, result["error"]["message"])
 
         # if we now disable the condition on userstore and privacyidea, we get a conflicting policy error
         with self.app.test_request_context('/policy/privacyidea',
                                            json={'scope': SCOPE.WEBUI,
-                                                 'action': u"{}={}".format(ACTION.LOGINMODE, LOGINMODE.PRIVACYIDEA),
+                                                 'action': f"{PolicyAction.LOGINMODE}={LOGINMODE.PRIVACYIDEA}",
                                                  'realm': '',
                                                  'active': True,
                                                  'conditions': [
@@ -1319,7 +1805,7 @@ class PolicyConditionsTestCase(MyApiTestCase):
 
         with self.app.test_request_context('/policy/userstore',
                                            json={'scope': SCOPE.WEBUI,
-                                                 'action': u"{}={}".format(ACTION.LOGINMODE, LOGINMODE.USERSTORE),
+                                                 'action': f"{PolicyAction.LOGINMODE}={LOGINMODE.USERSTORE}",
                                                  'realm': '',
                                                  'active': True,
                                                  'conditions': [
@@ -1384,7 +1870,7 @@ class PolicyConditionsTestCase(MyApiTestCase):
         with self.app.test_request_context('/auth',
                                            method='POST',
                                            data={"username": "bob",
-                                                 "password": u"bobpwééé"}):
+                                                 "password": "bobpwééé"}):
             res = self.app.full_dispatch_request()
             self.assertEqual(res.status_code, 200)
             result = res.json.get("result")
@@ -1475,7 +1961,8 @@ class PolicyConditionsTestCase(MyApiTestCase):
         status_code, result = _try_enroll(bob_token, 'totp')
         self.assertEqual(status_code, 403)
         self.assertFalse(result['status'])
-        self.assertIn("has conditions on tokens, but a token object is not available", result['error']['message'])
+        self.assertIn("has a condition on the section 'token' with key 'count', but a token is unavailable",
+                      result['error']['message'])
         # ... and certainly not SPASS
         status_code, result = _try_enroll(bob_token, 'spass')
         self.assertEqual(status_code, 403)

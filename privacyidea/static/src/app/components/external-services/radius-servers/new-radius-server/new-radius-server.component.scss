@@ -1,0 +1,39 @@
+@use "styles";
+
+.radius-server-page-layout {
+  display: flex;
+  justify-content: center;
+}
+
+.radius-server-page-container {
+  @include styles.main-component-style;
+  min-width: calc(var(--config-form-width) + 32px);
+  display: grid;
+  position: relative;
+}
+
+.header-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 1rem;
+
+  .action-buttons {
+    display: flex;
+    flex-direction: row;
+    gap: 16px;
+  }
+}
+
+.radius-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.checkbox-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}

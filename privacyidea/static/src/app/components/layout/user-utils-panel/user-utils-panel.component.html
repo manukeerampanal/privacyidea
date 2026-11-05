@@ -1,0 +1,85 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
+<div class="utils-group flex-row">
+  <span
+    class="padding-8"
+    [matTooltip]="profileTooltip()"
+    [matTooltipDisabled]="isLargeScreen()">
+    <mat-icon>account_circle</mat-icon>
+  </span>
+  @if (isLargeScreen()) {
+    <div class="profile-text-wrapper">
+      <span class="profile-text">
+        {{ profileText() }}
+      </span>
+      @if (localNode()) {
+        <i
+          #nodeEl
+          class="node-text"
+          [matTooltip]="localNode()!"
+          [matTooltipDisabled]="nodeEl.scrollWidth <= nodeEl.clientWidth">
+          {{ localNode() }}
+        </i>
+      }
+    </div>
+  }
+  <button
+    [routerLink]="ROUTE_PATHS.SETTINGS"
+    aria-label="UI Settings"
+    i18n-aria-label="@@common.uiSettings"
+    mat-icon-button
+    i18n-matTooltip="@@common.uiSettings"
+    matTooltip="UI Settings">
+    <mat-icon>settings</mat-icon>
+  </button>
+  <button
+    (click)="refreshPage()"
+    mat-icon-button
+    i18n-matTooltip="@@nav.refreshResources"
+    matTooltip="Refresh Resources">
+    <mat-icon>refresh</mat-icon>
+  </button>
+  <div
+    [ngClass]="[
+      sessionTimerService.remainingTime()! < 31000
+        ? 'red-light'
+        : sessionTimerService.remainingTime()! < 60000
+          ? 'yellow-light'
+          : 'on-surface-variant'
+    ]"
+    class="session-timer"
+    i18n-matTooltip="@@nav.timeUntilSession"
+    matTooltip="Time until session expires">
+    @if (sessionOverOneDay()) {
+      {{ sessionDaysText() }}
+    } @else {
+      {{ displayedTime() | date: sessionTimeFormat() : "UTC" }}
+    }
+  </div>
+  <button
+    (click)="logout()"
+    aria-label="Logout"
+    i18n-aria-label="@@common.logout"
+    mat-icon-button
+    i18n-matTooltip="@@common.logout"
+    matTooltip="Logout">
+    <mat-icon>logout</mat-icon>
+  </button>
+</div>

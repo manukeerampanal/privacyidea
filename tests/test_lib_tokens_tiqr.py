@@ -1,27 +1,26 @@
-# coding: utf-8
 """
 This test file tests the lib.tokens.tiqrtoken and lib.tokens.ocra
 This depends on lib.tokenclass
 """
-from tests import smtpmock
-from .base import MyTestCase, MyApiTestCase
-from privacyidea.lib.challenge import get_challenges
-from privacyidea.lib.tokens.tiqrtoken import TiqrTokenClass
-from privacyidea.lib.tokens.ocratoken import OcraTokenClass
-from privacyidea.lib.tokens.ocra import OCRASuite, OCRA
-from privacyidea.lib.user import User
-from privacyidea.lib.token import init_token, remove_token
-from privacyidea.lib.utils import hexlify_and_unicode
-from privacyidea.lib.error import ParameterError
-from privacyidea.lib import _
-import re
 import binascii
 import hashlib
-from six.moves.urllib.parse import urlparse
-from six.moves.urllib.parse import urlencode
-import json
+import re
+from urllib.parse import urlparse, urlencode
+
 from flask import Request, g
 from werkzeug.test import EnvironBuilder
+
+from privacyidea.lib import _
+from privacyidea.lib.challenge import get_challenges
+from privacyidea.lib.error import ParameterError
+from privacyidea.lib.token import init_token, remove_token, get_tokens, import_tokens
+from privacyidea.lib.tokens.ocra import OCRASuite, OCRA
+from privacyidea.lib.tokens.ocratoken import OcraTokenClass
+from privacyidea.lib.tokens.tiqrtoken import TiqrTokenClass
+from privacyidea.lib.user import User
+from privacyidea.lib.utils import hexlify_and_unicode
+from tests import smtpmock
+from .base import MyTestCase, MyApiTestCase
 
 
 class OCRASuiteTestCase(MyTestCase):
@@ -140,7 +139,7 @@ class OCRASuiteTestCase(MyTestCase):
         c = os.create_challenge()
         self.assertEqual(len(c), 10)
         # Test, if this is a number
-        i_c = int(c)
+        int(c)
 
 
 KEY20 = "3132333435363738393031323334353637383930"
@@ -288,27 +287,27 @@ class OCRATestCase(MyTestCase):
     def test_08_create_data_input(self):
         # The ocrasuite is stored as a unicode in the webui. As it is used for
         # the OCRA datainput, it must be internally converted to a string.
-        ocrasuite = u"OCRA-1:HOTP-SHA1-6:QN10"
+        ocrasuite = "OCRA-1:HOTP-SHA1-6:QN10"
         question = "1344454126"
         ocra_object = OCRA(ocrasuite, binascii.unhexlify(KEY20))
         r = ocra_object.create_data_input(question)
 
         # create data_input with missing counter
-        ocrasuite = u"OCRA-1:HOTP-SHA1-6:C-QN10"
-        ocra_object=OCRA(ocrasuite, binascii.unhexlify(KEY20))
+        ocrasuite = "OCRA-1:HOTP-SHA1-6:C-QN10"
+        ocra_object = OCRA(ocrasuite, binascii.unhexlify(KEY20))
         self.assertRaises(Exception, ocra_object.create_data_input, question)
 
         # create data_input with missing PIN
-        ocrasuite = u"OCRA-1:HOTP-SHA1-6:QN10-PSHA1"
-        ocra_object=OCRA(ocrasuite, binascii.unhexlify(KEY20))
+        ocrasuite = "OCRA-1:HOTP-SHA1-6:QN10-PSHA1"
+        ocra_object = OCRA(ocrasuite, binascii.unhexlify(KEY20))
         self.assertRaises(Exception, ocra_object.create_data_input, question)
 
         # create data_input with missing Timesteps
-        ocrasuite = u"OCRA-1:HOTP-SHA1-6:QN10-T1M"
-        ocra_object=OCRA(ocrasuite, binascii.unhexlify(KEY20))
+        ocrasuite = "OCRA-1:HOTP-SHA1-6:QN10-T1M"
+        ocra_object = OCRA(ocrasuite, binascii.unhexlify(KEY20))
         self.assertRaises(Exception, ocra_object.create_data_input, question)
 
-        ocrasuite = u"OCRA-1:HOTP-SHA1-8:QH40"
+        ocrasuite = "OCRA-1:HOTP-SHA1-8:QH40"
         dTAN = b"83507112  ~320,00~1399458665_G6HNVF"
         question = binascii.hexlify(hashlib.sha1(dTAN).digest())
         ocra_object = OCRA(ocrasuite, binascii.unhexlify(KEY20))
@@ -528,7 +527,7 @@ class TiQRTokenTestCase(MyApiTestCase):
         # Calculate Response with the challenge.
         response = ocra_object.get_response(challenge)
 
-        encoded_user_id = u"{!s}_{!s}".format(user, self.realm1).encode('utf-8')
+        encoded_user_id = f"{user!s}_{self.realm1!s}".encode()
         # First, send a wrong response
         req.all_data = {"response": "12345",
                         "userId": encoded_user_id,
@@ -538,7 +537,7 @@ class TiQRTokenTestCase(MyApiTestCase):
         self.assertEqual(r[0], "plain")
         # check the failed response count
         fcnt1 = token.get_max_failcount() - token.get_failcount()
-        self.assertRegexpMatches(r[1], r"INVALID_RESPONSE:{0!s}".format(fcnt1))
+        self.assertRegex(r[1], rf"INVALID_RESPONSE:{fcnt1!s}")
 
         # Try another wrong response
         req.all_data = {"response": "67890",
@@ -549,13 +548,13 @@ class TiQRTokenTestCase(MyApiTestCase):
         self.assertEqual(r[0], "plain")
         # check the failed response count
         fcnt2 = token.get_max_failcount() - token.get_failcount()
-        self.assertRegexpMatches(r[1], r"INVALID_RESPONSE:{0!s}".format(fcnt2))
+        self.assertRegex(r[1], rf"INVALID_RESPONSE:{fcnt2!s}")
         # has the failcounter decreased?
         self.assertEqual(fcnt1 - 1, fcnt2)
 
         # Check that the OTP status is still incorrect
         r = token.check_challenge_response(options={"transaction_id":
-                                                    transaction_id})
+                                                        transaction_id})
         self.assertEqual(r, -1)
 
         # Send the correct response
@@ -579,13 +578,13 @@ class TiQRTokenTestCase(MyApiTestCase):
 
         # Finally we check the OTP status:
         r = token.check_challenge_response(options={"transaction_id":
-                                                    transaction_id})
+                                                        transaction_id})
         self.assertTrue(r > 0, r)
 
         # Check the same challenge again. It will fail, since the
         # challenge was deleted from the database
         r = token.check_challenge_response(options={"transaction_id":
-                                                    transaction_id})
+                                                        transaction_id})
         self.assertTrue(r < 0, r)
 
     def test_01_create_token(self):
@@ -595,18 +594,18 @@ class TiQRTokenTestCase(MyApiTestCase):
         self._test_api_endpoint('cornelius', 'cornelius_realm1@org.privacyidea')
 
     def test_03_create_token_nonascii(self):
-        self._test_create_token(u'nönäscii')
+        self._test_create_token('nönäscii')
 
     def test_04_api_endpoint_nonascii(self):
-        self._test_api_endpoint(u'nönäscii', 'n%C3%B6n%C3%A4scii_realm1@org.privacyidea')
+        self._test_api_endpoint('nönäscii', 'n%C3%B6n%C3%A4scii_realm1@org.privacyidea')
 
     @smtpmock.activate
     def test_05_api_endpoint_with_multiple_tokens(self):
         # We test the behavior of the TiQR token with other CR tokens (ie. an email token) present
         smtpmock.setdata(response={"pi_tester@privacyidea.org": (200, 'OK')})
-        other_token = init_token({"type": "email",
-                                  "email": "some@example.com",
-                                  "pin": "somepin"}, User('selfservice', self.realm1))
+        init_token({"type": "email",
+                    "email": "some@example.com",
+                    "pin": "somepin"}, User('selfservice', self.realm1))
         pin = "tiqr"
         token = init_token({"type": "tiqr",
                             "pin": pin}, User('selfservice', self.realm1))
@@ -698,7 +697,7 @@ class TiQRTokenTestCase(MyApiTestCase):
         # Calculate Response with the challenge.
         response = ocra_object.get_response(challenge)
 
-        encoded_user_id = u"{!s}_{!s}".format("selfservice", self.realm1).encode('utf-8')
+        encoded_user_id = "{!s}_{!s}".format("selfservice", self.realm1).encode('utf-8')
         # First, send a wrong response
         req.all_data = {"response": "12345",
                         "userId": encoded_user_id,
@@ -706,11 +705,11 @@ class TiQRTokenTestCase(MyApiTestCase):
                         "operation": "login"}
         r = TiqrTokenClass.api_endpoint(req, g)
         self.assertEqual(r[0], "plain")
-        self.assertRegexpMatches(r[1], r"INVALID_RESPONSE:[0-9]+")
+        self.assertRegex(r[1], r"INVALID_RESPONSE:[0-9]+")
 
         # Check that the OTP status is still incorrect
         r = token.check_challenge_response(options={"transaction_id":
-                                                    transaction_id})
+                                                        transaction_id})
         self.assertEqual(r, -1)
 
         # Send the correct response
@@ -734,11 +733,64 @@ class TiQRTokenTestCase(MyApiTestCase):
 
         # Finally we check the OTP status:
         r = token.check_challenge_response(options={"transaction_id":
-                                                    transaction_id})
+                                                        transaction_id})
         self.assertTrue(r > 0, r)
 
         # Check the same challenge again. It will fail, since the
         # challenge was deleted from the database
         r = token.check_challenge_response(options={"transaction_id":
-                                                    transaction_id})
+                                                        transaction_id})
         self.assertTrue(r < 0, r)
+
+    def test_06_tiqr_token_export(self):
+        # This test can't be run alone
+        # Set up the tiqr token for testing
+        self._test_create_token('cornelius')
+        token = get_tokens(serial="TIQR1")[0]
+        token.set_description("this is a tiqr token export test")
+
+        # Test that all expected keys are present in the exported dictionary
+        exported_data = token.export_token()
+        expected_keys = ["serial", "type", "otpkey", "description", "issuer"]
+        self.assertTrue(set(expected_keys).issubset(exported_data.keys()))
+
+        expected_tokeninfo_keys = ["tokenkind", "ocrasuite", "session"]
+        self.assertTrue(set(expected_tokeninfo_keys).issubset(exported_data["info_list"].keys()))
+
+        # Test that the exported values match the token's data
+        self.assertEqual(exported_data["serial"], "TIQR1")
+        self.assertEqual(exported_data["type"], "tiqr")
+        self.assertEqual(exported_data["description"], "this is a tiqr token export test")
+        self.assertEqual(exported_data["info_list"]["tokenkind"], "software")
+        self.assertEqual(exported_data["issuer"], "privacyIDEA")
+
+        # Clean up
+        remove_token(token.token.serial)
+
+    def test_07_tiqr_token_import(self):
+        # Define the token data to be imported
+        token_data = [{
+            "serial": "TIQR1",
+            "type": "tiqr",
+            "description": "this is a tiqr token import test",
+            "otpkey": '',
+            "info_list": {'ocrasuite': 'OCRA-1:HOTP-SHA1-6:QN10',
+                          'session': 'c1c6664ab32f70b1dff792ac1525e7b06ea9d125',
+                          'tokenkind': 'software'},
+            "issuer": "privacyIDEA"
+        }]
+
+        # Import the token
+        import_tokens(token_data)
+
+        # Retrieve the imported token
+        token = get_tokens(serial=token_data[0]["serial"])[0]
+
+        # Verify that the token data matches the imported data
+        self.assertEqual(token.token.serial, token_data[0]["serial"])
+        self.assertEqual(token.type, token_data[0]["type"])
+        self.assertEqual(token.token.description, token_data[0]["description"])
+        self.assertEqual(token.get_tokeninfo("tokenkind"), token_data[0]["info_list"]["tokenkind"])
+
+        # Clean up
+        remove_token(token.token.serial)

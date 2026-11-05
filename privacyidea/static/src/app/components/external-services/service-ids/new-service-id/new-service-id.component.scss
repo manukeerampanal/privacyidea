@@ -1,0 +1,33 @@
+@use "styles";
+
+.service-id-page-layout {
+  display: flex;
+  justify-content: center;
+}
+
+.service-id-page-container {
+  @include styles.main-component-style;
+  min-width: calc(var(--config-form-width) + 32px);
+  display: grid;
+  position: relative;
+}
+
+.header-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  padding: 8px 16px;
+
+  .action-buttons {
+    display: flex;
+    flex-direction: row;
+    gap: 16px;
+  }
+}
+
+.service-id-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}

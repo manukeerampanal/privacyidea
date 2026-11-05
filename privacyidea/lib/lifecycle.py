@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2018-08-08   Friedrich Weber <friedrich.weber@netknights.it>
 #               Add a lifecycle module that allows to
 #               register functions to be called after the request
@@ -28,6 +26,7 @@ def register_finalizer(func):
     """
     Register ``func`` to be called after the request has ended (this includes
     cases in which an error has been thrown)
+
     :param func: a function that takes no arguments
     """
     # from http://flask.pocoo.org/snippets/53/
@@ -48,6 +47,6 @@ def call_finalizers():
             try:
                 func()
             except Exception as exx:
-                log.warning(u"Caught exception in finalizer: {!r}".format(exx))
-                log.debug(u"Exception in finalizer:", exc_info=True)
+                log.warning(f"Caught exception in finalizer: {exx!r}")
+                log.debug("Exception in finalizer:", exc_info=True)
         store['call_on_teardown'] = []

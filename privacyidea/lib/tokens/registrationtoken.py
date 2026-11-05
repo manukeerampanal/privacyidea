@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  privacyIDEA
 #  Aug 12, 2014 Cornelius Kölbel
 #  License:  AGPLv3
@@ -29,19 +27,17 @@ The code is tested in test_lib_tokens_registration.py.
 
 import logging
 
-from privacyidea.lib.utils import to_unicode
 from privacyidea.lib.tokens.passwordtoken import PasswordTokenClass
 from privacyidea.lib.log import log_with
 from privacyidea.lib.decorators import check_token_locked
 from privacyidea.lib import _
-from privacyidea.lib.policy import SCOPE, ACTION, GROUP
+from privacyidea.lib.policy import SCOPE, GROUP
+from privacyidea.lib.policies.actions import PolicyAction
 
 # We use the old default length of 24 for registration tokens
 DEFAULT_LENGTH = 24
 DEFAULT_CONTENTS = 'cn'
 
-optional = True
-required = False
 
 log = logging.getLogger(__name__)
 
@@ -94,14 +90,14 @@ class RegistrationTokenClass(PasswordTokenClass):
 
     """
 
-    password_detail_key = "registrationcode"
+    password_detail_key = "registrationcode"  # nosec B105 # key name
 
     def __init__(self, aToken):
         PasswordTokenClass.__init__(self, aToken)
         self.hKeyRequired = False
         self.otp_len = DEFAULT_LENGTH
         self.otp_contents = DEFAULT_CONTENTS
-        self.set_type(u"registration")
+        self.set_type("registration")
 
     @staticmethod
     def get_class_type():
@@ -136,12 +132,12 @@ class RegistrationTokenClass(PasswordTokenClass):
                'ui_enroll': ["admin"],
                'policy': {
                    SCOPE.ENROLL: {
-                       ACTION.MAXTOKENUSER: {
+                       PolicyAction.MAXTOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of registration tokens assigned."),
                            'group': GROUP.TOKEN
                        },
-                       ACTION.MAXACTIVETOKENUSER: {
+                       PolicyAction.MAXACTIVETOKENUSER: {
                            'type': 'int',
                            'desc': _(
                                "The user may only have this maximum number of active registration tokens assigned."),

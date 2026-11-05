@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 #  2020-09-24 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Use Argon2
 #  2017-08-11 Cornelius Kölbel <cornelius.koelbel@netknights.it>
@@ -20,40 +19,116 @@
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-from ..models import AuthCache, db
-from sqlalchemy import and_
-from passlib.hash import argon2
 import datetime
 import logging
+import re
 
-ROUNDS = 9
+from passlib.exc import PasswordSizeError
+from sqlalchemy import update, select, delete
+
+from ..models import AuthCache, db
+from ..models.utils import utc_now
+from .cache import auth as redis_auth_cache
+from .crypto import pass_hash, verify_pass_hash
+from .utils import parse_timedelta
+
 log = logging.getLogger(__name__)
 
 
+def parse_auth_cache_value(value: str) -> tuple[datetime.timedelta, datetime.timedelta | None, int]:
+    """
+    Split the value of an ``auth_cache`` policy, like ``4h``, ``4h/5m`` or ``2m/3``.
+
+    :param value: the policy value
+    :return: how long after its first authentication an entry can be used, how long
+        after its last one (``None`` if the policy does not limit that) and how often it
+        can be used (``0`` for no limit)
+    :raises TypeError: if a time in the value can not be parsed
+    """
+    auth_times = value.split("/")
+    first_offset = parse_timedelta(auth_times[0])
+    last_offset = None
+    max_auths = 0
+    if len(auth_times) == 2:
+        if re.match(r"^\d+$", auth_times[1]):
+            max_auths = int(auth_times[1])
+        else:
+            last_offset = parse_timedelta(auth_times[1])
+    return first_offset, last_offset, max_auths
+
+
+def get_idle_limit(value: str) -> datetime.timedelta:
+    """
+    How long an entry can go unused before an ``auth_cache`` policy with this value
+    stops accepting it for good.
+
+    An entry is accepted while its first authentication lies within the first interval
+    of the policy and, for a value like ``4h/5m``, its last one within the second. The
+    last authentication is never older than the first, so an entry unused for longer
+    than the shorter of the two intervals can not be accepted any more.
+
+    :param value: the policy value
+    :raises TypeError: if a time in the value can not be parsed
+    """
+    first_offset, last_offset, _max_auths = parse_auth_cache_value(value)
+    if last_offset is None:
+        return first_offset
+    return min(first_offset, last_offset)
+
+
 def _hash_password(password):
-    return argon2.using(rounds=ROUNDS).hash(password)
+    # The same hash algorithm and parameters the rest of privacyIDEA uses for passwords
+    # and PINs, so PI_HASH_ALGO_LIST and PI_HASH_ALGO_PARAMS apply here as well.
+    return pass_hash(password)
 
 
-def add_to_cache(username, realm, resolver, password):
+def add_to_cache(username: str, realm: str, resolver: str, password: str,
+                 max_age_seconds: int = None) -> int:
+    """
+    Remember a successful authentication so the next one within the policy's
+    window does not have to reach the user store.
+
+    :param username: login name of the user
+    :param realm: realm of the user
+    :param resolver: resolver name of the user
+    :param password: the password that authenticated
+    :param max_age_seconds: how long the entry may be used, from the policy.
+        Only Redis can act on it - a database row has no lifetime of its own and
+        is removed by the cleanup job instead.
+    :return: the id of the database row, or 0 if the entry went to Redis (which
+        has no row to identify) or if the password was too long to hash and so
+        was not cached at all
+    """
+    try:
+        auth_hash = _hash_password(password)
+    except PasswordSizeError:
+        # The authentication has already succeeded at this point. A password that the hash
+        # algorithm refuses to take simply does not get cached, it does not fail the request.
+        log.info(f"Not caching the authentication of {username!s}@{realm!s}: the password is "
+                 "longer than the hash algorithm accepts.")
+        return 0
+    log.debug(f'Adding record to auth cache: ({username!r}, {realm!r}, {resolver!r})')
+    if redis_auth_cache.add_to_cache(username, realm, resolver, auth_hash, max_age_seconds):
+        return 0
     # Can not store timezone aware timestamps!
-    first_auth = datetime.datetime.utcnow()
-    auth_hash = _hash_password(password)
+    first_auth = utc_now()
     record = AuthCache(username, realm, resolver, auth_hash, first_auth, first_auth)
-    log.debug('Adding record to auth cache: ({!r}, {!r}, {!r}, {!r})'.format(
-        username, realm, resolver, auth_hash))
     r = record.save()
     return r
 
 
-def update_cache(cache_id):
-    last_auth = datetime.datetime.utcnow()
-    db.session.query(AuthCache).filter(
-        AuthCache.id == cache_id).update({"last_auth": last_auth,
-                                          AuthCache.auth_count: AuthCache.auth_count + 1})
+def update_cache(cache_id: int):
+    last_auth = utc_now()
+    update_stmt = update(AuthCache).where(AuthCache.id == cache_id).values(
+        last_auth=last_auth,
+        auth_count=AuthCache.auth_count + 1
+    )
+    db.session.execute(update_stmt)
     db.session.commit()
 
 
-def delete_from_cache(username, realm, resolver, password, last_valid_cache_time=None, max_auths=0):
+def delete_from_cache(username: str, realm: str, resolver: str, password: str,
+                      last_valid_cache_time: datetime.datetime = None, max_auths: int = 0):
     """
     Deletes all authcache entries that match the user and either match the password, are expired, or have reached the
     maximum number of allowed authentications.
@@ -66,9 +141,17 @@ def delete_from_cache(username, realm, resolver, password, last_valid_cache_time
     authentication of the entry is before this time point, it is not valid anymore.
     :param max_auths: Maximum number of allowed authentications.
     """
-    cached_auths = db.session.query(AuthCache).filter(AuthCache.username == username,
-                                                      AuthCache.realm == realm,
-                                                      AuthCache.resolver == resolver).all()
+    deleted_in_redis = redis_auth_cache.delete_from_cache(username, realm, resolver, password,
+                                                         last_valid_cache_time=last_valid_cache_time,
+                                                         max_auths=max_auths)
+    if deleted_in_redis is not None:
+        return deleted_in_redis
+
+    stmt = select(AuthCache).where(AuthCache.username == username,
+                                   AuthCache.realm == realm,
+                                   AuthCache.resolver == resolver)
+    cached_auths = db.session.scalars(stmt).all()
+
     r = 0
     for cached_auth in cached_auths:
         delete_entry = False
@@ -78,73 +161,85 @@ def delete_from_cache(username, realm, resolver, password, last_valid_cache_time
                 delete_entry = True
             elif last_valid_cache_time and cached_auth.first_auth < last_valid_cache_time:
                 delete_entry = True
-            elif argon2.verify(password, cached_auth.authentication):
+            elif verify_pass_hash(password, cached_auth.authentication):
                 delete_entry = True
 
         except ValueError:
-            log.debug("Old (non-argon2) authcache entry for user {0!s}@{1!s}.".format(username, realm))
-            # Also delete old entries
+            # The stored value can not be read: either no configured algorithm recognises
+            # it, or one does but the value is malformed. passlib raises UnknownHashError
+            # for the first and a plain ValueError for the second, and both mean the entry
+            # can never verify again. An over-long password does not arrive here, because
+            # verify_pass_hash() answers that with False.
+            log.debug(f"Unreadable authcache entry for user {username!s}@{realm!s}.")
             delete_entry = True
         if delete_entry:
             r += 1
-            cached_auth.delete()
+            db.session.delete(cached_auth)
     db.session.commit()
     return r
 
 
-def cleanup(minutes):
+def cleanup(minutes: int) -> int:
     """
     Will delete all authcache entries, where last_auth column is older than
     the given minutes.
 
     :param minutes: Age of the last_authentication in minutes
-    :type minutes: int
-    :return:
+    :return: Number of deleted cache entries
     """
-    cleanuptime = datetime.datetime.utcnow() - datetime.timedelta(minutes=minutes)
-    r = db.session.query(AuthCache).filter(AuthCache.last_auth < cleanuptime).delete()
+    cleanuptime = utc_now() - datetime.timedelta(minutes=minutes)
+    delete_stmt = delete(AuthCache).where(AuthCache.last_auth < cleanuptime)
+    result = db.session.execute(delete_stmt)
     db.session.commit()
-    return r
+    return result.rowcount
 
 
 def verify_in_cache(username, realm, resolver, password, first_auth=None, last_auth=None,
                     max_auths=0):
     """
     Verify if the given credentials are cached and if the time is correct.
-    
-    :param username: 
-    :param realm: 
-    :param resolver: 
-    :param password: 
-    :param first_auth: The timestamp when the entry was first written to the 
-        cache. Only find newer entries 
-    :param last_auth: The timestamp when the entry was last successfully 
+
+    :param username:
+    :param realm:
+    :param resolver:
+    :param password:
+    :param first_auth: The timestamp when the entry was first written to the
+        cache. Only find newer entries
+    :param last_auth: The timestamp when the entry was last successfully
         verified. Only find newer entries
     :param max_auths: Maximum number of times the authcache entry can be used to skip
         authentication, as defined by ACTION.AUTH_CACHE policy. Will return False if the current number of
         authentications + 1 of the cached authentication exceeds this value.
     :type max_auths: int
-    :return: 
+    :return:
     """
-    conditions = []
+    cached = redis_auth_cache.verify_in_cache(username, realm, resolver, password,
+                                              first_auth=first_auth, last_auth=last_auth,
+                                              max_auths=max_auths)
+    if cached is not None:
+        # Redis holds the cached authentications, so its answer is the whole
+        # answer - a miss there is a miss, not a reason to look in the database
+        return cached
+
     result = False
-    conditions.append(AuthCache.username == username)
-    conditions.append(AuthCache.realm == realm)
-    conditions.append(AuthCache.resolver == resolver)
+
+    select_stmt = select(AuthCache).where(AuthCache.username == username, AuthCache.realm == realm,
+                                          AuthCache.resolver == resolver)
 
     if first_auth:
-        conditions.append(AuthCache.first_auth > first_auth)
+        select_stmt = select_stmt.where(AuthCache.first_auth > first_auth)
     if last_auth:
-        conditions.append(AuthCache.last_auth > last_auth)
+        select_stmt = select_stmt.where(AuthCache.last_auth > last_auth)
 
-    filter_condition = and_(*conditions)
-    cached_auths = AuthCache.query.filter(filter_condition).all()
+    cached_auths = db.session.scalars(select_stmt).all()
 
     for cached_auth in cached_auths:
         try:
-            result = argon2.verify(password, cached_auth.authentication)
+            result = verify_pass_hash(password, cached_auth.authentication)
         except ValueError:
-            log.debug("Old (non-argon2) authcache entry for user {0!s}@{1!s}.".format(username, realm))
+            # Both an unrecognised and a malformed stored value land here, see
+            # delete_from_cache()
+            log.debug(f"Unreadable authcache entry for user {username!s}@{realm!s}.")
             result = False
 
         if result and max_auths > 0:

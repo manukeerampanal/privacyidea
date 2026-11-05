@@ -1,0 +1,90 @@
+<!--
+ (c) NetKnights GmbH 2025,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div
+  #scrollContainer
+  appScrollToTop
+  aria-label="Token Enrollment"
+  class="token-enrollment-container"
+  i18n-aria-label="@@common.tokenEnrollment">
+  @let preTopHtml = preTopHtml$ | async;
+  @if (preTopHtml?.hasContent) {
+    <div
+      [innerHTML]="preTopHtml?.sanitized"
+      class="margin-top-16"></div>
+  } @else {
+    <h3
+      class="margin-8"
+      i18n="@@token.enrollToken"
+      >Enroll {{ tokenType().name }} Token</h3
+    >
+  }
+  <form
+    class="margin-left-16"
+    (submit)="$event.preventDefault(); enrollToken()">
+    <div class="enroll-button-container margin-top-16 margin-bottom-16">
+      <!-- A disabled button fires no hover events, so the wrapper carries the tooltip. -->
+      <span
+        [matTooltip]="enrollmentBlockedReason() ?? ''"
+        [matTooltipDisabled]="!enrollmentBlockedReason()">
+        <button
+          [disabled]="isFormInvalid()"
+          class="action-button-primary button-width-m"
+          mat-stroked-button
+          type="submit">
+          <mat-icon>add_moderator</mat-icon>
+          <span i18n="@@common.enrollToken">Enroll Token</span>
+        </button>
+      </span>
+      <button
+        (click)="reopenEnrollmentDialog()"
+        matTooltip="Reopen enrollment dialog"
+        i18n-matTooltip="@@common.reopenEnrollment"
+        [ngClass]="{ hidden: !canReopenEnrollmentDialog() }"
+        mat-icon-button
+        type="button">
+        <mat-icon>open_in_new</mat-icon>
+      </button>
+    </div>
+    <app-enroll-token-type-switch
+      [tokenTypeKey]="authService.defaultTokentype() || 'hotp'"
+      [wizard]="wizard" />
+    @if (descriptionRequired()) {
+      <mat-form-field class="input-width-l description-form">
+        <mat-label i18n="@@common.description">Description</mat-label>
+        <textarea
+          [formField]="descriptionForm"
+          i18n-placeholder="@@common.enterDescription"
+          matInput
+          placeholder="Enter description"
+          rows="3"></textarea>
+        <mat-hint align="end">{{ description().length }} / {{ tokenService.maxDescriptionLength }} </mat-hint>
+        @if (descriptionForm().errors().some(e => e.kind === 'required') && descriptionForm().touched()) {
+          <mat-error i18n="@@token.descriptionRequired">Description is <strong>required</strong>.</mat-error>
+        } @else if (descriptionForm().errors().some(e => e.kind === 'maxlength') && descriptionForm().touched()) {
+          <mat-error i18n="@@token.descriptionCannot"
+            >Description cannot exceed <strong>80 characters</strong>.</mat-error
+          >
+        }
+      </mat-form-field>
+    }
+  </form>
+  <div
+    [innerHTML]="preBottomHtml$ | async"
+    class="margin-bottom-16"></div>
+</div>

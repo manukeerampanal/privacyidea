@@ -1,0 +1,295 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { MatSuffix } from "@angular/material/form-field";
+import { InfoHintComponent } from "@components/shared/info-hint/info-hint.component";
+import { Component, computed, ElementRef, inject, linkedSignal, ViewChild, WritableSignal } from "@angular/core";
+import { MatFormField, MatHint, MatLabel } from "@angular/material/form-field";
+import { MatPaginator, PageEvent } from "@angular/material/paginator";
+import {
+  MatCell,
+  MatCellDef,
+  MatColumnDef,
+  MatHeaderCell,
+  MatHeaderCellDef,
+  MatHeaderRow,
+  MatHeaderRowDef,
+  MatNoDataRow,
+  MatRow,
+  MatRowDef,
+  MatTable,
+  MatTableDataSource
+} from "@angular/material/table";
+import { AuditData, AuditService, AuditServiceInterface } from "@services/audit/audit.service";
+import { AuthService, AuthServiceInterface } from "@services/auth/auth.service";
+import { ContentService, ContentServiceInterface } from "@services/content/content.service";
+import { TableUtilsService, TableUtilsServiceInterface } from "@services/table-utils/table-utils.service";
+import { RefocusAfterReloadDirective } from "@components/shared/directives/refocus-after-reload.directive";
+
+import { DatePipe, NgClass } from "@angular/common";
+import { MatButtonModule } from "@angular/material/button";
+import { MatCardModule } from "@angular/material/card";
+import { MatIcon, MatIconModule } from "@angular/material/icon";
+import { MatInput } from "@angular/material/input";
+import { MatTooltipModule } from "@angular/material/tooltip";
+import { RouterLink } from "@angular/router";
+import { ClearableInputComponent } from "@components/shared/clearable-input/clearable-input.component";
+import { CopyableComponent } from "@components/shared/copyable/copyable.component";
+import { ScrollToTopDirective } from "@components/shared/directives/app-scroll-to-top.directive";
+import { FilterAutocompleteDirective } from "@components/shared/directives/filter-autocomplete.directive";
+import { PaginatorCompactRangeDirective } from "@components/shared/directives/paginator-compact-range.directive";
+import { PaginatorPageSizeTooltipDirective } from "@components/shared/directives/paginator-page-size-tooltip.directive";
+import { ScrollEdgesDirective } from "@components/shared/directives/scroll-edges.directive";
+import { TableStateComponent } from "@components/shared/table-state/table-state.component";
+import { TableState } from "@core/models/table_state/table-state";
+import { FilterValue } from "@core/models/filter_value/filter_value";
+import { filterMatchTooltip, inlineFilterHint } from "@utils/filter-hint.utils";
+import { exactMatch } from "@utils/filter.utils";
+import { FilterValueButtonComponent } from "@components/shared/filter-value-button/filter-value-button.component";
+import { TruncationTooltipDirective } from "@components/shared/directives/truncation-tooltip.directive";
+
+type AuditCellRenderType =
+  | "status-span"
+  | "highlight-ok"
+  | "date"
+  | "policies-csv"
+  | "copy-filter-text"
+  | "serial-link"
+  | "container-link"
+  | "user-link"
+  | "default";
+
+const cellRenderTypeByKey: Record<string, AuditCellRenderType> = {
+  success: "status-span",
+  authentication: "status-span",
+  sig_check: "highlight-ok",
+  missing_line: "highlight-ok",
+  startdate: "date",
+  date: "date",
+  policies: "policies-csv",
+  serial: "serial-link",
+  container_serial: "container-link",
+  user: "user-link",
+  action: "copy-filter-text",
+  action_detail: "copy-filter-text",
+  info: "copy-filter-text",
+  user_agent: "copy-filter-text",
+  privacyidea_server: "copy-filter-text",
+  realm: "copy-filter-text",
+  administrator: "copy-filter-text",
+  client: "copy-filter-text",
+  resolver: "copy-filter-text"
+};
+
+// A clicked cell value names one entry, so it is matched in full - except a day, which only begins the timestamp it
+// is compared with, and a policy, which is one of several the column lists.
+const PARTIAL_MATCH_CELL_FILTER_KEYS = new Set(["startdate", "date", "policies"]);
+
+// width: the col-width-* tier (see --column-width-* in styles.scss) each column's cell is fixed
+// to. Columns left without a "width" stay flexible (long free text or a list that can overflow);
+// the ones that do have a tier and their combined sizes (see table-width() in table.scss) drive
+// the table's min-width in audit.component.scss.
+const columnKeysMap: { key: string; label: string; width?: "s" | "m" | "l" | "xl" }[] = [
+  { key: "number", label: $localize`:@@audit.number:Number`, width: "s" },
+  { key: "action", label: $localize`:@@common.action:Action`, width: "l" },
+  { key: "success", label: $localize`:@@common.successLabel:Success`, width: "s" },
+  { key: "authentication", label: $localize`:@@audit.authentication:Authentication`, width: "m" },
+  { key: "serial", label: $localize`:@@common.serial:Serial`, width: "m" },
+  { key: "container_serial", label: $localize`:@@common.containerSerial:Container Serial`, width: "m" },
+  { key: "startdate", label: $localize`:@@audit.startDate:Start Date`, width: "l" },
+  { key: "duration", label: $localize`:@@audit.duration:Duration`, width: "s" },
+  { key: "token_type", label: $localize`:@@common.tokenType:Token Type`, width: "s" },
+  { key: "user", label: $localize`:@@common.user:User`, width: "s" },
+  { key: "realm", label: $localize`:@@common.realm:Realm`, width: "s" },
+  { key: "administrator", label: $localize`:@@common.administrator:Administrator`, width: "m" },
+  { key: "action_detail", label: $localize`:@@audit.actionDetail:Action Detail` },
+  { key: "info", label: $localize`:@@audit.info:Info` },
+  { key: "policies", label: $localize`:@@common.policies:Policies` },
+  { key: "client", label: $localize`:@@common.client:Client`, width: "s" },
+  { key: "user_agent", label: $localize`:@@common.userAgent:User Agent`, width: "l" },
+  { key: "user_agent_version", label: $localize`:@@audit.userAgentVersion:User Agent Version`, width: "s" },
+  { key: "privacyidea_server", label: $localize`:@@audit.privacyideaServer:PrivacyIDEA Server`, width: "m" },
+  { key: "log_level", label: $localize`:@@audit.logLevel:Log Level`, width: "s" },
+  { key: "clearance_level", label: $localize`:@@audit.clearanceLevel:Clearance Level`, width: "s" },
+  { key: "sig_check", label: $localize`:@@audit.signatureCheck:Signature Check`, width: "s" },
+  { key: "missing_line", label: $localize`:@@audit.missingLine:Missing Line`, width: "s" },
+  { key: "resolver", label: $localize`:@@common.resolver:Resolver`, width: "s" },
+  { key: "thread_id", label: $localize`:@@audit.threadId:Thread ID`, width: "m" },
+  { key: "container_type", label: $localize`:@@common.containerType:Container Type`, width: "s" }
+];
+
+@Component({
+  selector: "app-audit",
+  imports: [
+    InfoHintComponent,
+    MatSuffix,
+    RefocusAfterReloadDirective,
+    FilterAutocompleteDirective,
+    MatCardModule,
+    MatCell,
+    MatFormField,
+    MatHint,
+    MatInput,
+    MatPaginator,
+    MatHeaderCellDef,
+    MatHeaderCell,
+    MatTable,
+    MatCellDef,
+    NgClass,
+    MatHeaderRowDef,
+    MatHeaderRow,
+    MatRowDef,
+    MatNoDataRow,
+    MatRow,
+    MatColumnDef,
+    MatLabel,
+    CopyableComponent,
+    FilterValueButtonComponent,
+    RouterLink,
+    ScrollToTopDirective,
+    ClearableInputComponent,
+    MatIcon,
+    MatButtonModule,
+    MatIconModule,
+    MatTooltipModule,
+    ScrollEdgesDirective,
+    DatePipe,
+    TableStateComponent,
+    PaginatorPageSizeTooltipDirective,
+    PaginatorCompactRangeDirective,
+    TruncationTooltipDirective
+  ],
+  templateUrl: "./audit.component.html",
+  styleUrl: "./audit.component.scss"
+})
+export class AuditComponent {
+  protected linkLabel(label: string): string {
+    return $localize`:@@common.linkLabel:${label}:LABEL: link`;
+  }
+
+  readonly columnKeysMap = columnKeysMap;
+  readonly columnKeys: string[] = this.columnKeysMap.map((column) => column.key);
+  protected readonly auditService: AuditServiceInterface = inject(AuditService);
+  protected readonly tableUtilsService: TableUtilsServiceInterface = inject(TableUtilsService);
+  protected readonly contentService: ContentServiceInterface = inject(ContentService);
+  protected readonly authService: AuthServiceInterface = inject(AuthService);
+  readonly apiFilterKeyMap = this.auditService.apiFilterKeyMap;
+  readonly filterHint = inlineFilterHint();
+  readonly filterMatchInfo = computed(() =>
+    filterMatchTooltip(
+      $localize`:@@nav.audit:Audit`,
+      [...this.auditService.apiFilterKeys, ...this.auditService.advancedApiFilterKeys],
+      (key) => this.auditService.exactMatchKeys.has(key)
+    )
+  );
+  sort = this.auditService.sort;
+
+  @ViewChild("filterHTMLInputElement", { static: false })
+  filterInput!: ElementRef<HTMLInputElement>;
+
+  totalLength: WritableSignal<number> = linkedSignal({
+    source: () => (this.auditService.auditResource.hasValue() ? this.auditService.auditResource.value() : undefined),
+    computation: (auditResource, previous) => {
+      return auditResource?.result?.value?.count ?? previous?.value ?? 0;
+    }
+  });
+  auditDataSource: WritableSignal<MatTableDataSource<AuditData>> = linkedSignal({
+    source: () => (this.auditService.auditResource.hasValue() ? this.auditService.auditResource.value() : undefined),
+    computation: (auditResource, previous) => {
+      if (auditResource) {
+        return new MatTableDataSource(auditResource.result?.value?.auditdata);
+      }
+      // A reload in flight clears the resource value before the new response arrives - keep
+      // showing the previous rows instead of flashing empty, now that the table itself stays
+      // mounted through a reload (see TableState.lastKnownCount).
+      return previous?.value ?? new MatTableDataSource<AuditData>([]);
+    }
+  });
+  readonly tableState = new TableState({
+    resource: this.auditService.auditResource,
+    count: () => this.totalLength(),
+    filterActive: () => !this.auditService.activeFilter().isEmpty,
+    allowed: () => this.authService.actionAllowed("auditlog"),
+    resetFilter: () => this.auditService.clearFilter()
+  });
+  basePageSizeOptions = [...this.tableUtilsService.pageSizeOptions()];
+  pageSizeOptions = computed(() => {
+    if (!this.basePageSizeOptions.includes(this.auditService.pageSize())) {
+      this.basePageSizeOptions.push(this.auditService.pageSize());
+      this.basePageSizeOptions.sort((a, b) => a - b);
+    }
+    return this.basePageSizeOptions;
+  });
+
+  onPageEvent(event: PageEvent) {
+    this.auditService.pageSize.set(event.pageSize);
+    this.auditService.pageIndex.set(event.pageIndex);
+  }
+
+  toggleFilter(filterKeyword: string): void {
+    this.auditService.updateFilter((current) =>
+      filterKeyword === "success"
+        ? this.tableUtilsService.toggleBooleanInFilter({
+            keyword: filterKeyword,
+            currentValue: current
+          })
+        : this.tableUtilsService.toggleKeywordInFilter({
+            keyword: filterKeyword,
+            currentValue: current
+          })
+    );
+  }
+
+  isFilterSelected(filter: string, inputValue: FilterValue): boolean {
+    return inputValue.hasKey(filter);
+  }
+
+  getFilterIconName(keyword: string): string {
+    if (keyword === "success") {
+      const value = this.auditService.activeFilter().booleanValueOfKey(keyword);
+      if (value === undefined) {
+        return "filter_alt";
+      }
+      return value ? "screen_rotation_alt" : "filter_alt_off";
+    } else {
+      const isSelected = this.auditService.activeFilter().hasKey(keyword);
+      return isSelected ? "filter_alt_off" : "filter_alt";
+    }
+  }
+
+  onKeywordClick(filterKeyword: string): void {
+    this.toggleFilter(filterKeyword);
+    this.filterInput?.nativeElement.focus();
+  }
+
+  getCellRenderType(columnKey: string): AuditCellRenderType {
+    return cellRenderTypeByKey[columnKey] ?? "default";
+  }
+
+  // info is free prose that practically never repeats, so filtering on one entry's value finds only that entry.
+  showInlineCellFilter(columnKey: string): boolean {
+    return columnKey !== "info";
+  }
+
+  // Inline "filter by this value" action on a cell: replaces whatever the column was filtered by with this value.
+  addFilterValue(columnKey: string, value: string): void {
+    const keyword = this.apiFilterKeyMap[columnKey] ?? columnKey;
+    const filterValue = PARTIAL_MATCH_CELL_FILTER_KEYS.has(keyword) ? value : exactMatch(value);
+    this.auditService.updateFilter((current) => current.addEntry(keyword, filterValue));
+  }
+}

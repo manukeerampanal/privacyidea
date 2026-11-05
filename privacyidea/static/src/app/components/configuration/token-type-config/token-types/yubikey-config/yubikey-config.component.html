@@ -1,0 +1,125 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<mat-expansion-panel>
+  <mat-expansion-panel-header>
+    <mat-panel-title i18n="@@tokenTypeConfig.yubikey">Yubikey</mat-panel-title>
+  </mat-expansion-panel-header>
+  <div class="panel-content expansion-well">
+    <p i18n="@@tokenTypeConfig.yubikeyYubico"
+      >This is a Yubikey in the Yubico Mode authenticated against privacyIDEA.</p
+    >
+    <p i18n="@@tokenTypeConfig.yubikeyEmits44">The Yubikey emits a 44 character on time password.</p>
+    <p i18n="@@tokenTypeConfig.authenticationRequestHandled"
+      >The authentication request can be handled by the default privacyIDEA
+      <a
+        href="https://privacyidea.readthedocs.io/en/latest/modules/api/validate.html"
+        target="_blank"
+        >validate API
+      </a>
+      but can also be handled by the
+      <a
+        href="https://privacyidea.readthedocs.io/en/latest/modules/lib/tokentypes/yubikey.html#privacyidea.lib.tokens.yubikeytoken.YubikeyTokenClass.api_endpoint"
+        target="_blank"
+        >Yubico Validation Protocol.
+      </a></p
+    >
+
+    <table class="table margin-bottom-16">
+      <thead>
+        <tr>
+          <th i18n="@@tokenTypeConfig.clientIdApiKey">Client ID API Key</th>
+        </tr>
+      </thead>
+      <tbody>
+        @for (key of yubikeyApiIds(); track key) {
+          <tr>
+            <td>
+              {{ key }}
+              <mat-divider class="margin-top-4" />
+            </td>
+            <td>
+              {{ formData()[key] }}
+              <mat-divider class="margin-top-4" />
+            </td>
+            <td>
+              <button
+                (click)="deleteEntry(key)"
+                mat-icon-button>
+                <mat-icon>delete</mat-icon>
+              </button>
+            </td>
+          </tr>
+        }
+      </tbody>
+    </table>
+    <div class="flex-row gap-16 ali-center">
+      <mat-form-field
+        appearance="fill"
+        class="input-width-m">
+        <mat-label i18n="@@common.clientId">Client ID</mat-label>
+        <input
+          #apiIdInput
+          (input)="newYubikeyApiId.set($any($event.target).value)"
+          [value]="newYubikeyApiId()"
+          matInput
+          pattern="^[a-zA-Z0-9._-]*$"
+          i18n-placeholder="@@common.clientId"
+          placeholder="Client ID"
+          required />
+        @if (apiIdInput.validity.valueMissing) {
+          <mat-error i18n="@@tokenTypeConfig.clientIdRequired">Client ID is <strong>required</strong></mat-error>
+        }
+        @if (apiIdInput.validity.patternMismatch) {
+          <mat-error i18n="@@tokenTypeConfig.invalidCharacters"
+            >Invalid characters. Only alphanumeric, dots, underscores and hyphens are allowed.</mat-error
+          >
+        }
+      </mat-form-field>
+
+      <mat-form-field
+        appearance="fill"
+        class="input-width-l">
+        <mat-label i18n="@@tokenTypeConfig.apiKey">API Key</mat-label>
+        <input
+          (input)="newYubikeyApiKey.set($any($event.target).value)"
+          [value]="newYubikeyApiKey()"
+          [disabled]="newYubikeyGenKey()"
+          matInput
+          i18n-placeholder="@@tokenTypeConfig.apiKey"
+          placeholder="API Key" />
+      </mat-form-field>
+
+      <mat-checkbox
+        (change)="newYubikeyGenKey.set($event.checked)"
+        [checked]="newYubikeyGenKey()"
+        class="genkey-spacing"
+        i18n="@@tokenTypeConfig.generateApiKey"
+        >Generate API Key</mat-checkbox
+      >
+    </div>
+
+    <button
+      (click)="createNewKey()"
+      class="action-button-secondary button-width-m margin-top-16"
+      mat-stroked-button>
+      <mat-icon>add</mat-icon>
+      <span i18n="@@tokenTypeConfig.add">Add</span>
+    </button>
+  </div>
+</mat-expansion-panel>

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2018-08-07   Friedrich Weber <friedrich.weber@netknights.it>
 #               Add a shared registry of SQLAlchemy engines to
 #               properly implement connection pooling for
@@ -37,10 +35,15 @@ from privacyidea.lib.framework import get_app_local_store, get_app_config_value
 log = logging.getLogger(__name__)
 
 
-class BaseEngineRegistry(object):
+class BaseEngineRegistry:
     """
     Abstract base class for engine registries.
     """
+    #: Whether an engine handed out by this registry may be held by other callers as well.
+    #: Disposing a shared engine takes the connection pool away from everyone else using the
+    #: same key, so only the requester of a private engine may dispose it.
+    shares_engines = False
+
     def get_engine(self, key, creator):
         """
         Return the engine associated with the key ``key``.
@@ -70,6 +73,8 @@ class SharedEngineRegistry(BaseEngineRegistry):
 
     It can be activated by setting ``PI_ENGINE_REGISTRY_CLASS`` to "shared".
     """
+    shares_engines = True
+
     def __init__(self):
         BaseEngineRegistry.__init__(self)
         self._engine_lock = Lock()
@@ -81,7 +86,7 @@ class SharedEngineRegistry(BaseEngineRegistry):
         # is already one associated with the given key, we use a lock.
         with self._engine_lock:
             if key not in self._engines:
-                log.info(u"Creating a new engine and connection pool for key {!s}".format(key))
+                log.info(f"Creating a new engine and connection pool for key {key!s}")
                 self._engines[key] = creator()
             return self._engines[key]
 
@@ -113,10 +118,10 @@ def get_registry():
         # create a new engine registry of the appropriate class
         registry_class_name = get_app_config_value("PI_ENGINE_REGISTRY_CLASS", DEFAULT_REGISTRY_CLASS_NAME)
         if registry_class_name not in ENGINE_REGISTRY_CLASSES:
-            log.warning(u"Unknown engine registry class: {!r}".format(registry_class_name))
+            log.warning(f"Unknown engine registry class: {registry_class_name!r}")
             registry_class_name = DEFAULT_REGISTRY_CLASS_NAME
         registry = ENGINE_REGISTRY_CLASSES[registry_class_name]()
-        log.info(u"Created a new engine registry: {!r}".format(registry))
+        log.info(f"Created a new engine registry: {registry!r}")
         return app_store.setdefault("engine_registry", registry)
 
 
@@ -126,3 +131,16 @@ def get_engine(key, creator):
     :return: an SQLAlchemy engine
     """
     return get_registry().get_engine(key, creator)
+
+
+def engines_are_shared() -> bool:
+    """
+    Whether :py:func:`get_engine` hands out engines that other callers may hold as well.
+
+    An engine from the shared registry outlives the request that asked for it, so disposing it
+    closes connections that later requests expect to find in the pool. Only an engine the
+    requester has to itself may be disposed by that requester.
+
+    :return: True if engines are shared between callers
+    """
+    return get_registry().shares_engines

@@ -5,7 +5,7 @@ import grpc
 import privacyidea.lib.caconnectors.caservice_pb2 as caservice__pb2
 
 
-class CAServiceStub(object):
+class CAServiceStub:
     """Disposition values:
     0 - Incomplete
     1 - Error
@@ -57,9 +57,19 @@ class CAServiceStub(object):
                 request_serializer=caservice__pb2.GetOptionsRequest.SerializeToString,
                 response_deserializer=caservice__pb2.GetOptionsReply.FromString,
                 )
+        self.RevokeCertificate = channel.unary_unary(
+                '/CAService/RevokeCertificate',
+                request_serializer=caservice__pb2.RevokeCertificateRequest.SerializeToString,
+                response_deserializer=caservice__pb2.RevokeCertificateReply.FromString,
+                )
+        self.GetCertificateValidity = channel.unary_unary(
+                '/CAService/GetCertificateValidity',
+                request_serializer=caservice__pb2.GetCertificateValidityRequest.SerializeToString,
+                response_deserializer=caservice__pb2.GetCertificateValidityReply.FromString,
+                )
 
 
-class CAServiceServicer(object):
+class CAServiceServicer:
     """Disposition values:
     0 - Incomplete
     1 - Error
@@ -112,6 +122,18 @@ class CAServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def RevokeCertificate(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetCertificateValidity(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_CAServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -150,6 +172,16 @@ def add_CAServiceServicer_to_server(servicer, server):
                     request_deserializer=caservice__pb2.GetOptionsRequest.FromString,
                     response_serializer=caservice__pb2.GetOptionsReply.SerializeToString,
             ),
+            'RevokeCertificate': grpc.unary_unary_rpc_method_handler(
+                    servicer.RevokeCertificate,
+                    request_deserializer=caservice__pb2.RevokeCertificateRequest.FromString,
+                    response_serializer=caservice__pb2.RevokeCertificateReply.SerializeToString,
+            ),
+            'GetCertificateValidity': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetCertificateValidity,
+                    request_deserializer=caservice__pb2.GetCertificateValidityRequest.FromString,
+                    response_serializer=caservice__pb2.GetCertificateValidityReply.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'CAService', rpc_method_handlers)
@@ -157,7 +189,7 @@ def add_CAServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class CAService(object):
+class CAService:
     """Disposition values:
     0 - Incomplete
     1 - Error
@@ -284,5 +316,39 @@ class CAService(object):
         return grpc.experimental.unary_unary(request, target, '/CAService/GetOptions',
             caservice__pb2.GetOptionsRequest.SerializeToString,
             caservice__pb2.GetOptionsReply.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def RevokeCertificate(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/CAService/RevokeCertificate',
+            caservice__pb2.RevokeCertificateRequest.SerializeToString,
+            caservice__pb2.RevokeCertificateReply.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def GetCertificateValidity(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/CAService/GetCertificateValidity',
+            caservice__pb2.GetCertificateValidityRequest.SerializeToString,
+            caservice__pb2.GetCertificateValidityReply.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)

@@ -3,88 +3,107 @@ This test file tests the lib.resolvers.py
 
 The lib.resolvers.py only depends on the database model.
 """
-import json
-from .base import MyTestCase
+import uuid
+from unittest import mock
 
-from privacyidea.lib.resolver import (save_resolver,
-                                      delete_resolver)
-
+from privacyidea.lib.container import (init_container, unassign_user, delete_container_by_serial,
+                                       get_container_realms, find_container_by_serial)
+from privacyidea.lib.error import Error, ResolverError, UserError
 from privacyidea.lib.realm import (set_realm,
                                    get_realms,
                                    get_default_realm,
                                    realm_is_defined,
                                    set_default_realm,
-                                   delete_realm)
+                                   delete_realm, export_realms, import_realms, get_realm_delete_warnings,
+                                   split_realms)
+from privacyidea.lib.resolver import (save_resolver,
+                                      delete_resolver)
+from privacyidea.lib.token import init_token, unassign_token
+from privacyidea.lib.user import User
+from privacyidea.models import CustomUserAttribute, NodeName, TokenContainerOwner, TokenOwner, db
+from .base import MyTestCase
 
 
 class ResolverTestCase(MyTestCase):
-    '''
+    """
     Test the token on the database level
-    '''
+    """
     resolvername1 = "resolver1"
     resolvername2 = "Resolver2"
     realm1 = "realm1"
     realm_dot = "realm1.com"
-    
+
     def test_01_create_realm(self):
         rid = save_resolver({"resolver": self.resolvername1,
-                               "type": "passwdresolver",
-                               "fileName": "/etc/passwd"})
+                             "type": "passwdresolver",
+                             "fileName": "/etc/passwd"})
         self.assertTrue(rid > 0, rid)
-        
+
         rid = save_resolver({"resolver": self.resolvername2,
-                               "type": "passwdresolver",
-                               "fileName": "/etc/secrets"})
+                             "type": "passwdresolver",
+                             "fileName": "/etc/secrets"})
         self.assertTrue(rid > 0, rid)
-        
+
         (added, failed) = set_realm(self.realm1,
-                                    [self.resolvername1,
-                                     self.resolvername2])
+                                    [{"name": self.resolvername1},
+                                     {"name": self.resolvername2}])
         self.assertTrue(len(failed) == 0)
         self.assertTrue(len(added) == 2)
 
         (added, failed) = set_realm(self.realm_dot,
-                                    [self.resolvername1,
-                                     self.resolvername2])
-        self.assertTrue(len(failed) == 0)
-        self.assertTrue(len(added) == 2)
+                                    [{"name": self.resolvername1},
+                                     {"name": self.resolvername2}])
+        self.assertEqual(0, len(failed))
+        self.assertEqual(2, len(added))
 
         # test the realms
         realms = get_realms()
         self.assertTrue(self.realm1 in realms, realms)
         self.assertTrue(realms.get("realm1").get("default"), realms)
         self.assertTrue(self.realm_dot in realms, realms)
+        # check that no node is set
+        self.assertEqual("", realms.get("realm1").get("resolver")[0].get("node"), realms)
+        self.assertEqual("", realms.get("realm1").get("resolver")[1].get("node"), realms)
 
         # delete dot realm
         delete_realm(self.realm_dot)
-        
+
         # try to create realm with invalid name
         self.assertRaises(Exception, set_realm, "#####")
-        
+
         # update the resolver list:
         (added, failed) = set_realm(self.realm1,
-                                    [self.resolvername1,
-                                     "non exiting"])
+                                    [{'name': self.resolvername1},
+                                     {'name': "non exiting"}])
         self.assertTrue(len(failed) == 1)
         self.assertTrue(len(added) == 1)
-        
+
         self.assertTrue(realm_is_defined(self.realm1))
         self.assertTrue(realm_is_defined("non exist") is False)
-               
+
     def test_03_get_specific_realm(self):
         realm = get_realms(self.realm1)
         self.assertTrue(self.realm1 in realm, realm)
         self.assertTrue(len(realm) == 1, realm)
-        
+
+    def test_04_split_realms(self):
+        for empty in (None, "", " , ", [], [None, ""]):
+            self.assertEqual([], split_realms(empty), empty)
+        # Realm names are lowercase and can not hold a comma, so both are safe to apply.
+        self.assertEqual(["realm1"], split_realms(" Realm1 "))
+        self.assertEqual(["realm1", "realm2"], split_realms("realm1, REALM2,realm1"))
+        self.assertEqual(["realm1", "realm2", "realm3"], split_realms(["realm1", " Realm2,realm3", None, "realm1"]))
+        self.assertEqual(["realm1"], split_realms(("realm1",)))
+
     def test_02_set_default_realm(self):
         (added, failed) = set_realm("realm2",
-                                    [self.resolvername2])
+                                    [{'name': self.resolvername2}])
         self.assertTrue(len(added) == 1)
         self.assertTrue(len(failed) == 0)
-        
+
         realm = get_default_realm()
         self.assertTrue(realm == self.realm1)
-        
+
         set_default_realm("realm2")
         realm = get_default_realm()
         self.assertTrue(realm == "realm2")
@@ -94,9 +113,258 @@ class ResolverTestCase(MyTestCase):
         self.assertTrue(realm is None, realm)
 
     def test_10_delete_realm(self):
-        delete_realm(self.realm1)
+        # user of the realm is still assigned to a token
+        token = init_token({"type": "hotp"}, User("root", self.realm1))
+        self.assertRaises(UserError, delete_realm, self.realm1)
+        unassign_token(token.get_serial())
+        # user of the realm is still assigned to a container
+        container_serial = init_container({"type": "generic", "user": "root", "realm": self.realm1})["container_serial"]
+        self.assertRaises(UserError, delete_realm, self.realm1)
+        unassign_user(container_serial, User("root", self.realm1))
+        # user of the realm still has custom user attributes: deletion is refused
+        # unless we opt in to removing them
+        user = User("root", self.realm1)
+        user.set_attribute("test_key", "test_value")
+        self.assertRaises(UserError, delete_realm, self.realm1)
+        # Deleting with delete_custom_attributes removes the realm and its custom
+        # user attributes together
+        delete_realm(self.realm1, delete_custom_attributes=True)
+        self.assertEqual(0, CustomUserAttribute.query.filter_by(Key="test_key").count())
+
+        # check that the token and container realm are also deleted
+        self.assertEqual(0, len(token.get_realms()), token.get_realms())
+        token.delete_token()
+        container_realms = get_container_realms(container_serial)
+        self.assertEqual(0, len(container_realms), container_realms)
+        delete_container_by_serial(container_serial)
+
         delete_realm("realm2")
         delete_resolver(self.resolvername1)
         delete_resolver(self.resolvername2)
         realms = get_realms()
         self.assertTrue(len(realms) == 0, realms)
+
+    def test_11_delete_realm_owner_check(self):
+        save_resolver({"resolver": self.resolvername1, "type": "passwdresolver", "fileName": "/etc/passwd"})
+        set_realm("realm3", [{"name": self.resolvername1}])
+        set_realm("realm4", [{"name": self.resolvername1}])
+        unreachable = mock.patch.object(User, "_get_user_from_userstore",
+                                        side_effect=ResolverError("Failed to perform http request"))
+
+        # the owner check does not query the resolver
+        token = init_token({"type": "hotp"}, User("root", "realm3"))
+        with unreachable:
+            self.assertRaises(UserError, delete_realm, "realm3")
+        unassign_token(token.get_serial())
+
+        # a second owner in the realm is found, although the token is not in the realm
+        token = init_token({"type": "hotp"}, User("root", "realm4"))
+        self.assertSetEqual({"realm4"}, set(token.get_realms()))
+        owner = TokenOwner(token_id=token.token.id, user_id="0", resolver=self.resolvername1,
+                           realmname="realm3").save()
+        with self.assertRaises(UserError) as cm:
+            delete_realm("realm3")
+        self.assertIn("assigned to a token", cm.exception.message)
+        db.session.delete(db.session.get(TokenOwner, owner))
+        db.session.commit()
+        token.delete_token()
+
+        # a container owner in the realm is found, although the container is not in the realm
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+        db.session.add(TokenContainerOwner(container_id=container._db_container.id, user_id="0",
+                                           resolver=self.resolvername1, realm_name="realm3"))
+        db.session.commit()
+        self.assertListEqual([], get_container_realms(container_serial))
+        with self.assertRaises(UserError) as cm:
+            delete_realm("realm3")
+        self.assertIn("assigned to a container", cm.exception.message)
+        delete_container_by_serial(container_serial)
+
+        # without assignments the realm is deleted although the resolver is unreachable
+        with unreachable:
+            delete_realm("realm3")
+        self.assertNotIn("realm3", get_realms())
+
+        delete_realm("realm4")
+        delete_resolver(self.resolvername1)
+
+    def test_20_realms_with_nodes(self):
+        nd1_uuid = "8e4272a9-9037-40df-8aa3-976e4a04b5a9"
+        nd2_uuid = "d1d7fde6-330f-4c12-88f3-58a1752594bf"
+        node1 = NodeName(id=nd1_uuid, name="Node1")
+        node2 = NodeName(id=nd2_uuid, name="Node2")
+        db.session.add_all([node1, node2])
+
+        save_resolver({"resolver": self.resolvername1,
+                       "type": "passwdresolver",
+                       "fileName": "/etc/passwd"})
+
+        save_resolver({"resolver": self.resolvername2,
+                       "type": "passwdresolver",
+                       "fileName": "/etc/secrets"})
+
+        (added, failed) = set_realm("realm1",
+                                    [
+                                        {'name': self.resolvername1,
+                                         'node': uuid.UUID(nd1_uuid)}])
+        self.assertIn(self.resolvername1, added, added)
+        self.assertEqual(len(failed), 0, failed)
+        realms_dict = get_realms()
+        self.assertIn("realm1", realms_dict, realms_dict)
+        resolver_list = realms_dict["realm1"]["resolver"]
+        self.assertEqual(len(resolver_list), 1, realms_dict)
+        self.assertEqual(resolver_list[0]["node"], nd1_uuid, resolver_list)
+
+        # overwrite/update existing realm with resolvers with different nodes
+        (added, failed) = set_realm("realm1",
+                                    [
+                                        {'name': self.resolvername1,
+                                         'node': uuid.UUID(nd1_uuid)},
+                                        {'name': self.resolvername1,
+                                         'node': uuid.UUID(nd2_uuid)}])
+        self.assertIn(self.resolvername1, added, added)
+        self.assertEqual(len(failed), 0, failed)
+        realms_dict = get_realms()
+        self.assertIn("realm1", realms_dict, realms_dict)
+        resolver_list = realms_dict["realm1"]["resolver"]
+        self.assertEqual(len(resolver_list), 2, realms_dict)
+        self.assertIn(nd1_uuid, [x.get('node') for x in resolver_list], resolver_list)
+        self.assertIn(nd2_uuid, [x.get('node') for x in resolver_list], resolver_list)
+
+        # different resolvers, one with node, one without
+        (added, failed) = set_realm("realm1",
+                                    [
+                                        {'name': self.resolvername1,
+                                         'node': uuid.UUID(nd1_uuid)},
+                                        {'name': self.resolvername2}])
+        self.assertIn(self.resolvername1, added, added)
+        self.assertIn(self.resolvername2, added, added)
+        self.assertEqual(len(failed), 0, failed)
+        realms_dict = get_realms()
+        self.assertIn("realm1", realms_dict, realms_dict)
+        resolver_list = realms_dict["realm1"]["resolver"]
+        self.assertEqual(len(resolver_list), 2, realms_dict)
+        self.assertEqual(
+            nd1_uuid,
+            next(x.get('node') for x in resolver_list if x.get("name") == self.resolvername1),
+            resolver_list)
+        self.assertEqual(
+            "",
+            next(x.get('node') for x in resolver_list if x.get("name") == self.resolvername2),
+            resolver_list)
+
+        # different resolvers, different nodes
+        (added, failed) = set_realm("realm1",
+                                    [
+                                        {'name': self.resolvername1,
+                                         'node': uuid.UUID(nd1_uuid)},
+                                        {'name': self.resolvername2,
+                                         'node': uuid.UUID(nd2_uuid)}])
+        self.assertIn(self.resolvername1, added, added)
+        self.assertIn(self.resolvername2, added, added)
+        self.assertEqual(len(failed), 0, failed)
+        realms_dict = get_realms()
+        self.assertIn("realm1", realms_dict, realms_dict)
+        resolver_list = realms_dict["realm1"]["resolver"]
+        self.assertEqual(len(resolver_list), 2, realms_dict)
+        self.assertEqual(
+            nd1_uuid,
+            next(x.get('node') for x in resolver_list if x.get("name") == self.resolvername1),
+            resolver_list)
+        self.assertEqual(
+            nd2_uuid,
+            next(x.get('node') for x in resolver_list if x.get("name") == self.resolvername2),
+            resolver_list)
+
+        delete_realm('realm1')
+        db.session.delete(node1)
+        db.session.delete(node2)
+
+    def test_30_realm_import_export(self):
+        nd1_uuid = "8e4272a9-9037-40df-8aa3-976e4a04b5a9"
+        nd2_uuid = "d1d7fde6-330f-4c12-88f3-58a1752594bf"
+        node1 = NodeName(id=nd1_uuid, name="Node1")
+        node2 = NodeName(id=nd2_uuid, name="Node2")
+        db.session.add_all([node1, node2])
+
+        save_resolver({"resolver": self.resolvername1,
+                       "type": "passwdresolver",
+                       "fileName": "/etc/passwd"})
+
+        save_resolver({"resolver": self.resolvername2,
+                       "type": "passwdresolver",
+                       "fileName": "/etc/secrets"})
+
+        set_realm("realm1",
+                  [
+                      {'name': self.resolvername1,
+                       'node': uuid.UUID(nd1_uuid)},
+                      {'name': self.resolvername1}])
+        realm_exp = export_realms("realm1")
+        self.assertIn("realm1", realm_exp, realm_exp)
+        self.assertTrue(realm_exp["realm1"]["default"], realm_exp)
+        self.assertIn(self.resolvername1, [x["name"] for x in realm_exp["realm1"]["resolver"]], realm_exp)
+        self.assertIn(nd1_uuid, [x["node"] for x in realm_exp["realm1"]["resolver"]], realm_exp)
+
+        import_dict = {
+            'realm2': {'id': 2, 'option': '', 'default': False, 'resolver': [
+                {'priority': None, 'name': 'Resolver2', 'type': 'passwdresolver',
+                 'node': nd2_uuid},
+                {'priority': None, 'name': 'resolver1', 'type': 'passwdresolver',
+                 'node': ''}]}}
+
+        import_realms(import_dict)
+        realms_dict = get_realms()
+        self.assertEqual(len(realms_dict), 2, realms_dict)
+        self.assertIn("realm2", realms_dict, realms_dict)
+        resolver_list = realms_dict["realm2"]["resolver"]
+        self.assertEqual(len(resolver_list), 2, realms_dict)
+        self.assertIn(nd2_uuid, [x.get('node') for x in resolver_list], resolver_list)
+        self.assertIn(self.resolvername2, [x.get('name') for x in resolver_list], resolver_list)
+
+        delete_realm('realm1')
+        delete_realm('realm2')
+        delete_resolver("resolver1")
+        delete_resolver("Resolver2")
+
+    def test_30_delete_realm_warns_about_conditional_access_policies(self):
+        from privacyidea.lib.conditional_access.policy import (create_conditional_access_policy,
+                                                                delete_conditional_access_policy)
+
+        rid = save_resolver({"resolver": self.resolvername1,
+                             "type": "passwdresolver",
+                             "fileName": "/etc/passwd"})
+        self.assertTrue(rid > 0, rid)
+        set_realm(self.realm1, [{"name": self.resolvername1}])
+
+        stages = [{"failure_threshold": 3,
+                  "actions": [{"action_type": "LOCK_USER", "action_value": {"duration_seconds": 600}}]}]
+        excludes_id = create_conditional_access_policy(
+            name="excludes_realm1", time_window_seconds=3600, counter_types_to_track=["MFA_FAIL"],
+            stages=stages, target="user", priority=1,
+            conditions=[{"condition_type": "USER_REALM", "operator": "NOT_IN", "value": [self.realm1]}])
+        restricted_id = create_conditional_access_policy(
+            name="restricted_to_realm1", time_window_seconds=3600, counter_types_to_track=["MFA_FAIL"],
+            stages=stages, target="user", priority=2,
+            conditions=[{"condition_type": "USER_REALM", "operator": "IN", "value": [self.realm1]}])
+
+        warnings = get_realm_delete_warnings(self.realm1)
+        self.assertEqual(warnings["custom_attribute_keys"], [])
+        self.assertEqual(sorted(warnings["ca_policy_names"]), ["excludes_realm1", "restricted_to_realm1"])
+
+        with self.assertRaises(UserError) as cm:
+            delete_realm(self.realm1)
+        self.assertEqual(cm.exception.id, Error.REALM_DELETE_CA_POLICY_REFERENCE)
+        self.assertIn("excludes_realm1", cm.exception.message)
+        self.assertIn("restricted_to_realm1", cm.exception.message)
+
+        with self.assertLogs("privacyidea.lib.realm", level="WARNING") as logs:
+            delete_realm(self.realm1, confirm_ca_policies=True)
+        warnings = "\n".join(logs.output)
+        self.assertIn("excludes_realm1", warnings)
+        self.assertIn("restricted_to_realm1", warnings)
+
+        delete_conditional_access_policy(excludes_id)
+        delete_conditional_access_policy(restricted_id)
+        delete_resolver(self.resolvername1)

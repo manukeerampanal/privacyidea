@@ -1,0 +1,75 @@
+@use "styles";
+@use "table";
+
+:host {
+  display: block;
+}
+
+.mapping-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 32px 0 16px 0;
+}
+
+@include table.base-table-structure(".mapping-table");
+
+.mapping-table {
+  width: 100%;
+  margin-bottom: 1rem;
+
+  .mat-column-privacyideaAttr,
+  .mat-column-userStoreAttr {
+    width: 300px;
+  }
+
+  .mat-column-actions {
+    width: 80px;
+    text-align: center;
+  }
+
+  td,
+  th {
+    background: var(--table-color);
+    --mat-form-field-filled-container-color: var(--table-color);
+  }
+}
+
+.actions-buttons {
+  display: flex;
+  gap: 0.25rem;
+  justify-content: center;
+  align-items: center;
+}
+
+// Sits inside a raised expansion panel, so the shallow recess.
+.auth-panel-body {
+  @include styles.card-recessed(3);
+  padding: 16px;
+}
+
+.auth-description {
+  margin: 0 0 12px 0;
+  opacity: 0.8;
+  max-width: 800px;
+}
+
+.hint {
+  font-size: var(--mat-sys-body-small-size);
+  color: var(--mat-sys-primary);
+}
+
+.checkbox-inline {
+  display: flex;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+.mat-button-toggle-appearance-standard.mat-button-toggle-checked {
+  background-color: var(--mat-sys-primary-base-active);
+  color: white;
+}
+
+.height-57 {
+  height: 57px;
+}

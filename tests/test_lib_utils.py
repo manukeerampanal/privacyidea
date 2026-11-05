@@ -1,17 +1,25 @@
-# -*- coding: utf-8 -*-
 """
 This tests the package lib.utils
 """
-from .base import MyTestCase
+import binascii
+from dataclasses import dataclass, field
+from datetime import timedelta, datetime
 
+import segno
+from dateutil.tz import tzlocal, tzoffset, gettz
+from netaddr import IPAddress, IPNetwork, AddrFormatError
+from unittest import mock
+from werkzeug.user_agent import UserAgent
+
+from privacyidea.config import TestingConfig
+from privacyidea.lib.crypto import generate_password
+from privacyidea.lib.error import PolicyError, ParameterError
 from privacyidea.lib.utils import (parse_timelimit,
                                    check_time_in_range, parse_proxy,
-                                   check_proxy, reduce_realms, is_true,
-                                   parse_date, compare_condition,
-                                   get_data_from_params, parse_legacy_time,
-                                   int_to_hex, compare_value_value,
-                                   compare_generic_condition,
-                                   parse_time_offset_from_now, censor_connect_string,
+                                   check_proxy, get_client_ip_info, MAX_IP_CHAIN_HOPS, MAX_IP_CHAIN_HOP_LENGTH,
+                                   reduce_realms, is_true,
+                                   parse_date, get_data_from_params, parse_legacy_time,
+                                   int_to_hex, parse_time_offset_from_now, censor_connect_string,
                                    parse_timedelta, to_unicode,
                                    parse_int, convert_column_to_unicode,
                                    truncate_comma_list, check_pin_contents, CHARLIST_CONTENTPOLICY,
@@ -24,14 +32,25 @@ from privacyidea.lib.utils import (parse_timelimit,
                                    modhex_decode, checksum, urlsafe_b64encode_and_unicode,
                                    check_ip_in_policy, split_pin_pass, create_tag_dict,
                                    check_serial_valid, determine_logged_in_userparams,
-                                   to_list, parse_string_to_dict)
-from privacyidea.lib.crypto import generate_password
-from datetime import timedelta, datetime
-from netaddr import IPAddress, IPNetwork, AddrFormatError
-from dateutil.tz import tzlocal, tzoffset, gettz
-from privacyidea.lib.tokenclass import DATE_FORMAT
-from privacyidea.lib.error import PolicyError
-import binascii
+                                   to_list, parse_string_to_dict,
+                                   get_plugin_info_from_useragent, get_computer_name_from_user_agent,
+                                   get_useragent_name,
+                                   redacted_email, redacted_phone_number,
+                                   convert_wildcard_to_sql_like, SQL_LIKE_ESCAPE)
+from privacyidea.lib.params import require_in
+from privacyidea.lib import utils as privacyidea_utils
+from privacyidea.lib.utils import check_module_allowed
+from privacyidea.lib.tokenclass import AUTH_DATE_FORMAT
+from .base import MyTestCase, OverrideConfigTestCase
+
+
+@dataclass
+class ClientIpRequestMock:
+    """The request attributes that get_client_ip_info reads."""
+    remote_addr: str | None = "10.0.0.1"
+    access_route: list[str] = field(default_factory=list)
+    blueprint: str | None = "token_blueprint"
+    all_data: dict = field(default_factory=dict)
 
 
 class UtilsTestCase(MyTestCase):
@@ -68,7 +87,7 @@ class UtilsTestCase(MyTestCase):
         self.assertEqual(tdelta, timedelta(hours=31))
 
         tdelta = parse_timedelta(" 2y")
-        self.assertEqual(tdelta, timedelta(days=2*365))
+        self.assertEqual(tdelta, timedelta(days=2 * 365))
 
         tdelta = parse_timedelta("30 m ")
         self.assertEqual(tdelta, timedelta(minutes=30))
@@ -82,41 +101,42 @@ class UtilsTestCase(MyTestCase):
     def test_03_check_time_in_range(self):
         # April 5th, 2016 is a Tuesday
         t = datetime(2016, 4, 5, hour=9, minute=12)
-        r = check_time_in_range("Mon-Fri: 09:00-17:30", t)
-        self.assertEqual(r, True)
-        r = check_time_in_range("Mon - Fri : 09:00- 17:30", t)
-        self.assertEqual(r, True)
-        r = check_time_in_range("Sat-Sun:10:00-15:00, Mon - Fri : 09:00- "
-                                "17:30", t)
-        self.assertEqual(r, True)
+        self.assertTrue(check_time_in_range("Mon-Fri: 09:00-17:30", t))
+        self.assertTrue(check_time_in_range("Mon - Fri : 09:00- 17:30", t))
+        self.assertTrue(check_time_in_range("Sat-Sun:10:00-15:00, Mon - Fri : 09:00- 17:30", t))
 
         # Short time description
-        r = check_time_in_range("Tue: 9-15", t)
-        self.assertEqual(r, True)
-        r = check_time_in_range("Tue: 9-15:1", t)
-        self.assertEqual(r, True)
+        self.assertTrue(check_time_in_range("Tue: 9-15", t))
+        self.assertTrue(check_time_in_range("Tue: 9-15:1", t))
 
         # day out of range
-        r = check_time_in_range("Wed - Fri: 09:00-17:30", t)
-        self.assertEqual(r, False)
+        self.assertFalse(check_time_in_range("Wed - Fri: 09:00-17:30", t))
 
         # time out of range
-        r = check_time_in_range("Mon-Fri: 09:30-17:30", t)
-        self.assertEqual(r, False)
+        self.assertFalse(check_time_in_range("Mon-Fri: 09:30-17:30", t))
 
         # A time with a missing leading 0 matches anyway
-        r = check_time_in_range("Mon-Fri: 9:12-17:30", t)
-        self.assertEqual(r, True)
+        self.assertTrue(check_time_in_range("Mon-Fri: 9:12-17:30", t))
 
         # Nonsense will not match
-        r = check_time_in_range("Mon-Wrong: asd-17:30", t)
-        self.assertEqual(r, False)
+        self.assertRaises(ParameterError, check_time_in_range, "Mon-Wrong: asd-17:30", t)
 
     def test_04a_parse_proxy(self):
         self.assertEqual(parse_proxy(""), set())
-        # 127.0.0.1 may rewrite to any IP
-        self.assertEqual(parse_proxy("127.0.0.1"),
-                         {(IPNetwork("127.0.0.1/32"), IPNetwork("0.0.0.0/0"))})
+        # 127.0.0.1 may rewrite to any IP of either family
+        self.assertEqual({(IPNetwork("127.0.0.1/32"), IPNetwork("0.0.0.0/0")),
+                          (IPNetwork("127.0.0.1/32"), IPNetwork("::/0"))},
+                         parse_proxy("127.0.0.1"))
+        # A bare IPv6 entry expands the same way, whatever the entry's own family
+        self.assertEqual(
+            {(IPNetwork("2001:db8::1/128"), IPNetwork("0.0.0.0/0")), (IPNetwork("2001:db8::1/128"), IPNetwork("::/0"))},
+            parse_proxy("2001:db8::1"),
+        )
+        # An entry in the mapped form is kept as written; _ip_in_network matches both spellings
+        self.assertEqual(
+            {(IPNetwork("::ffff:10.0.0.0/120"), IPNetwork("192.0.2.0/24"))},
+            parse_proxy("::ffff:10.0.0.0/120 > 192.0.2.0/24"),
+        )
         # 127.0.0.x may rewrite to 10.0.x.x
         self.assertEqual(parse_proxy("127.0.0.1/24 >  10.0.0.0/16"),
                          {(IPNetwork("127.0.0.1/24"), IPNetwork("10.0.0.0/16"))})
@@ -132,9 +152,10 @@ class UtilsTestCase(MyTestCase):
                     ">10.0.0.0/8   "
         r = parse_proxy(proxy_def)
 
-        self.assertEqual(len(r), 3)
+        self.assertEqual(4, len(r))
         self.assertIn((IPNetwork("1.2.3.4/16"), IPNetwork("192.168.1.0/24")), r)
         self.assertIn((IPNetwork("10.0.0.12/32"), IPNetwork("0.0.0.0/0")), r)
+        self.assertIn((IPNetwork("10.0.0.12/32"), IPNetwork("::/0")), r)
         self.assertIn((IPNetwork("172.16.0.1/32"), IPNetwork("10.0.0.0/8")), r)
 
         # check paths with only a single hop
@@ -155,7 +176,7 @@ class UtilsTestCase(MyTestCase):
         self.assertRaises(AddrFormatError, parse_proxy, proxy_def)
         # 10.0.0.12 is not allowed to map because the proxy settings are invalid
         self.assertEqual(check_proxy(list(map(IPAddress, ["10.0.0.12", "1.2.3.4"])), proxy_def),
-                         IPAddress("10.0.12"))
+                         IPAddress("10.0.0.12"))
 
         # check paths with several hops
         # 1.2.3.4 -------> 10.0.0.1 -------> 192.168.1.1 --------> privacyIDEA
@@ -211,15 +232,15 @@ class UtilsTestCase(MyTestCase):
         realms = {'defrealm': {'default': False,
                                'option': '',
                                'resolver': [
-                                    {'priority': None,
-                                     'type': 'passwdresolver',
-                                     'name': 'deflocal'}]},
+                                   {'priority': None,
+                                    'type': 'passwdresolver',
+                                    'name': 'deflocal'}]},
                   'localsql': {'default': True,
                                'option': '',
                                'resolver': [
-                                    {'priority': None,
-                                     'type': 'sqlresolver',
-                                     'name': 'localusers2'}]}}
+                                   {'priority': None,
+                                    'type': 'sqlresolver',
+                                    'name': 'localusers2'}]}}
         # The policy dictionary contains much more entries, but for us only
         # the realm is relevant
         policies = [{'realm': []}]
@@ -336,46 +357,9 @@ class UtilsTestCase(MyTestCase):
         self.assertEqual(parse_date("7 Januar 17"), None)
         self.assertIsNone(parse_date('15/15'))
 
-    def test_08_compare_condition(self):
-        self.assertTrue(compare_condition("100", 100))
-        self.assertTrue(compare_condition("=100", 100))
-        self.assertTrue(compare_condition(" = 100 ", 100))
-
-        self.assertFalse(compare_condition("100 ", 99))
-
-        self.assertTrue(compare_condition(">100", 101))
-        self.assertFalse(compare_condition(">100", 100))
-        self.assertFalse(compare_condition(">100", 1))
-
-        self.assertTrue(compare_condition("<100", 10))
-        self.assertTrue(compare_condition("  <100", 10))
-        self.assertFalse(compare_condition("<100", 1000))
-        self.assertFalse(compare_condition("<100", 100))
-
-        # There are invalid conditions, which should not raise an exception
-        # An empty condition will result in False
-        self.assertFalse(compare_condition("", 100))
-        # An invalid condition, which misses a compare-value, will result in false
-        self.assertFalse(compare_condition(">", 100))
-
-        # Test new comparators
-        self.assertTrue(compare_condition('>=100', 100))
-        self.assertTrue(compare_condition('=> 100', 200))
-        self.assertFalse(compare_condition('>= 100', 99))
-
-        self.assertTrue(compare_condition('<=100', 100))
-        self.assertTrue(compare_condition('=< 100', 99))
-        self.assertFalse(compare_condition('<= 100', 101))
-
-        self.assertTrue(compare_condition('!=100', 99))
-        self.assertFalse(compare_condition('!= 100', 100))
-
-        self.assertTrue(compare_condition('==100', 100))
-        self.assertFalse(compare_condition('== 100', 99))
-
     def test_09_get_data_from_params(self):
         config_description = {
-            "local":  {
+            "local": {
                 'cakey': 'string',
                 'cacert': 'string',
                 'openssl.cnf': 'string',
@@ -425,54 +409,6 @@ class UtilsTestCase(MyTestCase):
         h = int_to_hex(65536)
         self.assertEqual(h, "010000")
 
-    def test_12_compare_value_value(self):
-        self.assertTrue(compare_value_value("1000", ">", "999"))
-        self.assertTrue(compare_value_value("ABD", ">", "ABC"))
-        self.assertTrue(compare_value_value(1000, "==", "1000"))
-        self.assertTrue(compare_value_value("99", "<", "1000"))
-
-        self.assertTrue(compare_value_value(100, '>', '10'))
-        self.assertTrue(compare_value_value(100, '>=', '10'))
-        self.assertTrue(compare_value_value("100", '=>', 10))
-        self.assertTrue(compare_value_value(100, '>=', '100'))
-        self.assertFalse(compare_value_value(100, '>=', '101'))
-
-        self.assertTrue(compare_value_value('ABC', '=', 'ABC'))
-        self.assertTrue(compare_value_value('ABC', '!=', 'ABD'))
-
-        self.assertTrue(compare_value_value(10, '<', '100'))
-        self.assertTrue(compare_value_value(10, '<=', '100'))
-        self.assertTrue(compare_value_value("10", '=<', 100))
-        self.assertTrue(compare_value_value(10, '<=', '10'))
-        self.assertFalse(compare_value_value(10, '<=', '9'))
-
-        # compare dates
-        self.assertTrue(compare_value_value(
-                        datetime.now(tzlocal()).strftime(DATE_FORMAT), ">",
-                        "2017-01-01T10:00+0200"))
-        self.assertFalse(compare_value_value(
-            datetime.now(tzlocal()).strftime(DATE_FORMAT), "<",
-            "2017-01-01T10:00+0200"))
-        # The timestamp in 10 hours is bigger than the current time
-        self.assertTrue(compare_value_value(
-            (datetime.now(tzlocal()) + timedelta(hours=10)).strftime(DATE_FORMAT),
-            ">", datetime.now(tzlocal()).strftime(DATE_FORMAT)))
-
-        self.assertTrue(compare_value_value('+3h', '>', ''))
-        self.assertFalse(compare_value_value('2017/04/20 11:30+0200', '>',
-                                             datetime.now(tzlocal()).strftime(DATE_FORMAT)))
-
-        self.assertTrue(compare_value_value('2020-01-15T00:00', '==',
-                                            datetime(2020, 1, 15).strftime(DATE_FORMAT)))
-        # unexpected result: The date string can not be parsed since dateutil.parser
-        # does not understand locale dates. So the strings themselves are compared
-        # since parse_date() returns 'None'
-        self.assertTrue(compare_value_value('16. März 2020', '<',
-                                            datetime(2020, 3, 15).strftime(DATE_FORMAT)))
-
-        # check for unknown comparator
-        self.assertRaises(Exception, compare_value_value, 5, '~=', 5)
-
     def test_13_parse_time_offset_from_now(self):
         td = parse_timedelta("+5s")
         self.assertEqual(td, timedelta(seconds=5))
@@ -507,6 +443,27 @@ class UtilsTestCase(MyTestCase):
         d_utc = convert_timestamp_to_utc(d)
         self.assertGreater(d_utc, d.replace(tzinfo=None))
 
+    def test_15_convert_wildcard_to_sql_like(self):
+        # the user wildcard '*' becomes the SQL wildcard '%'
+        self.assertEqual("PUSH%", convert_wildcard_to_sql_like("PUSH*"))
+        self.assertEqual("%", convert_wildcard_to_sql_like("*"))
+        # SQL LIKE metacharacters in the input are escaped so they match literally
+        self.assertEqual(f"OATH{SQL_LIKE_ESCAPE}_01", convert_wildcard_to_sql_like("OATH_01"))
+        self.assertEqual(f"a{SQL_LIKE_ESCAPE}%b", convert_wildcard_to_sql_like("a%b"))
+        # the escape character itself is escaped
+        self.assertEqual(f"a{SQL_LIKE_ESCAPE}{SQL_LIKE_ESCAPE}b", convert_wildcard_to_sql_like("a/b"))
+        # combination: literals stay literal, only '*' expands
+        self.assertEqual(f"a{SQL_LIKE_ESCAPE}_b%c", convert_wildcard_to_sql_like("a_b*c"))
+        # a custom wildcard character can be used
+        self.assertEqual("a%b", convert_wildcard_to_sql_like("a?b", wildcard="?"))
+        # a custom wildcard that is itself a LIKE metacharacter or the escape
+        # character is still handled correctly: only the wildcard expands, any
+        # remaining metacharacters are escaped to match literally
+        self.assertEqual("a%b%x", convert_wildcard_to_sql_like("a_b_x", wildcard="_"))
+        self.assertEqual(f"a{SQL_LIKE_ESCAPE}%b%c", convert_wildcard_to_sql_like("a%b_c", wildcard="_"))
+        self.assertEqual(f"a%b{SQL_LIKE_ESCAPE}_c", convert_wildcard_to_sql_like("a%b_c", wildcard="%"))
+        self.assertEqual(f"a%b{SQL_LIKE_ESCAPE}_c", convert_wildcard_to_sql_like("a/b_c", wildcard="/"))
+
     def test_16_parse_int(self):
         r = parse_int("xxx", 12)
         self.assertEqual(r, 12)
@@ -527,8 +484,8 @@ class UtilsTestCase(MyTestCase):
         self.assertEqual(convert_column_to_unicode(None), None)
         self.assertEqual(convert_column_to_unicode(True), "True")
         self.assertEqual(convert_column_to_unicode(False), "False")
-        self.assertEqual(convert_column_to_unicode(b"yes"), u"yes")
-        self.assertEqual(convert_column_to_unicode(u"yes"), u"yes")
+        self.assertEqual(convert_column_to_unicode(b"yes"), "yes")
+        self.assertEqual(convert_column_to_unicode("yes"), "yes")
 
     def test_18_censor_connect_string(self):
         self.assertEqual(censor_connect_string("sqlite:////home/foo/privacyidea/privacyidea/data.sqlite"),
@@ -541,12 +498,13 @@ class UtilsTestCase(MyTestCase):
                          "psql+odbc://pi@localhost/pi")
         self.assertEqual(censor_connect_string("psql+odbc://pi:MySecretPassword123466$@localhost/pi"),
                          "psql+odbc://pi:***@localhost/pi")
-        self.assertEqual(censor_connect_string("mysql://pi:kW44s@@qqWtGYX@localhost/pi"),
+        self.assertEqual(censor_connect_string("mysql://pi:kW44s%40%40qqWtGYX@localhost/pi"),
                          "mysql://pi:***@localhost/pi")
-        self.assertEqual(censor_connect_string(u"mysql://knöbel:föö@localhost/pi"),
-                         u"mysql://knöbel:***@localhost/pi")
-        self.assertEqual(censor_connect_string(u"oracle+cx_oracle://pi:MySecretPassword1234@localhost:1521/?service_name=my_database"),
-                         u"oracle+cx_oracle://pi:***@localhost:1521/?service_name=my_database")
+        # Percentage-encoded special characters
+        self.assertEqual("mysql://kn%C3%B6bel:***@localhost/pi", censor_connect_string("mysql://knöbel:föö@localhost/pi"))
+        self.assertEqual(censor_connect_string(
+            "oracle+cx_oracle://pi:MySecretPassword1234@localhost:1521/?service_name=my_database"),
+            "oracle+cx_oracle://pi:***@localhost:1521/?service_name=my_database")
 
     def test_19_truncate_comma_list(self):
         r = truncate_comma_list("123456,234567,345678", 19)
@@ -566,6 +524,19 @@ class UtilsTestCase(MyTestCase):
         r = truncate_comma_list("12,234567,3456,989,123,234,234", 4)
         self.assertEqual(len(r), 4)
         self.assertEqual(r, "12,+")
+
+        # More entries than fit even when every entry is shortened to its marker. The
+        # entries can not get any shorter, so the list is cut and the beginning of it is
+        # kept, which says more than a row of markers.
+        for count in [22, 30, 101, 150, 199]:
+            for max_length in [40, 200]:
+                serials = ",".join(f"OATH{index:04d}" for index in range(count))
+                r = truncate_comma_list(serials, max_length)
+                self.assertLessEqual(len(r), max_length, (count, max_length))
+                if len(serials) > max_length:
+                    self.assertTrue(r.endswith("+"), r)
+                else:
+                    self.assertEqual(serials, r)
 
     def test_20_pin_policy(self):
         # Unspecified character specifier
@@ -694,24 +665,14 @@ class UtilsTestCase(MyTestCase):
         self.assertRaises(Exception, decode_base32check, client_component)
 
     def test_23_get_client_ip(self):
-
-        class RequestMock():
-            blueprint = None
-            remote_addr = None
-            all_data = {}
-            access_route = []
-
-        r = RequestMock()
-        r.blueprint = "token_blueprint"
         # The real client
         direct_client = "10.0.0.1"
-        r.remote_addr = direct_client
         # The client parameter
         client_parameter = "192.168.2.1"
-        r.all_data = {"client": client_parameter}
         # The X-Forwarded-For
         client_proxy = "172.16.1.2"
-        r.access_route = [client_proxy]
+        r = ClientIpRequestMock(remote_addr=direct_client, access_route=[client_proxy],
+                                all_data={"client": client_parameter})
 
         # Setup:
         # 192.168.2.1 ---------> 172.16.1.2 -------> 10.0.0.1 --------> privacyIDEA
@@ -746,16 +707,372 @@ class UtilsTestCase(MyTestCase):
         ip = get_client_ip(r, "10.0.0.1")
         self.assertEqual(ip, direct_client)
 
+    def test_23b_get_client_ip_info_records_the_derivation(self):
+        # Same selection as test_23, plus the record of how it was reached.
+        direct_client, client_proxy, client_parameter = "10.0.0.1", "172.16.1.2", "192.168.2.1"
+        r = ClientIpRequestMock(remote_addr=direct_client, access_route=[client_proxy],
+                                blueprint="validate_blueprint", all_data={"client": client_parameter})
+
+        # No override configured: the peer is the client, but the header and the client parameter it claimed
+        # are still recorded - recording is not honouring.
+        info = get_client_ip_info(r, "")
+        self.assertEqual(direct_client, info.ip)
+        self.assertEqual(direct_client, info.peer_ip)
+        self.assertEqual("REMOTE_ADDR", info.source)
+        self.assertEqual([direct_client, client_proxy, client_parameter], [hop.ip for hop in info.chain])
+        self.assertEqual(["REMOTE_ADDR", "X_FORWARDED_FOR", "CLIENT_PARAM"],
+                         [hop.source for hop in info.chain])
+        self.assertEqual(0, info.effective_index)
+
+        # The override admits the header hop.
+        info = get_client_ip_info(r, "10.0.0.1")
+        self.assertEqual(client_proxy, info.ip)
+        self.assertEqual("X_FORWARDED_FOR", info.source)
+        self.assertEqual(1, info.effective_index)
+
+        # ... and, with the proxy also allowed to map, the client parameter.
+        info = get_client_ip_info(r, "10.0.0.1>172.16.1.2>0.0.0.0/0")
+        self.assertEqual(client_parameter, info.ip)
+        self.assertEqual("CLIENT_PARAM", info.source)
+
+        # An override is configured but this peer may not map any further: that is a different fact from
+        # "no override configured", and must not read as a direct connection.
+        info = get_client_ip_info(r, "203.0.113.1")
+        self.assertEqual(direct_client, info.ip)
+        self.assertEqual("REMOTE_ADDR_UNMAPPED", info.source)
+
+        # No route at all with an override configured: get_client_ip has always returned None here.
+        r.access_route = []
+        info = get_client_ip_info(r, "10.0.0.1")
+        self.assertIsNone(info.ip)
+        self.assertIsNone(info.source)
+        self.assertEqual(direct_client, info.peer_ip)
+
+    def test_23c_get_client_ip_info_caps_a_long_claimed_chain(self):
+        # X-Forwarded-For is attacker-controlled, so the recorded chain is capped rather than stored whole.
+        r = ClientIpRequestMock(access_route=[f"172.16.0.{index}" for index in range(1, 40)])
+        info = get_client_ip_info(r, "")
+        self.assertEqual(MAX_IP_CHAIN_HOPS, len(info.chain))
+        self.assertEqual(40 - MAX_IP_CHAIN_HOPS, info.dropped_hops)
+        # The effective hop survives the cap.
+        self.assertEqual("10.0.0.1", info.chain[info.effective_index].ip)
+
+    def test_23d_get_client_ip_info_marks_the_actual_hop_when_the_chain_repeats_an_address(self):
+        # The same address can legitimately appear twice in a chain (a client behind two proxies that both
+        # add the same X-Forwarded-For value, say). effective_index must still point at the hop that was
+        # actually walked to, not just the first hop whose (ip, source) happens to match it.
+        r = ClientIpRequestMock(remote_addr="9.9.9.9", access_route=["1.2.3.4", "1.2.3.4", "1.2.3.4"])
+        # Trust the peer and all three (duplicated) X-Forwarded-For hops.
+        info = get_client_ip_info(r, "9.9.9.9>1.2.3.4>1.2.3.4>0.0.0.0/0")
+        self.assertEqual("1.2.3.4", info.ip)
+        # hops: [peer 9.9.9.9, 1.2.3.4, 1.2.3.4, 1.2.3.4] - the deepest one was chosen, not the first duplicate.
+        self.assertEqual(3, info.effective_index)
+        self.assertEqual("1.2.3.4", info.chain[info.effective_index].ip)
+
+    def test_23e_get_client_ip_info_caps_the_chain_even_without_a_route(self):
+        # An override is configured but the request has no X-Forwarded-For route at all: the ``client``
+        # parameter is still attacker-controlled and must be capped like every other return path.
+        r = ClientIpRequestMock(blueprint="validate_blueprint", all_data={"client": "1" * 999})
+        info = get_client_ip_info(r, "10.0.0.1>0.0.0.0/0")
+        self.assertIsNone(info.ip)
+        for hop in info.chain:
+            self.assertLessEqual(len(hop.ip), MAX_IP_CHAIN_HOP_LENGTH)
+
+    def test_23f_get_client_ip_info_cuts_the_chain_at_a_malformed_hop_instead_of_raising(self):
+        # A garbled X-Forwarded-For entry must not turn the request into a 500. It ends the chain, and the hops
+        # between it and privacyIDEA are still mapped.
+        r = ClientIpRequestMock(access_route=["not-an-ip", "172.16.0.5"])
+        info = get_client_ip_info(r, "10.0.0.1>0.0.0.0/0")
+        self.assertEqual("172.16.0.5", info.ip)
+        # The malformed hop is still recorded for the forensic chain, just excluded from the mapping.
+        self.assertIn("not-an-ip", [hop.ip for hop in info.chain])
+
+    def test_23g_get_client_ip_info_returns_none_when_every_hop_is_unusable(self):
+        # No peer and every claimed hop unparseable: nothing is left to map, which must behave like having
+        # no route at all rather than raising out of check_proxy_index() on an empty list.
+        r = ClientIpRequestMock(remote_addr="", access_route=["garbage", "also-garbage"])
+        info = get_client_ip_info(r, "10.0.0.1>0.0.0.0/0")
+        self.assertIsNone(info.ip)
+        self.assertIsNone(info.effective_index)
+
+        # An empty REMOTE_ADDR (e.g. a Unix socket) without X-Forwarded-For: werkzeug's access_route is [""],
+        # so there is a route but not a single hop.
+        r = ClientIpRequestMock(remote_addr="", access_route=[""])
+        info = get_client_ip_info(r, "10.0.0.1")
+        self.assertIsNone(info.ip)
+        self.assertIsNone(info.effective_index)
+        self.assertListEqual([], info.chain)
+
+    def test_23h_get_client_ip_info_cap_is_never_exceeded_even_for_the_effective_hop(self):
+        # A permissive override can make the effective hop land deep in an attacker-padded chain; the stored
+        # chain must still never exceed MAX_IP_CHAIN_HOPS, even at the cost of the effective hop falling
+        # outside the recorded (truncated) chain.
+        depth = MAX_IP_CHAIN_HOPS + 5
+        peer = "172.16.0.1"
+        # peer first, then the claimed origin deepest last - matches _path_to_client's hop order.
+        claimed = [f"172.16.0.{i}" for i in range(2, depth + 2)]
+        path_to_client = [peer] + claimed
+
+        r = ClientIpRequestMock(remote_addr=peer, access_route=list(reversed(claimed)))
+        # Trust the whole chain, so the deepest hop is the effective one.
+        info = get_client_ip_info(r, ">".join(path_to_client))
+        self.assertEqual(claimed[-1], info.ip)
+        self.assertEqual(len(path_to_client) - 1, info.effective_index)
+        self.assertLessEqual(len(info.chain), MAX_IP_CHAIN_HOPS)
+        self.assertEqual(len(path_to_client) - MAX_IP_CHAIN_HOPS, info.dropped_hops)
+
+    def test_23i_get_client_ip_cuts_the_chain_at_a_malformed_hop_like_get_client_ip_info(self):
+        # get_client_ip is get_client_ip_info reduced to .ip, so a malformed client parameter or
+        # X-Forwarded-For hop ends the chain the same way rather than raising or being trusted.
+        r = ClientIpRequestMock(access_route=["172.16.1.2"], blueprint="validate_blueprint",
+                                all_data={"client": "not-an-ip-address"})
+        self.assertEqual("172.16.1.2", get_client_ip(r, "10.0.0.1"))
+
+        r.access_route = ["not-an-ip-address"]
+        r.all_data = {}
+        self.assertEqual("10.0.0.1", get_client_ip(r, "10.0.0.1"))
+
+        # If not a single hop is an address, there is nothing to map: same as no route at all.
+        r.remote_addr = "not-an-ip-address"
+        r.access_route = ["not-an-ip-address"]
+        self.assertIsNone(get_client_ip(r, "10.0.0.1"))
+
+    def test_23j_client_ip_hops_with_ports_and_brackets_are_parsed(self):
+        # Some reverse proxies write X-Forwarded-For hops as "IP:port" or bracketed IPv6
+        # addresses. None of those spellings may make the real client IP get lost.
+        v6_client = "2001:638:822:2f33:f87d:c326:6404:e3d9"
+        proxy_settings = "10.199.1.18 > 0.0.0.0/0, 10.199.1.18 > ::/0"
+        for xff, expected in (
+            (v6_client, v6_client),
+            ("[" + v6_client + "]", v6_client),
+            ("[" + v6_client + "]:51234", v6_client),
+            ("192.0.2.43:51234", "192.0.2.43"),
+            ("192.0.2.43:65535", "192.0.2.43"),
+            ("192.0.2.43:00080", "192.0.2.43"),
+            ("[::ffff:192.0.2.43]", "192.0.2.43"),
+            ("[" + v6_client + "]:65535", v6_client),
+            ("fe80::1%eth0", "fe80::1"),
+            ("[fe80::1%eth0]:51234", "fe80::1"),
+        ):
+            with self.subTest(xff=xff):
+                r = ClientIpRequestMock(remote_addr="10.199.1.18", access_route=[xff])
+                info = get_client_ip_info(r, proxy_settings)
+                self.assertEqual(expected, info.ip)
+                self.assertEqual("X_FORWARDED_FOR", info.source)
+
+        # The bare-IPv6 spelling keeps working: a bare IPv6 address must not be mistaken for
+        # "address:port" and cut at its first zero run.
+        r = ClientIpRequestMock(remote_addr="10.199.1.18", access_route=[v6_client])
+        self.assertEqual(v6_client, get_client_ip(r, proxy_settings))
+
+        # The operating system reports a link-local peer with its zone. The peer is read without it, so it
+        # matches its network and maps the client.
+        r = ClientIpRequestMock(remote_addr="fe80::1%eth0", access_route=["192.0.2.43"])
+        info = get_client_ip_info(r, "fe80::/10")
+        self.assertEqual("192.0.2.43", info.ip)
+        self.assertEqual("X_FORWARDED_FOR", info.source)
+        self.assertEqual("fe80::1%eth0", info.peer_ip)
+
+        # A suffix that is not a valid port is not stripped, in the unbracketed branch
+        # exactly as in the bracket branch, and a bracketed IPv4 address is rejected: the
+        # hop stays unparsed and cuts the chain (see test_23m). A zone is only dropped
+        # from a non-empty zone of an IPv6 address.
+        for bad in ("10.0.0.1:junk", "10.0.0.1:", "10.0.0.1:99999999", "10.0.0.1:65536", "10.0.0.1:99999",
+                    "10.0.0.1:\u00b2", "10.0.0.1:000080", "10.0.0.1:" + "9" * 4301, "[" + v6_client + "]:junk",
+                    "[" + v6_client + "]:99999", "[" + v6_client + "]:" + "9" * 4301, "[10.0.0.1]",
+                    "[10.0.0.1]:80", "fe80::1%", "10.0.0.1%eth0", "%eth0"):
+            with self.subTest(xff=bad[:30]):
+                r = ClientIpRequestMock(remote_addr="10.199.1.18", access_route=[bad])
+                info = get_client_ip_info(r, proxy_settings)
+                self.assertEqual("10.199.1.18", info.ip)
+                self.assertEqual("REMOTE_ADDR_UNMAPPED", info.source)
+
+    def test_23k_bare_proxy_entry_maps_ipv6_clients(self):
+        # "172.16.0.1" is documented as "the proxy may mask as any arbitrary client IP" -
+        # which includes IPv6 clients. A bare IPv4 entry therefore expands to both address
+        # families, otherwise an IPv6 client behind it is reported as the proxy itself.
+        r = ClientIpRequestMock(remote_addr="172.16.0.1", access_route=["2001:db8::1"])
+        self.assertEqual("2001:db8::1", get_client_ip(r, "172.16.0.1"))
+        # ... and an IPv4 client keeps being mapped by the same entry.
+        r = ClientIpRequestMock(remote_addr="172.16.0.1", access_route=["192.0.2.7"])
+        self.assertEqual("192.0.2.7", get_client_ip(r, "172.16.0.1"))
+        # A bare IPv6 entry maps clients of either family.
+        r = ClientIpRequestMock(remote_addr="2001:db8::1", access_route=["2001:db8:ffff::1"])
+        self.assertEqual("2001:db8:ffff::1", get_client_ip(r, "2001:db8::1"))
+        # ... including IPv4 clients: the entry's own family does not restrict the mapped family.
+        r = ClientIpRequestMock(remote_addr="2001:db8::1", access_route=["192.0.2.7"])
+        self.assertEqual("192.0.2.7", get_client_ip(r, "2001:db8::1"))
+
+    def test_23l_mapped_ipv6_peer_matches_an_ipv4_proxy_entry(self):
+        # On a dual-stack socket an IPv4 connection is reported with an IPv4-mapped IPv6
+        # peer address ("::ffff:10.0.0.1"). Both spellings match the same proxy entries. The
+        # peer IP keeps the reported spelling, the client IP is the IPv4 address.
+        mapped_peer = ClientIpRequestMock(remote_addr="::ffff:10.0.0.1", access_route=["192.0.2.43"])
+        info = get_client_ip_info(mapped_peer, "10.0.0.1")
+        self.assertEqual("192.0.2.43", info.ip)
+        self.assertEqual("X_FORWARDED_FOR", info.source)
+        self.assertEqual("::ffff:10.0.0.1", info.peer_ip)
+        # A mapped hop is the IPv4 address as the effective address
+        r = ClientIpRequestMock(remote_addr="::ffff:10.0.0.1", access_route=["::ffff:192.0.2.9"])
+        info = get_client_ip_info(r, "10.0.0.1 > 0.0.0.0/0")
+        self.assertEqual("192.0.2.9", info.ip)
+        self.assertEqual("X_FORWARDED_FOR", info.source)
+        # ... and IPv4 policy entries match it, included and excluded
+        self.assertTupleEqual((True, True), check_ip_in_policy(info.ip, ["192.0.2.0/24", "!192.0.2.9"]))
+        # Entries in the mapped form match mapped and IPv4 peers alike
+        for remote_addr, proxy_settings in (
+            ("::ffff:10.0.0.1", "::ffff:10.0.0.1"),
+            ("::ffff:10.0.0.1", "::ffff:10.0.0.0/120"),
+            ("10.0.0.1", "::ffff:10.0.0.1"),
+            ("10.0.0.1", "::ffff:10.0.0.0/120"),
+        ):
+            with self.subTest(remote_addr=remote_addr, proxy_settings=proxy_settings):
+                r = ClientIpRequestMock(remote_addr=remote_addr, access_route=["192.0.2.43"])
+                info = get_client_ip_info(r, proxy_settings)
+                self.assertEqual("192.0.2.43", info.ip)
+                self.assertEqual("X_FORWARDED_FOR", info.source)
+        # Other IPv6 networks match literally: they contain a mapped address, but not its IPv4 spelling
+        for proxy_settings in ("::/0 > 0.0.0.0/0", "::/64 > 0.0.0.0/0", "::ffff:10.0.0.1/64 > 0.0.0.0/0"):
+            with self.subTest(proxy_settings=proxy_settings):
+                info = get_client_ip_info(mapped_peer, proxy_settings)
+                self.assertEqual("192.0.2.43", info.ip)
+                self.assertEqual("X_FORWARDED_FOR", info.source)
+                r = ClientIpRequestMock(access_route=["192.0.2.43"])
+                info = get_client_ip_info(r, proxy_settings)
+                self.assertEqual("10.0.0.1", info.ip)
+                self.assertEqual("REMOTE_ADDR_UNMAPPED", info.source)
+        # An IPv4 peer is no proxy of an IPv6 entry
+        r = ClientIpRequestMock(remote_addr="203.0.113.5", access_route=["2001:db8::5"])
+        info = get_client_ip_info(r, "::/0 > 2001:db8::/32")
+        self.assertEqual("203.0.113.5", info.ip)
+        self.assertEqual("REMOTE_ADDR_UNMAPPED", info.source)
+        # An IPv4 hop is no client of an IPv6 target, its mapped spelling is. The client IP is
+        # then the IPv4 address.
+        r = ClientIpRequestMock(access_route=["198.51.100.7"])
+        info = get_client_ip_info(r, "10.0.0.1 > ::/0")
+        self.assertEqual("10.0.0.1", info.ip)
+        self.assertEqual("REMOTE_ADDR_UNMAPPED", info.source)
+        r = ClientIpRequestMock(access_route=["::ffff:198.51.100.7"])
+        info = get_client_ip_info(r, "10.0.0.1 > ::/0")
+        self.assertEqual("198.51.100.7", info.ip)
+        self.assertEqual("X_FORWARDED_FOR", info.source)
+
+    def test_23o_a_mapped_peer_is_its_ipv4_address_with_and_without_an_override(self):
+        r = ClientIpRequestMock(remote_addr="::ffff:10.0.0.1", access_route=["192.0.2.43"])
+        for proxy_settings, source in (("", "REMOTE_ADDR"), ("172.16.0.1", "REMOTE_ADDR_UNMAPPED")):
+            with self.subTest(proxy_settings=proxy_settings):
+                info = get_client_ip_info(r, proxy_settings)
+                self.assertEqual("10.0.0.1", info.ip)
+                self.assertEqual(source, info.source)
+                self.assertEqual("::ffff:10.0.0.1", info.peer_ip)
+                self.assertEqual("::ffff:10.0.0.1", info.chain[0].ip)
+
+    def test_23p_a_scoped_peer_gets_the_same_client_ip_with_and_without_an_override(self):
+        # The client IP of a link-local peer is read without its zone, so client-restricted policies can match it.
+        # The peer IP keeps the address as the operating system reported it.
+        r = ClientIpRequestMock(remote_addr="fe80::1%eth0", access_route=["192.0.2.43"])
+        for proxy_settings, source in (("", "REMOTE_ADDR"), ("172.16.0.1", "REMOTE_ADDR_UNMAPPED")):
+            with self.subTest(proxy_settings=proxy_settings):
+                info = get_client_ip_info(r, proxy_settings)
+                self.assertEqual("fe80::1", info.ip)
+                self.assertEqual(source, info.source)
+                self.assertEqual("fe80::1%eth0", info.peer_ip)
+                self.assertTupleEqual((True, False), check_ip_in_policy(info.ip, ["fe80::/10"]))
+        # Without an override, a peer that is not an address and an empty peer are kept as they are.
+        for remote_addr in ("not-an-ip", ""):
+            with self.subTest(remote_addr=remote_addr):
+                info = get_client_ip_info(ClientIpRequestMock(remote_addr=remote_addr, access_route=[remote_addr]), "")
+                self.assertEqual(remote_addr, info.ip)
+                self.assertEqual(remote_addr, info.peer_ip)
+
+    def test_23q_an_undetermined_client_ip_is_logged_as_a_warning(self):
+        # With an override, a path that does not start with an address gives no client IP, which is logged as a
+        # warning naming the connection address and the first address of the path.
+        for remote_addr, access_route, first_hop in (("", ["192.0.2.43", "unknown"], "'unknown'"),
+                                                     ("", [""], "None"),
+                                                     ("not-an-ip", ["192.0.2.43"], "'not-an-ip'")):
+            with self.subTest(remote_addr=remote_addr, access_route=access_route):
+                r = ClientIpRequestMock(remote_addr=remote_addr, access_route=access_route)
+                with self.assertLogs("privacyidea.lib.utils", level="WARNING") as logs:
+                    info = get_client_ip_info(r, "10.0.0.1")
+                self.assertIsNone(info.ip)
+                self.assertEqual(1, len(logs.output))
+                self.assertIn("Could not determine the client IP", logs.output[0])
+                self.assertIn(f"the first address of the path is {first_hop}", logs.output[0])
+        # A hop that cannot be read further along the path, or a request without an override, logs no warning.
+        for remote_addr, access_route, proxy_settings in (("10.0.0.1", ["192.0.2.43", "unknown"], "10.0.0.1"),
+                                                          ("", ["unknown"], "")):
+            with self.subTest(remote_addr=remote_addr, proxy_settings=proxy_settings):
+                r = ClientIpRequestMock(remote_addr=remote_addr, access_route=access_route)
+                with self.assertNoLogs("privacyidea.lib.utils", level="WARNING"):
+                    get_client_ip_info(r, proxy_settings)
+
+    def test_23m_unparseable_hop_cuts_the_chain_instead_of_shifting_it(self):
+        # An unparseable hop ends the chain at its position. The hops behind it keep their
+        # positions, so none of them is compared with the network configured for the
+        # unparseable hop's position. They stay recorded, but unmapped.
+        # Origin-first, as in the header: the origin "8.8.8.8" claims it passed a proxy
+        # whose XFF hop is unparseable, which in turn sits in front of our trusted proxy.
+        r = ClientIpRequestMock(access_route=["8.8.8.8", "not-an-ip", "172.16.0.5"])
+        # The third network of the path below, 8.0.0.0/8, is the one for the position of
+        # "not-an-ip", and it contains 8.8.8.8. The chain ends at "not-an-ip", so the request
+        # did not pass the third hop and the peer itself is the client.
+        with self.assertLogs("privacyidea.lib.utils", level="DEBUG") as logs:
+            info = get_client_ip_info(r, "10.0.0.1 > 0.0.0.0/0 > 8.0.0.0/8")
+        self.assertEqual("10.0.0.1", info.ip)
+        self.assertEqual("REMOTE_ADDR_UNMAPPED", info.source)
+        # The cut is logged at debug level, as the hop is client-controlled. The logged hop
+        # is capped at MAX_IP_CHAIN_HOP_LENGTH and must not be echoed into the log in full.
+        cut_logs = [line for line in logs.output if "Cutting the client IP chain" in line]
+        self.assertEqual(1, len(cut_logs))
+        self.assertIn("'not-an-ip'", cut_logs[0])
+        long_hop = "A" * (MAX_IP_CHAIN_HOP_LENGTH + 30)
+        with self.assertLogs("privacyidea.lib.utils", level="DEBUG") as logs:
+            get_client_ip_info(ClientIpRequestMock(access_route=[long_hop]), "10.0.0.1 > 0.0.0.0/0")
+        cut_logs = [line for line in logs.output if "Cutting the client IP chain" in line]
+        self.assertEqual(1, len(cut_logs))
+        self.assertIn(repr("A" * MAX_IP_CHAIN_HOP_LENGTH), cut_logs[0])
+        self.assertNotIn(repr(long_hop), cut_logs[0])
+        # The whole chain, including the unparseable hop, stays in the forensic record.
+        self.assertEqual(["10.0.0.1", "172.16.0.5", "not-an-ip", "8.8.8.8"], [hop.ip for hop in info.chain])
+        # A path that ends within the cut prefix still admits the hops before the cut.
+        info = get_client_ip_info(r, "10.0.0.1 > 0.0.0.0/0")
+        self.assertEqual("172.16.0.5", info.ip)
+        self.assertEqual("X_FORWARDED_FOR", info.source)
+        # ... and get_client_ip, which reduces get_client_ip_info, cuts the same way.
+        self.assertEqual("10.0.0.1", get_client_ip(r, "10.0.0.1 > 0.0.0.0/0 > 8.0.0.0/8"))
+
+    def test_23n_a_non_string_client_parameter_is_not_an_ip_hop(self):
+        # The ``client`` parameter is untyped request data: a JSON body can carry it as a number or a
+        # boolean. Neither is an address spelling any proxy writes, so neither is a hop: the parameter is
+        # skipped, both with and without an override configured, and the request is served as if it had
+        # not been sent.
+        for client_param in (123, 2130706433, True, 1.5, None, ["10.0.0.1"], {"client": "10.0.0.1"}, ""):
+            with self.subTest(client_param=client_param):
+                r = ClientIpRequestMock(access_route=["10.0.0.1"], blueprint="ttype_blueprint",
+                                        all_data={"client": client_param})
+                # Without an override, the request must not raise, and the peer is the client.
+                info = get_client_ip_info(r, "")
+                self.assertEqual("10.0.0.1", info.ip)
+                self.assertEqual("REMOTE_ADDR", info.source)
+                self.assertNotIn("CLIENT_PARAM", [hop.source for hop in info.chain])
+                # With an override that the peer satisfies but no XFF header to map, the peer is
+                # the client, this time explicitly "we do not map" rather than unconfigured.
+                info = get_client_ip_info(r, "10.0.0.1 > 0.0.0.0/0")
+                self.assertEqual("10.0.0.1", info.ip)
+                self.assertEqual("REMOTE_ADDR_UNMAPPED", info.source)
+                self.assertNotIn("CLIENT_PARAM", [hop.source for hop in info.chain])
+
     def test_24_sanity_name_check(self):
         self.assertTrue(sanity_name_check('Hello_World'))
-        with self.assertRaisesRegexp(Exception, "non conformant characters in the name"):
+        with self.assertRaisesRegex(Exception, "non conformant characters in the name"):
             sanity_name_check('Hello World!')
         self.assertTrue(sanity_name_check('Hello World', name_exp='^[A-Za-z\\ ]+$'))
-        with self.assertRaisesRegexp(Exception, "non conformant characters in the name"):
+        with self.assertRaisesRegex(Exception, "non conformant characters in the name"):
             sanity_name_check('Hello_World', name_exp='^[A-Za-z]+$')
 
     def test_25_encodings(self):
-        u = u'Hello Wörld'
+        u = 'Hello Wörld'
         b = b'Hello World'
         self.assertEqual(to_utf8(None), None)
         self.assertEqual(to_utf8(u), u.encode('utf8'))
@@ -775,46 +1092,40 @@ class UtilsTestCase(MyTestCase):
         self.assertEqual(to_byte_string(10), b'10')
 
     def test_26_conversions(self):
-        self.assertEqual(hexlify_and_unicode(u'Hallo'), u'48616c6c6f')
-        self.assertEqual(hexlify_and_unicode(b'Hallo'), u'48616c6c6f')
-        self.assertEqual(hexlify_and_unicode(b'\x00\x01\x02\xab'), u'000102ab')
+        self.assertEqual(hexlify_and_unicode('Hallo'), '48616c6c6f')
+        self.assertEqual(hexlify_and_unicode(b'Hallo'), '48616c6c6f')
+        self.assertEqual(hexlify_and_unicode(b'\x00\x01\x02\xab'), '000102ab')
 
-        self.assertEqual(b32encode_and_unicode(u'Hallo'), u'JBQWY3DP')
-        self.assertEqual(b32encode_and_unicode(b'Hallo'), u'JBQWY3DP')
-        self.assertEqual(b32encode_and_unicode(b'\x00\x01\x02\xab'), u'AAAQFKY=')
+        self.assertEqual(b32encode_and_unicode('Hallo'), 'JBQWY3DP')
+        self.assertEqual(b32encode_and_unicode(b'Hallo'), 'JBQWY3DP')
+        self.assertEqual(b32encode_and_unicode(b'\x00\x01\x02\xab'), 'AAAQFKY=')
 
-        self.assertEqual(b64encode_and_unicode(u'Hallo'), u'SGFsbG8=')
-        self.assertEqual(b64encode_and_unicode(b'Hallo'), u'SGFsbG8=')
-        self.assertEqual(b64encode_and_unicode(b'\x00\x01\x02\xab'), u'AAECqw==')
+        self.assertEqual(b64encode_and_unicode('Hallo'), 'SGFsbG8=')
+        self.assertEqual(b64encode_and_unicode(b'Hallo'), 'SGFsbG8=')
+        self.assertEqual(b64encode_and_unicode(b'\x00\x01\x02\xab'), 'AAECqw==')
 
-        self.assertEqual(urlsafe_b64encode_and_unicode(u'Hallo'), u'SGFsbG8=')
-        self.assertEqual(urlsafe_b64encode_and_unicode(b'Hallo'), u'SGFsbG8=')
-        self.assertEqual(urlsafe_b64encode_and_unicode(b'\x00\x01\x02\xab'), u'AAECqw==')
+        self.assertEqual(urlsafe_b64encode_and_unicode('Hallo'), 'SGFsbG8=')
+        self.assertEqual(urlsafe_b64encode_and_unicode(b'Hallo'), 'SGFsbG8=')
+        self.assertEqual(urlsafe_b64encode_and_unicode(b'\x00\x01\x02\xab'), 'AAECqw==')
         self.assertEqual(urlsafe_b64encode_and_unicode(b'\xfa\xfb\xfc\xfd\xfe\xff'),
-                          u'-vv8_f7_')
+                         '-vv8_f7_')
 
     def test_27_images(self):
-        hallo_qr_png = "iVBORw0KGgoAAAANSUhEUgAAASIAAAEiAQAAAAB1xeIbAAABC0lEQV" \
-                       "R42u2aQQ6EIBAEJ7sP8El8nSftA0xYGBiM8eIe6E1McTCofSpnmka1" \
-                       "cmNkQ4UKFSpUj1DZGO86//ghriRXvezOQPWbarB3xBP7mM0bsF/Kvh" \
-                       "V6asRzFL+3AezV7H0GezV7s2036v4/fp8r+94B+L2G/cw5vfgTOUfG" \
-                       "/hgV9n5Jp7Bfyr4nSzf92QGwl6211epLZMwSCy6es7zu83aC3di7+8" \
-                       "BelDFtRpzeAVs4P+zXrrWVc26nx742kTHVOad3QCn4vTzfz1RPztHv" \
-                       "a3u8DAuCve59ToR8fwrsa6Xs4wEM96Hulez9PeaM+7CX+n0P+acFF/" \
-                       "aSnBOfcY26l+d7/i1AhQoVqmeqvi4sW6dMYAvIAAAAAElFTkSuQmCC"
-        self.assertEqual(create_img('Hallo'), 'data:image/png;base64,{0!s}'.format(hallo_qr_png))
+        # Probably more of a dummy test now but the pre-generated image comparison kept on failing
+        hallo_qr_png = segno.make_qr('Hallo').png_data_uri(scale=10)
+        self.assertEqual(create_img('Hallo'), hallo_qr_png)
 
     def test_28_yubikey_utils(self):
         self.assertEqual(modhex_encode(b'\x47'), 'fi')
         self.assertEqual(modhex_encode(b'\xba\xad\xf0\x0d'), 'nlltvcct')
         self.assertEqual(modhex_encode(binascii.unhexlify('0123456789abcdef')),
-                          'cbdefghijklnrtuv')
+                         'cbdefghijklnrtuv')
         self.assertEqual(modhex_encode('Hallo'), 'fjhbhrhrhv')
         # and the other way around
         self.assertEqual(modhex_decode('fi'), b'\x47')
         self.assertEqual(modhex_decode('nlltvcct'), b'\xba\xad\xf0\x0d')
         self.assertEqual(modhex_decode('cbdefghijklnrtuv'),
-                          binascii.unhexlify('0123456789abcdef'))
+                         binascii.unhexlify('0123456789abcdef'))
         self.assertEqual(modhex_decode('fjhbhrhrhv'), b'Hallo')
         # fail with invalid modhex
         self.assertRaises((binascii.Error, TypeError), modhex_decode, 'nlltvcc')
@@ -833,9 +1144,28 @@ class UtilsTestCase(MyTestCase):
         self.assertTrue(found)
 
         # run a test for empty condition
-        found, excluded = check_ip_in_policy("10.0.1.2", ["10.0.1.0/24", "!10.0.1.2", u'', None])
+        found, excluded = check_ip_in_policy("10.0.1.2", ["10.0.1.0/24", "!10.0.1.2", '', None])
         self.assertTrue(excluded)
         self.assertTrue(found)
+
+        # An IPv4 address and its IPv4-mapped form match the same entries, included and excluded
+        self.assertTupleEqual((True, False), check_ip_in_policy("::ffff:192.0.2.12", ["192.0.2.0/24"]))
+        self.assertTupleEqual((True, True), check_ip_in_policy("::ffff:192.0.2.12", ["192.0.2.0/24", "!192.0.2.12"]))
+        self.assertTupleEqual((True, True), check_ip_in_policy("::ffff:192.0.2.12", ["::/0", "-192.0.2.12"]))
+        self.assertTupleEqual((True, True),
+                              check_ip_in_policy("192.0.2.12", ["::ffff:192.0.2.0/120", "!::ffff:192.0.2.12"]))
+        self.assertTupleEqual((False, False), check_ip_in_policy("::ffff:198.51.100.1", ["192.0.2.0/24"]))
+        self.assertTupleEqual((False, False), check_ip_in_policy("2001:db8::1", ["192.0.2.0/24", "!0.0.0.0/0"]))
+        # Other IPv6 networks match literally: ::/0 contains the mapped spelling only
+        self.assertTupleEqual((False, False), check_ip_in_policy("192.0.2.12", ["::/0"]))
+        self.assertTupleEqual((True, False), check_ip_in_policy("::ffff:192.0.2.12", ["::/0"]))
+
+        # Without entries the client IP is not parsed, so a peer netaddr rejects does not fail a policy
+        # without a client restriction
+        self.assertTupleEqual((False, False), check_ip_in_policy("fe80::1%eth0", []))
+        self.assertTupleEqual((False, False), check_ip_in_policy("fe80::1%eth0", ["", None]))
+        with self.assertRaises(AddrFormatError):
+            check_ip_in_policy("fe80::1%eth0", ["10.0.0.0/8"])
 
     def test_30_split_pin_pass(self):
         pin, otp = split_pin_pass("test1234", 4, True)
@@ -846,24 +1176,82 @@ class UtilsTestCase(MyTestCase):
         self.assertEqual(otp, "12345678")
 
     def test_31_create_tag_dict(self):
-        class UserAgentMock():
+        class UserAgentMock:
             string = "<b>hello world</b>"
             browser = "browser"
 
-        class RequestMock():
+        class RequestMock:
             user_agent = UserAgentMock()
             path = "/validate/check"
-            url_root = ""
+            # A spoofed Host header must never end up in the {url} tag (CWE-640).
+            url_root = "http://attacker.example/"
 
-        recipient = {"givenname": u"<b>Sömeone</b>"}
+        class PluginUserAgentMock:
+            string = "privacyidea-keycloak/1.2.3"
+            browser = None
+
+        class PluginRequestMock:
+            user_agent = PluginUserAgentMock()
+            path = "/validate/check"
+            url_root = "http://pi.example.com/"
+
+        recipient = {"givenname": "<b>Sömeone</b>"}
         dict1 = create_tag_dict(request=RequestMock(), recipient=recipient)
         self.assertEqual(dict1["ua_string"], "<b>hello world</b>")
         self.assertEqual(dict1["action"], "/validate/check")
-        self.assertEqual(dict1["recipient_givenname"], u"<b>Sömeone</b>")
+        self.assertEqual(dict1["recipient_givenname"], "<b>Sömeone</b>")
         dict2 = create_tag_dict(request=RequestMock(), recipient=recipient, escape_html=True)
         self.assertEqual(dict2["ua_string"], "&lt;b&gt;hello world&lt;/b&gt;")
         self.assertEqual(dict2["action"], "/validate/check")
-        self.assertEqual(dict2["recipient_givenname"], u"&lt;b&gt;Sömeone&lt;/b&gt;")
+        self.assertEqual(dict2["recipient_givenname"], "&lt;b&gt;Sömeone&lt;/b&gt;")
+
+        # The {url} tag is built only from the trusted PI_BASE_URL, never the request
+        # Host header. Unconfigured -> empty (not the spoofed request host).
+        self.app.config.pop("PI_BASE_URL", None)
+        self.assertEqual(create_tag_dict(request=RequestMock())["url"], "")
+        self.app.config["PI_BASE_URL"] = "https://pi.example.com"
+        try:
+            self.assertEqual(create_tag_dict(request=RequestMock())["url"], "https://pi.example.com")
+        finally:
+            self.app.config.pop("PI_BASE_URL", None)
+
+        # The name of the client application is taken from the user agent
+        plugin_tags = create_tag_dict(request=PluginRequestMock())
+        self.assertEqual(plugin_tags["ua_browser"], "privacyidea-keycloak")
+        self.assertEqual(plugin_tags["ua_string"], "privacyidea-keycloak/1.2.3")
+        # Without a request there is no client application
+        self.assertEqual(create_tag_dict()["ua_browser"], "")
+
+        # {now} and {current_time} render the current timestamp and honor an offset
+        tags_now = create_tag_dict()
+        self.assertIn("now", tags_now)
+        self.assertIn("current_time", tags_now)
+        self.assertEqual(tags_now["now"], tags_now["current_time"])
+        self.assertIn(str(datetime.now().year), tags_now["now"])
+        # A one hour offset must move the rendered timestamp roughly one hour ahead
+        base = datetime.strptime(create_tag_dict()["now"], AUTH_DATE_FORMAT)
+        offset = datetime.strptime(
+            create_tag_dict(time_offset=timedelta(hours=1))["now"], AUTH_DATE_FORMAT)
+        self.assertAlmostEqual((offset - base).total_seconds(), 3600, delta=5)
+
+    def test_31a_get_useragent_name(self):
+        class RequestMock:
+            def __init__(self, useragent):
+                self.user_agent = UserAgent(useragent)
+
+        # A plugin, the app and a script send their own name
+        self.assertEqual("privacyidea-keycloak", get_useragent_name(RequestMock("privacyidea-keycloak/1.2.3")))
+        self.assertEqual("privacyIDEA-Authenticator", get_useragent_name(RequestMock("privacyIDEA-Authenticator/4.5")))
+        self.assertEqual("PAM", get_useragent_name(RequestMock("PAM/1.1.0")))
+        # Browsers all report Mozilla, the complete user agent is available as {ua_string}
+        chrome = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36")
+        self.assertEqual("Mozilla", get_useragent_name(RequestMock(chrome)))
+        self.assertEqual("Mozilla", get_useragent_name(RequestMock("Mozilla/5.0 (Windows NT 10.0; rv:121.0) "
+                                                                  "Gecko/20100101 Firefox/121.0")))
+        # No user agent and no request at all
+        self.assertEqual("", get_useragent_name(RequestMock("")))
+        self.assertEqual("", get_useragent_name(None))
 
     def test_32_allowed_serial_numbers(self):
         self.assertTrue(check_serial_valid("TOTP12345"))
@@ -882,8 +1270,8 @@ class UtilsTestCase(MyTestCase):
 
     def test_33_determine_logged_in_user(self):
         (role, user, realm, adminuser, adminrealm) = determine_logged_in_userparams({"role": "user",
-                                                                                      "username": "hans",
-                                                                                      "realm": "realm1"}, {})
+                                                                                     "username": "hans",
+                                                                                     "realm": "realm1"}, {})
 
         self.assertEqual(role, "user")
         self.assertEqual(user, "hans")
@@ -892,10 +1280,10 @@ class UtilsTestCase(MyTestCase):
         self.assertEqual(adminrealm, None)
 
         (role, user, realm, adminuser, adminrealm) = determine_logged_in_userparams({"role": "admin",
-                                                                                      "username": "hans",
-                                                                                      "realm": "realm1"},
-                                                                                     {"user": "peter",
-                                                                                      "realm": "domain"})
+                                                                                     "username": "hans",
+                                                                                     "realm": "realm1"},
+                                                                                    {"user": "peter",
+                                                                                     "realm": "domain"})
 
         self.assertEqual(role, "admin")
         self.assertEqual(user, "peter")
@@ -909,54 +1297,6 @@ class UtilsTestCase(MyTestCase):
                            "realm": "Wild West"},
                           {"user": "Dave Rudabaugh",
                            "realm": "Dodge City"})
-
-    def test_34_compare_generic_condition(self):
-
-        def mock_attribute(key):
-            attr = {"a": "10",
-                    "b": "100",
-                    "c": "1000"}
-            return attr.get(key)
-
-        self.assertTrue(compare_generic_condition("a<100",
-                                                  mock_attribute,
-                                                  "Error {0!s}"))
-
-        self.assertTrue(compare_generic_condition("a <100",
-                                                  mock_attribute,
-                                                  "Error {0!s}"))
-
-        self.assertTrue(compare_generic_condition("b==100",
-                                                  mock_attribute,
-                                                  "Error {0!s}"))
-
-        # Wrong condition
-        self.assertFalse(compare_generic_condition("a== 100",
-                                                   mock_attribute,
-                                                   "Error {0!s}"))
-
-        # Wrong condition
-        self.assertFalse(compare_generic_condition("b>100",
-                                                   mock_attribute,
-                                                   "Error {0!s}"))
-
-        # Wrong condition
-        self.assertFalse(compare_generic_condition("c < 500",
-                                                   mock_attribute,
-                                                   "Error {0!s}"))
-
-        # Wrong condition
-        self.assertFalse(compare_generic_condition("c <500",
-                                                   mock_attribute,
-                                                   "Error {0!s}"))
-
-        # Wrong entry, that is not processed
-        self.assertRaises(Exception, compare_generic_condition,
-                          "c 500", mock_attribute, "Error {0!s}")
-
-        # Wrong entry, that cannot be processed
-        self.assertRaises(Exception, compare_generic_condition,
-                          "b!~100", mock_attribute, "Error {0!s}")
 
     def test_34_to_list(self):
         # Simple string
@@ -1012,3 +1352,146 @@ class UtilsTestCase(MyTestCase):
         self.assertEqual(d.get("key1"), ["v1", "v2", "v3"])
         self.assertEqual(d.get("key2"), [])
         self.assertEqual(d.get("key3"), ["v5"])
+
+    def test_37_useragent_split(self):
+        user_agents = [
+            ("privacyidea-cp", "privacyidea-cp", None, None),
+            ("privacyidea-cp/2.0", "privacyidea-cp", "2.0", None),
+            ("Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:47.0) Gecko/20100101 "
+             "Firefox/47.0", "Mozilla", "5.0",
+             "(Windows NT 6.1; Win64; x64; rv:47.0) Gecko/20100101 Firefox/47.0"),
+            ("privacyIDEA-Keycloak", "privacyIDEA-Keycloak", None, None),
+            ("privacyIDEA-Keycloak/20 java/8", "privacyIDEA-Keycloak", "20", "java/8"),
+            ("PrivacyIDEA-ADFS", "PrivacyIDEA-ADFS", None, None),
+            ("simpleSAMLphp", "simpleSAMLphp", None, None),
+            ("simpleSAMLphp/1.2.3", "simpleSAMLphp", "1.2.3", None),
+            ("ownCloud", "ownCloud", None, None),
+            ("privacyIDEA-PAM", "privacyIDEA-PAM", None, None),
+            ("privacyIDEA-Shibboleth", "privacyIDEA-Shibboleth", None, None),
+            ("privacyIDEA-LDAP-Proxy", "privacyIDEA-LDAP-Proxy", None, None),
+            ("privacyIDEA-LDAP-Proxy/10", "privacyIDEA-LDAP-Proxy", "10", None),
+            # matching fails completely
+            ("#test", "", None, None),
+            # matching fails after first dot
+            ("1.2.3", "1", None, None),
+            # matching stops after missing version
+            ("SomePlugin/ Some Comment", "SomePlugin", None, None),
+            # no user-agent string given
+            ("", "", None, None),
+            (None, "", None, None)
+        ]
+
+        for val in user_agents:
+            res = get_plugin_info_from_useragent(val[0])
+            self.assertEqual(res, val[1:], res)
+
+    def test_38_redacted_email(self):
+        self.assertEqual("ex********@t****.com", redacted_email("example.mail@test.com"))
+        self.assertEqual("ex********@t****.com", redacted_email("example.mail@test.sub.com"))
+        self.assertEqual("sh********@t****.co", redacted_email("short@t.co"))
+        self.assertEqual("a*********@b****.c", redacted_email("a@b.c"))
+        self.assertEqual("**********@b****.c", redacted_email("@b.c"))
+        self.assertEqual("ex********@*****.***", redacted_email("example@test"))
+        self.assertEqual("**********@*****.***", redacted_email("invalid-email"))
+
+    def test_39_redacted_phone_number(self):
+        self.assertEqual("****-******78", redacted_phone_number("012345678"))
+        self.assertEqual("****-******89", redacted_phone_number("01234567890123456789"))
+        self.assertEqual("****-******01", redacted_phone_number("01"))
+        self.assertEqual("****-********", redacted_phone_number(""))
+
+
+class ModuleAllowlistTestCase(MyTestCase):
+    """
+    A class named by API-written configuration is checked against the classes that ship with
+    privacyIDEA plus the ones an installation declares in pi.cfg.
+    """
+
+    SHIPPED = ["privacyidea.lib.pinhandling.base.PinHandler"]
+    CUSTOM = "mycompany.pinhandler.LetterPinHandler"
+
+    def setUp(self):
+        privacyidea_utils._module_allowlist_warned.clear()
+
+    def tearDown(self):
+        privacyidea_utils._module_allowlist_warned.clear()
+        self.app.config.pop("PI_MODULE_ALLOWLIST_MODE", None)
+        self.app.config.pop("PI_PIN_HANDLER_MODULES", None)
+
+    def test_01_a_shipped_class_is_allowed(self):
+        for mode in ("warn", "enforce"):
+            self.app.config["PI_MODULE_ALLOWLIST_MODE"] = mode
+            check_module_allowed(self.SHIPPED[0], self.SHIPPED, "PI_PIN_HANDLER_MODULES", "pin handler class")
+
+    def test_02_an_undeclared_class_is_used_but_logged_by_default(self):
+        # The default mode keeps an installation that upgrades into this check working
+        self.assertIsNone(self.app.config.get("PI_MODULE_ALLOWLIST_MODE"))
+        with mock.patch("privacyidea.lib.utils.log") as mock_log:
+            check_module_allowed(self.CUSTOM, self.SHIPPED, "PI_PIN_HANDLER_MODULES", "pin handler class")
+        self.assertTrue(mock_log.warning.called)
+        logged = mock_log.warning.call_args[0][0]
+        self.assertIn(self.CUSTOM, logged)
+        self.assertIn("PI_PIN_HANDLER_MODULES", logged)
+
+    def test_03_an_undeclared_class_is_refused_when_enforced(self):
+        self.app.config["PI_MODULE_ALLOWLIST_MODE"] = "enforce"
+        with self.assertRaises(ParameterError) as context:
+            check_module_allowed(self.CUSTOM, self.SHIPPED, "PI_PIN_HANDLER_MODULES", "pin handler class")
+        self.assertIn(self.CUSTOM, f"{context.exception}")
+        self.assertIn("PI_PIN_HANDLER_MODULES", f"{context.exception}")
+
+    def test_04_a_declared_class_is_allowed_when_enforced(self):
+        self.app.config["PI_MODULE_ALLOWLIST_MODE"] = "enforce"
+        self.app.config["PI_PIN_HANDLER_MODULES"] = [self.CUSTOM]
+        check_module_allowed(self.CUSTOM, self.SHIPPED, "PI_PIN_HANDLER_MODULES", "pin handler class")
+
+    def test_04a_a_single_class_may_be_declared_as_a_plain_string(self):
+        # The key name is plural, which invites writing one class without the list around it.
+        self.app.config["PI_MODULE_ALLOWLIST_MODE"] = "enforce"
+        self.app.config["PI_PIN_HANDLER_MODULES"] = self.CUSTOM
+        check_module_allowed(self.CUSTOM, self.SHIPPED, "PI_PIN_HANDLER_MODULES", "pin handler class")
+
+    def test_04b_an_undeclared_class_is_logged_once_per_process(self):
+        # The check runs on every use of the class - for a pin handler that is every enrollment -
+        # so the line must not repeat per request.
+        with mock.patch("privacyidea.lib.utils.log") as mock_log:
+            for _ in range(3):
+                check_module_allowed(self.CUSTOM, self.SHIPPED, "PI_PIN_HANDLER_MODULES", "pin handler class")
+        warnings = [call for call in mock_log.warning.call_args_list if self.CUSTOM in call[0][0]]
+        self.assertEqual(1, len(warnings), warnings)
+
+    def test_05_require_in_names_what_is_allowed(self):
+        self.assertEqual("post", require_in("post", ["pre", "post"], "position"))
+        with self.assertRaises(ParameterError) as context:
+            require_in("during", ["pre", "post"], "position")
+        message = f"{context.exception}"
+        self.assertIn("during", message)
+        # The allowed values are sorted, so the message does not depend on dict or list order
+        self.assertIn("post, pre", message)
+        # A dict is checked against its keys, which is the shape a handler's actions have
+        self.assertEqual("a", require_in("a", {"a": 1, "b": 2}, "action"))
+
+
+class UtilsTestCaseOverrideConfig(OverrideConfigTestCase):
+    class Config(TestingConfig):
+        OFFLINE_MACHINE_KEYS = ["Hostname", "myMachineIdentifier", "otherMachineIdentifier"]
+
+    def test_01_get_computer_name(self):
+        data = {
+            "privacyidea-cp/1.1.1 Windows/Laptop-1": "Laptop-1",
+            "privacyidea-cp/1.1.1 ComputerName/Laptop-2": "Laptop-2",
+            "privacyidea-pam/2.2.2 Linux/Server-3": "Server-3",
+            "privacyidea-pam/2.2.2 Hostname/Server-4": "Server-4",
+            "privacyidea-mac/3.3.3 Mac/Server-5": "Server-5",
+            "": None,
+            None: None,
+            "privacyidea-mac/3.3.3": None,
+            "privacyidea-mac/3.3.3 myMachineIdentifier/Toaster": "Toaster",
+            # This is also "Toaster" because the order of the keys is fixed, therefore "myMachineIdentifier" is checked
+            # first and found
+            "otherMachineIdentifier/Dishwasher myMachineIdentifier/Toaster": "Toaster"
+        }
+
+        for k, v in data.items():
+            res = get_computer_name_from_user_agent(k)
+            self.assertEqual(v, res)

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2018-06-26 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             provide first interface to handle monitoring statistics
 #
@@ -21,7 +19,7 @@
 #
 __doc__ = """This module is used to write, read and handle data in the
 database table "monitoringstats". This can be arbitrary data for time series of
-  
+
    timestamp, key, value
 
 This module is tested in tests/test_lib_monitoringstats.py

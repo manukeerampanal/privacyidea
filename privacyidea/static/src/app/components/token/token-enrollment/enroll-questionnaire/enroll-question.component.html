@@ -1,0 +1,66 @@
+<!--
+ (c) NetKnights GmbH 2025,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div class="flex-column">
+  @if (configQuestions().length === 0) {
+    @if (authService.role() === "admin") {
+      <span
+        i18n="@@token.enableQuestionnaire"
+        class="inline-warning"
+        >To enable questionnaire token enrollment, you need to set up the
+        <a
+          role="button"
+          tabindex="0"
+          aria-label="Go to Questionnaire token configuration"
+          i18n-aria-label="@@token.goQuestionnaire"
+          (click)="goToQuestionConfig()"
+          (keydown)="onQuestionConfigKeydown($event)">
+          Questionnaire Token Configuration </a
+        >!</span
+      >
+    } @else {
+      <span
+        i18n="@@token.questionnaireToken"
+        class="inline-warning"
+        >The questionnaire token enrollment is not completely configured. Please contact your administrator.</span
+      >
+    }
+  } @else {
+    <span i18n="@@token.pleaseAnswerLeast"
+      >Please answer at least {{ configMinNumberOfAnswers() }} of the following questions:</span
+    >
+  }
+  <div class="margin-top-16 flex-column gap-16">
+    @for (question of configQuestions(); track question) {
+      <mat-form-field class="input-width-xl">
+        <mat-label>{{ question.question }}</mat-label>
+        <input
+          [value]="answers()[question.question]"
+          (input)="setAnswer(question.question, $event.target['value'])"
+          [disabled]="disabled()"
+          matInput
+          type="text" />
+      </mat-form-field>
+    }
+  </div>
+  @if (answeredCount() < configMinNumberOfAnswers() && formTouched()) {
+    <mat-error i18n="@@token.leastAnswersRequired"
+      >At least {{ configMinNumberOfAnswers() }} answers are <strong>required</strong>.</mat-error
+    >
+  }
+</div>

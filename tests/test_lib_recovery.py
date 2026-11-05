@@ -1,11 +1,14 @@
-# -*- coding: utf-8 -*-
 """
 This test file tests the lib/passwordreset.py
 """
 from .base import MyTestCase, FakeFlaskG
 from privacyidea.lib.smtpserver import add_smtpserver
 from . import smtpmock
-from privacyidea.lib.error import privacyIDEAError
+from sqlalchemy import select
+
+from privacyidea.lib.error import PrivacyIDEAError, ConfigAdminError, UserError
+from privacyidea.lib.framework import get_base_url
+from privacyidea.models import PasswordReset, db
 from privacyidea.lib.passwordreset import (create_recoverycode,
                                            check_recoverycode,
                                            is_password_reset)
@@ -13,7 +16,8 @@ from privacyidea.lib.config import set_privacyidea_config
 from privacyidea.lib.user import User
 from privacyidea.lib.resolver import save_resolver
 from privacyidea.lib.realm import set_realm
-from privacyidea.lib.policy import ACTION, SCOPE, set_policy, PolicyClass
+from privacyidea.lib.policy import SCOPE, set_policy, PolicyClass
+from privacyidea.lib.policies.actions import PolicyAction
 
 
 class RecoveryTestCase(MyTestCase):
@@ -45,7 +49,7 @@ class RecoveryTestCase(MyTestCase):
         smtpmock.setdata(response={"user@localhost.localdomain": (200, "OK")})
 
         # missing configuration
-        self.assertRaises(privacyIDEAError, create_recoverycode,
+        self.assertRaises(PrivacyIDEAError, create_recoverycode,
                           user=User("cornelius", self.realm1))
 
         # recover password with "recovery.identifier"
@@ -54,6 +58,15 @@ class RecoveryTestCase(MyTestCase):
         set_privacyidea_config("recovery.identifier", "myserver")
         r = create_recoverycode(User("cornelius", self.realm1))
         self.assertEqual(r, True)
+
+        # A user without an email address on file does not crash, but raises a
+        # clean UserError instead of an AttributeError on None. The rejected
+        # request must not leave a PasswordReset row behind (validation happens
+        # before the code is persisted).
+        self.assertRaises(UserError, create_recoverycode,
+                          user=User("selfservice", self.realm1))
+        stmt = select(PasswordReset).where(PasswordReset.username == "selfservice")
+        self.assertEqual(len(db.session.scalars(stmt).all()), 0)
 
     @smtpmock.activate
     def test_02_check_recoverycode(self):
@@ -78,9 +91,9 @@ class RecoveryTestCase(MyTestCase):
         r = save_resolver(param)
         self. assertTrue(r > 0)
 
-        added, failed = set_realm("register", resolvers=["register"])
-        self.assertTrue(len(added )> 0)
-        self.assertEqual(len(failed), 0)
+        added, failed = set_realm("register", resolvers=[{'name': "register"}])
+        self.assertGreater(len(added), 0, added)
+        self.assertEqual(len(failed), 0, failed)
 
         g = FakeFlaskG()
         g.client_ip = "127.0.0.1"
@@ -91,12 +104,12 @@ class RecoveryTestCase(MyTestCase):
         self.assertEqual(r, True)
 
         # create policy
-        set_policy(name="pwrest", scope=SCOPE.USER, action=ACTION.PASSWORDRESET)
+        set_policy(name="pwrest", scope=SCOPE.USER, action=PolicyAction.PASSWORDRESET)
         r = is_password_reset(g)
         self.assertEqual(r, True)
 
         # create policy that does not allow password_reset
-        set_policy(name="pwrest", scope=SCOPE.USER, action=ACTION.DELETE)
+        set_policy(name="pwrest", scope=SCOPE.USER, action=PolicyAction.DELETE)
         r = is_password_reset(g)
         self.assertEqual(r, False)
 
@@ -114,10 +127,10 @@ class RecoveryTestCase(MyTestCase):
         r = add_smtpserver(identifier="myserver", server="1.2.3.4")
         self.assertTrue(r > 0)
         set_privacyidea_config("recovery.identifier", "myserver")
-        r = create_recoverycode(User(u"nönäscii", "register"), recoverycode=recoverycode)
+        r = create_recoverycode(User("nönäscii", "register"), recoverycode=recoverycode)
         self.assertEqual(r, True)
 
-        user = User(u"nönäscii", "register")
+        user = User("nönäscii", "register")
 
         r = check_recoverycode(user, recoverycode)
         self.assertEqual(r, True)
@@ -125,3 +138,19 @@ class RecoveryTestCase(MyTestCase):
         # The recovery code is not valid a second time
         r = check_recoverycode(user, recoverycode)
         self.assertEqual(r, False)
+
+    def test_05_get_base_url(self):
+        # Not configured + required -> refuse, so that a recovery link can
+        # never be built from the untrusted HTTP Host header.
+        self.app.config.pop("PI_BASE_URL", None)
+        self.assertRaises(ConfigAdminError, get_base_url, required=True)
+        # Not configured + not required -> empty string (link left blank, never
+        # built from the request Host header)
+        self.assertEqual(get_base_url(), "")
+        # Configured -> value is returned, trailing slash stripped
+        self.app.config["PI_BASE_URL"] = "https://pi.example.com/"
+        try:
+            self.assertEqual(get_base_url(), "https://pi.example.com")
+            self.assertEqual(get_base_url(required=True), "https://pi.example.com")
+        finally:
+            self.app.config.pop("PI_BASE_URL", None)

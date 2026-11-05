@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2018-08-06 Paul Lettich <paul.lettich@netknights.it>
 #
 #
@@ -20,7 +18,7 @@
 import logging
 
 from privacyidea.lib.utils import is_true
-from privacyidea.lib.tokenclass import TOKENKIND
+from privacyidea.lib.tokenclass import Tokenkind
 from privacyidea.lib.token import get_tokens
 from privacyidea.lib.monitoringstats import write_stats
 from privacyidea.lib.subscriptions import get_users_with_active_tokens
@@ -73,11 +71,11 @@ class SimpleStatsTask(BaseTask):
 
     @property
     def _hardware_tokens(self):
-        return get_tokens(count=True, tokeninfo={'tokenkind': TOKENKIND.HARDWARE})
+        return get_tokens(count=True, tokeninfo={'tokenkind': Tokenkind.HARDWARE})
 
     @property
     def _software_tokens(self):
-        return get_tokens(count=True, tokeninfo={'tokenkind': TOKENKIND.SOFTWARE})
+        return get_tokens(count=True, tokeninfo={'tokenkind': Tokenkind.SOFTWARE})
 
     @property
     def _unassigned_hardware_tokens(self):
@@ -90,7 +88,7 @@ class SimpleStatsTask(BaseTask):
     def do(self, params):
         for opt in self.options.keys():
             if is_true(params.get(opt)):
-                log.debug("Got param {0}".format(opt))
+                log.debug(f"Got param {opt}")
                 write_stats(opt, getattr(self, '_' + opt))
 
         return True

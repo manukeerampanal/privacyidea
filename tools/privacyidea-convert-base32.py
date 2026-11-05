@@ -1,10 +1,6 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
-#
 #  2018-07-27 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             init
-from __future__ import print_function
-
 __doc__ = """Read a file containing serials and base32 encoded secrets and converting it to hex."""
 
 import argparse

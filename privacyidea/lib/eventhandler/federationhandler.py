@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2017-08-23 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Initial federation handler
 #
@@ -37,7 +35,7 @@ from flask import current_app
 log = logging.getLogger(__name__)
 
 
-class ACTION_TYPE(object):
+class ACTION_TYPE:
     """
     Allowed actions
     """
@@ -56,6 +54,9 @@ class FederationEventHandler(BaseEventHandler):
     identifier = "Federation"
     description = "This event handler can forward the request to other " \
                   "privacyIDEA servers"
+    # The forwarded response replaces the response of this server. Continuing without the handler would answer
+    # the client with the locally created response as if the remote server had produced it.
+    default_abort_on_error = True
 
     # TODO: Do we need to change the federation handler this way, that it does only pre-handling?
 
@@ -139,7 +140,7 @@ class FederationEventHandler(BaseEventHandler):
             if handler_options.get("resolver"):
                 data["resolver"] = handler_options.get("resolver")
 
-            log.info(u"Sending {0} request to {1!r}".format(method, url))
+            log.info(f"Sending {method} request to {url!r}")
             requestor = None
             params = None
             headers = {}
@@ -176,6 +177,6 @@ class FederationEventHandler(BaseEventHandler):
                                                                  mimetype="application/json")
                 options["response"].status_code = r.status_code
             else:
-                log.warning(u"Unsupported method: {0!r}".format(method))
+                log.warning(f"Unsupported method: {method!r}")
 
         return True

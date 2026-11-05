@@ -1,0 +1,85 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
+<app-dialog-wrapper
+  title="Assign SSH Machine"
+  i18n-title="@@token.assignSshMachine"
+  (actionTriggered)="onAction($event)"
+  [actions]="[assignAction]">
+  <mat-form-field
+    appearance="fill"
+    class="input-width-l">
+    <mat-label i18n="@@token.machine">Machine</mat-label>
+    <input
+      [formField]="selectedMachineForm"
+      [matAutocomplete]="machineAuto"
+      matInput
+      type="text" />
+    <mat-autocomplete
+      #machineAuto="matAutocomplete"
+      [displayWith]="getFullMachineName"
+      (optionSelected)="selectedMachineValue.set($event.option.value)">
+      @for (machine of filteredMachines(); track machine) {
+        <mat-option [value]="machine">{{ getFullMachineName(machine) }}</mat-option>
+      }
+    </mat-autocomplete>
+    @if (selectedMachineForm().touched() && !selectedMachineForm().valid()) {
+      <mat-error i18n="@@token.machineRequired">Machine is <strong>required</strong>.</mat-error>
+    }
+  </mat-form-field>
+
+  <mat-divider></mat-divider>
+  <mat-form-field
+    appearance="fill"
+    class="input-width-l">
+    <mat-label i18n="@@common.serviceId">Service ID</mat-label>
+    <mat-select
+      [value]="selectedServiceIdValue()"
+      (selectionChange)="selectedServiceIdValue.set($event.value)">
+      @for (serviceId of availableServiceIds(); track serviceId) {
+        <mat-option [value]="serviceId">{{ serviceId }}</mat-option>
+      }
+    </mat-select>
+    @if (selectedServiceIdForm().touched() && !selectedServiceIdForm().valid()) {
+      <mat-error i18n="@@token.serviceIdRequiredError">Service ID is <strong>required</strong>.</mat-error>
+    }
+  </mat-form-field>
+
+  <mat-form-field
+    appearance="fill"
+    class="input-width-l">
+    <mat-label i18n="@@common.user">User</mat-label>
+    <input
+      matInput
+      type="text"
+      [matAutocomplete]="userAuto"
+      [value]="selectedUserValue()"
+      (input)="selectedUserValue.set($any($event.target).value)" />
+    <mat-autocomplete
+      #userAuto="matAutocomplete"
+      (optionSelected)="selectedUserValue.set($event.option.value)">
+      @for (user of filteredUsers(); track user) {
+        <mat-option [value]="user">{{ user }}</mat-option>
+      }
+    </mat-autocomplete>
+    @if (selectedUserForm().touched() && !selectedUserForm().valid()) {
+      <mat-error i18n="@@token.userRequiredError">User is <strong>required</strong>.</mat-error>
+    }
+  </mat-form-field>
+</app-dialog-wrapper>

@@ -3,13 +3,19 @@ This test file tests the lib.challange methods.
 
 This tests the token functions on an interface level
 """
+import json
+from datetime import timedelta
+
+from privacyidea.lib.crypto import get_rand_digit_str
 from .base import MyTestCase
-from privacyidea.lib.error import (TokenAdminError, ParameterError)
-from privacyidea.lib.challenge import get_challenges, extract_answered_challenges
-from privacyidea.lib.policy import (set_policy, delete_policy, SCOPE,
-                                    ACTION)
+from privacyidea.lib.challenge import (get_challenges, extract_answered_challenges, delete_challenges,
+                                       cancel_enrollment_via_multichallenge, get_challenges_paginate)
+from privacyidea.lib.cache import redis_feature_enabled
+from privacyidea.lib.policy import (set_policy, delete_policy, SCOPE)
+from privacyidea.lib.policies.actions import PolicyAction
 from privacyidea.models import Challenge, db
-from privacyidea.lib.token import init_token
+from privacyidea.models.utils import utc_now
+from privacyidea.lib.token import init_token, check_serial_pass, get_tokens, remove_token
 from privacyidea.lib import _
 
 
@@ -19,19 +25,23 @@ class ChallengeTestCase(MyTestCase):
     """
 
     def test_01_challenge(self):
-
-        set_policy("chalresp", scope=SCOPE.AUTHZ,
-                   action="{0!s}=hotp".format(ACTION.CHALLENGERESPONSE))
+        set_policy("chalresp", scope=SCOPE.AUTH, action=f"{PolicyAction.CHALLENGERESPONSE}=hotp")
         token = init_token({"genkey": 1, "serial": "CHAL1", "pin": "pin"})
-        from privacyidea.lib.token import check_serial_pass
+
         r = check_serial_pass(token.token.serial, "pin")
         # The OTP PIN is correct
         self.assertEqual(r[0], False)
         self.assertEqual(r[1].get("message"), _("please enter otp: "))
         transaction_id = r[1].get("transaction_id")
         chals = get_challenges()
-        self.assertEqual(len(chals), 1)
-        self.assertEqual(chals[0].transaction_id, transaction_id)
+        if redis_feature_enabled("challenges"):
+            # Unfiltered list-all is not served from the cache (the aggregate
+            # listing is degraded under Redis); the per-serial lookup below
+            # confirms the challenge was created.
+            self.assertEqual(len(chals), 0)
+        else:
+            self.assertEqual(len(chals), 1)
+            self.assertEqual(chals[0].transaction_id, transaction_id)
 
         # get challenge for this serial
         chals = get_challenges(serial="CHAL1")
@@ -44,6 +54,50 @@ class ChallengeTestCase(MyTestCase):
 
         delete_policy("chalresp")
 
+    def test_01a_get_challenges_paginate_like_escaping(self):
+        # SQL LIKE metacharacters in the filter must match literally; only '*' is a wildcard.
+        Challenge(serial="ESC_01", transaction_id="txn_esc_1").save()
+        Challenge(serial="ESCX01", transaction_id="txn_esc_2").save()
+
+        # '*' expands: "ESC*01" matches both serials
+        result = get_challenges_paginate(serial="ESC*01")
+        self.assertSetEqual({"ESC_01", "ESCX01"},
+                            {challenge["serial"] for challenge in result["challenges"]}, result)
+
+        # '_' is literal: "ESC_*" matches only "ESC_01", not "ESCX01"
+        result = get_challenges_paginate(serial="ESC_*")
+        self.assertListEqual(["ESC_01"], [challenge["serial"] for challenge in result["challenges"]], result)
+
+        # transaction_id also goes through the wildcard branch, matching both challenges
+        result = get_challenges_paginate(transaction_id="txn_esc_*")
+        self.assertSetEqual({"ESC_01", "ESCX01"},
+                            {challenge["serial"] for challenge in result["challenges"]}, result)
+
+        delete_challenges(serial="ESC_01")
+        delete_challenges(serial="ESCX01")
+
+    def test_01b_get_challenges_paginate_sort_columns(self):
+        # The serials sort the other way round than the timestamps, so the order tells which one was used
+        now = utc_now()
+        serials = ["SORT_C", "SORT_B", "SORT_A"]
+        for offset, serial in enumerate(serials):
+            challenge = Challenge(serial=serial, transaction_id=f"txn_sort_{serial}", challenge=serial,
+                                  data={"serial": serial})
+            challenge.timestamp = now + timedelta(seconds=offset)
+            challenge.save()
+
+        result = get_challenges_paginate(serial="SORT_*", sortby="serial")
+        self.assertListEqual(sorted(serials), [challenge["serial"] for challenge in result["challenges"]])
+
+        # Neither the challenge nor its data can be sorted by, they sort by the timestamp like an unknown column
+        for sortby in ["challenge", "data", "_data", Challenge._data, "unknown"]:
+            with self.subTest(sortby=sortby), self.assertLogs("privacyidea.lib.challenge", level="WARNING"):
+                result = get_challenges_paginate(serial="SORT_*", sortby=sortby)
+                self.assertListEqual(serials, [challenge["serial"] for challenge in result["challenges"]])
+
+        for serial in serials:
+            delete_challenges(serial=serial)
+
     def test_02_extract_answered_challenges(self):
         token = init_token({"genkey": 1, "serial": "CHAL2", "pin": "pin"})
         # no challenges yet
@@ -51,23 +105,325 @@ class ChallengeTestCase(MyTestCase):
         self.assertEqual(challenges, [])
         self.assertEqual(extract_answered_challenges(challenges), [])
         # we trigger two challenges
-        from privacyidea.lib.token import check_serial_pass
         r = check_serial_pass(token.token.serial, "pin")
         self.assertEqual(r[0], False)
         transaction_id1 = r[1].get("transaction_id")
         r = check_serial_pass(token.token.serial, "pin")
         self.assertEqual(r[0], False)
-        transaction_id2 = r[1].get("transaction_id")
         # two challenges, but no answered challenges
         challenges = get_challenges(serial="CHAL2")
         self.assertEqual(len(challenges), 2)
         self.assertEqual(extract_answered_challenges(challenges), [])
-        # answer one challenge
-        Challenge.query.filter_by(transaction_id=transaction_id1).update({"otp_valid": True})
-        db.session.commit()
+        # answer one challenge (backend-agnostic: set_otp_status + save work
+        # against both the DB and the Redis cache, unlike a raw Challenge.query
+        # update which would silently miss the Redis-backed challenge)
+        answered_challenge = get_challenges(transaction_id=transaction_id1)[0]
+        answered_challenge.set_otp_status(True)
+        answered_challenge.save()
         # two challenges, one answered challenge
         challenges = get_challenges(serial="CHAL2")
         answered = extract_answered_challenges(challenges)
         self.assertEqual(len(challenges), 2)
         self.assertEqual(len(answered), 1)
         self.assertEqual(answered[0].transaction_id, transaction_id1)
+
+    def test_03_delete_challenges(self):
+        hotp = init_token({"type": "hotp", "genkey": 1, "pin": "pin"})
+        # no challenges yet
+        challenges = get_challenges(serial=hotp.get_serial())
+        self.assertEqual(challenges, [])
+
+        # trigger two challenges for hotp
+        r = check_serial_pass(hotp.get_serial(), "pin")
+        self.assertEqual(r[0], False)
+        r = check_serial_pass(hotp.get_serial(), "pin")
+        self.assertEqual(r[0], False)
+        transaction_id = r[1].get("transaction_id")
+
+        # trigger one challenges for totp
+        totp = init_token({"type": "totp", "genkey": 1, "pin": "pin"})
+        r = check_serial_pass(totp.get_serial(), "pin")
+        self.assertEqual(r[0], False)
+
+        # delete challenges by serial
+        self.assertEqual(1, len(get_challenges(serial=totp.get_serial())))
+        delete_challenges(serial=totp.get_serial())
+        self.assertEqual(0, len(get_challenges(serial=totp.get_serial())))
+
+        # delete challenges by transaction_id
+        self.assertEqual(1, len(get_challenges(transaction_id=transaction_id)))
+        delete_challenges(transaction_id=transaction_id)
+        self.assertEqual(0, len(get_challenges(transaction_id=transaction_id)))
+
+    def test_04_cancel_enrollment_failures(self):
+        transaction_id = get_rand_digit_str()
+        ret = cancel_enrollment_via_multichallenge(transaction_id=transaction_id)
+        self.assertFalse(ret)
+
+        # More than one challenge found returns False because that should not be possible in that step
+        c1 = Challenge(serial="test1", transaction_id=transaction_id)
+        c2 = Challenge(serial="test2", transaction_id=transaction_id)
+        c1.save()
+        c2.save()
+        ret = cancel_enrollment_via_multichallenge(transaction_id=transaction_id)
+        self.assertFalse(ret)
+        c1.delete()
+        c2.delete()
+
+        # Challenge without data can not be confirmed to be for enrollment, so it won't be cancelled
+        c1 = Challenge(serial="test1", transaction_id=transaction_id)
+        c1.save()
+        ret = cancel_enrollment_via_multichallenge(transaction_id=transaction_id)
+        self.assertFalse(ret)
+        c1.delete()
+
+        # Challenge without action ENROLL_VIA_MULTICHALLENGE can not be confirmed to be for enrollment,
+        # so it won't be cancelled
+        c1 = Challenge(serial="test1", transaction_id=transaction_id, data={"type": "token"})
+        c1.save()
+        ret = cancel_enrollment_via_multichallenge(transaction_id=transaction_id)
+        self.assertFalse(ret)
+        c1.delete()
+
+        # Challenge without action ENROLL_VIA_MULTICHALLENGE_OPTIONAL can not be confirmed to be cancellable
+        c1 = Challenge(serial="test1", transaction_id=transaction_id, data={
+            "type": "token",
+            PolicyAction.ENROLL_VIA_MULTICHALLENGE: True
+        })
+        c1.save()
+        ret = cancel_enrollment_via_multichallenge(transaction_id=transaction_id)
+        self.assertFalse(ret)
+        c1.delete()
+
+        # Trying to cancel an enrollment which has optional=False will not cancel the enrollment
+        c1 = Challenge(serial="test1", transaction_id=transaction_id, data={
+            "type": "token",
+            PolicyAction.ENROLL_VIA_MULTICHALLENGE: True,
+            PolicyAction.ENROLL_VIA_MULTICHALLENGE_OPTIONAL: False
+        })
+        c1.save()
+        ret = cancel_enrollment_via_multichallenge(transaction_id=transaction_id)
+        self.assertFalse(ret)
+        c1.delete()
+
+    def test_05_cancel_enrollment_keeps_answered_enrollment(self):
+        enroll_data = {"type": "token",
+                       PolicyAction.ENROLL_VIA_MULTICHALLENGE: True,
+                       PolicyAction.ENROLL_VIA_MULTICHALLENGE_OPTIONAL: True}
+
+        # An enrollment whose challenge has not been answered yet is still in progress and is cancelled:
+        # the token is removed.
+        token = init_token({"type": "hotp", "genkey": 1})
+        serial = token.get_serial()
+        transaction_id = get_rand_digit_str()
+        c1 = Challenge(serial=serial, transaction_id=transaction_id, data=enroll_data)
+        c1.save()
+        ret = cancel_enrollment_via_multichallenge(transaction_id=transaction_id)
+        self.assertTrue(ret)
+        self.assertEqual(0, len(get_tokens(serial=serial)))
+
+        # An enrollment whose challenge has already been answered belongs to a finished enrollment and is
+        # kept: the token remains.
+        token = init_token({"type": "hotp", "genkey": 1})
+        serial = token.get_serial()
+        transaction_id = get_rand_digit_str()
+        c1 = Challenge(serial=serial, transaction_id=transaction_id, data=enroll_data)
+        c1.set_otp_status(True)
+        c1.save()
+        ret = cancel_enrollment_via_multichallenge(transaction_id=transaction_id)
+        self.assertFalse(ret)
+        self.assertEqual(1, len(get_tokens(serial=serial)))
+        remove_token(serial)
+
+
+class ChallengeDataEncryptionTestCase(MyTestCase):
+    """Test that challenge data is encrypted in the database."""
+
+    def test_01_challenge_data_encrypted(self):
+        """Challenge data (dict) is encrypted in the database."""
+        data = {"otp": "123456"}
+        c = Challenge(serial="SPASS01", transaction_id="tid_enc_001",
+                      data=data, validitytime=300)
+        c.save()
+
+        # Verify the raw _data attribute is the encrypted form (not plaintext)
+        self.assertNotEqual(c._data, json.dumps(data),
+                            "Challenge data should be stored encrypted!")
+        self.assertIn(":", c._data)
+
+        # Verify the data property transparently decrypts
+        self.assertEqual(json.loads(c.data), data)
+
+        # Verify get_data() returns the dict
+        self.assertEqual(c.get_data(), data)
+
+        # Clean up
+        db.session.delete(c)
+        db.session.commit()
+
+    def test_02_challenge_dict_data_encrypted(self):
+        """Dict data stored in a challenge is encrypted in the database."""
+        data_dict = {"smartphone_confirmed": True, "display_code": "4829"}
+        c = Challenge(serial="PUSH01", transaction_id="tid_enc_002",
+                      data=data_dict, validitytime=300)
+        c.save()
+
+        # Verify raw _data value is encrypted
+        self.assertNotEqual(c._data, json.dumps(data_dict))
+        self.assertIn(":", c._data)
+
+        # Verify data property returns the decrypted JSON string
+        self.assertEqual(json.loads(c.data), data_dict)
+
+        # Verify get_data() returns the correct dict
+        retrieved = c.get_data()
+        self.assertEqual(retrieved, data_dict)
+
+        # Clean up
+        db.session.delete(c)
+        db.session.commit()
+
+    def test_03_challenge_empty_data(self):
+        """Empty/None data is stored as empty string, not encrypted."""
+        c = Challenge(serial="HOTP01", transaction_id="tid_enc_003",
+                      data=None, validitytime=120)
+        c.save()
+
+        self.assertEqual(c._data, "")
+        self.assertEqual(c.get_data(), {})
+
+        # Clean up
+        db.session.delete(c)
+        db.session.commit()
+
+    def test_04_challenge_empty_string_data(self):
+        """Empty string data is stored as empty string."""
+        c = Challenge(serial="HOTP02", transaction_id="tid_enc_004",
+                      data="", validitytime=120)
+        c.save()
+
+        self.assertEqual(c._data, "")
+        self.assertEqual(c.get_data(), {})
+
+        # Clean up
+        db.session.delete(c)
+        db.session.commit()
+
+    def test_05_challenge_set_data_after_creation(self):
+        """set_data() called after creation also encrypts the data."""
+        c = Challenge(serial="PUSH02", transaction_id="tid_enc_005",
+                      validitytime=300)
+        c.save()
+
+        # Now set data after creation (like pushtoken does)
+        new_data = {"smartphone_confirmed": True, "display_code": "1234"}
+        c.set_data(new_data)
+        db.session.commit()
+
+        # Verify encrypted in raw _data
+        self.assertNotEqual(c._data, json.dumps(new_data))
+        self.assertIn(":", c._data)
+
+        # Verify correct decryption via property
+        self.assertEqual(json.loads(c.data), new_data)
+
+        # Verify correct decryption via get_data()
+        self.assertEqual(c.get_data(), new_data)
+
+        # Clean up
+        db.session.delete(c)
+        db.session.commit()
+
+    def test_08_data_property_setter_encrypts(self):
+        """Assigning to c.data via the property setter encrypts the value."""
+        c = Challenge(serial="SETTER01", transaction_id="tid_enc_008",
+                      validitytime=300)
+        c.save()
+
+        # Assign a dict via property setter
+        c.data = {"push_confirmed": True}
+        db.session.commit()
+
+        self.assertNotEqual(c._data, json.dumps({"push_confirmed": True}))
+        self.assertIn(":", c._data)
+        self.assertEqual(json.loads(c.data), {"push_confirmed": True})
+        self.assertEqual(c.get_data(), {"push_confirmed": True})
+
+        # Assign empty dict via setter - stored as empty, not encrypted
+        c.data = {}
+        db.session.commit()
+        self.assertEqual(c._data, "")
+        self.assertEqual(c.get_data(), {})
+
+        # Assign None via setter
+        c.data = None
+        db.session.commit()
+        self.assertEqual(c._data, "")
+        self.assertEqual(c.get_data(), {})
+
+        # Clean up
+        db.session.delete(c)
+        db.session.commit()
+
+    def test_09_get_data_returns_empty_dict_on_corrupt_data(self):
+        """get_data() returns {} if decrypted data is not valid JSON."""
+        from privacyidea.lib.crypto import encryptPassword
+
+        c = Challenge(serial="CORRUPT01", transaction_id="tid_enc_009",
+                      validitytime=300)
+        c.save()
+
+        # Bypass set_data() and write non-JSON encrypted data directly
+        c._data = encryptPassword("not valid json {{{")
+        db.session.commit()
+
+        # get_data() should catch the JSONDecodeError and return {}
+        self.assertEqual(c.get_data(), {})
+
+        # Clean up
+        db.session.delete(c)
+        db.session.commit()
+
+    def test_09a_data_is_empty_string_on_decryption_failure(self):
+        """The data property returns "" if the stored ciphertext cannot be decrypted."""
+        c = Challenge(serial="UNDECRYPTABLE01", transaction_id="tid_enc_009a",
+                      validitytime=300)
+        c.save()
+
+        # Write a value that is not valid ciphertext, so decryptPassword() fails
+        c._data = "not-a-valid-ciphertext"
+        db.session.commit()
+
+        self.assertEqual("", c.data)
+        self.assertEqual({}, c.get_data())
+
+        # Clean up
+        db.session.delete(c)
+        db.session.commit()
+
+    def test_10_get_data_returns_empty_dict_on_non_dict_json(self):
+        """get_data() returns {} if decrypted data is valid JSON but not a dict."""
+        from privacyidea.lib.crypto import encryptPassword
+
+        c = Challenge(serial="NONDICT01", transaction_id="tid_enc_010",
+                      validitytime=300)
+        c.save()
+
+        # Store a JSON list (valid JSON, but not a dict)
+        c._data = encryptPassword('[1, 2, 3]')
+        db.session.commit()
+        self.assertEqual(c.get_data(), {})
+
+        # Store a JSON integer
+        c._data = encryptPassword('42')
+        db.session.commit()
+        self.assertEqual(c.get_data(), {})
+
+        # Store a JSON string
+        c._data = encryptPassword('"just a string"')
+        db.session.commit()
+        self.assertEqual(c.get_data(), {})
+
+        # Clean up
+        db.session.delete(c)
+        db.session.commit()

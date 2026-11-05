@@ -1,4 +1,3 @@
-# coding: utf-8
 """
 This test file tests the lib.usercache
 
@@ -6,12 +5,12 @@ The lib.usercache.py only depends on the database model
 """
 from contextlib import contextmanager
 
-from mock import patch
+from unittest.mock import patch
 
 from privacyidea.lib.error import UserError
 from tests import ldap3mock
 from tests.test_mock_ldap3 import LDAPDirectory
-from .base import MyTestCase
+from .base import MyTestCase, PristineSqliteFixtures
 from privacyidea.lib.resolver import (save_resolver, delete_resolver, get_resolver_object)
 from privacyidea.lib.realm import (set_realm, delete_realm)
 from privacyidea.lib.user import (User, get_username, create_user)
@@ -21,13 +20,14 @@ from privacyidea.lib.usercache import (get_cache_time,
 from privacyidea.lib.config import set_privacyidea_config
 from datetime import timedelta
 from datetime import datetime
-from privacyidea.models import UserCache
+from privacyidea.models import UserCache, db
 
 
-class UserCacheTestCase(MyTestCase):
+class UserCacheTestCase(PristineSqliteFixtures, MyTestCase):
     """
     Test the user on the database level
     """
+    pristine_fixtures = ["tests/testdata/testusercache.sqlite"]
     PWFILE = "tests/testdata/passwd"
     resolvername1 = "resolver1"
     realm1 = "realm1"
@@ -61,7 +61,8 @@ class UserCacheTestCase(MyTestCase):
                                "type.fileName": "string",
                                "desc.fileName": "The name of the file"})
         self.assertTrue(rid > 0, rid)
-        added, failed = set_realm(realm=self.realm1, resolvers=[self.resolvername1])
+        added, failed = set_realm(realm=self.realm1,
+                                  resolvers=[{'name': self.resolvername1}])
         self.assertTrue(len(added) > 0, added)
         self.assertEqual(len(failed), 0)
 
@@ -95,8 +96,7 @@ class UserCacheTestCase(MyTestCase):
         resolver = "resolver1"
         uid = "1"
 
-        expiration_delta = get_cache_time()
-        r = UserCache(username, username, resolver, uid, datetime.now()).save()
+        UserCache(username, username, resolver, uid, datetime.now()).save()
         u_name = get_username(uid, resolver)
         self.assertEqual(u_name, username)
 
@@ -130,6 +130,10 @@ class UserCacheTestCase(MyTestCase):
         # delete the resolver, which also purges the cache
         self._delete_realm()
 
+        # Clear session before adding new entries to avoid conflicts due to re-adding user cache entry which gets the
+        # same primary key ID as the deleted one.
+        db.session.expunge_all()
+
         # manually re-add the entry from above
         UserCache(self.username, self.username, self.resolvername1,
                   self.uid, ts).save()
@@ -157,7 +161,7 @@ class UserCacheTestCase(MyTestCase):
         # At the same time the cache is filled. Implicitly we test the
         # _get_resolvers!
         user = User(self.username, self.realm1, self.resolvername1)
-        uids = user.get_user_identifiers()
+        user.get_user_identifiers()
         self.assertEqual(user.login, self.username)
         self.assertEqual(user.uid, self.uid)
 
@@ -170,6 +174,10 @@ class UserCacheTestCase(MyTestCase):
 
         # delete the resolver, which also purges the cache
         self._delete_realm()
+
+        # Clear session before adding new entries to avoid conflicts due to re-adding user cache entry which gets the
+        # same primary key ID as the deleted one.
+        db.session.expunge_all()
 
         # manually re-add the entry from above
         UserCache(self.username, self.username, self.resolvername1,
@@ -194,7 +202,7 @@ class UserCacheTestCase(MyTestCase):
         # similar case for the `User` class
         # The `User` class also tries to fetch the UID from the cache
         with self.assertRaises(UserError):
-            user3 = User(self.username, self.realm1, self.resolvername1)
+            User(self.username, self.realm1, self.resolvername1)
 
 
     def test_04_delete_cache(self):
@@ -323,7 +331,7 @@ class UserCacheTestCase(MyTestCase):
         rid = save_resolver(self.sql_parameters)
         self.assertTrue(rid > 0, rid)
 
-        (added, failed) = set_realm(self.sql_realm, [self.sql_resolver])
+        (added, failed) = set_realm(self.sql_realm, [{'name': self.sql_resolver}])
         self.assertEqual(len(failed), 0)
         self.assertEqual(len(added), 1)
 
@@ -348,7 +356,7 @@ class UserCacheTestCase(MyTestCase):
         # This should have removed the entry from the cache
         self.assertEqual(UserCache.query.count(), 0)
         # But now it gets added again
-        user2 = User(login="wordpressuser", realm=self.sql_realm)
+        User(login="wordpressuser", realm=self.sql_realm)
         self.assertEqual(UserCache.query.count(), 1)
         # Change it back for the other tests
         user.update_user_info({"givenname": ""})
@@ -435,10 +443,10 @@ class UserCacheTestCase(MyTestCase):
         self.assertTrue(rid_b > 0, rid_b)
 
         # First ask reso_a, then reso_b
-        (added, failed) = set_realm(self.sql_realm, ['reso_a', 'reso_b'], {
-            'reso_a': 1,
-            'reso_b': 2
-        })
+        (added, failed) = set_realm(self.sql_realm,
+                                    [
+                                        {'name': 'reso_a', 'priority': 1},
+                                        {'name': 'reso_b', 'priority': 2}])
         self.assertEqual(len(failed), 0)
         self.assertEqual(len(added), 2)
 
@@ -493,6 +501,26 @@ class UserCacheTestCase(MyTestCase):
         self.assertEqual(r, "user1")
         self.assertEqual(self.counter, 1)
 
+    def test_14_user_init(self):
+        self._create_realm()
+        corny = User("corny", self.realm1, self.resolvername1)
+        root = User("root", self.realm1, self.resolvername1)
+        UserCache(corny.login, corny.login, self.resolvername1, corny.uid, datetime.now()).save()
+        UserCache(root.login, root.login, self.resolvername1, root.uid, datetime.now()).save()
+
+        # Check that the user is correctly fetched from the cache if only the login is given and only the uid is given
+        cache_root = User(root.login, self.realm1, self.resolvername1)
+        self.assertEqual(root.uid, cache_root.uid)
+        cache_root = User(realm=self.realm1, resolver=self.resolvername1, uid=root.uid)
+        self.assertEqual(root.login, cache_root.login)
+
+        cache_corny = User(corny.login, self.realm1, self.resolvername1)
+        self.assertEqual(corny.uid, cache_corny.uid)
+        cache_corny = User(realm=self.realm1, resolver=self.resolvername1, uid=corny.uid)
+        self.assertEqual(corny.login, cache_corny.login)
+
+        self._delete_realm()
+
     def test_99_unset_config(self):
         # Test early exit!
         # Assert that the function `retrieve_latest_entry` is called if the cache is enabled
@@ -534,7 +562,7 @@ class TestUserCacheMultipleLoginAttributes(MyTestCase):
         rid = save_resolver(self.ldap_parameters)
         self.assertTrue(rid > 0, rid)
 
-        (added, failed) = set_realm(self.ldap_realm, [self.ldap_resolver])
+        (added, failed) = set_realm(self.ldap_realm, [{'name': self.ldap_resolver}])
         self.assertEqual(len(failed), 0)
         self.assertEqual(len(added), 1)
 

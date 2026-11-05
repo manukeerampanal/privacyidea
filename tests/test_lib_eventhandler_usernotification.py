@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 """
 This file tests:
 
@@ -9,16 +7,17 @@ import email
 import os
 from datetime import datetime, timedelta
 
-import mock
+from unittest import mock
 from dateutil.tz import tzlocal
-from flask import Request
+from flask import Request, Response
 from werkzeug.test import EnvironBuilder
 
-from privacyidea.app import PiResponseClass as Response
+from privacyidea.lib.audit import getAudit
+from privacyidea.lib.error import ResolverError
 from privacyidea.lib.eventhandler.base import CONDITION
 from privacyidea.lib.eventhandler.usernotification import (UserNotificationEventHandler,
                                                            NOTIFY_TYPE)
-from privacyidea.lib.policy import ACTION
+from privacyidea.lib.policies.actions import PolicyAction
 from privacyidea.lib.realm import set_realm, delete_realm
 from privacyidea.lib.resolver import save_resolver, delete_resolver
 from privacyidea.lib.smsprovider.SMSProvider import set_smsgateway
@@ -26,10 +25,11 @@ from privacyidea.lib.smtpserver import add_smtpserver
 from privacyidea.lib.token import init_token, unassign_token, remove_token
 from privacyidea.lib.tokenclass import DATE_FORMAT
 from privacyidea.lib.user import User, create_user
-from privacyidea.lib.utils import to_unicode
+from privacyidea.lib.utils import to_unicode, AUTH_RESPONSE
 from privacyidea.models import TokenOwner
 from . import smtpmock
-from .base import MyTestCase, FakeFlaskG, FakeAudit
+from .base import MyTestCase, FakeFlaskG, FakeAudit, PristineSqliteFixtures, PWFILE2
+from .test_lib_user import patch_resolver_to_raise
 
 PNG_IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAeoAAAHqAQAAAADjFj" \
             "CXAAAD+UlEQVR4nO2dTYrkSAxGn8aGWtowB6ij2Dcb5khzA/soeYABe9lgo1mE4q" \
@@ -59,7 +59,8 @@ OAUTH_URL = "otpauth://hotp/OATH0001D8B6?secret=GQROHTUPBAK5N6T2HBUK4IP42R56E" \
             "MV3&counter=1&digits=6&issuer=privacyIDEA"
 
 
-class UserNotificationTestCase(MyTestCase):
+class UserNotificationTestCase(PristineSqliteFixtures, MyTestCase):
+    pristine_fixtures = ["tests/testdata/testuser.sqlite"]
 
     def test_01_basefunctions(self):
         actions = UserNotificationEventHandler().actions
@@ -80,6 +81,59 @@ class UserNotificationTestCase(MyTestCase):
         self.assertTrue(r > 0)
 
         smtpmock.setdata(response={"recp@example.com": (200, "OK")},
+                         support_tls=False)
+
+        init_token({"serial": "SomeSerial", "description": "It works", "type": "spass"},
+                   user=User("cornelius", "realm1"))
+
+        g = FakeFlaskG()
+        audit_object = FakeAudit()
+        audit_object.audit_data["serial"] = "123456"
+
+        g.logged_in_user = {"username": "cornelius",
+                            "role": "admin",
+                            "realm": "realm1"}
+        g.audit_object = audit_object
+
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "OATH123456"},
+                                 headers={})
+
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.all_data = {"serial": "SomeSerial",
+                        "user": "cornelius"}
+        req.User = User("cornelius", self.realm1)
+        resp = Response()
+        resp.data = """{"result": {"value": true}}"""
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {"options": {"subject": "token description: {tokendescription}"
+                                                          " token serial: {serial}",
+                                               "emailconfig": "myserver"}
+                                   }
+                   }
+
+        un_handler = UserNotificationEventHandler()
+        res = un_handler.do("sendmail", options=options)
+        self.assertTrue(res)
+        msg = smtpmock.get_sent_message()
+        self.assertIn("token description: It works token serial: SomeSerial", msg, msg)
+        assert 'To: user@localhost.localdomain' in msg
+
+    @smtpmock.activate
+    def test_02a_sendmail(self):
+        # setup realms
+        self.setUp_user_realms()
+
+        r = add_smtpserver(identifier="myserver", server="1.2.3.4", tls=False)
+        self.assertTrue(r > 0)
+
+        smtpmock.setdata(response={"user@localhost.localdomain": (450, "Mailbox not available")},
                          support_tls=False)
 
         g = FakeFlaskG()
@@ -115,9 +169,9 @@ class UserNotificationTestCase(MyTestCase):
 
         un_handler = UserNotificationEventHandler()
         res = un_handler.do("sendmail", options=options)
-        self.assertTrue(res)
+        self.assertFalse(res)
         msg = smtpmock.get_sent_message()
-        assert 'To: user@localhost.localdomain' in msg
+        self.assertIn('To: user@localhost.localdomain', msg)
 
     @smtpmock.activate
     def test_03_sendsms(self):
@@ -178,24 +232,42 @@ class UserNotificationTestCase(MyTestCase):
     def test_05_check_conditions(self):
 
         uhandler = UserNotificationEventHandler()
-        resp = Response()
         # The actual result_status is false and the result_value is false.
-        resp.data = """{"result": {"value": false, "status": false}}"""
+        resp = Response(response="""{"result": {"value": false, "authentication": "REJECT", "status": false}}""",
+                        mimetype='application/json')
         builder = EnvironBuilder(method='POST')
         env = builder.get_environ()
         req = Request(env)
         req.all_data = {}
         req.User = User()
+        fake_g = FakeFlaskG()
+        fake_g.audit_object = getAudit(self.app.config)
         r = uhandler.check_condition(
-            {"g": {},
+            {"g": fake_g,
              "handler_def": {"conditions": {"logged_in_user": "admin"}},
              "response": resp,
              "request": req})
         self.assertEqual(r, False)
 
+        # We expect the result_authentication to be "REJECT" and it is
+        r = uhandler.check_condition(
+            {"g": fake_g,
+             "handler_def": {"conditions": {"result_authentication": AUTH_RESPONSE.REJECT}},
+             "response": resp,
+             "request": req})
+        self.assertTrue(r)
+
+        # We expect the result_authentication to be "ACCEPT" and it is not
+        r = uhandler.check_condition(
+            {"g": fake_g,
+             "handler_def": {"conditions": {"result_authentication": AUTH_RESPONSE.ACCEPT}},
+             "response": resp,
+             "request": req})
+        self.assertFalse(r)
+
         # We expect the result_value to be True, but it is not.
         r = uhandler.check_condition(
-            {"g": {},
+            {"g": fake_g,
              "handler_def": {"conditions": {"result_value": "True"}},
              "response": resp,
              "request": req})
@@ -203,7 +275,7 @@ class UserNotificationTestCase(MyTestCase):
 
         # We expect the result_value to be False, and it is.
         r = uhandler.check_condition(
-            {"g": {},
+            {"g": fake_g,
              "handler_def": {"conditions": {"result_value": "False"}},
              "response": resp,
              "request": req})
@@ -211,7 +283,7 @@ class UserNotificationTestCase(MyTestCase):
 
         # We expect the result_status to be True, but it is not!
         r = uhandler.check_condition(
-            {"g": {},
+            {"g": fake_g,
              "handler_def": {"conditions": {"result_status": "True"}},
              "response": resp,
              "request": req})
@@ -219,7 +291,7 @@ class UserNotificationTestCase(MyTestCase):
 
         # We expect the result_status to be False, and it is!
         r = uhandler.check_condition(
-            {"g": {},
+            {"g": fake_g,
              "handler_def": {"conditions": {"result_status": "False"}},
              "response": resp,
              "request": req})
@@ -237,7 +309,7 @@ class UserNotificationTestCase(MyTestCase):
         """
         tok = init_token({"serial": "lockedtoken", "type": "spass"})
         r = uhandler.check_condition(
-            {"g": {},
+            {"g": fake_g,
              "handler_def": {"conditions": {"token_locked": "True"}},
              "response": resp,
              "request": req
@@ -248,7 +320,8 @@ class UserNotificationTestCase(MyTestCase):
 
         # lock it
         tok.set_failcount(10)
-        options = {"g": {},
+        tok.token.save()
+        options = {"g": fake_g,
                    "handler_def": {"conditions": {"token_locked": "True"}},
                    "response": resp,
                    "request": req
@@ -291,8 +364,10 @@ class UserNotificationTestCase(MyTestCase):
         req.User = User("cornelius", "realm1")
         resp = Response()
         resp.data = """{"result": {"value": false}}"""
+        fake_g = FakeFlaskG()
+        fake_g.audit_object = getAudit(self.app.config)
         r = uhandler.check_condition(
-            {"g": {},
+            {"g": fake_g,
              "handler_def": {"conditions": {"realm": "realm2"}},
              "request": req,
              "response": resp
@@ -303,7 +378,7 @@ class UserNotificationTestCase(MyTestCase):
 
         # Check condition resolver
         r = uhandler.check_condition(
-            {"g": {},
+            {"g": fake_g,
              "handler_def": {"conditions": {"resolver": "resolver1"}},
              "request": req,
              "response": resp
@@ -311,7 +386,7 @@ class UserNotificationTestCase(MyTestCase):
         )
         self.assertTrue(r)
         r = uhandler.check_condition(
-            {"g": {},
+            {"g": fake_g,
              "handler_def": {"conditions": {"resolver": "resolver2"}},
              "request": req,
              "response": resp
@@ -325,6 +400,7 @@ class UserNotificationTestCase(MyTestCase):
                           "pin": "pin"}, user=User("cornelius", "realm1"))
         # lock it
         tok.set_failcount(10)
+        tok.save()
 
         uhandler = UserNotificationEventHandler()
         resp = Response()
@@ -390,8 +466,8 @@ class UserNotificationTestCase(MyTestCase):
                                  data={'user': "cornelius@realm1"},
                                  headers={})
 
-        tok = init_token({"serial": "oath1234", "type": "spass"},
-                         user=User("cornelius", "realm1"))
+        init_token({"serial": "oath1234", "type": "spass"},
+                   user=User("cornelius", "realm1"))
 
         env = builder.get_environ()
         req = Request(env)
@@ -436,8 +512,8 @@ class UserNotificationTestCase(MyTestCase):
                                  data={'user': "cornelius@realm1"},
                                  headers={})
 
-        tok = init_token({"serial": "oath1234", "type": "spass"},
-                         user=User("cornelius", "realm1"))
+        init_token({"serial": "oath1234", "type": "spass"},
+                   user=User("cornelius", "realm1"))
 
         env = builder.get_environ()
         req = Request(env)
@@ -463,8 +539,8 @@ class UserNotificationTestCase(MyTestCase):
                                  data={'user': "cornelius@realm1"},
                                  headers={})
 
-        tok = init_token({"serial": "oath1234", "type": "spass"},
-                         user=User("cornelius", "realm1"))
+        init_token({"serial": "oath1234", "type": "spass"},
+                   user=User("cornelius", "realm1"))
 
         env = builder.get_environ()
         req = Request(env)
@@ -515,7 +591,7 @@ class UserNotificationTestCase(MyTestCase):
 
         tok = init_token({"serial": serial,
                           "type": "spass"},
-                          user=User("cornelius", "realm1"))
+                         user=User("cornelius", "realm1"))
 
         env = builder.get_environ()
         req = Request(env)
@@ -777,15 +853,88 @@ class UserNotificationTestCase(MyTestCase):
                        "options": {"body": "your {registrationcode}",
                                    "emailconfig": "myserver",
                                    "To": NOTIFY_TYPE.TOKENOWNER,
-                                   "To " + NOTIFY_TYPE.TOKENOWNER:
-                                       "recp@example.com",
-                                   "reply_to": NOTIFY_TYPE.TOKENOWNER,
-                                   "reply_to" + NOTIFY_TYPE.TOKENOWNER:
-                                       "recp@example.com"}}}
+                                   "reply_to": NOTIFY_TYPE.TOKENOWNER}}}
 
         un_handler = UserNotificationEventHandler()
         res = un_handler.do("sendmail", options=options)
         self.assertTrue(res)
+        msg = smtpmock.get_sent_message()
+        assert 'Subject: An action was performed on your token.' in msg
+        assert 'To: user@localhost.localdomain' in msg
+
+    @smtpmock.activate
+    def test_12_send_with_diffent_attribute(self):
+        # setup realms
+        self.setUp_user_realms()
+
+        r = add_smtpserver(identifier="myserver", server="1.2.3.4", tls=False)
+        self.assertTrue(r > 0)
+
+        smtpmock.setdata(response={"recp@example.com": (200, "OK")},
+                         support_tls=False)
+
+        g = FakeFlaskG()
+        audit_object = FakeAudit()
+        audit_object.audit_data["serial"] = "123456"
+
+        g.logged_in_user = {"username": "admin",
+                            "role": "admin",
+                            "realm": ""}
+        g.audit_object = audit_object
+
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "OATH123456"},
+                                 headers={})
+
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.all_data = {"serial": "SomeSerial",
+                        "user": "cornelius"}
+        user = User('cornelius', self.realm1)
+        user.set_attribute('sec_mail', 'user2@localhost.localdomain')
+        req.User = user
+        resp = Response()
+        resp.data = """{"result": {"value": true},
+           "detail": {"registrationcode": "12345678910"}
+           }
+           """
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {
+                       "conditions": {"serial": "123.*"},
+                       "options": {"body": "your {registrationcode}",
+                                   "emailconfig": "myserver",
+                                   "To": NOTIFY_TYPE.TOKENOWNER,
+                                   "To " + NOTIFY_TYPE.TOKENOWNER: 'sec_mail',
+                                   "reply_to": NOTIFY_TYPE.TOKENOWNER}}}
+
+        un_handler = UserNotificationEventHandler()
+        res = un_handler.do("sendmail", options=options)
+        self.assertTrue(res)
+        msg = smtpmock.get_sent_message()
+        assert 'Subject: An action was performed on your token.' in msg
+        assert 'To: user2@localhost.localdomain' in msg
+
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {
+                       "conditions": {"serial": "123.*"},
+                       "options": {"body": "your {registrationcode}",
+                                   "emailconfig": "myserver",
+                                   "To": NOTIFY_TYPE.TOKENOWNER,
+                                   "reply_to": NOTIFY_TYPE.TOKENOWNER}}}
+
+        un_handler = UserNotificationEventHandler()
+        res = un_handler.do("sendmail", options=options)
+        self.assertTrue(res)
+        msg = smtpmock.get_sent_message()
+        assert 'Subject: An action was performed on your token.' in msg
+        assert 'To: user@localhost.localdomain' in msg
 
     @smtpmock.activate
     def test_12_send_to_internal_admin(self):
@@ -1023,7 +1172,7 @@ class UserNotificationTestCase(MyTestCase):
         r = save_resolver(parameters)
         self.assertTrue(r)
 
-        success, fail = set_realm("notify_realm", ["notify_resolver"])
+        success, fail = set_realm("notify_realm", [{'name': "notify_resolver"}])
         self.assertEqual(len(success), 1)
         self.assertEqual(len(fail), 0)
 
@@ -1078,9 +1227,9 @@ class UserNotificationTestCase(MyTestCase):
         # TODO: Also we should check that no email was sent (i.e. call of smtpserver)
         self.assertTrue(res)
         # Cleanup
+        remove_token("SPNOTIFY")
         delete_realm("notify_realm")
         delete_resolver("notify_resolver")
-        remove_token("SPNOTIFY")
 
     def test_16_check_conditions_user_num_tokens(self):
         # prepare
@@ -1091,8 +1240,8 @@ class UserNotificationTestCase(MyTestCase):
                                  data={'user': "cornelius@realm1"},
                                  headers={})
 
-        tok = init_token({"serial": "oath1234", "type": "spass"},
-                         user=user)
+        init_token({"serial": "oath1234", "type": "spass"},
+                   user=user)
 
         env = builder.get_environ()
         req = Request(env)
@@ -1203,7 +1352,7 @@ class UserNotificationTestCase(MyTestCase):
                           "otppin": "spass"},
                          user=user)
         # Add last authentication
-        tok.add_tokeninfo(ACTION.LASTAUTH, "2016-10-10 10:10:10.000")
+        tok.write_tokeninfo(PolicyAction.LASTAUTH, "2016-10-10 10:10:10.000")
         env = builder.get_environ()
         req = Request(env)
         req.all_data = {"user": "cornelius@realm1",
@@ -1264,8 +1413,8 @@ class UserNotificationTestCase(MyTestCase):
         g.client_ip = env["REMOTE_ADDR"]
         req = Request(env)
         req.all_data = {"serial": "SomeSerial",
-                        "user": u"nönäscii"}
-        req.User = User(u"nönäscii", self.realm1)
+                        "user": "nönäscii"}
+        req.User = User("nönäscii", self.realm1)
         resp = Response()
         resp.data = """{"result": {"value": true}}"""
         # If we send a plain email, we do not escape HTML
@@ -1337,13 +1486,13 @@ class UserNotificationTestCase(MyTestCase):
                         "user": "cornelius"}
         req.User = User("cornelius", self.realm1)
         resp = Response()
-        resp.data = """
+        resp.data = f"""
 {{
     "detail": {{
         "googleurl": {{
             "description": "URL for google Authenticator",
-            "img": "{0!s}",
-            "value": "{1!s}"
+            "img": "{PNG_IMAGE!s}",
+            "value": "{OAUTH_URL!s}"
         }},
         "rollout_state": "",
         "serial": "OATH0001D8B6",
@@ -1359,7 +1508,8 @@ class UserNotificationTestCase(MyTestCase):
     "time": 1561549651.093083,
     "version": "privacyIDEA 3.0.1.dev2",
     "versionnumber": "3.0.1.dev2"
-}}""".format(PNG_IMAGE, OAUTH_URL)
+}}"""
+        resp.content_type = "application/json"
         options = {"g": g,
                    "request": req,
                    "response": resp,
@@ -1376,7 +1526,7 @@ class UserNotificationTestCase(MyTestCase):
         payload = to_unicode(parsed_email.get_payload(decode=True))
         self.assertEqual(parsed_email.get_content_type(), "text/html")
         # Check that the base64-encoded image does not get mangled
-        self.assertEqual(payload, "<img src='{0!s}' />".format(PNG_IMAGE))
+        self.assertEqual(payload, f"<img src='{PNG_IMAGE!s}' />")
 
     @smtpmock.activate
     def test_21_sendmail_attachment(self):
@@ -1410,12 +1560,12 @@ class UserNotificationTestCase(MyTestCase):
                         "user": "cornelius"}
         req.User = User("cornelius", self.realm1)
         resp = Response()
-        resp.data = """{{
+        resp.data = f"""{{
             "detail": {{
                 "googleurl": {{
                     "description": "URL for google Authenticator",
-                    "img": "{0!s}",
-                    "value": "{1!s}"
+                    "img": "{PNG_IMAGE!s}",
+                    "value": "{OAUTH_URL!s}"
                 }},
                 "rollout_state": "",
                 "serial": "OATH0001D8B6",
@@ -1432,7 +1582,8 @@ class UserNotificationTestCase(MyTestCase):
             "version": "privacyIDEA 3.0.1.dev2",
             "versionnumber": "3.0.1.dev2"
         }}
-        """.format(PNG_IMAGE, OAUTH_URL)
+        """
+        resp.content_type = "application/json"
         options = {"g": g,
                    "request": req,
                    "response": resp,
@@ -1508,8 +1659,8 @@ class UserNotificationTestCase(MyTestCase):
         self.assertTrue(res)
         # check, if the file was written with the correct contents
         with open("tests/testdata/testOATH123456.txt") as f:
-            l = f.read()
-        self.assertEqual(l, "OATH123456, Cornelius")
+            content = f.read()
+        self.assertEqual(content, "OATH123456, Cornelius")
         os.remove("tests/testdata/testOATH123456.txt")
 
         # Check what happens if we try to write outside of spooldir
@@ -1527,6 +1678,10 @@ class UserNotificationTestCase(MyTestCase):
         with mock.patch("logging.Logger.error") as mock_log:
             un_handler.do("savefile", options=options)
             mock_log.assert_called_once_with("Cannot write outside of spooldir tests/testdata/!")
+
+        # This part only works for a non-root user
+        if os.getuid() == 0:
+            return
 
         # Check what happens if the file can not be written
         options = {"g": g,
@@ -1554,3 +1709,274 @@ class UserNotificationTestCase(MyTestCase):
             self.assertTrue(call_args[0][0].startswith("Failed to write notification file:"))
 
         os.remove("tests/testdata/testOATH123456.txt")
+
+    @smtpmock.activate
+    def test_23_empty_admin_realm_no_fanout(self):
+        """
+        Test that an empty/None admin realm in "To admin realm" does NOT
+        fan out notifications to all users. The handler should short-circuit
+        without attempting to send any email: it returns True (no-op default),
+        no SMTP send is attempted (sent_recipient stays None).
+        """
+        # setup realms
+        self.setUp_user_realms()
+
+        r = add_smtpserver(identifier="myserver", server="1.2.3.4", tls=False)
+        self.assertTrue(r > 0)
+
+        smtpmock.setdata(response={"recp@example.com": (200, "OK")},
+                         support_tls=False)
+
+        g = FakeFlaskG()
+        audit_object = FakeAudit()
+        audit_object.audit_data["serial"] = "123456"
+
+        g.logged_in_user = {"username": "testadmin",
+                            "role": "admin",
+                            "realm": ""}
+        g.audit_object = audit_object
+
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "OATH123456"},
+                                 headers={})
+
+        env = builder.get_environ()
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.all_data = {"serial": "SomeSerial",
+                        "user": "cornelius"}
+        req.User = User("cornelius", self.realm1)
+        resp = Response()
+        resp.data = """{"result": {"value": true}}"""
+
+        # --- Case 1: "To admin realm" set to empty string ---
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {
+                       "options": {"body": "test body",
+                                   "emailconfig": "myserver",
+                                   "To": NOTIFY_TYPE.ADMIN_REALM,
+                                   "To " + NOTIFY_TYPE.ADMIN_REALM: ""}}}
+
+        un_handler = UserNotificationEventHandler()
+        res = un_handler.do("sendmail", options=options)
+        # Handler returns True (default, short-circuited before send)
+        self.assertTrue(res)
+        # No SMTP send was attempted
+        self.assertIsNone(smtpmock.get_sent_recipient())
+        self.assertIsNone(smtpmock.get_sent_message())
+        # The skipped send is surfaced via run_details so it lands in the audit
+        self.assertIn("No admin realm configured", un_handler.run_details)
+
+        # --- Case 2: "To admin realm" key missing entirely (None) ---
+        smtpmock.setdata(response={"recp@example.com": (200, "OK")},
+                         support_tls=False)
+
+        options_none = {"g": g,
+                        "request": req,
+                        "response": resp,
+                        "handler_def": {
+                            "options": {"body": "test body",
+                                        "emailconfig": "myserver",
+                                        "To": NOTIFY_TYPE.ADMIN_REALM}}}
+
+        un_handler = UserNotificationEventHandler()
+        res = un_handler.do("sendmail", options=options_none)
+        # Handler returns True (default, short-circuited before send)
+        self.assertTrue(res)
+        # No SMTP send was attempted
+        self.assertIsNone(smtpmock.get_sent_recipient())
+        self.assertIsNone(smtpmock.get_sent_message())
+        # The skipped send is surfaced via run_details so it lands in the audit
+        self.assertIn("No admin realm configured", un_handler.run_details)
+
+    @smtpmock.activate
+    def test_24_empty_reply_to_admin_realm_no_fanout(self):
+        """
+        Test that an empty/None admin realm in "reply_to admin realm" does NOT
+        fan out reply-to addresses to all users in all realms.
+        The SMTP layer falls back reply_to to the sender when reply_to is
+        falsy, so we assert that Reply-To equals the configured sender (not a
+        comma-separated list of realm user emails).
+        """
+        # setup realms
+        self.setUp_user_realms()
+
+        # Use a known sender so we can assert the fallback
+        smtp_sender = "noreply@example.com"
+        r = add_smtpserver(identifier="myserver", server="1.2.3.4", tls=False,
+                           sender=smtp_sender)
+        self.assertTrue(r > 0)
+
+        smtpmock.setdata(response={"recp@example.com": (200, "OK")},
+                         support_tls=False)
+
+        g = FakeFlaskG()
+        audit_object = FakeAudit()
+        audit_object.audit_data["serial"] = "123456"
+
+        g.logged_in_user = {"username": "testadmin",
+                            "role": "admin",
+                            "realm": ""}
+        g.audit_object = audit_object
+
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "OATH123456"},
+                                 headers={})
+
+        env = builder.get_environ()
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.all_data = {"serial": "SomeSerial",
+                        "user": "cornelius"}
+        req.User = User("cornelius", self.realm1)
+        resp = Response()
+        resp.data = """{"result": {"value": true}}"""
+
+        # Send to tokenowner but with reply_to set to an empty admin realm
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {
+                       "options": {"body": "test body",
+                                   "emailconfig": "myserver",
+                                   "To": NOTIFY_TYPE.TOKENOWNER,
+                                   "reply_to": NOTIFY_TYPE.ADMIN_REALM,
+                                   "reply_to " + NOTIFY_TYPE.ADMIN_REALM: ""}}}
+
+        un_handler = UserNotificationEventHandler()
+        with mock.patch("logging.Logger.warning") as mock_log:
+            res = un_handler.do("sendmail", options=options)
+            self.assertTrue(res)
+            mock_log.assert_any_call(
+                "No admin realm specified for ADMIN_REALM reply-to. "
+                "Reply-To will fall back to the SMTP sender address.")
+
+        # Parse the sent email and check the Reply-To header
+        msg = smtpmock.get_sent_message()
+        self.assertIsNotNone(msg)
+        parsed = email.message_from_string(msg)
+        reply_to_val = parsed.get("Reply-To", "")
+
+        # Reply-To must be the sender fallback, NOT a comma-separated list of realm users
+        self.assertEqual(reply_to_val, smtp_sender)
+        # Must not contain any comma (i.e. no multi-recipient fanout)
+        self.assertNotIn(",", reply_to_val)
+        # Must not contain realm1 user emails
+        self.assertNotIn("user@localhost.localdomain", reply_to_val)
+
+    def test_25_admin_realm_option_required(self):
+        """
+        Test that the "To admin realm" and "reply_to admin realm" sub-options
+        are marked as required in the action definition. The UI template
+        (config.events.details.html) uses ng-required with a visibleIf guard
+        so this is only enforced when the field is actually shown.
+        """
+        actions = UserNotificationEventHandler().actions
+        sendmail_opts = actions["sendmail"]
+
+        to_key = "To " + NOTIFY_TYPE.ADMIN_REALM
+        self.assertIn(to_key, sendmail_opts)
+        self.assertTrue(sendmail_opts[to_key].get("required"),
+                        f"'{to_key}' should be marked required")
+
+        reply_to_key = "reply_to " + NOTIFY_TYPE.ADMIN_REALM
+        self.assertIn(reply_to_key, sendmail_opts)
+        self.assertTrue(sendmail_opts[reply_to_key].get("required"),
+                        f"'{reply_to_key}' should be marked required")
+
+    @smtpmock.activate
+    def test_26_reply_to_admin_realm_with_valid_realm(self):
+        """
+        Test that when reply_to is set to ADMIN_REALM with a valid realm,
+        the Reply-To header is populated with the comma-separated email
+        addresses of all users in that realm who have an email.
+        """
+        # setup realms
+        self.setUp_user_realms()
+
+        smtp_sender = "noreply@example.com"
+        r = add_smtpserver(identifier="myserver", server="1.2.3.4", tls=False,
+                           sender=smtp_sender)
+        self.assertTrue(r > 0)
+
+        smtpmock.setdata(response={"recp@example.com": (200, "OK")},
+                         support_tls=False)
+
+        g = FakeFlaskG()
+        audit_object = FakeAudit()
+        audit_object.audit_data["serial"] = "123456"
+
+        g.logged_in_user = {"username": "testadmin",
+                            "role": "admin",
+                            "realm": ""}
+        g.audit_object = audit_object
+
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "OATH123456"},
+                                 headers={})
+
+        env = builder.get_environ()
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.all_data = {"serial": "SomeSerial",
+                        "user": "cornelius"}
+        req.User = User("cornelius", self.realm1)
+        resp = Response()
+        resp.data = """{"result": {"value": true}}"""
+
+        # Send to tokenowner with reply_to set to a valid admin realm
+        # realm1 has cornelius with email user@localhost.localdomain
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {
+                       "options": {"body": "test body",
+                                   "emailconfig": "myserver",
+                                   "To": NOTIFY_TYPE.TOKENOWNER,
+                                   "reply_to": NOTIFY_TYPE.ADMIN_REALM,
+                                   "reply_to " + NOTIFY_TYPE.ADMIN_REALM: "realm1"}}}
+
+        un_handler = UserNotificationEventHandler()
+        res = un_handler.do("sendmail", options=options)
+        self.assertTrue(res)
+
+        # Parse the sent email and verify Reply-To contains realm1 user emails
+        msg = smtpmock.get_sent_message()
+        self.assertIsNotNone(msg)
+        parsed = email.message_from_string(msg)
+        reply_to_val = parsed.get("Reply-To", "")
+
+        # Reply-To must contain the realm user's email, NOT the sender fallback
+        self.assertIn("user@localhost.localdomain", reply_to_val)
+        self.assertNotEqual(reply_to_val, smtp_sender)
+
+    def test_27_get_admin_realm_emails_warns_on_skipped_resolver(self):
+        # A resolver that raises while listing users must not empty out the
+        # whole recipient list; other resolvers in the realm still contribute
+        # their users' emails, and the caller is warned the list may be
+        # incomplete.
+        self.setUp_user_realms()
+        flaky = "notification_flaky_resolver"
+        save_resolver({"resolver": flaky, "type": "passwdresolver", "fileName": PWFILE2})
+        self.addCleanup(delete_resolver, flaky)
+        self.addCleanup(set_realm, self.realm1, [{"name": self.resolvername1}])
+        (added, failed) = set_realm(self.realm1,
+                                    [{"name": self.resolvername1}, {"name": flaky}])
+        self.assertEqual(0, len(failed))
+        self.assertEqual(2, len(added))
+
+        with patch_resolver_to_raise(flaky, ResolverError("simulated outage")):
+            with mock.patch("privacyidea.lib.eventhandler.usernotification.log") as mock_log:
+                emails = UserNotificationEventHandler.get_admin_realm_emails(self.realm1)
+
+        # resolvername1 still works, so its user's email is still returned.
+        self.assertIn("user@localhost.localdomain", emails)
+        self.assertTrue(mock_log.warning.called)
+        warned_realm = mock_log.warning.call_args[0][0]
+        self.assertIn(self.realm1, warned_realm)
+        self.assertIn(flaky, warned_realm)

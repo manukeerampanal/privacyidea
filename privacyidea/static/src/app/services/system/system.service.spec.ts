@@ -1,0 +1,376 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { HttpHeaders, provideHttpClient } from "@angular/common/http";
+import { HttpTestingController, provideHttpClientTesting } from "@angular/common/http/testing";
+import { signal } from "@angular/core";
+import { TestBed } from "@angular/core/testing";
+import { ROUTE_PATHS } from "@app/route_paths";
+import { environment } from "@env/environment";
+import { AuthService } from "@services/auth/auth.service";
+import { ContentService } from "@services/content/content.service";
+import { MockContentService, MockPiResponse } from "@testing/mock-services";
+import { MockAuthService } from "@testing/mock-services/mock-auth-service";
+import { lastValueFrom, of } from "rxjs";
+import { SystemService } from "./system.service";
+
+describe("SystemService", () => {
+  let service: SystemService;
+  let httpMock: HttpTestingController;
+  let contentService: MockContentService;
+  let authService: MockAuthService;
+
+  beforeEach(() => {
+    TestBed.configureTestingModule({
+      providers: [
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        { provide: AuthService, useClass: MockAuthService },
+        { provide: ContentService, useClass: MockContentService },
+        SystemService
+      ]
+    });
+    service = TestBed.inject(SystemService);
+    httpMock = TestBed.inject(HttpTestingController);
+    contentService = TestBed.inject(ContentService) as unknown as MockContentService;
+    authService = TestBed.inject(AuthService) as unknown as MockAuthService;
+  });
+
+  it("should be created", () => {
+    expect(service).toBeTruthy();
+  });
+
+  it("caConnectorResource should make a request if on allowed route and return response", async () => {
+    async function testLoadResource() {
+      const caConnectorResponse = { service1: {}, service2: {} };
+      const mockResponse = MockPiResponse.fromValue(caConnectorResponse);
+      TestBed.tick();
+      const req = httpMock.expectOne(`${environment.proxyUrl}/system/names/caconnector`);
+      expect(req.request.method).toBe("GET");
+      req.flush(mockResponse);
+      await lastValueFrom(of({})); // Wait for async updates
+
+      const response = service.caConnectorResource.value();
+      expect(response).toBeDefined();
+      expect(response).toEqual(mockResponse);
+      expect(response?.result?.value).toEqual(caConnectorResponse);
+      expect(service.caConnectors()).toEqual(caConnectorResponse);
+    }
+
+    authService.actionAllowed.mockImplementation((action) => action === "enrollCERTIFICATE");
+
+    contentService.routeUrl.set(ROUTE_PATHS.CONFIGURATION_SYSTEM);
+    await testLoadResource();
+
+    // set not allowed route to trigger resource reload
+    contentService.routeUrl.set(ROUTE_PATHS.CONFIGURATION_MACHINES);
+    expect(service.caConnectorResource.value()).toBeUndefined();
+
+    contentService.routeUrl.set(ROUTE_PATHS.CONFIGURATION_SYSTEM);
+    await testLoadResource();
+
+    // set not allowed route to trigger resource reload
+    contentService.routeUrl.set(ROUTE_PATHS.TOKENS);
+    expect(service.caConnectorResource.value()).toBeUndefined();
+
+    contentService.routeUrl.set(ROUTE_PATHS.TOKENS_ENROLLMENT);
+    contentService.onTokenEnrollmentLikely.set(true);
+    await testLoadResource();
+  });
+
+  it("caConnectors should handle http error from caConnectorResource", async () => {
+    authService.actionAllowed.mockImplementation((action) => action === "enrollCERTIFICATE");
+    contentService.routeUrl.set(ROUTE_PATHS.TOKENS_ENROLLMENT);
+    contentService.onTokenEnrollmentLikely.set(true);
+
+    TestBed.tick();
+    const req = httpMock.expectOne(`${environment.proxyUrl}/system/names/caconnector`);
+    expect(req.request.method).toBe("GET");
+    req.flush(MockPiResponse.fromError({ message: "Permission denied" }), {
+      status: 403,
+      statusText: "Permission denied"
+    });
+    await lastValueFrom(of({})); // Wait for async updates
+
+    expect(service.caConnectorResource.hasValue()).toEqual(false);
+    expect(service.caConnectors()).toEqual([]);
+  });
+
+  it("caConnectors should reset to empty when resource errors after successful load", async () => {
+    authService.actionAllowed.mockImplementation((action) => action === "enrollCERTIFICATE");
+    contentService.routeUrl.set(ROUTE_PATHS.TOKENS_ENROLLMENT);
+    contentService.onTokenEnrollmentLikely.set(true);
+
+    TestBed.tick();
+    let req = httpMock.expectOne(`${environment.proxyUrl}/system/names/caconnector`);
+    const caConnectorResponse = { service1: {}, service2: {} };
+    req.flush(MockPiResponse.fromValue(caConnectorResponse));
+    await lastValueFrom(of({}));
+    expect(service.caConnectors()).toEqual(caConnectorResponse);
+
+    service.caConnectorResource.reload();
+    TestBed.tick();
+    req = httpMock.expectOne(`${environment.proxyUrl}/system/names/caconnector`);
+    req.flush("Error", { status: 500, statusText: "Server Error" });
+    await lastValueFrom(of({}));
+
+    expect(service.caConnectors()).toEqual([]);
+  });
+
+  describe("systemConfigResource", () => {
+    // An admin only gets the configuration with configread.
+    beforeEach(() => {
+      authService.authData.set({ ...MockAuthService.MOCK_AUTH_DATA, rights: ["configread"] });
+    });
+
+    it("systemConfig and systemConfigInit fall back to default when resource empty", () => {
+      expect(service.systemConfig()).toEqual({});
+      expect(service.systemConfigInit()).toEqual({});
+    });
+
+    it("should update signals based on systemConfigResource on successful response", async () => {
+      contentService.onConfigurationSystem = signal(true);
+      TestBed.tick();
+
+      const req = httpMock.expectOne((r) => r.url === "/system/");
+      expect(req.request.method).toBe("GET");
+      const systemConfig = [{ name: "test", providermodule: "TestProvider", options: {}, headers: {} }];
+      const systemConfigInit = { key1: "value1", key2: "value2" };
+      const response = MockPiResponse.fromValue(systemConfig, {}, systemConfigInit);
+      req.flush(response);
+      await Promise.resolve();
+
+      expect(service.systemConfig()).toEqual(systemConfig);
+      expect(service.systemConfigInit()).toEqual(systemConfigInit);
+    });
+
+    it("should handle error state from smsGatewayResource", async () => {
+      contentService.onConfigurationSystem = signal(true);
+      TestBed.tick();
+
+      const req = httpMock.expectOne((r) => r.url === "/system/");
+      expect(req.request.method).toBe("GET");
+      req.flush(MockPiResponse.fromError({ message: "Permission denied" }), {
+        status: 403,
+        statusText: "Permission denied"
+      });
+      await Promise.resolve();
+
+      expect(service.systemConfigResource.hasValue()).toEqual(false);
+      expect(service.systemConfig()).toEqual({});
+      expect(service.systemConfigInit()).toEqual({});
+    });
+
+    it("should not request the configuration for an admin without configread", () => {
+      authService.authData.set({ ...MockAuthService.MOCK_AUTH_DATA, rights: [] });
+      contentService.onConfigurationSystem = signal(true);
+      TestBed.tick();
+
+      httpMock.expectNone((r) => r.url === "/system/");
+      expect(service.systemConfig()).toEqual({});
+    });
+
+    // The backend checks configread for admins only, so a user still gets the configuration.
+    it("should request the configuration for a user without configread", () => {
+      authService.authData.set({ ...MockAuthService.MOCK_AUTH_DATA, role: "user", rights: [] });
+      contentService.onTokenEnrollmentLikely.set(true);
+      TestBed.tick();
+
+      httpMock.expectOne((r) => r.url === "/system/").flush(MockPiResponse.fromValue({}));
+    });
+  });
+
+  describe("nodesResource", () => {
+    it("nodes falls back to default when resource is empty", () => {
+      expect(service.nodes()).toEqual([]);
+    });
+
+    it("should update nodes signal based on nodesResource on successful response", async () => {
+      contentService.onConfigurationSystem = signal(true);
+      TestBed.tick();
+
+      const req = httpMock.expectOne((r) => r.url === "/system/nodes");
+      expect(req.request.method).toBe("GET");
+      const nodes = [{ name: "test", uuid: "1234" }];
+      const response = MockPiResponse.fromValue(nodes);
+      req.flush(response);
+      await Promise.resolve();
+
+      expect(service.nodes()).toEqual(nodes);
+    });
+
+    it("should handle error state from nodesResource", async () => {
+      contentService.onConfigurationSystem = signal(true);
+      TestBed.tick();
+
+      const req = httpMock.expectOne((r) => r.url === "/system/nodes");
+      expect(req.request.method).toBe("GET");
+      req.flush(MockPiResponse.fromError({ message: "Permission denied" }), {
+        status: 403,
+        statusText: "Permission denied"
+      });
+      await Promise.resolve();
+
+      expect(service.nodesResource.hasValue()).toEqual(false);
+      expect(service.nodes()).toEqual([]);
+    });
+  });
+
+  describe("radiusServers", () => {
+    beforeEach(() => {
+      authService.actionAllowed.mockImplementation((action) => action === "enrollRADIUS");
+    });
+
+    it("radiusServers falls back to default when resource is empty", () => {
+      expect(service.radiusServers()).toEqual([]);
+    });
+
+    it("should update radiusServers signal based on radiusServersResource on successful response", async () => {
+      contentService.onConfigurationSystem = signal(true);
+      TestBed.tick();
+
+      const req = httpMock.expectOne((r) => r.url === "/system/names/radius");
+      expect(req.request.method).toBe("GET");
+      const radiusServers = ["server1", "server2"];
+      const response = MockPiResponse.fromValue(radiusServers);
+      req.flush(response);
+      await Promise.resolve();
+
+      expect(service.radiusServers()).toEqual(radiusServers);
+    });
+
+    it("should handle error state from radiusServersResource", async () => {
+      contentService.onConfigurationSystem = signal(true);
+      TestBed.tick();
+
+      const req = httpMock.expectOne((r) => r.url === "/system/names/radius");
+      expect(req.request.method).toBe("GET");
+      req.flush(MockPiResponse.fromError({ message: "Permission denied" }), {
+        status: 403,
+        statusText: "Permission denied"
+      });
+      await Promise.resolve();
+
+      expect(service.radiusServerResource.hasValue()).toEqual(false);
+      expect(service.radiusServers()).toEqual([]);
+    });
+  });
+
+  describe("imperative HTTP methods", () => {
+    const base = `${environment.proxyUrl}/system/`;
+
+    beforeEach(() => {
+      authService.getHeaders.mockReturnValue(new HttpHeaders({ Authorization: "test-token" }));
+    });
+
+    it("getResolverTiming defaults since_seconds to 3600 and forwards the response", () => {
+      const mockResponse = MockPiResponse.fromValue([]);
+      let res: unknown;
+      service.getResolverTiming().subscribe((r) => (res = r));
+
+      const req = httpMock.expectOne((r) => r.url === `${base}health/resolver_timing`);
+      expect(req.request.method).toBe("GET");
+      expect(req.request.params.get("since_seconds")).toBe("3600");
+      expect(req.request.headers.get("Authorization")).toBe("test-token");
+
+      req.flush(mockResponse);
+      expect(res).toEqual(mockResponse);
+    });
+
+    it("getResolverTiming sends a custom since_seconds value", () => {
+      service.getResolverTiming(600).subscribe();
+
+      const req = httpMock.expectOne((r) => r.url === `${base}health/resolver_timing`);
+      expect(req.request.params.get("since_seconds")).toBe("600");
+      req.flush(MockPiResponse.fromValue([]));
+    });
+
+    it("getNotificationDelivery defaults since_seconds to 3600 and forwards the response", () => {
+      const mockResponse = MockPiResponse.fromValue({ push: [], sms: [], email: [], since_seconds: 3600 });
+      let res: unknown;
+      service.getNotificationDelivery().subscribe((r) => (res = r));
+
+      const req = httpMock.expectOne((r) => r.url === `${base}health/notification_delivery`);
+      expect(req.request.method).toBe("GET");
+      expect(req.request.params.get("since_seconds")).toBe("3600");
+      expect(req.request.headers.get("Authorization")).toBe("test-token");
+
+      req.flush(mockResponse);
+      expect(res).toEqual(mockResponse);
+    });
+
+    it("getNotificationDelivery sends a custom since_seconds value", () => {
+      service.getNotificationDelivery(120).subscribe();
+
+      const req = httpMock.expectOne((r) => r.url === `${base}health/notification_delivery`);
+      expect(req.request.params.get("since_seconds")).toBe("120");
+      req.flush(MockPiResponse.fromValue({ push: [], sms: [], email: [], since_seconds: 120 }));
+    });
+
+    it("getCertificateHealth issues a GET to health/certificates", () => {
+      service.getCertificateHealth().subscribe();
+
+      const req = httpMock.expectOne(`${base}health/certificates`);
+      expect(req.request.method).toBe("GET");
+      expect(req.request.headers.get("Authorization")).toBe("test-token");
+      req.flush(MockPiResponse.fromValue([]));
+    });
+
+    it("saveSystemConfig posts the config to setConfig", () => {
+      const config = { key1: "value1" };
+      service.saveSystemConfig(config).subscribe();
+
+      const req = httpMock.expectOne(`${base}setConfig`);
+      expect(req.request.method).toBe("POST");
+      expect(req.request.body).toEqual(config);
+      expect(req.request.headers.get("Authorization")).toBe("test-token");
+      req.flush(MockPiResponse.fromValue({ key1: "insert" }));
+    });
+
+    it("deleteSystemConfig deletes the url-encoded key", () => {
+      service.deleteSystemConfig("some key/with slash").subscribe();
+
+      const req = httpMock.expectOne(`${base}${encodeURIComponent("some key/with slash")}`);
+      expect(req.request.method).toBe("DELETE");
+      req.flush(MockPiResponse.fromValue(true));
+    });
+
+    it("deleteUserCache deletes user-cache", () => {
+      service.deleteUserCache().subscribe();
+
+      const req = httpMock.expectOne(`${base}user-cache`);
+      expect(req.request.method).toBe("DELETE");
+      req.flush(MockPiResponse.fromValue({ status: true, deleted: 3 }));
+    });
+
+    it("getDocumentation requests documentation as text", () => {
+      let res: unknown;
+      service.getDocumentation().subscribe((r) => (res = r));
+
+      const req = httpMock.expectOne(`${base}documentation`);
+      expect(req.request.method).toBe("GET");
+      expect(req.request.responseType).toBe("text");
+      req.flush("plain docs");
+      expect(res).toBe("plain docs");
+    });
+
+    afterEach(() => {
+      httpMock.verify();
+    });
+  });
+});

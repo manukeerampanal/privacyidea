@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 2017-12-27 Cornelius Kölbel <cornelius.koelbel@netknights.it>
            Mocking the SMPP client
@@ -20,17 +19,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from __future__ import (
-    absolute_import, print_function, division, unicode_literals
-)
-
 from collections import namedtuple
-from mock import Mock
+from unittest.mock import Mock
 
-try:
-    from collections import Sequence, Sized
-except ImportError:
-    from collections.abc import Sequence, Sized
+from collections.abc import Sequence, Sized
 
 from smpplib.exceptions import ConnectionError
 
@@ -65,7 +57,7 @@ class CallList(Sequence, Sized):
         self._calls = []
 
 
-class SmppMock(object):
+class SmppMock:
 
     def __init__(self):
         self._calls = CallList()
@@ -128,7 +120,7 @@ class SmppMock(object):
         return SubmitSMMock
 
     def start(self):
-        import mock
+        from unittest import mock
 
         def unbound_on_init(SMPP, host, port):
             return self._on_init(SMPP, host, port)

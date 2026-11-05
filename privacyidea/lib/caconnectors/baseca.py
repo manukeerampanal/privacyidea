@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2015-04-22 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Initial writup
 #
@@ -26,29 +24,29 @@ In this first implementation it is only a local certificate authority.
 This module is tested in tests/test_lib_caconnector.py
 """
 
-# This takes a set of all CA Connector modules.
-AvailableCAConnectors = []
+# This contains the fully qualified class paths of all available CA connectors.
+AvailableCAConnectors = ["privacyidea.lib.caconnectors.localca.LocalCAConnector",
+                         "privacyidea.lib.caconnectors.msca.MSCAConnector"]
 
 
-class BaseCAConnector(object):
-    def revoke_cert(self, certificate, request_id=None, reason=None):
+class BaseCAConnector:
+    def revoke_cert(self, certificate: str, request_id=None, reason=None):
         """
         Revoke the specified certificate. At this point only the database
         index.txt is updated.
 
-        :param certificate: The certificate to revoke
-        :type certificate: Either takes X509 object or a PEM encoded
-            certificate (string)
-        :param request_id: The Id of the certificate in the certificate authority
+        :param certificate: The certificate to revoke (PEM format)
+        :type certificate: str
+        :param request_id: The ID of the certificate in the certificate authority
         :type request_id: int
         :param reason: One of the available reasons the certificate gets revoked
         :type reason: basestring
-        :return: Returns the serial number of the revoked certificate. Otherwise
+        :return: Returns the serial number of the revoked certificate. Otherwise,
             an error is raised.
         """
         pass
 
-    def sign_request(self, csr, options=None):
+    def sign_request(self, csr: str, options: dict = None) -> tuple[int, str | None]:
         """
         Signs a certificate request with the key of the CA.
 
@@ -60,13 +58,13 @@ class BaseCAConnector(object):
         CertificateDir: The directory where to save the certificates. This is
         relative to the WorkingDir.
 
-        :param csr: Certificate signing request
-        :type csr: PEM string or SPKAC
+        :param csr: Certificate signing request (PEM format)
+        :type csr: str
         :param options: Additional options like the validity time or the
-            template or spkac=1
+            template
         :type options: dict
-        :return: Returns a return value and the certificate
-        :rtype: (int, x509)
+        :return: Returns a return value and the certificate in PEM format
+        :rtype: tuple
         """
         pass
 
@@ -76,7 +74,7 @@ class BaseCAConnector(object):
 
         :param publish: Whether the CRL should be published at its CDPs
         :param check_validity: Only create a new CRL, if the old one is about to
-            expire. Therefore the overlap period and the remaining runtime of
+            expire. Therefore, the overlap period and the remaining runtime of
             the CRL is checked. If the remaining runtime is smaller than the
             overlap period, we recreate the CRL.
         :return: the CRL location or None, if no CRL was created
@@ -88,6 +86,7 @@ class BaseCAConnector(object):
         create key server side
         create key on client side
         via PKCS10
+
         :return:
         """
         pass
@@ -96,7 +95,7 @@ class BaseCAConnector(object):
         """
         If a certificate needs a CA manager approval the request is in a pending state.
         This method fetches the state of a requested certificate.
-        This way we can know, if the certificate was issued in the meantime.
+        This way we can know if the certificate was issued in the meantime.
 
         :return:
         """
@@ -126,6 +125,7 @@ class BaseCAConnector(object):
     def set_config(self, config=None):
         """
         Set the configuration of the
+
         :param config: A dict with specific config values
         :return:
         """
@@ -145,6 +145,7 @@ class BaseCAConnector(object):
     def get_config(self, config):
         """
         This method helps to format the config values of the CA Connector.
+
         :param config: The configuration as it is stored in the database
         :type config: dict
         :return:
@@ -154,6 +155,7 @@ class BaseCAConnector(object):
     def get_specific_options(self):
         """
         Returns a dict of additional options for a specific connector instance.
+
         :return:
         """
         return {}

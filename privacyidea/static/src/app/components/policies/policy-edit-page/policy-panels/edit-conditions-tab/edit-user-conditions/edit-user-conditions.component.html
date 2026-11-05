@@ -1,0 +1,102 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div class="conditions-container">
+  <h2
+    class="conditions-title"
+    i18n="@@policy.usersConditions"
+    >Users Conditions</h2
+  >
+
+  <app-multi-select-only
+    class="margin-bottom-16"
+    fieldClass="input-width-xl"
+    label="Select Realms"
+    [items]="availableRealms()"
+    [selectedItems]="selectedRealms()"
+    [tooltipText]="selectRealmTooltip()"
+    (selectionChange)="selectRealm($event)">
+  </app-multi-select-only>
+
+  <app-multi-select-only
+    class="margin-bottom-16"
+    fieldClass="input-width-xl"
+    label="Select Resolvers"
+    [items]="availableResolvers()"
+    [selectedItems]="selectedResolvers()"
+    [tooltipText]="selectResolverTooltip()"
+    (selectionChange)="selectResolver($event)">
+  </app-multi-select-only>
+
+  <div class="user-list-wrapper">
+    <div class="user-list">
+      @for (user of selectedUsers(); track user) {
+        <div class="user-chip-edit">
+          <span>{{ user }}</span>
+          <button
+            mat-icon-button
+            (click)="removeUser(user)"
+            class="remove-user-btn">
+            <mat-icon class="remove-user-icon">close</mat-icon>
+          </button>
+        </div>
+      }
+    </div>
+
+    @if (selectedUsers().length > 0) {
+      <div class="user-buttons-container">
+        <mat-checkbox
+          [checked]="userCaseInsensitive()"
+          (change)="toggleUserCaseInsensitive()"
+          color="primary">
+          <span i18n="@@policy.caseInsensitive">Case insensitive</span>
+        </mat-checkbox>
+
+        <button
+          mat-stroked-button
+          class="action-button-secondary button-width-m"
+          (click)="clearUsers()">
+          <mat-icon>clear_all</mat-icon>
+          <span i18n="@@policy.clearUsers">Clear users</span>
+        </button>
+      </div>
+    }
+  </div>
+
+  <div class="user-input-container">
+    <mat-form-field
+      subscriptSizing="dynamic"
+      class="input-width-l"
+      appearance="outline">
+      <mat-label i18n="@@policy.addUser">Add User</mat-label>
+      <input
+        matInput
+        [formField]="userField"
+        (keyup.enter)="addUser(userSignal())" />
+      @if (userField().errors().some(e => e.kind === 'includesComma')) {
+        <mat-error i18n="@@policy.userMustNotContain">User must not contain commas.</mat-error>
+      }
+    </mat-form-field>
+    <button
+      mat-icon-button
+      [disabled]="!userSignal().trim() || userField().errors().length > 0"
+      (click)="addUser(userSignal())">
+      <mat-icon>add</mat-icon>
+    </button>
+  </div>
+</div>

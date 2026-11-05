@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 # 2020-01-16 Jean-Pierre Höhmann <jean-pierre.hoehmann@netknights.it>
 #
 # License:  AGPLv3
@@ -56,33 +54,28 @@
 This file tests the lib.tokens.webauthntoken, along with lib.tokens.webauthn.
 This depends on lib.tokenclass
 """
-
 import os
-import struct
 import unittest
-from copy import copy
-from mock import patch
-from testfixtures import log_capture
-from privacyidea.lib.user import User
 
+from unittest.mock import patch
+
+from privacyidea.lib.challenge import get_challenges
 from privacyidea.lib.config import set_privacyidea_config
-from privacyidea.lib.tokens.webauthn import (COSE_ALGORITHM, RegistrationRejectedException,
-                                             WebAuthnMakeCredentialOptions, AuthenticationRejectedException,
-                                             webauthn_b64_decode, webauthn_b64_encode,
-                                             WebAuthnRegistrationResponse, ATTESTATION_REQUIREMENT_LEVEL,
-                                             ATTESTATION_LEVEL, AuthenticatorDataFlags, WebAuthnAssertionResponse,
-                                             WebAuthnUser)
+from privacyidea.lib.error import PolicyError, ParameterError, EnrollmentError
+from privacyidea.lib.fido2.config import FIDO2ConfigOptions
+from privacyidea.lib.fido2.policy_action import FIDO2PolicyAction
+from privacyidea.lib.fido2.token_info import FIDO2TokenInfo
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.policy import set_policy, SCOPE, delete_policy
+from privacyidea.lib.token import init_token, check_user_pass, remove_token, import_tokens, get_tokens
+from privacyidea.lib.tokens.webauthn import (CoseAlgorithm, webauthn_b64_decode, AttestationLevel)
+from privacyidea.lib.tokens.webauthntoken import (WebAuthnTokenClass, DEFAULT_AUTHENTICATOR_ATTESTATION_FORM,
+                                                  DEFAULT_USER_VERIFICATION_REQUIREMENT)
+from privacyidea.lib.user import User
 from privacyidea.lib.utils import hexlify_and_unicode
 from .base import MyTestCase
-from privacyidea.lib.tokens.webauthntoken import (WebAuthnTokenClass, WEBAUTHNACTION, WEBAUTHNCONFIG,
-                                                  DEFAULT_AUTHENTICATOR_ATTESTATION_FORM,
-                                                  DEFAULT_USER_VERIFICATION_REQUIREMENT, WEBAUTHNINFO)
-from privacyidea.lib.token import init_token, check_user_pass, remove_token
-from privacyidea.lib.policy import set_policy, SCOPE, ACTION, delete_policy
-from privacyidea.lib.challenge import get_challenges
-from privacyidea.lib.error import PolicyError, ParameterError, EnrollmentError
 
-TRUST_ANCHOR_DIR = "{}/testdata/trusted_attestation_roots".format(os.path.abspath(os.path.dirname(__file__)))
+TRUST_ANCHOR_DIR = f"{os.path.abspath(os.path.dirname(__file__))}/testdata/trusted_attestation_roots"
 REGISTRATION_RESPONSE_TMPL = {
     'clientData': b'eyJ0eXBlIjogIndlYmF1dGhuLmNyZWF0ZSIsICJjbGllbnRFeHRlbnNpb25zIjoge30sICJjaGFsbGVu'
                   b'Z2UiOiAiYlB6cFgzaEhRdHNwOWV2eUtZa2FadFZjOVVOMDdQVWRKMjJ2WlVkRHA5NCIsICJvcmlnaW4i'
@@ -130,28 +123,27 @@ TIMEOUT = 60000
 ATTESTATION_FORM = 'direct'
 USER_VERIFICATION = None
 PUBLIC_KEY_CREDENTIAL_ALGORITHMS = [
-    COSE_ALGORITHM.ES256,
-    COSE_ALGORITHM.RS256,
-    COSE_ALGORITHM.PS256
+    CoseAlgorithm.ES256,
+    CoseAlgorithm.RS256,
+    CoseAlgorithm.PS256
 ]
 EXPECTED_REGISTRATION_CLIENT_EXTENSIONS = {
     'appid': None,
     'loc': None
 }
-APP_ID = "http://localhost:5000"
 PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE = [
-    COSE_ALGORITHM.ES256,
-    COSE_ALGORITHM.PS256
+    CoseAlgorithm.ES256,
+    CoseAlgorithm.PS256
 ]
 ALLOWED_TRANSPORTS = "usb ble nfc"
 CRED_ID = 'ilNaaY5fYJoR1sg5IB7FL2Zoa-qBd_5Q95ZcyxNkmjkoDhiLCLgEKoKfCUElLt6_6Dmj_EUuOHZUI6x_gC32LQ'
-PUB_KEY = 'a401020326215820319ea01f1125ce6232947365800ae5d9ddc874247c55d1516bad3ca3ca32075c'\
+PUB_KEY = 'a401020326215820319ea01f1125ce6232947365800ae5d9ddc874247c55d1516bad3ca3ca32075c' \
           '22582059f1f07f3b2f86c0a51e0cfa13dc57e7c77a110e796f8a0b27741fe58663cb3a'
 
-URL_DECODE_TEST_STRING = 'MEQCIBxR_Zn2XNp8yp4gVaFWU7xdpdAjkBXpXPphKPrgc_4uAiBAB0oVN-8ryLRfo-koEF5NLn1J\r\n'\
+URL_DECODE_TEST_STRING = 'MEQCIBxR_Zn2XNp8yp4gVaFWU7xdpdAjkBXpXPphKPrgc_4uAiBAB0oVN-8ryLRfo-koEF5NLn1J\r\n' \
                          'Cj8yyeCsp1U7mhR32A'
-URL_DECODE_EXPECTED_RESULT = b'0D\x02 \x1cQ\xfd\x99\xf6\\\xda|\xca\x9e U\xa1VS\xbc]\xa5\xd0#\x90\x15\xe9\\\xfaa(\xfa'\
-                             b'\xe0s\xfe.\x02 @\x07J\x157\xef+\xc8\xb4_\xa3\xe9(\x10^M.}I\n?2\xc9\xe0\xac\xa7U;\x9a'\
+URL_DECODE_EXPECTED_RESULT = b'0D\x02 \x1cQ\xfd\x99\xf6\\\xda|\xca\x9e U\xa1VS\xbc]\xa5\xd0#\x90\x15\xe9\\\xfaa(\xfa' \
+                             b'\xe0s\xfe.\x02 @\x07J\x157\xef+\xc8\xb4_\xa3\xe9(\x10^M.}I\n?2\xc9\xe0\xac\xa7U;\x9a' \
                              b'\x14w\xd8'
 NONE_ATTESTATION_REGISTRATION_RESPONSE_TMPL = {
     'clientData': b'eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiZkszN3hLZGhXSmhVNmQyVEFH'
@@ -168,7 +160,7 @@ NONE_ATTESTATION_USER_DISPLAY_NAME = '<john.doe.resolver1@foorealm>'
 NONE_ATTESTATION_USER_ID = b'WAN000136AE'
 NONE_ATTESTATION_ATTESTATION_FORM = 'none'
 NONE_ATTESTATION_CRED_ID = 'XyBvPatPc3biviiMX2Rkq5Vj-W6Pk6RtNi6r7v0dSgrLYaPxxWi0qxhAbrMBQa-HYM1FYKmUDAAkj3ekCoITEw'
-NONE_ATTESTATION_PUB_KEY = 'a5010203262001215820d210be8ddfb5b0bc0be1ea8deaedec197e43e1fece4eb95791e97e1d9219491f22582'\
+NONE_ATTESTATION_PUB_KEY = 'a5010203262001215820d210be8ddfb5b0bc0be1ea8deaedec197e43e1fece4eb95791e97e1d9219491f22582' \
                            '0f80e408b103d424808474999556a4e2c76453cfd114295a39bc9325a83b84416'
 
 SELF_ATTESTATION_REGISTRATION_RESPONSE_TMPL = {
@@ -215,8 +207,8 @@ class WebAuthnTokenTestCase(MyTestCase):
 
     def _create_challenge(self):
         self.token.set_otpkey(hexlify_and_unicode(webauthn_b64_decode(CRED_ID)))
-        self.token.add_tokeninfo(WEBAUTHNINFO.PUB_KEY, PUB_KEY)
-        self.token.add_tokeninfo(WEBAUTHNINFO.RELYING_PARTY_ID, RP_ID)
+        self.token.write_tokeninfo(FIDO2TokenInfo.PUB_KEY, PUB_KEY)
+        self.token.write_tokeninfo(FIDO2TokenInfo.RELYING_PARTY_ID, RP_ID)
         (_, _, _, response_details) = self.token.create_challenge(options=self.challenge_options)
         return response_details
 
@@ -229,8 +221,8 @@ class WebAuthnTokenTestCase(MyTestCase):
             'serial': self.token.token.serial,
             'regdata': REGISTRATION_RESPONSE_TMPL['attObj'],
             'clientdata': REGISTRATION_RESPONSE_TMPL['clientData'],
-            WEBAUTHNACTION.RELYING_PARTY_ID: RP_ID,
-            WEBAUTHNACTION.AUTHENTICATOR_ATTESTATION_LEVEL: ATTESTATION_LEVEL.NONE,
+            FIDO2PolicyAction.RELYING_PARTY_ID: RP_ID,
+            FIDO2PolicyAction.AUTHENTICATOR_ATTESTATION_LEVEL: AttestationLevel.NONE,
             'HTTP_ORIGIN': ORIGIN
         })
 
@@ -239,10 +231,9 @@ class WebAuthnTokenTestCase(MyTestCase):
 
         set_policy(name="WebAuthn",
                    scope=SCOPE.ENROLL,
-                   action=WEBAUTHNACTION.RELYING_PARTY_NAME + "=" + RP_NAME + ","
-                          + WEBAUTHNACTION.RELYING_PARTY_ID + "=" + RP_ID)
-        set_privacyidea_config(WEBAUTHNCONFIG.TRUST_ANCHOR_DIR, TRUST_ANCHOR_DIR)
-        set_privacyidea_config(WEBAUTHNCONFIG.APP_ID, APP_ID)
+                   action=FIDO2PolicyAction.RELYING_PARTY_NAME + "=" + RP_NAME + ","
+                          + FIDO2PolicyAction.RELYING_PARTY_ID + "=" + RP_ID)
+        set_privacyidea_config(FIDO2ConfigOptions.TRUST_ANCHOR_DIR, TRUST_ANCHOR_DIR)
 
         self.user = User(login=USER_NAME, realm=self.realm1,
                          resolver=self.resolvername1)
@@ -253,19 +244,19 @@ class WebAuthnTokenTestCase(MyTestCase):
         }, user=self.user)
 
         self.init_params = {
-            WEBAUTHNACTION.RELYING_PARTY_ID: RP_ID,
-            WEBAUTHNACTION.RELYING_PARTY_NAME: RP_NAME,
-            WEBAUTHNACTION.TIMEOUT: TIMEOUT,
-            WEBAUTHNACTION.AUTHENTICATOR_ATTESTATION_FORM: DEFAULT_AUTHENTICATOR_ATTESTATION_FORM,
-            WEBAUTHNACTION.USER_VERIFICATION_REQUIREMENT: DEFAULT_USER_VERIFICATION_REQUIREMENT,
-            WEBAUTHNACTION.PUBLIC_KEY_CREDENTIAL_ALGORITHMS: PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE
+            FIDO2PolicyAction.RELYING_PARTY_ID: RP_ID,
+            FIDO2PolicyAction.RELYING_PARTY_NAME: RP_NAME,
+            FIDO2PolicyAction.TIMEOUT: TIMEOUT,
+            FIDO2PolicyAction.AUTHENTICATOR_ATTESTATION_FORM: DEFAULT_AUTHENTICATOR_ATTESTATION_FORM,
+            FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT: DEFAULT_USER_VERIFICATION_REQUIREMENT,
+            FIDO2PolicyAction.PUBLIC_KEY_CREDENTIAL_ALGORITHMS: PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE
         }
 
         self.challenge_options = {
             "user": self.user,
-            WEBAUTHNACTION.ALLOWED_TRANSPORTS: ALLOWED_TRANSPORTS,
-            WEBAUTHNACTION.USER_VERIFICATION_REQUIREMENT: DEFAULT_USER_VERIFICATION_REQUIREMENT,
-            WEBAUTHNACTION.TIMEOUT: TIMEOUT
+            FIDO2PolicyAction.ALLOWED_TRANSPORTS: ALLOWED_TRANSPORTS,
+            FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT: DEFAULT_USER_VERIFICATION_REQUIREMENT,
+            FIDO2PolicyAction.TIMEOUT: TIMEOUT
         }
 
     def tearDown(self):
@@ -284,9 +275,9 @@ class WebAuthnTokenTestCase(MyTestCase):
             self.token.get_init_detail(self.init_params)
 
     def test_02_token_init(self):
-        web_authn_register_request = self\
-            .token\
-            .get_init_detail(self.init_params, self.user)\
+        web_authn_register_request = self \
+            .token \
+            .get_init_detail(self.init_params, self.user) \
             .get("webAuthnRegisterRequest")
 
         self.assertEqual(self.token.token.serial, web_authn_register_request.get("serialNumber"))
@@ -301,13 +292,13 @@ class WebAuthnTokenTestCase(MyTestCase):
         self.assertEqual('public-key',
                          web_authn_register_request.get("pubKeyCredAlgorithms")[0].get("type"),
                          web_authn_register_request)
-        self.assertEqual(COSE_ALGORITHM.ES256,
+        self.assertEqual(CoseAlgorithm.ES256,
                          web_authn_register_request.get("pubKeyCredAlgorithms")[0].get("alg"),
                          web_authn_register_request)
         self.assertEqual(USER_NAME, web_authn_register_request.get("name"))
 
-        self.assertEqual(RP_ID, self.token.get_tokeninfo(WEBAUTHNINFO.RELYING_PARTY_ID))
-        self.assertEqual(RP_NAME, self.token.get_tokeninfo(WEBAUTHNINFO.RELYING_PARTY_NAME))
+        self.assertEqual(RP_ID, self.token.get_tokeninfo(FIDO2TokenInfo.RELYING_PARTY_ID))
+        self.assertEqual(RP_NAME, self.token.get_tokeninfo(FIDO2TokenInfo.RELYING_PARTY_NAME))
 
     def test_03_token_update(self):
         self._setup_token()
@@ -318,14 +309,14 @@ class WebAuthnTokenTestCase(MyTestCase):
                         .startswith("Yubico U2F EE Serial"))
         self.assertTrue(self
                         .token
-                        .get_tokeninfo(WEBAUTHNINFO.ATTESTATION_ISSUER)
+                        .get_tokeninfo(FIDO2TokenInfo.ATTESTATION_ISSUER)
                         .startswith("CN=Yubico U2F Root CA Serial"))
         self.assertTrue(self
                         .token
-                        .get_tokeninfo(WEBAUTHNINFO.ATTESTATION_SUBJECT)
+                        .get_tokeninfo(FIDO2TokenInfo.ATTESTATION_SUBJECT)
                         .startswith("CN=Yubico U2F EE Serial"))
         self.assertEqual(CRED_ID, self.token.decrypt_otpkey())
-        self.assertEqual(PUB_KEY, self.token.get_tokeninfo(WEBAUTHNINFO.PUB_KEY))
+        self.assertEqual(PUB_KEY, self.token.get_tokeninfo(FIDO2TokenInfo.PUB_KEY))
 
     def test_03b_double_registration(self):
         self.assertEqual(self.token.type, "webauthn")
@@ -351,7 +342,7 @@ class WebAuthnTokenTestCase(MyTestCase):
         self._setup_token()
 
         # Set avoid double registration
-        init_params[WEBAUTHNACTION.AVOID_DOUBLE_REGISTRATION] = True
+        init_params[FIDO2PolicyAction.AVOID_DOUBLE_REGISTRATION] = True
         web_authn_register_request = temp_token \
             .get_init_detail(init_params, self.user) \
             .get("webAuthnRegisterRequest")
@@ -386,32 +377,10 @@ class WebAuthnTokenTestCase(MyTestCase):
                                           })
         self.assertTrue(sign_count > 0)
 
-    @log_capture()
-    def test_06_missing_origin(self, capture):
-        self._create_challenge()
-        sign_count = self.token.check_otp(
-            otpval=None,
-            options={
-                "credentialid": CRED_ID,
-                "authenticatordata": ASSERTION_RESPONSE_TMPL['authData'],
-                "clientdata": ASSERTION_RESPONSE_TMPL['clientData'],
-                "signaturedata": ASSERTION_RESPONSE_TMPL['signature'],
-                "user": self.user,
-                "challenge": hexlify_and_unicode(webauthn_b64_decode(ASSERTION_CHALLENGE)),
-                "HTTP_ORIGIN": '',
-            })
-        self.assertTrue(sign_count == -1)
-        capture.check_present(
-            ('privacyidea.lib.tokens.webauthntoken',
-             'WARNING',
-             'Checking response for token {0!s} failed. HTTP Origin header '
-             'missing.'.format(self.token.get_serial()))
-        )
-
     def test_07_none_attestation(self):
         with patch('privacyidea.lib.tokens.webauthntoken.WebAuthnTokenClass._get_nonce') as mock_nonce:
             mock_nonce.return_value = webauthn_b64_decode(NONE_ATTESTATION_REGISTRATION_CHALLENGE)
-            self.init_params[WEBAUTHNACTION.AUTHENTICATOR_ATTESTATION_FORM] = 'none'
+            self.init_params[FIDO2PolicyAction.AUTHENTICATOR_ATTESTATION_FORM] = 'none'
             self.user = User(login=NONE_ATTESTATION_USER_NAME)
             self.token.get_init_detail(self.init_params, self.user)
         self.token.update({
@@ -419,14 +388,14 @@ class WebAuthnTokenTestCase(MyTestCase):
             'serial': self.token.token.serial,
             'regdata': NONE_ATTESTATION_REGISTRATION_RESPONSE_TMPL['attObj'],
             'clientdata': NONE_ATTESTATION_REGISTRATION_RESPONSE_TMPL['clientData'],
-            WEBAUTHNACTION.RELYING_PARTY_ID: RP_ID,
-            WEBAUTHNACTION.AUTHENTICATOR_ATTESTATION_LEVEL: ATTESTATION_LEVEL.NONE,
+            FIDO2PolicyAction.RELYING_PARTY_ID: RP_ID,
+            FIDO2PolicyAction.AUTHENTICATOR_ATTESTATION_LEVEL: AttestationLevel.NONE,
             'HTTP_ORIGIN': ORIGIN
         })
-        web_authn_registration_response = self.token.get_init_detail().get('webAuthnRegisterResponse')
+        self.token.get_init_detail().get('webAuthnRegisterResponse')
 
         self.assertEqual(NONE_ATTESTATION_CRED_ID, self.token.decrypt_otpkey())
-        self.assertEqual(NONE_ATTESTATION_PUB_KEY, self.token.get_tokeninfo(WEBAUTHNINFO.PUB_KEY))
+        self.assertEqual(NONE_ATTESTATION_PUB_KEY, self.token.get_tokeninfo(FIDO2TokenInfo.PUB_KEY))
 
     def test_08_missing_attestation(self):
         self.init_params['nonce'] = webauthn_b64_decode(NONE_ATTESTATION_REGISTRATION_CHALLENGE)
@@ -439,8 +408,8 @@ class WebAuthnTokenTestCase(MyTestCase):
                 'serial': self.token.token.serial,
                 'regdata': NONE_ATTESTATION_REGISTRATION_RESPONSE_TMPL['attObj'],
                 'clientdata': NONE_ATTESTATION_REGISTRATION_RESPONSE_TMPL['clientData'],
-                WEBAUTHNACTION.RELYING_PARTY_ID: RP_ID,
-                WEBAUTHNACTION.AUTHENTICATOR_ATTESTATION_LEVEL: ATTESTATION_LEVEL.UNTRUSTED,
+                FIDO2PolicyAction.RELYING_PARTY_ID: RP_ID,
+                FIDO2PolicyAction.AUTHENTICATOR_ATTESTATION_LEVEL: AttestationLevel.UNTRUSTED,
                 'HTTP_ORIGIN': ORIGIN
             })
 
@@ -454,7 +423,7 @@ class WebAuthnTokenTestCase(MyTestCase):
             "user": self.user,
             "challenge": hexlify_and_unicode(webauthn_b64_decode(ASSERTION_CHALLENGE)),
             "HTTP_ORIGIN": ORIGIN,
-            WEBAUTHNACTION.REQ: ['subject/.*Yubico.*/']
+            FIDO2PolicyAction.REQ: ['subject/.*Yubico.*/']
         }
         res = self.token.check_otp(otpval=None, options=options)
         self.assertGreaterEqual(res, 0)
@@ -469,14 +438,15 @@ class WebAuthnTokenTestCase(MyTestCase):
             "user": self.user,
             "challenge": hexlify_and_unicode(webauthn_b64_decode(ASSERTION_CHALLENGE)),
             "HTTP_ORIGIN": ORIGIN,
-            WEBAUTHNACTION.REQ: ['subject/.*Feitian.*/']
+            FIDO2PolicyAction.REQ: ['subject/.*Feitian.*/']
         }
-        self.assertRaisesRegexp(PolicyError,
-                                "The WebAuthn token is not allowed to authenticate "
-                                "due to a policy restriction.",
-                                self.token.check_otp,
-                                **{'otpval': None,
-                                   'options': options})
+        self.assertRaisesRegex(
+            PolicyError,
+            r"The WebAuthn token is not allowed to authenticate due to a policy "
+            r"restriction.",
+            self.token.check_otp,
+            **{'otpval': None,
+               'options': options})
 
     def test_10a_aaguid_allowed(self):
         self._setup_token()
@@ -489,252 +459,236 @@ class WebAuthnTokenTestCase(MyTestCase):
             "user": self.user,
             "challenge": hexlify_and_unicode(webauthn_b64_decode(ASSERTION_CHALLENGE)),
             "HTTP_ORIGIN": ORIGIN,
-            WEBAUTHNACTION.AUTHENTICATOR_SELECTION_LIST: ['00000000000000000000000000000000']
+            FIDO2PolicyAction.AUTHENTICATOR_SELECTION_LIST: ['00000000000000000000000000000000']
         })
         self.assertGreaterEqual(res, 0)
 
     def test_10b_aaguid_not_allowed(self):
         self._setup_token()
         # check token with an invalid aaguid
-        self.assertRaisesRegexp(PolicyError,
-                                "The WebAuthn token is not allowed to authenticate "
-                                "due to a policy restriction.",
-                                self.token.check_otp,
-                                **{'otpval': None,
-                                   'options': {
-                                       "credentialid": CRED_ID,
-                                       "authenticatordata": ASSERTION_RESPONSE_TMPL['authData'],
-                                       "clientdata": ASSERTION_RESPONSE_TMPL['clientData'],
-                                       "signaturedata": ASSERTION_RESPONSE_TMPL['signature'],
-                                       "user": self.user,
-                                       "challenge": hexlify_and_unicode(webauthn_b64_decode(ASSERTION_CHALLENGE)),
-                                       "HTTP_ORIGIN": ORIGIN,
-                                       WEBAUTHNACTION.AUTHENTICATOR_SELECTION_LIST: ['ffff0000000000000000000000000000']
-                                   }})
+        self.assertRaisesRegex(
+            PolicyError,
+            r"The WebAuthn token is not allowed to authenticate due to a "
+            r"policy restriction.",
+            self.token.check_otp,
+            **{'otpval': None,
+               'options': {
+                   "credentialid": CRED_ID,
+                   "authenticatordata": ASSERTION_RESPONSE_TMPL['authData'],
+                   "clientdata": ASSERTION_RESPONSE_TMPL['clientData'],
+                   "signaturedata": ASSERTION_RESPONSE_TMPL['signature'],
+                   "user": self.user,
+                   "challenge": hexlify_and_unicode(webauthn_b64_decode(ASSERTION_CHALLENGE)),
+                   "HTTP_ORIGIN": ORIGIN,
+                   FIDO2PolicyAction.AUTHENTICATOR_SELECTION_LIST: ['ffff0000000000000000000000000000']
+               }})
+
+    def test_11_uv_required(self):
+        self._setup_token()
+        # Adjust the token to be able to verify the data used in this test
+        self.token.write_tokeninfo(FIDO2TokenInfo.PUB_KEY, "a50102032620012158202eb296d6dfafe813d096743f8d1ba75b37af2"
+                                                         "e1e0e6356df112a57bc29c7200c22582022f057ded7de836a23a04be4cef4a"
+                                                         "5a1bd6d263a1554ea4107b74e3e12844c60")
+        self.token.set_otpkey(hexlify_and_unicode(webauthn_b64_decode("dvFzp44mRo8Wgu5926p-WawbCPWiwVHmFfldMDPL1tUMOpf5"
+                                                                      "eSRyg2phkH0Ar88ic2ck4Cy9Yrti5CpBkrvsCA")))
+        self.token.write_tokeninfo(FIDO2TokenInfo.RELYING_PARTY_ID, "cool.nils")
+
+        # Try to authenticate with authenticatordata where the UV bit is not set (B at the end)
+        # and UV=required, should fail
+        res = self.token.check_otp(otpval=None, options={
+            "credentialid": "dvFzp44mRo8Wgu5926p-WawbCPWiwVHmFfldMDPL1tUMOpf5eSRyg2phkH0Ar88ic2ck4Cy9Yrti5CpBkrvsCA",
+            "authenticatordata": "tPp8c-wXo6hFUbdedkHcOP1s-xkwOrHsxfvNfhI7wVcBAAAATQ",
+            "clientdata": "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoiMUJuU3Q0VFlIU3NObVFMblFLSnIxYWZCQmJKYndJdndQ"
+                          "aklFeDNmbXgtOCIsIm9yaWdpbiI6Imh0dHBzOi8vY29vbC5uaWxzOjUwMDAiLCJjcm9zc09yaWdpbiI6ZmFsc2V9",
+            "signaturedata": "MEYCIQC_kKwpVlWx7LQ5UXPjt0etsC45-EQHjvxq7oOHrdH_swIhAMSBzfY8JXJkP0zQMSQ39g2z-lLE1iAvZPM6"
+                             "0iWyPNtX",
+            "user": self.user,
+            "challenge": hexlify_and_unicode(webauthn_b64_decode("1BnSt4TYHSsNmQLnQKJr1afBBbJbwIvwPjIEx3fmx-8")),
+            "HTTP_ORIGIN": "https://cool.nils:5000",
+            FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT: "required"
+        })
+        self.assertEqual(res, -1)
+
+        # Try to authenticate with authenticatordata where the UV bit is set (F at the end)
+        # and UV=required, should succeed
+        res = self.token.check_otp(otpval=None, options={
+            "credentialid": "dvFzp44mRo8Wgu5926p-WawbCPWiwVHmFfldMDPL1tUMOpf5eSRyg2phkH0Ar88ic2ck4Cy9Yrti5CpBkrvsCA",
+            "authenticatordata": "tPp8c-wXo6hFUbdedkHcOP1s-xkwOrHsxfvNfhI7wVcFAAAATw",
+            "clientdata": "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoialFjck15WUFjTENjM0FudXlpdWlGNzhDUGFYSDFLRUVz"
+                          "R0Vrbkd3aHJYbyIsIm9yaWdpbiI6Imh0dHBzOi8vY29vbC5uaWxzOjUwMDAiLCJjcm9zc09yaWdpbiI6ZmFsc2V9",
+            "signaturedata": "MEUCIAMH6YDQCT4mA0GAgCJ53EA2mOOk1vB-pghsmREk-0aOAiEAtG5T-2M_sFC9KBQS9ybJdPSTZvfofZmR9GbHT"
+                             "-mBQrM",
+            "user": self.user,
+            "challenge": hexlify_and_unicode(webauthn_b64_decode("jQcrMyYAcLCc3AnuyiuiF78CPaXH1KEEsGEknGwhrXo")),
+            "HTTP_ORIGIN": "https://cool.nils:5000",
+            FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT: "required"
+        })
+        # Returns the sign count on success which is 79
+        self.assertEqual(res, 79)
+
+    def test_11b_uv_required_via_fido2_challenge_flow(self):
+        """
+        Challenges created by older code stored the UV requirement under the raw string key "user_verification".
+        Now, everything uses FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT.
+        This test inserts challenge rows using the old "user_verification" key and goes through
+        verify_fido2_challenge() to confirm it can still be loaded correctly.
+        """
+        from privacyidea.lib.fido2.challenge import verify_fido2_challenge
+        from privacyidea.models import Challenge
+
+        self._setup_token()
+        self.token.write_tokeninfo(FIDO2TokenInfo.PUB_KEY, "a50102032620012158202eb296d6dfafe813d096743f8d1ba75b37af2"
+                                                         "e1e0e6356df112a57bc29c7200c22582022f057ded7de836a23a04be4cef4a"
+                                                         "5a1bd6d263a1554ea4107b74e3e12844c60")
+        self.token.set_otpkey(hexlify_and_unicode(webauthn_b64_decode("dvFzp44mRo8Wgu5926p-WawbCPWiwVHmFfldMDPL1tUMOpf5"
+                                                                      "eSRyg2phkH0Ar88ic2ck4Cy9Yrti5CpBkrvsCA")))
+        self.token.write_tokeninfo(FIDO2TokenInfo.RELYING_PARTY_ID, "cool.nils")
+
+        # The WebAuthn token stores the challenge as the hex-encoded raw nonce bytes.
+        # These values match the clientdata used by the two assertions below.
+        challenge_no_uv = hexlify_and_unicode(webauthn_b64_decode("1BnSt4TYHSsNmQLnQKJr1afBBbJbwIvwPjIEx3fmx-8"))
+        challenge_with_uv = hexlify_and_unicode(webauthn_b64_decode("jQcrMyYAcLCc3AnuyiuiF78CPaXH1KEEsGEknGwhrXo"))
+
+        # Store the UV requirement under the old "user_verification" key to simulate a challenge that
+        # was written by code that predates the change. verify_fido2_challenge() must still pick it up.
+        old_key_data = {"user_verification": "required"}
+
+        # UV not set + policy "required" -> fail
+        failing_db_challenge = Challenge(
+            serial=self.token.get_serial(),
+            challenge=challenge_no_uv,
+            data=old_key_data,
+            validitytime=120
+        )
+        failing_db_challenge.save()
+        failing_transaction_id = failing_db_challenge.transaction_id
+
+        result = verify_fido2_challenge(
+            transaction_id=failing_transaction_id,
+            token=self.token,
+            params={
+                "credential_id": "dvFzp44mRo8Wgu5926p-WawbCPWiwVHmFfldMDPL1tUMOpf5eSRyg2phkH0Ar88ic2ck4Cy9Yrti5CpBkrvsC"
+                                 "A",
+                "authenticatordata": "tPp8c-wXo6hFUbdedkHcOP1s-xkwOrHsxfvNfhI7wVcBAAAATQ",
+                "clientdata": "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoiMUJuU3Q0VFlIU3NObVFMblFLSnIxYWZCQmJKYndJ"
+                              "dndQ"
+                              "aklFeDNmbXgtOCIsIm9yaWdpbiI6Imh0dHBzOi8vY29vbC5uaWxzOjUwMDAiLCJjcm9zc09yaWdpbiI6ZmFsc2V9",
+                "signaturedata": "MEYCIQC_kKwpVlWx7LQ5UXPjt0etsC45-EQHjvxq7oOHrdH_swIhAMSBzfY8JXJkP0zQMSQ39g2z-lLE1iAvZ"
+                                 "PM6"
+                                 "0iWyPNtX",
+                "HTTP_ORIGIN": "https://cool.nils:5000",
+            }
+        )
+        self.assertFalse(result.success > 0,
+                         "UV bypass: assertion without UV must be rejected when policy is 'required'")
+
+        # UV set + policy "required" -> success
+        working_db_challenge = Challenge(
+            serial=self.token.get_serial(),
+            challenge=challenge_with_uv,
+            data=old_key_data,
+            validitytime=120
+        )
+        working_db_challenge.save()
+        working_transaction_id = working_db_challenge.transaction_id
+
+        result = verify_fido2_challenge(
+            transaction_id=working_transaction_id,
+            token=self.token,
+            params={
+                "credential_id": "dvFzp44mRo8Wgu5926p-WawbCPWiwVHmFfldMDPL1tUMOpf5eSRyg2phkH0Ar88ic2ck4Cy9Yrti5CpBkrvsC"
+                                 "A",
+                "authenticatordata": "tPp8c-wXo6hFUbdedkHcOP1s-xkwOrHsxfvNfhI7wVcFAAAATw",
+                "clientdata": "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoialFjck15WUFjTENjM0FudXlpdWlGNzhDUGFYSDFL"
+                              "RUVzR0Vrbkd3aHJYbyIsIm9yaWdpbiI6Imh0dHBzOi8vY29vbC5uaWxzOjUwMDAiLCJjcm9zc09yaWdpbiI6ZmFs"
+                              "c2V9",
+                "signaturedata": "MEUCIAMH6YDQCT4mA0GAgCJ53EA2mOOk1vB-pghsmREk-0aOAiEAtG5T-2M_sFC9KBQS9ybJdPSTZvfofZmR9"
+                                 "GbHT-mBQrM",
+                "HTTP_ORIGIN": "https://cool.nils:5000",
+            }
+        )
+        # sign count is 79 on success
+        self.assertEqual(79, result.success,
+                         "Assertion with UV set must be accepted when policy is 'required'")
+
+    def test_12_webauthn_token_export(self):
+        # Set up the webauthn token for testing
+        self._setup_token()
+        token = self.token
+
+        # Test that all expected keys are present in the exported dictionary
+        exported_data = token.export_token()
+
+        expected_keys = ["serial", "type", "description", "otpkey", "issuer"]
+        self.assertTrue(set(expected_keys).issubset(exported_data.keys()))
+
+        expected_tokeninfo_keys = ["tokenkind", "pubKey", "attestation_serial", "attestation_issuer",
+                                   "attestation_subject"]
+        self.assertTrue(set(expected_tokeninfo_keys).issubset(exported_data["info_list"].keys()))
+
+        # Test that the exported values match the token's data
+        exported_data = token.export_token()
+        self.assertEqual(exported_data["serial"], token.token.serial)
+        self.assertEqual(exported_data["type"], "webauthn")
+        self.assertEqual(exported_data["description"], "Yubico U2F EE Serial 23925734811117901")
+        self.assertEqual(exported_data["otpkey"], "8a535a698e5f609a11d6c839201ec52f66686bea8177fe50f7965ccb1364"
+                                                  "9a39280e188b08b8042a829f0941252edebfe839a3fc452e38765423ac7f802df62d")
+        self.assertEqual(exported_data["issuer"], "privacyIDEA")
+        self.assertEqual(exported_data["info_list"]["pubKey"], "a401020326215820319ea01f1125ce6232947365800ae5d"
+                                                               "9ddc874247c55d1516bad3ca3ca32075c22582059f1f07f3b2f86c"
+                                                               "0a51e0cfa13dc57e7c77a110e796f8a0b27741fe58663cb3a")
+
+    def test_13_webauthn_token_import(self):
+        # Define the token data to be imported
+        token_data = [{
+            "serial": 'WAN0000FE64',
+            "type": 'webauthn',
+            "description": 'Yubico U2F EE Serial 23925734811117901',
+            "otpkey": '8a535a698e5f609a11d6c839201ec52f66686bea8177fe50f7965ccb13649a39280e188b08b8042a829f0941252ede'
+                      'bfe839a3fc452e38765423ac7f802df62d',
+            "issuer": "privacyIDEA",
+            "info_list": {'aaguid': '00000000000000000000000000000000',
+                          'attestation_issuer': 'CN=Yubico U2F Root CA Serial 457200631',
+                          'attestation_level': 'trusted', 'attestation_serial': '1013459277',
+                          'attestation_subject': 'CN=Yubico U2F EE Serial 23925734811117901',
+                          'credential_id_hash': 'a4bde50896eff4605bb451a18eb56ed6fc5dbc561cff0478dd8e2480a4c4bd66',
+                          'origin': 'https://webauthn.io',
+                          'pubKey': 'a401020326215820319ea01f1125ce6232947365800ae5d9ddc874247c55d1516bad3ca3ca32075c22'
+                                    '582059f1f07f3b2f86c0a51e0cfa13dc57e7c77a110e796f8a0b27741fe58663cb3a',
+                          'relying_party_id': 'webauthn.io',
+                          'relying_party_name': 'Web Authentication',
+                          'tokenkind': 'software'}
+        }]
+
+        # Import the token
+        import_tokens(token_data)
+
+        # Retrieve the imported token
+        token = get_tokens(serial=token_data[0]["serial"])[0]
+
+        # Verify that the token data matches the imported data
+        self.assertEqual(token.token.serial, token_data[0]["serial"])
+        self.assertEqual(token.type, token_data[0]["type"])
+        self.assertEqual(token.token.description, token_data[0]["description"])
+        self.assertEqual(token.token.get_otpkey().getKey().decode("utf-8"), token_data[0]["otpkey"])
+
+        reply_dict = self._create_challenge()
+        attributes = reply_dict.get("attributes")
+        web_authn_sign_request = attributes.get("webAuthnSignRequest")
+
+        self.assertEqual(RP_ID, web_authn_sign_request.get('rpId'))
+        self.assertEqual(1, len(web_authn_sign_request.get('allowCredentials') or []))
+        self.assertEqual('public-key', web_authn_sign_request.get('allowCredentials')[0].get('type'))
+        self.assertEqual(CRED_ID, web_authn_sign_request.get('allowCredentials')[0].get('id'))
+        self.assertEqual(ALLOWED_TRANSPORTS, web_authn_sign_request.get('allowCredentials')[0].get('transports'))
+
+        # Clean up
+        remove_token(token.token.serial)
 
 
 class WebAuthnTestCase(unittest.TestCase):
-    @staticmethod
-    def getWebAuthnCredential():
-        return WebAuthnRegistrationResponse(
-            rp_id=RP_ID,
-            origin=ORIGIN,
-            registration_response=copy(REGISTRATION_RESPONSE_TMPL),
-            challenge=REGISTRATION_CHALLENGE,
-            attestation_requirement_level=ATTESTATION_REQUIREMENT_LEVEL[ATTESTATION_LEVEL.NONE],
-            trust_anchor_dir=TRUST_ANCHOR_DIR,
-            uv_required=False,
-            expected_registration_client_extensions=EXPECTED_REGISTRATION_CLIENT_EXTENSIONS,
-        ).verify()
-
-    @staticmethod
-    def getAssertionResponse():
-        credential = WebAuthnTestCase.getWebAuthnCredential()
-        webauthn_user = WebAuthnUser(
-            user_id=USER_ID,
-            user_name=USER_NAME,
-            user_display_name=USER_DISPLAY_NAME,
-            icon_url=ICON_URL,
-            credential_id=credential.credential_id.decode(),
-            public_key=credential.public_key,
-            sign_count=credential.sign_count,
-            rp_id=credential.rp_id
-        )
-
-        webauthn_assertion_response = WebAuthnAssertionResponse(
-            webauthn_user=webauthn_user,
-            assertion_response=copy(ASSERTION_RESPONSE_TMPL),
-            challenge=ASSERTION_CHALLENGE,
-            origin=ORIGIN,
-            uv_required=False,
-        )
-
-        return webauthn_assertion_response
-
-    def setUp(self):
-        self.options = WebAuthnMakeCredentialOptions(
-            challenge=REGISTRATION_CHALLENGE,
-            rp_name=RP_NAME,
-            rp_id=RP_ID,
-            user_id=USER_ID,
-            user_name=USER_NAME,
-            user_display_name=USER_DISPLAY_NAME,
-            icon_url=ICON_URL,
-            timeout=TIMEOUT,
-            attestation=ATTESTATION_FORM,
-            user_verification=USER_VERIFICATION,
-            public_key_credential_algorithms=PUBLIC_KEY_CREDENTIAL_ALGORITHMS,
-            location=True,
-            credential_ids=[CRED_ID]
-        )
-
-    def test_00_create_options(self):
-        registration_dict = self.options.registration_dict
-        self.assertEqual(registration_dict['challenge'], REGISTRATION_CHALLENGE)
-        self.assertTrue(CRED_KEY in registration_dict['pubKeyCredParams'])
-
-    def test_01_validate_registration(self):
-        webauthn_credential = self.getWebAuthnCredential()
-        self.assertEqual(RP_ID, webauthn_credential.rp_id, webauthn_credential)
-        self.assertEqual(ORIGIN, webauthn_credential.origin, webauthn_credential)
-        self.assertTrue(webauthn_credential.has_signed_attestation, webauthn_credential)
-        self.assertTrue(webauthn_credential.has_trusted_attestation, webauthn_credential)
-        self.assertEqual(str(webauthn_credential),
-                         '{0!r} ({1!s}, {2!s}, {3!s})'.format(CREDENTIAL_ID,
-                                                              RP_ID, ORIGIN, 0),
-                         webauthn_credential)
-
-    def test_01b_validate_untrusted_registration(self):
-        webauthn_credential = WebAuthnRegistrationResponse(
-            rp_id=RP_ID,
-            origin=ORIGIN,
-            registration_response=copy(REGISTRATION_RESPONSE_TMPL),
-            challenge=REGISTRATION_CHALLENGE,
-            attestation_requirement_level=ATTESTATION_REQUIREMENT_LEVEL[ATTESTATION_LEVEL.NONE],
-            uv_required=False,
-            expected_registration_client_extensions=EXPECTED_REGISTRATION_CLIENT_EXTENSIONS,
-        ).verify()
-        self.assertEqual(RP_ID, webauthn_credential.rp_id, webauthn_credential)
-        self.assertEqual(ORIGIN, webauthn_credential.origin, webauthn_credential)
-        self.assertTrue(webauthn_credential.has_signed_attestation, webauthn_credential)
-        self.assertFalse(webauthn_credential.has_trusted_attestation, webauthn_credential)
-
-    def test_02_registration_invalid_user_verification(self):
-        registration_response = WebAuthnRegistrationResponse(
-            rp_id=RP_ID,
-            origin=ORIGIN,
-            registration_response=copy(REGISTRATION_RESPONSE_TMPL),
-            challenge=REGISTRATION_CHALLENGE,
-            attestation_requirement_level=ATTESTATION_REQUIREMENT_LEVEL[ATTESTATION_LEVEL.UNTRUSTED],
-            trust_anchor_dir=TRUST_ANCHOR_DIR,
-            uv_required=True,
-            expected_registration_client_extensions=EXPECTED_REGISTRATION_CLIENT_EXTENSIONS
-        )
-
-        with self.assertRaisesRegexp(RegistrationRejectedException,
-                                     'Malformed request received.'):
-            registration_response.verify()
-
-    def test_03_validate_assertion(self):
-        webauthn_assertion_response = self.getAssertionResponse()
-        webauthn_user = webauthn_assertion_response.webauthn_user
-        self.assertEqual(str(webauthn_user),
-                         '{0!r} ({1!s}, {2!s}, {3!s})'.format(USER_ID, USER_NAME,
-                                                              USER_DISPLAY_NAME, 0),
-                         webauthn_user)
-        webauthn_assertion_response.verify()
-
-    def test_04_invalid_signature_fail_assertion(self):
-        def mess_up(response):
-            response = copy(response)
-            response['signature'] = b'00' + response['signature'][2:]
-            return response
-
-        webauthn_assertion_response = self.getAssertionResponse()
-        webauthn_assertion_response.assertion_response = mess_up(webauthn_assertion_response.assertion_response)
-
-        with self.assertRaises(AuthenticationRejectedException):
-            webauthn_assertion_response.verify()
-
-    def test_05_no_user_presence_fail_assertion(self):
-        webauthn_assertion_response = self.getAssertionResponse()
-        auth_data = webauthn_b64_decode(webauthn_assertion_response.assertion_response['authData'])
-        flags = struct.unpack('!B', auth_data[32:33])[0]
-        flags = flags & ~AuthenticatorDataFlags.USER_PRESENT
-        auth_data = auth_data[:32] + struct.pack('!B', flags) + auth_data[33:]
-        webauthn_assertion_response.assertion_response['authData'] = webauthn_b64_encode(auth_data)
-
-        # FIXME: This *should* fail because UP=0, but will fail anyway later on because the
-        #  signature is invalid.
-        # TODO: Build a mock Authenticator implementation, to be able to sign arbitrary
-        #  authenticator data statements.
-        # TODO: Sign an authenticator data statement with UP=0 and test against that so that the
-        #  signature is valid.
-        with self.assertRaises(AuthenticationRejectedException):
-            webauthn_assertion_response.verify()
-
-    def test_06_duplicate_authentication_fail_assertion(self):
-        webauthn_assertion_response = self.getAssertionResponse()
-        webauthn_assertion_response.webauthn_user.sign_count = ASSERTION_RESPONSE_SIGN_COUNT
-
-        with self.assertRaisesRegexp(AuthenticationRejectedException,
-                                     'Duplicate authentication detected.'):
-            webauthn_assertion_response.verify()
-        # TODO: we should add a test for a missing sign_count (or 0) but we need
-        #  to change the auth data for that.
-
     def test_07_webauthn_b64_decode(self):
         self.assertEqual(webauthn_b64_decode(URL_DECODE_TEST_STRING), URL_DECODE_EXPECTED_RESULT)
-
-    def test_08_registration_invalid_requirement_level(self):
-        with self.assertRaisesRegexp(ValueError,
-                                     'Illegal attestation_requirement_level.'):
-            WebAuthnRegistrationResponse(
-                rp_id=RP_ID,
-                origin=ORIGIN,
-                registration_response=copy(REGISTRATION_RESPONSE_TMPL),
-                challenge=REGISTRATION_CHALLENGE,
-                attestation_requirement_level={'unknown level': False},
-                trust_anchor_dir=TRUST_ANCHOR_DIR,
-                uv_required=True,
-                expected_registration_client_extensions=EXPECTED_REGISTRATION_CLIENT_EXTENSIONS
-            )
-
-    def test_09_registration_self_Attestation(self):
-        webauthn_credential = WebAuthnRegistrationResponse(
-            rp_id='localhost',
-            origin='http://localhost:3000',
-            registration_response=copy(SELF_ATTESTATION_REGISTRATION_RESPONSE_TMPL),
-            challenge='AXkXWXPP3gLx8OLlpkJ3aRRhFWntnSENggnjDpBql1ngKol7xWwevUYvrpBDP3LEvdr2EOStOFpGGxnMvXk-Vw',
-            attestation_requirement_level=ATTESTATION_REQUIREMENT_LEVEL[ATTESTATION_LEVEL.UNTRUSTED],
-            trust_anchor_dir=TRUST_ANCHOR_DIR,
-            expected_registration_client_extensions=EXPECTED_REGISTRATION_CLIENT_EXTENSIONS
-        ).verify()
-        self.assertEqual('localhost', webauthn_credential.rp_id, webauthn_credential)
-        self.assertEqual('http://localhost:3000', webauthn_credential.origin, webauthn_credential)
-        self.assertTrue(webauthn_credential.has_signed_attestation, webauthn_credential)
-        self.assertFalse(webauthn_credential.has_trusted_attestation, webauthn_credential)
-
-    def test_09b_registration_self_Attestation_bad_cose_alg(self):
-        self.assertRaises(
-            RegistrationRejectedException,
-            WebAuthnRegistrationResponse(
-                rp_id='localhost',
-                origin='http://localhost:3000',
-                registration_response=copy(SELF_ATTESTATION_REGISTRATION_RESPONSE_BAD_COSE_ALG),
-                challenge='AXkXWXPP3gLx8OLlpkJ3aRRhFWntnSENggnjDpBql1ngKol7xWwevUYvrpBDP3LEvdr2EOStOFpGGxnMvXk-Vw',
-                attestation_requirement_level=ATTESTATION_REQUIREMENT_LEVEL[ATTESTATION_LEVEL.UNTRUSTED],
-                trust_anchor_dir=TRUST_ANCHOR_DIR,
-                expected_registration_client_extensions=EXPECTED_REGISTRATION_CLIENT_EXTENSIONS
-            ).verify)
-
-    def test_09c_registration_self_Attestation_alg_mismatch(self):
-        self.assertRaisesRegexp(
-            RegistrationRejectedException,
-            'does not match algorithm from attestation statement',
-            WebAuthnRegistrationResponse(
-                rp_id='localhost',
-                origin='http://localhost:3000',
-                registration_response=copy(SELF_ATTESTATION_REGISTRATION_RESPONSE_ALG_MISMATCH),
-                challenge='AXkXWXPP3gLx8OLlpkJ3aRRhFWntnSENggnjDpBql1ngKol7xWwevUYvrpBDP3LEvdr2EOStOFpGGxnMvXk-Vw',
-                attestation_requirement_level=ATTESTATION_REQUIREMENT_LEVEL[ATTESTATION_LEVEL.UNTRUSTED],
-                trust_anchor_dir=TRUST_ANCHOR_DIR,
-                expected_registration_client_extensions=EXPECTED_REGISTRATION_CLIENT_EXTENSIONS
-            ).verify)
-
-    def test_09d_registration_self_Attestation_broken_signature(self):
-        self.assertRaisesRegexp(
-            RegistrationRejectedException,
-            'Invalid signature received.',
-            WebAuthnRegistrationResponse(
-                rp_id='localhost',
-                origin='http://localhost:3000',
-                registration_response=copy(SELF_ATTESTATION_REGISTRATION_RESPONSE_BROKEN_SIG),
-                challenge='AXkXWXPP3gLx8OLlpkJ3aRRhFWntnSENggnjDpBql1ngKol7xWwevUYvrpBDP3LEvdr2EOStOFpGGxnMvXk-Vw',
-                attestation_requirement_level=ATTESTATION_REQUIREMENT_LEVEL[ATTESTATION_LEVEL.UNTRUSTED],
-                trust_anchor_dir=TRUST_ANCHOR_DIR,
-                expected_registration_client_extensions=EXPECTED_REGISTRATION_CLIENT_EXTENSIONS
-            ).verify)
 
 
 class MultipleWebAuthnTokenTestCase(MyTestCase):
@@ -801,26 +755,23 @@ class MultipleWebAuthnTokenTestCase(MyTestCase):
     nonce2 = 'FnyL0FzVVECu9wMHj2PMXsEPXkLpC--6AQcGn4wY_xg'
 
     init_params = {
-            WEBAUTHNACTION.RELYING_PARTY_ID: rp_id,
-            WEBAUTHNACTION.RELYING_PARTY_NAME: rp_name,
-            WEBAUTHNACTION.TIMEOUT: TIMEOUT,
-            WEBAUTHNACTION.AUTHENTICATOR_ATTESTATION_FORM: DEFAULT_AUTHENTICATOR_ATTESTATION_FORM,
-            WEBAUTHNACTION.USER_VERIFICATION_REQUIREMENT: DEFAULT_USER_VERIFICATION_REQUIREMENT,
-            WEBAUTHNACTION.PUBLIC_KEY_CREDENTIAL_ALGORITHMS: PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE
-        }
+        FIDO2PolicyAction.RELYING_PARTY_ID: rp_id,
+        FIDO2PolicyAction.RELYING_PARTY_NAME: rp_name,
+        FIDO2PolicyAction.TIMEOUT: TIMEOUT,
+        FIDO2PolicyAction.AUTHENTICATOR_ATTESTATION_FORM: DEFAULT_AUTHENTICATOR_ATTESTATION_FORM,
+        FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT: DEFAULT_USER_VERIFICATION_REQUIREMENT,
+        FIDO2PolicyAction.PUBLIC_KEY_CREDENTIAL_ALGORITHMS: PUBLIC_KEY_CREDENTIAL_ALGORITHM_PREFERENCE
+    }
     auth_options = {
-        WEBAUTHNACTION.ALLOWED_TRANSPORTS: ALLOWED_TRANSPORTS,
-        WEBAUTHNACTION.USER_VERIFICATION_REQUIREMENT: DEFAULT_USER_VERIFICATION_REQUIREMENT,
-        WEBAUTHNACTION.TIMEOUT: TIMEOUT}
+        FIDO2PolicyAction.ALLOWED_TRANSPORTS: ALLOWED_TRANSPORTS,
+        FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT: DEFAULT_USER_VERIFICATION_REQUIREMENT,
+        FIDO2PolicyAction.TIMEOUT: TIMEOUT
+    }
 
     def setUp(self):
         self.setUp_user_realms()
         set_policy(name="WebAuthn", scope=SCOPE.ENROLL,
-                   action='{0!s}={1!s},{2!s}={3!s}'.format(WEBAUTHNACTION.RELYING_PARTY_NAME,
-                                                           self.rp_name,
-                                                           WEBAUTHNACTION.RELYING_PARTY_ID,
-                                                           self.rp_id))
-        set_privacyidea_config(WEBAUTHNCONFIG.APP_ID, self.app_id)
+                   action=f'{FIDO2PolicyAction.RELYING_PARTY_NAME!s}={self.rp_name!s},{FIDO2PolicyAction.RELYING_PARTY_ID!s}={self.rp_id!s}')
         self.user = User(login='hans', realm=self.realm1,
                          resolver=self.resolvername1)
         # TODO: extract token enrollment into a local function
@@ -841,8 +792,8 @@ class MultipleWebAuthnTokenTestCase(MyTestCase):
             'serial': self.serial1,
             'regdata': self.reg_data1,
             'clientdata': self.client_data1,
-            WEBAUTHNACTION.RELYING_PARTY_ID: self.rp_id,
-            WEBAUTHNACTION.AUTHENTICATOR_ATTESTATION_LEVEL: ATTESTATION_LEVEL.NONE,
+            FIDO2PolicyAction.RELYING_PARTY_ID: self.rp_id,
+            FIDO2PolicyAction.AUTHENTICATOR_ATTESTATION_LEVEL: AttestationLevel.NONE,
             'HTTP_ORIGIN': self.app_id
         })
         res = self.token1.get_init_detail()
@@ -865,8 +816,8 @@ class MultipleWebAuthnTokenTestCase(MyTestCase):
             'serial': self.serial2,
             'regdata': self.reg_data2,
             'clientdata': self.client_data2,
-            WEBAUTHNACTION.RELYING_PARTY_ID: self.rp_id,
-            WEBAUTHNACTION.AUTHENTICATOR_ATTESTATION_LEVEL: ATTESTATION_LEVEL.NONE,
+            FIDO2PolicyAction.RELYING_PARTY_ID: self.rp_id,
+            FIDO2PolicyAction.AUTHENTICATOR_ATTESTATION_LEVEL: AttestationLevel.NONE,
             'HTTP_ORIGIN': self.app_id
         })
         res = self.token2.get_init_detail()
@@ -878,8 +829,8 @@ class MultipleWebAuthnTokenTestCase(MyTestCase):
         remove_token(serial=self.serial2)
 
     # TODO: also test challenge-response with different tokens (webauthn + totp)
-    def test_01_mulitple_webauthntoken_auth(self):
-        set_policy("otppin", scope=SCOPE.AUTH, action="{0!s}=none".format(ACTION.OTPPIN))
+    def test_01_multiple_webauthntoken_auth(self):
+        set_policy("otppin", scope=SCOPE.AUTH, action=f"{PolicyAction.OTPPIN!s}=none")
         res, reply = check_user_pass(self.user, '', options=self.auth_options)
         self.assertFalse(res)
         self.assertIn('transaction_id', reply, reply)
@@ -887,7 +838,9 @@ class MultipleWebAuthnTokenTestCase(MyTestCase):
         self.assertIn('multi_challenge', reply, reply)
         self.assertEqual(len(reply['multi_challenge']), 2, reply['multi_challenge'])
         self.assertIn('messages', reply, reply)
-        self.assertEqual(len(reply['messages']), 2, reply['messages'])
+        # Messages are empty because there is no message passed in options
+        # The message is added by the policy decorator which is not in use here
+        self.assertEqual(len(reply['messages']), 0, reply['messages'])
         # check that the serials of the challenges are different
         chal1 = reply['multi_challenge'][0]
         chal2 = reply['multi_challenge'][1]

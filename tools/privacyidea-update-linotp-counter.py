@@ -1,19 +1,18 @@
 #!/usr/bin/python
-# -*- coding: utf-8 -*-
-#
 #  2018-05-27 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             init
 
 __doc__ = """
-You can use this script to update counter values of tokens in the privacyIDEA
-database. This is helpful after database migrations. Counters in the old
-instance may have been updated, since users still authenticate against this
-old instance. You would simply fetch these updated counters and use this
-script to update them in the new privacyIDEA database.
+You can use this script to update counter values of tokens in a LinOTP
+database, e.g. while LinOTP and privacyIDEA run side by side during a migration.
+The file given with -c needs a SQLALCHEMY_DATABASE_URI line that points to the
+LinOTP database.
 
 You can update counters like
 
-privacyidea-export-linotp-counter.py -c MIGRATION/linotp.ini  | ./tools/privacyidea-update-counter.py -c /etc/privacyidea/pi.cfg -i -
+privacyidea-update-linotp-counter.py -c linotp.cfg -i counters.csv
+
+The file contains one serial and counter per line, separated by a comma.
 """
 from sqlalchemy.orm import sessionmaker
 
@@ -22,7 +21,7 @@ import sys
 from sqlalchemy import create_engine
 from sqlalchemy import MetaData, Column
 from sqlalchemy import Integer, Unicode, Boolean
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
 metadata = MetaData()
@@ -32,22 +31,22 @@ class LinToken(Base):
     __tablename__ = "Token"
 
     LinOtpTokenId = Column(Integer, primary_key=True, nullable=False)
-    LinOtpTokenDesc = Column(Unicode(80), default=u'')
-    LinOtpTokenSerialnumber = Column(Unicode(40), default=u'', unique=True, nullable=False, index=True)
-    LinOtpTokenType = Column(Unicode(30), default=u'HMAC',index=True)
-    LinOtpTokenInfo = Column(Unicode(2000), default=u'')
-    LinOtpTokenPinUser = Column(Unicode(512), default=u'')
-    LinOtpTokenPinUserIV =Column(Unicode(32), default=u'')
-    LinOtpTokenPinSO = Column(Unicode(512), default=u'')
-    LinOtpTokenPinSOIV = Column(Unicode(32), default=u'')
-    LinOtpIdResolver = Column(Unicode(120), default=u'', index=True)
-    LinOtpIdResClass = Column(Unicode(120), default=u'')
-    LinOtpUserid = Column(Unicode(320), default=u'', index=True)
-    LinOtpSeed = Column(Unicode(32), default=u'')
+    LinOtpTokenDesc = Column(Unicode(80), default='')
+    LinOtpTokenSerialnumber = Column(Unicode(40), default='', unique=True, nullable=False, index=True)
+    LinOtpTokenType = Column(Unicode(30), default='HMAC',index=True)
+    LinOtpTokenInfo = Column(Unicode(2000), default='')
+    LinOtpTokenPinUser = Column(Unicode(512), default='')
+    LinOtpTokenPinUserIV =Column(Unicode(32), default='')
+    LinOtpTokenPinSO = Column(Unicode(512), default='')
+    LinOtpTokenPinSOIV = Column(Unicode(32), default='')
+    LinOtpIdResolver = Column(Unicode(120), default='', index=True)
+    LinOtpIdResClass = Column(Unicode(120), default='')
+    LinOtpUserid = Column(Unicode(320), default='', index=True)
+    LinOtpSeed = Column(Unicode(32), default='')
     LinOtpOtpLen = Column(Integer, default=6)
-    LinOtpPinHash = Column(Unicode(512), default=u'')
-    LinOtpKeyEnc = Column(Unicode(1024), default=u'')
-    LinOtpKeyIV = Column(Unicode(32), default=u'')
+    LinOtpPinHash = Column(Unicode(512), default='')
+    LinOtpKeyEnc = Column(Unicode(1024), default='')
+    LinOtpKeyIV = Column(Unicode(32), default='')
     LinOtpMaxFail = Column(Integer, default=10)
     LinOtpIsactive = Column(Boolean(), default=True)
     LinOtpFailCount = Column(Integer, default=0)
@@ -73,7 +72,7 @@ def read_counter_file(import_file):
     for line in import_file.readlines():
         try:
             serial, counter = [v.strip() for v in line.split(",")]
-            update_list.append((u"{0!s}".format(serial), int(counter)))
+            update_list.append(("{0!s}".format(serial), int(counter)))
         except ValueError as ve:
             # If there is a line, that does not comply
             sys.stderr.write("Failed to parse line: {0!s}\n".format(line))
@@ -83,7 +82,7 @@ def read_counter_file(import_file):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-c", "--config", help="privacyIDEA config file. We only need the SQLALCHEMY_DATABASE_URI.",
+    parser.add_argument("-c", "--config", help="Config file with the SQLALCHEMY_DATABASE_URI of the LinOTP database.",
                         required=True)
     parser.add_argument('file', help='The CSV file with the updated counters. The file should contain one serial and '
                                      'counter per line split by a comma. You can specify "-" to read from stdin.',

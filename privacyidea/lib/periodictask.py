@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 #  2018-06-25 Friedrich Weber <friedrich.weber@netknights.it>
 #             Initial implementation of periodic tasks
 #
@@ -21,19 +20,21 @@ __doc__ = """This module provides functions to manage periodic tasks in the data
 to determine their next scheduled running time and to run them."""
 
 import logging
-from datetime import datetime
-from privacyidea.lib.tokenclass import DATE_FORMAT
+from datetime import datetime, UTC
 
 from croniter import croniter
 from dateutil.tz import tzutc, tzlocal
+from sqlalchemy import select, delete, update
 
 from privacyidea.lib.error import ParameterError, ResourceNotFoundError
-from privacyidea.lib.utils import fetch_one_resource, parse_date
+from privacyidea.lib.framework import get_app_config
 from privacyidea.lib.task.eventcounter import EventCounterTask
 from privacyidea.lib.task.simplestats import SimpleStatsTask
-from privacyidea.models import PeriodicTask
-from privacyidea.lib.framework import get_app_config
+from privacyidea.lib.tokenclass import DATE_FORMAT
+from privacyidea.lib.utils import fetch_one_resource
 from privacyidea.lib.utils.export import (register_import, register_export)
+from privacyidea.models import PeriodicTask, db, PeriodicTaskOption, PeriodicTaskLastRun
+from privacyidea.models.utils import utc_now
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ def get_taskmodule(identifier, config=None):
     :return: instance of a BaseTask subclass
     """
     if identifier not in TASK_MODULES:
-        raise ParameterError(u"Unknown task module: {!r}".format(identifier))
+        raise ParameterError(f"Unknown task module: {identifier!r}")
     else:
         r = TASK_MODULES[identifier](config=get_app_config())
         return r
@@ -122,27 +123,86 @@ def set_periodic_task(name=None, interval=None, nodes=None, taskmodule=None,
     :type id: int or None
     :return: ID of the entry
     """
+    existing_task = None
     try:
         croniter(interval)
     except ValueError as e:
-        raise ParameterError("Invalid interval: {!s}".format(e))
+        raise ParameterError(f"Invalid interval: {e!s}")
     if ordering < 0:
-        raise ParameterError("Invalid ordering: {!s}".format(ordering))
+        raise ParameterError(f"Invalid ordering: {ordering!s}")
     if id is not None:
         # This will throw a ParameterError if there is no such entry
         get_periodic_task_by_id(id)
-    periodic_task = PeriodicTask(name, active, interval, nodes, taskmodule,
-                                 ordering, options, id, retry_if_failed)
+
+        existing_task_stmt = select(PeriodicTask).where(PeriodicTask.id == id)
+        existing_task = db.session.scalars(existing_task_stmt).one_or_none()
+
+    if existing_task:
+        existing_task.last_update = datetime.now(UTC).replace(tzinfo=None)
+        existing_task.name = name
+        existing_task.active = active
+        existing_task.interval = interval
+        existing_task.nodes = ", ".join(nodes)
+        existing_task.taskmodule = taskmodule
+        existing_task.ordering = ordering
+        existing_task.retry_if_failed = retry_if_failed
+
+        periodic_task = existing_task
+    else:
+        # Create new periodic task entry
+        periodic_task = PeriodicTask(name, active, interval, nodes, taskmodule, ordering, options, id, retry_if_failed)
+        db.session.add(periodic_task)
+        db.session.flush()  # To assign ID
+        id = periodic_task.id
+
+    # Add options
+    existing_options = db.session.scalars(select(PeriodicTaskOption).filter_by(periodictask_id=id)).all()
+    existing_option_keys = {opt.key for opt in existing_options}
+    new_option_keys = set(options.keys()) if options else set()
+    option_keys_to_delete = existing_option_keys - new_option_keys
+
+    # Delete options that are no longer present
+    if option_keys_to_delete:
+        delete_option_stmt = delete(PeriodicTaskOption).where(
+            PeriodicTaskOption.periodictask_id == id,
+            PeriodicTaskOption.key.in_(option_keys_to_delete)
+        )
+        db.session.execute(delete_option_stmt)
+
+    # Add new options or update existing ones
+    if options:
+        for key, value in options.items():
+            if key in existing_option_keys:
+                # Update existing option
+                update_stmt = update(PeriodicTaskOption).where(
+                    PeriodicTaskOption.periodictask_id == id,
+                    PeriodicTaskOption.key == key
+                ).values(value=value)
+                db.session.execute(update_stmt)
+            else:
+                # Add new option
+                option = PeriodicTaskOption(periodictask_id=id, key=key, value=value)
+                db.session.add(option)
+
+    # Remove last runs from different nodes
+    delete_run_stmt = delete(PeriodicTaskLastRun).where(PeriodicTaskLastRun.periodictask_id == id,
+                                                        ~PeriodicTaskLastRun.node.in_(nodes))
+    db.session.execute(delete_run_stmt)
+
+    db.session.commit()
     return periodic_task.id
 
 
-def delete_periodic_task(ptask_id):
+def delete_periodic_task(ptask_id: int) -> int:
     """
     Delete an existing periodic task. If ``ptask_id`` refers to an unknown entry, a ParameterError is raised.
     :param ptask_id: ID of the database entry
     :return: ID of the deleted entry
     """
-    periodic_task = _get_periodic_task_entry(ptask_id)
+    select_stmt = select(PeriodicTask).where(PeriodicTask.id == ptask_id)
+    periodic_task = db.session.scalars(select_stmt).one_or_none()
+    if periodic_task is None:
+        raise ResourceNotFoundError(f"The periodic task with ID {ptask_id!r} does not exist")
     return periodic_task.delete()
 
 
@@ -154,9 +214,14 @@ def enable_periodic_task(ptask_id, enable=True):
     :param enable: New value of the ``active`` flag
     :return: ID of the database entry
     """
-    periodic_task = _get_periodic_task_entry(ptask_id)
-    periodic_task.active = enable
-    return periodic_task.save()
+    select_stmt = select(PeriodicTask).where(PeriodicTask.id == ptask_id)
+    task = db.session.scalars(select_stmt).one_or_none()
+    if not task:
+        raise ResourceNotFoundError(f"The periodic task with ID {ptask_id} does not exist")
+    task.active = enable
+    task.last_update = utc_now()
+    db.session.commit()
+    return ptask_id
 
 
 def get_periodic_tasks(name=None, node=None, active=None):
@@ -172,12 +237,12 @@ def get_periodic_tasks(name=None, node=None, active=None):
     :param active: This can be used to filter for active or inactive tasks only
     :return: A (possibly empty) list of periodic task dictionaries
     """
-    query = PeriodicTask.query
+    stmt = select(PeriodicTask)
     if name is not None:
-        query = query.filter_by(name=name)
+        stmt = stmt.filter_by(name=name)
     if active is not None:
-        query = query.filter_by(active=active)
-    entries = query.order_by(PeriodicTask.ordering).all()
+        stmt = stmt.filter_by(active=active)
+    entries = db.session.scalars(stmt.order_by(PeriodicTask.ordering)).all()
     result = []
     for entry in entries:
         ptask = entry.get()
@@ -194,7 +259,7 @@ def get_periodic_task_by_name(name):
     """
     periodic_tasks = get_periodic_tasks(name)
     if len(periodic_tasks) != 1:
-        raise ResourceNotFoundError(u"The periodic task with unique name {!r} does not exist".format(name))
+        raise ResourceNotFoundError(f"The periodic task with unique name {name!r} does not exist")
     return periodic_tasks[0]
 
 
@@ -231,7 +296,17 @@ def set_periodic_task_last_run(ptask_id, node, last_run_timestamp):
     """
     periodic_task = _get_periodic_task_entry(ptask_id)
     utc_last_run = last_run_timestamp.astimezone(tzutc()).replace(tzinfo=None)
-    periodic_task.set_last_run(node, utc_last_run)
+
+    existing_task_stmt = select(PeriodicTaskLastRun).where(PeriodicTaskLastRun.periodictask_id == periodic_task.id,
+                                                           PeriodicTaskLastRun.node == node)
+    existing_task = db.session.scalars(existing_task_stmt).one_or_none()
+
+    if existing_task:
+        existing_task.timestamp = utc_last_run
+    else:
+        last_run = PeriodicTaskLastRun(periodic_task.id, node, utc_last_run)
+        db.session.add(last_run)
+    db.session.commit()
 
 
 def get_scheduled_periodic_tasks(node, current_timestamp=None, interval_tzinfo=None):
@@ -254,18 +329,18 @@ def get_scheduled_periodic_tasks(node, current_timestamp=None, interval_tzinfo=N
     if current_timestamp is None:
         current_timestamp = datetime.now(tzutc())
     if current_timestamp.tzinfo is None:
-        raise ParameterError(u"expected timezone-aware datetime, got {!r}".format(current_timestamp))
+        raise ParameterError(f"expected timezone-aware datetime, got {current_timestamp!r}")
     scheduled_ptasks = []
-    log.debug(u"Collecting periodic tasks to run at {!s}".format(current_timestamp.isoformat()))
+    log.debug(f"Collecting periodic tasks to run at {current_timestamp.isoformat()!s}")
     for ptask in active_ptasks:
         try:
             next_timestamp = calculate_next_timestamp(ptask, node, interval_tzinfo)
-            log.debug(u"Next scheduled run of {!r}: {!s}".format(ptask["name"], next_timestamp.isoformat()))
+            log.debug("Next scheduled run of {!r}: {!s}".format(ptask["name"], next_timestamp.isoformat()))
             if next_timestamp <= current_timestamp:
-                log.debug(u"Scheduling periodic task {!r}".format(ptask["name"]))
+                log.debug("Scheduling periodic task {!r}".format(ptask["name"]))
                 scheduled_ptasks.append(ptask)
         except Exception as e:
-            log.warning(u"Ignoring periodic task {!r}: {!r}".format(ptask["name"], e))
+            log.warning("Ignoring periodic task {!r}: {!r}".format(ptask["name"], e))
     return scheduled_ptasks
 
 
@@ -278,7 +353,7 @@ def execute_task(taskmodule, params):
     :return: boolean returned by the task
     """
     module = get_taskmodule(taskmodule)
-    log.info(u"Running taskmodule {!r} with parameters {!r}".format(module, params))
+    log.info(f"Running taskmodule {module!r} with parameters {params!r}")
     return module.do(params)
 
 
@@ -297,12 +372,12 @@ def export_periodictask(name=None):
 @register_import('periodictask')
 def import_periodictask(data, name=None):
     """Import periodictask configuration"""
-    log.debug('Import periodictask config: {0!s}'.format(data))
+    log.debug(f'Import periodictask config: {data!s}')
     for res_data in data:
         if name and name != res_data.get('name'):
             continue
         res_data.pop('last_update')
         res_data.pop('last_runs')
         rid = set_periodic_task(**res_data)
-        log.info('Import of periodictask "{0!s}" finished,'
-                 ' id: {1!s}'.format(res_data['name'], rid))
+        log.info('Import of periodictask "{!s}" finished,'
+                 ' id: {!s}'.format(res_data['name'], rid))

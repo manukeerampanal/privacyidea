@@ -1,0 +1,341 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { provideHttpClient } from "@angular/common/http";
+import { provideHttpClientTesting } from "@angular/common/http/testing";
+import { signal } from "@angular/core";
+import { ComponentFixture, TestBed } from "@angular/core/testing";
+import { MatDialogRef } from "@angular/material/dialog";
+import { ActivatedRoute, convertToParamMap, ParamMap, Router } from "@angular/router";
+import { ROUTE_PATHS } from "@app/route_paths";
+import { SaveAndExitDialogComponent } from "@components/shared/dialog/save-and-exit-dialog/save-and-exit-dialog.component";
+import { AuthService } from "@services/auth/auth.service";
+import { DialogService } from "@services/dialog/dialog.service";
+import { PendingChangesService } from "@services/pending-changes/pending-changes.service";
+import { RadiusServerService } from "@services/radius-server/radius-server.service";
+import { MockDialogService, MockRouter } from "@testing/mock-services";
+import { MockAuthService } from "@testing/mock-services/mock-auth-service";
+import { MockPendingChangesService } from "@testing/mock-services/mock-pending-changes-service";
+import { MockRadiusService } from "@testing/mock-services/mock-radius-service";
+import { BehaviorSubject } from "rxjs";
+import { NewRadiusServerComponent } from "./new-radius-server.component";
+
+describe("NewRadiusServerComponent", () => {
+  let component: NewRadiusServerComponent;
+  let fixture: ComponentFixture<NewRadiusServerComponent>;
+  let radiusServiceMock: MockRadiusService;
+  let pendingChangesService: MockPendingChangesService;
+  let dialogService: MockDialogService;
+  let authService: MockAuthService;
+  let routerMock: MockRouter;
+  let paramMapSubject: BehaviorSubject<ParamMap>;
+
+  beforeEach(async () => {
+    paramMapSubject = new BehaviorSubject(convertToParamMap({}));
+
+    await TestBed.configureTestingModule({
+      imports: [NewRadiusServerComponent],
+      providers: [
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        { provide: Router, useClass: MockRouter },
+        { provide: RadiusServerService, useClass: MockRadiusService },
+        { provide: PendingChangesService, useClass: MockPendingChangesService },
+        { provide: DialogService, useClass: MockDialogService },
+        { provide: AuthService, useClass: MockAuthService },
+        { provide: ActivatedRoute, useValue: { paramMap: paramMapSubject.asObservable() } }
+      ]
+    }).compileComponents();
+
+    radiusServiceMock = TestBed.inject(RadiusServerService) as unknown as MockRadiusService;
+    pendingChangesService = TestBed.inject(PendingChangesService) as unknown as MockPendingChangesService;
+    dialogService = TestBed.inject(DialogService) as unknown as MockDialogService;
+    authService = TestBed.inject(AuthService) as unknown as MockAuthService;
+    routerMock = TestBed.inject(Router) as unknown as MockRouter;
+    (routerMock.navigateByUrl as jest.Mock).mockResolvedValue(true);
+
+    fixture = TestBed.createComponent(NewRadiusServerComponent);
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+  });
+
+  it("should create", () => {
+    expect(component).toBeTruthy();
+  });
+
+  it("should initialize form for create mode", () => {
+    expect(component.isEditMode()).toBe(false);
+    expect(component.radiusModel().identifier).toBe("");
+  });
+
+  it("should initialize form for edit mode", () => {
+    radiusServiceMock.radiusServers = signal([
+      { identifier: "test", server: "1.2.3.4", port: 1812, timeout: 5, retries: 3, secret: "s" }
+    ]);
+
+    paramMapSubject.next(convertToParamMap({ identifier: "test" }));
+
+    fixture.destroy();
+    fixture = TestBed.createComponent(NewRadiusServerComponent);
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+
+    expect(component.isEditMode()).toBe(true);
+    expect(component.radiusModel().identifier).toBe("test");
+    expect(component.radiusForm.identifier().disabled()).toBe(true);
+  });
+
+  it.each(["test_request", ".", ".."])("rejects the reserved identifier %p", (identifier) => {
+    component.radiusModel.update((m) => ({ ...m, identifier, server: "1.2.3.4", secret: "s" }));
+    expect(component.radiusForm.identifier().errors().some((e) => e.kind === "reservedName")).toBe(true);
+    expect(component.radiusForm().valid()).toBe(false);
+    expect(component.canSave).toBe(false);
+  });
+
+  it("should call save when form is valid", async () => {
+    component.radiusModel.update((m) => ({
+      ...m,
+      identifier: "test",
+      server: "1.2.3.4",
+      secret: "secret",
+      port: 1812,
+      timeout: 5,
+      retries: 3
+    }));
+
+    const success = await component.save();
+
+    expect(success).toBe(true);
+    expect(radiusServiceMock.postRadiusServer).toHaveBeenCalled();
+    expect(routerMock.navigateByUrl).toHaveBeenCalledWith(ROUTE_PATHS.EXTERNAL_SERVICES_RADIUS);
+  });
+
+  it("should handle error on save", async () => {
+    component.radiusModel.update((m) => ({
+      ...m,
+      identifier: "test",
+      server: "1.2.3.4",
+      secret: "secret",
+      port: 1812,
+      timeout: 5,
+      retries: 3
+    }));
+    radiusServiceMock.postRadiusServer.mockRejectedValue(new Error("Save failed"));
+
+    const success = await component.save();
+
+    expect(success).toBe(false);
+    expect(radiusServiceMock.postRadiusServer).toHaveBeenCalled();
+  });
+
+  it("should call test when form is valid", async () => {
+    component.radiusModel.update((m) => ({
+      ...m,
+      identifier: "test",
+      server: "1.2.3.4",
+      secret: "secret",
+      port: 1812,
+      timeout: 5,
+      retries: 3
+    }));
+    await component.test();
+    expect(radiusServiceMock.testRadiusServer).toHaveBeenCalled();
+  });
+
+  describe("onCancel", () => {
+    let mockSaveExitDialogRef: { afterClosed: jest.Mock };
+
+    beforeEach(() => {
+      mockSaveExitDialogRef = {
+        afterClosed: jest.fn()
+      };
+      dialogService.openDialog.mockReturnValue(
+        mockSaveExitDialogRef as unknown as MatDialogRef<SaveAndExitDialogComponent>
+      );
+      authService.actionAllowed = jest.fn().mockReturnValue(true);
+      (routerMock.navigateByUrl as jest.Mock).mockClear();
+    });
+
+    it("should navigate back directly when there are no changes", () => {
+      component.onCancel();
+
+      expect(dialogService.openDialog).not.toHaveBeenCalled();
+      expect(routerMock.navigateByUrl).toHaveBeenCalledWith(ROUTE_PATHS.EXTERNAL_SERVICES_RADIUS);
+    });
+
+    it("should open SaveAndExitDialog when there are changes", () => {
+      mockSaveExitDialogRef.afterClosed.mockReturnValue(new BehaviorSubject("discard").asObservable());
+      component.radiusModel.update((m) => ({
+        ...m,
+        identifier: "test",
+        server: "1.2.3.4",
+        secret: "secret",
+        port: 1812
+      }));
+      component.radiusForm().markAsDirty();
+
+      component.onCancel();
+
+      expect(dialogService.openDialog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          component: SaveAndExitDialogComponent,
+          data: expect.objectContaining({
+            allowSaveExit: true
+          })
+        })
+      );
+    });
+
+    it("should navigate back when user selects 'discard' in cancel dialog", async () => {
+      mockSaveExitDialogRef.afterClosed.mockReturnValue(new BehaviorSubject("discard").asObservable());
+      component.radiusModel.update((m) => ({
+        ...m,
+        identifier: "test",
+        server: "1.2.3.4",
+        secret: "secret",
+        port: 1812
+      }));
+      component.radiusForm().markAsDirty();
+
+      component.onCancel();
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(pendingChangesService.clearAllRegistrations).toHaveBeenCalled();
+      expect(routerMock.navigateByUrl).toHaveBeenCalledWith(ROUTE_PATHS.EXTERNAL_SERVICES_RADIUS);
+    });
+
+    it("should navigate back when user selects 'save-exit' and save succeeds", async () => {
+      component.radiusModel.update((m) => ({
+        ...m,
+        identifier: "test",
+        server: "1.2.3.4",
+        secret: "secret",
+        port: 1812
+      }));
+      component.radiusForm().markAsDirty();
+      mockSaveExitDialogRef.afterClosed.mockReturnValue(new BehaviorSubject("save-exit").asObservable());
+      pendingChangesService.save.mockReturnValue(Promise.resolve(true));
+
+      component.onCancel();
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(pendingChangesService.clearAllRegistrations).toHaveBeenCalled();
+      expect(routerMock.navigateByUrl).toHaveBeenCalledWith(ROUTE_PATHS.EXTERNAL_SERVICES_RADIUS);
+    });
+
+    it("should NOT navigate when user selects 'save-exit' but save fails", async () => {
+      component.radiusModel.update((m) => ({
+        ...m,
+        identifier: "test",
+        server: "1.2.3.4",
+        secret: "secret",
+        port: 1812
+      }));
+      component.radiusForm().markAsDirty();
+      radiusServiceMock.postRadiusServer.mockRejectedValue(new Error("Save failed"));
+      mockSaveExitDialogRef.afterClosed.mockReturnValue(new BehaviorSubject("save-exit").asObservable());
+      pendingChangesService.save.mockReturnValue(Promise.resolve(false));
+
+      component.onCancel();
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(pendingChangesService.clearAllRegistrations).not.toHaveBeenCalled();
+      expect(routerMock.navigateByUrl).not.toHaveBeenCalled();
+    });
+
+    it("should do nothing when user selects 'save-exit' but canSave is false", async () => {
+      component.radiusModel.update((m) => ({ ...m, identifier: "" }));
+      component.radiusForm().markAsDirty();
+      mockSaveExitDialogRef.afterClosed.mockReturnValue(new BehaviorSubject("save-exit").asObservable());
+
+      component.onCancel();
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(pendingChangesService.save).not.toHaveBeenCalled();
+      expect(pendingChangesService.clearAllRegistrations).not.toHaveBeenCalled();
+      expect(routerMock.navigateByUrl).not.toHaveBeenCalled();
+    });
+
+    it("should do nothing when user closes dialog without selecting an option", async () => {
+      mockSaveExitDialogRef.afterClosed.mockReturnValue(new BehaviorSubject(undefined).asObservable());
+      component.radiusModel.update((m) => ({
+        ...m,
+        identifier: "test",
+        server: "1.2.3.4",
+        secret: "secret",
+        port: 1812
+      }));
+      component.radiusForm().markAsDirty();
+
+      component.onCancel();
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(pendingChangesService.clearAllRegistrations).not.toHaveBeenCalled();
+      expect(routerMock.navigateByUrl).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("deleteServer", () => {
+    let dialog: MockDialogService;
+    let pending: MockPendingChangesService;
+    let service: MockRadiusService;
+    let navigateSpy: jest.SpyInstance;
+
+    beforeEach(() => {
+      dialog = TestBed.inject(DialogService) as unknown as MockDialogService;
+      pending = TestBed.inject(PendingChangesService) as unknown as MockPendingChangesService;
+      service = TestBed.inject(RadiusServerService) as unknown as MockRadiusService;
+      navigateSpy = jest.spyOn(TestBed.inject(Router), "navigateByUrl").mockResolvedValue(true);
+      component["editIdentifier"] = "radius-server";
+    });
+
+    it("does nothing without an identifier", async () => {
+      component["editIdentifier"] = null;
+      await component.deleteServer();
+      expect(dialog.confirmDelete).not.toHaveBeenCalled();
+      expect(service.deleteRadiusServer).not.toHaveBeenCalled();
+    });
+
+    it("does not delete when the confirmation is cancelled", async () => {
+      dialog.confirmDelete.mockResolvedValue(false);
+      await component.deleteServer();
+      expect(service.deleteRadiusServer).not.toHaveBeenCalled();
+      expect(navigateSpy).not.toHaveBeenCalled();
+    });
+
+    it("deletes after confirmation and navigates back to the list", async () => {
+      await component.deleteServer();
+      expect(dialog.confirmDelete).toHaveBeenCalledWith(expect.objectContaining({ items: ["radius-server"] }));
+      expect(service.deleteRadiusServer).toHaveBeenCalledWith("radius-server");
+      expect(pending.clearAllRegistrations).toHaveBeenCalled();
+      expect(navigateSpy).toHaveBeenCalledWith(ROUTE_PATHS.EXTERNAL_SERVICES_RADIUS);
+    });
+
+    it("stays on the page when the deletion fails", async () => {
+      service.deleteRadiusServer.mockRejectedValue(new Error("delete failed"));
+      await component.deleteServer();
+      expect(pending.clearAllRegistrations).not.toHaveBeenCalled();
+      expect(navigateSpy).not.toHaveBeenCalled();
+    });
+  });
+});

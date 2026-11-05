@@ -1,0 +1,186 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+
+import { computed, Signal, signal } from "@angular/core";
+import { Sort } from "@angular/material/sort";
+import { PiResponse } from "@app/app.component";
+import { FilterValue } from "@core/models/filter_value/filter_value";
+import {
+  ContainerDetailData,
+  ContainerDetails,
+  ContainerRegisterData,
+  ContainerServiceInterface,
+  ContainerTemplate,
+  ContainerType,
+  ContainerTypes,
+  TemplateComparisonResult
+} from "@services/container/container.service";
+import { RowSelector } from "@services/table-utils/row-selector";
+import { MockHttpResourceRef, MockPiResponse } from "@testing/mock-services/mock-utils";
+import { Observable, of, Subject } from "rxjs";
+import { Debouncer } from "@utils/debounce.utils";
+
+export class MockContainerService implements ContainerServiceInterface {
+  containersForTokenType: Signal<string[]> = signal([]);
+  compareWithTemplate: () => Promise<void> = jest.fn().mockResolvedValue(undefined);
+  compatibleWithSelectedTokenType = signal<string | null>(null);
+  filterContainersByTokenOwner = signal(false);
+  isPollingActive: Signal<boolean> = signal(false);
+  apiFilterKeys: string[] = [];
+  advancedApiFilterKeys: string[] = [];
+  hiddenApiFilterKeys: string[] = [];
+  apiFilterKeyMap: Record<string, string> = {};
+  exactMatchKeys = new Set<string>();
+  allFilterKeys: Signal<string[]> = signal([
+    ...this.apiFilterKeys,
+    ...this.advancedApiFilterKeys,
+    ...this.hiddenApiFilterKeys
+  ]);
+  stopPolling$ = new Subject<void>();
+  readonly containerBaseUrl = "mockEnvironment.proxyUrl + '/container'";
+  readonly eventPageSize = signal(10);
+  states = signal<string[]>([]);
+  readonly containerSerial = signal("CONT-1");
+  readonly selectedContainerSerial = signal("");
+  readonly sort = signal<Sort>({ active: "serial", direction: "asc" });
+  readonly activeFilter = signal<FilterValue>(new FilterValue());
+  filterDebouncer = new Debouncer(this.activeFilter);
+  readonly filterDraft = this.activeFilter;
+  readonly filterParams = signal<Record<string, string>>({});
+  pageSize = signal<number>(10);
+  pageIndex = signal<number>(0);
+  containerResource = new MockHttpResourceRef<PiResponse<ContainerDetails> | undefined>(
+    MockPiResponse.fromValue({ containers: [], count: 0 })
+  );
+  userContainersResource = new MockHttpResourceRef<PiResponse<ContainerDetails> | undefined>(
+    MockPiResponse.fromValue({ containers: [], count: 0 })
+  );
+  containersForTokenTypeResource = new MockHttpResourceRef<PiResponse<ContainerDetails> | undefined>(
+    MockPiResponse.fromValue({ containers: [], count: 0 })
+  );
+  selectableContainers = signal<ContainerDetailData[]>([]);
+  containerSelection = new RowSelector<ContainerDetailData>({
+    keyGetter: (container) => container.serial,
+    visibleRows: this.selectableContainers
+  });
+
+  /** Makes the given containers the visible rows and selects them all. */
+  setContainerSelection(containers: ContainerDetailData[]): void {
+    this.selectableContainers.set(containers);
+    this.containerSelection.selectAllRows();
+  }
+  containerTypesResource = new MockHttpResourceRef<PiResponse<ContainerTypes, unknown> | undefined>(
+    MockPiResponse.fromValue<ContainerTypes>(new Map())
+  );
+  containerTypeOptions: Signal<ContainerType[]> = computed(() => {
+    return [
+      { containerType: "generic", description: "", token_types: [] } as ContainerType,
+      { containerType: "smartphone", description: "", token_types: [] } as ContainerType,
+      { containerType: "yubikey", description: "", token_types: [] } as ContainerType
+    ];
+  });
+  selectedContainerType = signal<ContainerType | undefined>(undefined);
+  containerDetailsResource = new MockHttpResourceRef(
+    MockPiResponse.fromValue({
+      containers: [
+        {
+          serial: "CONT-1",
+          users: [{ user_realm: "", user_name: "", user_resolver: "", user_id: "" }],
+          tokens: [],
+          realms: [],
+          states: [],
+          type: "",
+          select: "",
+          description: "",
+          info: {}
+        }
+      ],
+      count: 1
+    })
+  );
+  containerDetails = signal<ContainerDetails>({ containers: [], count: 0 });
+  supportedTokenTypes = signal<string[]>([]);
+  containerDetail = signal<ContainerDetailData | null>(null);
+  templateComparison = signal<TemplateComparisonResult | null>(null);
+  addToken = jest.fn().mockReturnValue(of(null));
+  removeToken = jest.fn().mockReturnValue(of(null));
+  setContainerRealm = jest.fn().mockReturnValue(of(null));
+  setContainerDescription = jest.fn().mockReturnValue(of(null));
+  toggleActive = jest.fn().mockReturnValue(of({}));
+  setStates = jest.fn().mockReturnValue(of({}));
+  unassignUser = jest.fn().mockReturnValue(of(null));
+  assignUser = jest.fn().mockReturnValue(of(null));
+  setContainerInfos = jest.fn().mockReturnValue(of({}));
+  deleteInfo = jest.fn().mockReturnValue(of({}));
+  addTokenToContainer = jest.fn().mockReturnValue(of(null));
+  removeTokenFromContainer = jest.fn().mockReturnValue(of(null));
+  toggleAll = jest.fn().mockReturnValue(of(null));
+  removeAll = jest.fn().mockReturnValue(of(null));
+  deleteContainer = jest.fn().mockReturnValue(of({}));
+  deleteAllTokens = jest.fn().mockReturnValue(of(null));
+
+  registerContainer = jest.fn(() => of(MockPiResponse.fromValue({})) as Observable<PiResponse<ContainerRegisterData>>);
+
+  readonly unregister = jest.fn().mockReturnValue(of({}));
+  containerBelongsToUser = jest.fn().mockReturnValue(false);
+  filterFromInput = jest.fn();
+  handleFilterInput = jest.fn();
+  applyFilterInput = jest.fn();
+  setFilter = jest.fn().mockImplementation((filter: FilterValue) => {
+    this.activeFilter.set(filter);
+  });
+  updateFilter = jest.fn().mockImplementation((computeFilter: (current: FilterValue) => FilterValue) => {
+    this.activeFilter.set(computeFilter(this.activeFilter()));
+  });
+  clearFilter = jest.fn();
+  stopPolling = jest.fn();
+  createContainer = jest.fn();
+  startPolling = jest.fn();
+  templatesResource = new MockHttpResourceRef<PiResponse<{ templates: ContainerTemplate[] }, unknown> | undefined>(
+    MockPiResponse.fromValue<{ templates: ContainerTemplate[] }>({ templates: [] })
+  );
+  templates = signal<ContainerTemplate[]>([]);
+  assignContainer = jest.fn().mockReturnValue(of(null));
+  unassignContainer = jest.fn().mockReturnValue(of(null));
+  pollContainerRolloutState = jest.fn();
+  getContainerData = jest.fn().mockReturnValue(
+    of({
+      result: {
+        value: {
+          containers: [
+            {
+              serial: "CONT-1",
+              users: [],
+              tokens: [],
+              realms: [],
+              states: [],
+              type: "",
+              select: "",
+              description: ""
+            },
+            { serial: "CONT-2", users: [], tokens: [], realms: [], states: [], type: "", select: "", description: "" }
+          ],
+          count: 2
+        }
+      }
+    })
+  );
+
+  getContainerDetails = jest.fn();
+}

@@ -1,6 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
-#
 #  2018-05-27 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             init
 
@@ -13,7 +11,9 @@ script to update them in the new privacyIDEA database.
 
 You can update counters like
 
-privacyidea-export-linotp-counter.py -c MIGRATION/linotp.ini  | ./tools/privacyidea-update-counter.py -c /etc/privacyidea/pi.cfg -i -
+privacyidea-update-counter.py -c /etc/privacyidea/pi.cfg -i counters.csv
+
+The file contains one serial and counter per line, separated by a comma.
 """
 
 from privacyidea.models import Token
@@ -40,7 +40,7 @@ def read_counter_file(import_file):
     for line in import_file.readlines():
         try:
             serial, counter = [v.strip() for v in line.split(",")]
-            update_list.append((u"{0!s}".format(serial), int(counter)))
+            update_list.append(("{0!s}".format(serial), int(counter)))
         except ValueError as ve:
             # If there is a line, that does not comply
             sys.stderr.write("Failed to parse line: {0!s}\n".format(line))

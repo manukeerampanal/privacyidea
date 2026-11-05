@@ -5,11 +5,12 @@ to fetch machine information and to attach token to machines
 import passlib
 
 from privacyidea.lib.user import User
+from privacyidea.lib.crypto import CENSORED
 from .base import MyApiTestCase
-import json
 from privacyidea.lib.token import init_token, get_tokens, remove_token
 from privacyidea.lib.machine import attach_token, detach_token, ANY_MACHINE, NO_RESOLVER
-from privacyidea.lib.policy import (set_policy, delete_policy, ACTION, SCOPE)
+from privacyidea.lib.policy import (set_policy, delete_policy, SCOPE)
+from privacyidea.lib.policies.actions import PolicyAction
 
 HOSTSFILE = "tests/testdata/hosts"
 
@@ -27,14 +28,13 @@ SSHKEY = "ssh-rsa " \
          "afLE9AtAL4nnMPuubC87L0wJ88un9teza/N02KJMHy01Yz3iJKt3Ou9eV6kqO" \
          "ei3kvLs5dXmriTHp6g9whtnN6/Liv9SzZPJTs8YfThi34Wccrw== " \
          "NetKnights GmbH"
-SSHKEY_ecdsa = u"ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzd" \
-               u"HAyNTYAAABBBHGCdIk0pO1HFr/mF4oLb43ZRyQJ4K7ICLrAhAiQERVa0tUvyY5TE" \
-               u"zurWTqxSMx203rY77t6xnHLZBMPPpv8rk0= cornelius@puck"
+SSHKEY_ecdsa = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzd" \
+               "HAyNTYAAABBBHGCdIk0pO1HFr/mF4oLb43ZRyQJ4K7ICLrAhAiQERVa0tUvyY5TE" \
+               "zurWTqxSMx203rY77t6xnHLZBMPPpv8rk0= cornelius@puck"
 OTPKEY = "3132333435363738393031323334353637383930"
 
 
 class APIMachinesTestCase(MyApiTestCase):
-
     serial2 = "ser1"
     serial3 = "UBOM12345"
     serial4 = "OATH1234"
@@ -119,52 +119,48 @@ class APIMachinesTestCase(MyApiTestCase):
                                                  "count": "12"},
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(200, res.status_code, res)
             result = res.json.get("result")
-            self.assertEqual(result["status"], True)
-            self.assertTrue(result["value"] >= 1)
+            self.assertTrue(result["status"])
+            self.assertGreaterEqual(result["value"], 1)
 
         # check if the options were set.
         token_obj = get_tokens(serial=serial)[0]
-        self.assertEqual(token_obj.token.machine_list[0].application, "offline")
-        self.assertEqual(token_obj.token.machine_list[0].option_list[0].mt_key,
-                         "count")
+        self.assertEqual("offline", token_obj.token.machine_list[0].application)
+        self.assertEqual("count", token_obj.token.machine_list[0].option_list[0].mt_key)
 
         # Get the token
         with self.app.test_request_context('/machine/token',
                                            method='GET',
-                                           data={"serial": serial},
+                                           query_string={"serial": serial},
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(200, res.status_code, res)
             result = res.json.get("result")
-            self.assertEqual(result["status"], True)
+            self.assertTrue(result["status"])
             machine_list = result.get("value")
-            self.assertEqual(len(machine_list), 1)
-            self.assertEqual(machine_list[0].get("serial"), serial)
-            self.assertEqual(machine_list[0].get("hostname"), "any host")
+            self.assertEqual(1, len(machine_list))
+            self.assertEqual(serial, machine_list[0].get("serial"))
+            self.assertEqual("any host", machine_list[0].get("hostname"))
 
         # check if the options were set.
         token_obj = get_tokens(serial=serial)[0]
-        self.assertEqual(token_obj.token.machine_list[0].application, "offline")
-        self.assertEqual(token_obj.token.machine_list[0].option_list[0].mt_key,
-                         "count")
+        self.assertEqual("offline", token_obj.token.machine_list[0].application)
+        self.assertEqual("count", token_obj.token.machine_list[0].option_list[0].mt_key)
 
         # Now detach the offline token. In this case we ignore the machine and resolver.
-        with self.app.test_request_context('/machine/token/{0!s}/{1!s}/{2!s}/offline'.format(serial,
-                                                                                             ANY_MACHINE,
-                                                                                             NO_RESOLVER),
+        with self.app.test_request_context(f'/machine/token/{serial!s}/{ANY_MACHINE!s}/{NO_RESOLVER!s}/offline',
                                            method='DELETE',
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
+            self.assertEqual(200, res.status_code, res)
             result = res.json.get("result")
-            self.assertEqual(result["status"], True)
-            self.assertEqual(result["value"], 1)
+            self.assertTrue(result["status"])
+            self.assertEqual(1, result["value"])
 
         # check that the token has no applications/machines anymore
         token_obj = get_tokens(serial=serial)[0]
-        self.assertEqual(len(token_obj.token.machine_list), 0)
+        self.assertEqual(0, len(token_obj.token.machine_list))
 
         remove_token(serial)
 
@@ -186,9 +182,13 @@ class APIMachinesTestCase(MyApiTestCase):
 
         # check if the options were set.
         token_obj = get_tokens(serial=serial)[0]
-        self.assertEqual(token_obj.token.machine_list[0].application, "luks")
-        self.assertEqual(token_obj.token.machine_list[0].option_list[
-                             1].mt_value, "/dev/sdb1")
+        self.assertEqual("luks", token_obj.token.machine_list[0].application)
+        self.assertEqual(2, len(token_obj.token.machine_list[0].option_list))
+        for option in token_obj.token.machine_list[0].option_list:
+            if option.mt_key == "slot":
+                self.assertEqual("1", option.mt_value)
+            elif option.mt_key == "partition":
+                self.assertEqual("/dev/sdb1", option.mt_value)
 
         # delete slot!
         with self.app.test_request_context('/machine/tokenoption',
@@ -236,6 +236,60 @@ class APIMachinesTestCase(MyApiTestCase):
         self.assertEqual(token_obj.token.machine_list[0].option_list[
                              0].mt_value, "/dev/sda1")
 
+    def test_04_set_options_by_mtid(self):
+        serial = "S1"
+        # current number of attached applications.
+        token_obj = get_tokens(serial=serial)[0]
+        num_applications = len(token_obj.token.machine_list)
+        # create an ssh application
+        with self.app.test_request_context('/machine/token',
+                                           method='POST',
+                                           data={"hostname": "gandalf",
+                                                 "serial": serial,
+                                                 "application": "ssh",
+                                                 "user": "root",
+                                                 "service_id": "webserver"},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertEqual(result["status"], True)
+            self.assertTrue(result["value"] >= 1)
+            mtid = result.get("value")
+
+        with self.app.test_request_context('/machine/tokenoption',
+                                           method='POST',
+                                           data={"mtid": mtid,
+                                                 "application": "ssh",
+                                                 "service_id": "mailserver",
+                                                 "user": ""},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertEqual(result["status"], True, result)
+            self.assertEqual(1, result["value"]["added"], result)
+            self.assertEqual(1, result['value']['deleted'], result)
+
+        # check if the options were set.
+        token_obj = get_tokens(serial=serial)[0]
+        self.assertEqual(token_obj.token.machine_list[1].application, "ssh")
+        self.assertEqual(token_obj.token.machine_list[1].option_list[
+                             0].mt_value, "mailserver")
+        # Delete machinetoken
+        with self.app.test_request_context(
+                f'/machine/token/S1/ssh/{mtid}',
+                method='DELETE',
+                headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertEqual(result["status"], True)
+            self.assertTrue(result["value"] >= 1)
+
+        # check if the the application is detached again
+        token_obj = get_tokens(serial=serial)[0]
+        self.assertEqual(num_applications, len(token_obj.token.machine_list))
 
     def test_05_list_machinetokens(self):
         with self.app.test_request_context('/machine/token?serial=S1',
@@ -287,6 +341,7 @@ class APIMachinesTestCase(MyApiTestCase):
         # Attach the token to the machine "gandalf" with the application SSH
         r = attach_token(hostname="gandalf", serial=self.serial2,
                          application="ssh", options={"user": "testuser"})
+        mtid = r.id
 
         self.assertEqual(r.machine_id, "192.168.0.1")
 
@@ -318,7 +373,7 @@ class APIMachinesTestCase(MyApiTestCase):
         # Remove everything that sounds like "SOMETHING\" in front of
         # the username
         set_policy(name="mangle1", scope=SCOPE.AUTH,
-                   action="{0!s}=user/.*\\\\(.*)/\\1/".format(ACTION.MANGLE))
+                   action=f"{PolicyAction.MANGLE!s}=user/.*\\\\(.*)/\\1/")
         with self.app.test_request_context(
                 '/machine/authitem/ssh?hostname=gandalf&user=DOMAIN\\testuser',
                 method='GET',
@@ -356,7 +411,96 @@ class APIMachinesTestCase(MyApiTestCase):
             sshkey = result["value"].get("ssh")[0].get("sshkey")
             self.assertTrue(sshkey.startswith("ssh-rsa"), sshkey)
 
-        detach_token(self.serial2, application="ssh", hostname="gandalf")
+        # Detach the machinetoken via ID - this is used in the UI
+        with self.app.test_request_context(f"/machine/token/{self.serial2!s}/ssh/{mtid!s}",
+                                           method='DELETE',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+
+        remove_token(self.serial2)
+
+    def test_10_auth_items_ssh_rsa_with_service_id(self):
+        # Attach with service_id and without IP, but still also support IP
+        # create an SSH token
+        token_obj = init_token({"serial": self.serial2, "type": "sshkey",
+                                "sshkey": SSHKEY})
+        self.assertEqual(token_obj.type, "sshkey")
+
+        # Attach the token to the machine "gandalf" with the application SSH
+        r = attach_token(serial=self.serial2,
+                         application="ssh", options={"user": "testuser", "service_id": "webserver"})
+
+        self.assertEqual(None, r.machine_id)
+        self.assertEqual("ssh", r.application)
+
+        # fetch the auth_items for application SSH on machine gandalf
+        with self.app.test_request_context(
+                '/machine/authitem/ssh?hostname=gandalf&service_id=webserver',
+                method='GET',
+                headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertEqual(result["status"], True)
+            sshkey = result["value"].get("ssh")[0].get("sshkey")
+            self.assertTrue(sshkey.startswith("ssh-rsa"), sshkey)
+
+        # fetch the auth_items for user testuser
+        with self.app.test_request_context(
+                '/machine/authitem/ssh?hostname=gandalf&service_id=webserver&user=testuser',
+                method='GET',
+                headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertEqual(result["status"], True)
+            sshkey = result["value"].get("ssh")[0].get("sshkey")
+            self.assertTrue(sshkey.startswith("ssh-rsa"), sshkey)
+
+        # fetch the auth_items for a user, who has no ssh keys
+        with self.app.test_request_context(
+                '/machine/authitem/ssh?hostname=gandalf&service_id=webserver&user=root',
+                method='GET',
+                headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertEqual(result["status"], True)
+            self.assertEqual({}, result.get("value"))
+
+        # fetch auth_items for testuser, but with mangle policy
+        # Remove everything that sounds like "SOMETHING\" in front of
+        # the username
+        set_policy(name="mangle1", scope=SCOPE.AUTH,
+                   action=f"{PolicyAction.MANGLE!s}=user/.*\\\\(.*)/\\1/")
+        with self.app.test_request_context(
+                '/machine/authitem/ssh?hostname=gandalf&service_id=webserver&user=DOMAIN\\testuser',
+                method='GET',
+                headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertEqual(result["status"], True)
+            sshkey = result["value"].get("ssh")[0].get("sshkey")
+            self.assertTrue(sshkey.startswith("ssh-rsa"), sshkey)
+        delete_policy("mangle1")
+
+        # Now that the policy is deleted, we will not get the auth_items
+        # anymore, since the username is not mangled.
+        with self.app.test_request_context(
+                '/machine/authitem/ssh?service_id=webserver&hostname=gandalft&user=DOMAIN\\testuser',
+                method='GET',
+                headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertEqual(result["status"], True)
+            sshkeys = result["value"].get("ssh")
+            # No user DOMAIN\\testuser and no SSH keys
+            self.assertFalse(sshkeys)
+
+        detach_token(self.serial2, application="ssh")
         remove_token(self.serial2)
 
     def test_10_auth_items_ssh_ecdsa(self):
@@ -437,7 +581,7 @@ class APIMachinesTestCase(MyApiTestCase):
                              "93235fc7d1d444d0ec014ea9eafcc44fc65b73eb")
 
     def test_12_auth_items_offline(self):
-        #create HOTP token for offline usage
+        # Create HOTP token for offline usage
         self.setUp_user_realms()
         token_obj = init_token({"serial": self.serial4, "type": "hotp",
                                 "otpkey": OTPKEY,
@@ -466,13 +610,13 @@ class APIMachinesTestCase(MyApiTestCase):
             response = offline_auth_item.get("response")
             self.assertEqual(len(response), 17)
             self.assertEqual(token_obj.token.count, 17)
-            self.assertTrue(passlib.hash.\
+            self.assertTrue(passlib.hash.
                             pbkdf2_sha512.verify("755224",
                                                  response.get('0')))
 
-        self.assertEqual(token_obj.check_otp('187581'), -1) # count = 16
+        self.assertEqual(token_obj.check_otp('187581'), -1)  # count = 16
         with self.app.test_request_context(
-                '/validate/check?user=cornelius&pass=test447589', # count = 17
+                '/validate/check?user=cornelius&pass=test447589',  # count = 17
                 environ_base={'REMOTE_ADDR': '192.168.0.1'},
                 method='GET'):
             res = self.app.full_dispatch_request()
@@ -486,15 +630,15 @@ class APIMachinesTestCase(MyApiTestCase):
             # check, if we got 17 otp values
             response = offline_auth_item.get("response")
             self.assertEqual(len(response), 17)
-            self.assertEqual(token_obj.token.count, 35) # 17 + 17 + 1, because we consumed 447589
+            self.assertEqual(token_obj.token.count, 35)  # 17 + 17 + 1, because we consumed 447589
             self.assertTrue(passlib.hash.
-                            pbkdf2_sha512.verify("test903435", # count = 18
+                            pbkdf2_sha512.verify("test903435",  # count = 18
                                                  response.get('18')))
             self.assertTrue(passlib.hash.
-                            pbkdf2_sha512.verify("test749439", # count = 34
+                            pbkdf2_sha512.verify("test749439",  # count = 34
                                                  response.get('34')))
-        self.assertEqual(token_obj.check_otp('747439'), -1) # count = 34
-        self.assertEqual(token_obj.check_otp('037211'), 35) # count = 35
+        self.assertEqual(token_obj.check_otp('747439'), -1)  # count = 34
+        self.assertEqual(token_obj.check_otp('037211'), 35)  # count = 35
 
     def test_20_detach_ssh_key_any_token(self):
         # we could also attach an SSH key to "any machine".
@@ -527,7 +671,7 @@ class APIMachinesTestCase(MyApiTestCase):
         # Get the token
         with self.app.test_request_context('/machine/token',
                                            method='GET',
-                                           data={"serial": serial},
+                                           query_string={"serial": serial},
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
@@ -544,7 +688,7 @@ class APIMachinesTestCase(MyApiTestCase):
         self.assertEqual("user", token_obj.token.machine_list[0].option_list[0].mt_key)
 
         # Now detach the ssh token from any machine
-        with self.app.test_request_context('/machine/token/{0!s}/any%20machine/no%20resolver/ssh'.format(serial),
+        with self.app.test_request_context(f'/machine/token/{serial!s}/any%20machine/no%20resolver/ssh',
                                            method='DELETE',
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
@@ -607,7 +751,7 @@ class APIMachinesTestCase(MyApiTestCase):
             self.assertIn("refilltoken", offline[0])
 
         # 5. Detach this token from the offline application and machine
-        with self.app.test_request_context('/machine/token/{0!s}/192.168.0.1/machineresolver1/offline'.format(serial),
+        with self.app.test_request_context(f'/machine/token/{serial!s}/192.168.0.1/machineresolver1/offline',
                                            method='DELETE',
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
@@ -621,3 +765,126 @@ class APIMachinesTestCase(MyApiTestCase):
         token_obj = get_tokens(serial=serial)[0]
         self.assertEqual(len(token_obj.token.machine_list), 0)
         remove_token(serial)
+
+    def test_35_delete_offline_token(self):
+        # Delete an offline token with machine token options (Issue #4136)
+        serial = "hotp01"
+        init_token({"type": "hotp", "otpkey": self.otpkey, "serial": serial})
+        # Mark this token as "offline"
+        with self.app.test_request_context('/machine/token',
+                                           method='POST',
+                                           data={"machineid": 0,
+                                                 "serial": serial,
+                                                 "application": "offline",
+                                                 "rounds": 25,
+                                                 "count": 15,
+                                                 "resolver": ""},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code)
+            result = res.json.get("result")
+            self.assertTrue(result["status"])
+            self.assertGreaterEqual(result["value"], 1, result)
+
+        # Check if the options were set.
+        with self.app.test_request_context('/machine/token', method="GET",
+                                           query_string={"serial": serial},
+                                           headers={"Authorization": self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code)
+            result = res.json.get("result")
+            self.assertEqual("offline", result["value"][0]["application"], result)
+            self.assertEqual("15", result["value"][0]["options"]["count"], result)
+            self.assertEqual("25", result["value"][0]["options"]["rounds"], result)
+
+        # Delete the token
+        with self.app.test_request_context(f"/token/{serial}", method="DELETE",
+                                           headers={"Authorization": self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code)
+            result = res.json.get("result")
+            self.assertTrue(result["status"])
+            self.assertEqual(1, result["value"], result)
+
+        # Check that the token was deleted
+        self.assertFalse(get_tokens(serial=serial))
+
+    def test_40_machineresolver_password_censored(self):
+        """GET /machineresolver/ must censor password-type config values (e.g. BINDPW)."""
+        # Create an LDAP machine resolver with a BINDPW (password-type field)
+        with self.app.test_request_context('/machineresolver/ldap_mr',
+                                           data={
+                                               'type': 'ldap',
+                                               'LDAPURI': 'ldap://ldap.example.com',
+                                               'LDAPBASE': 'dc=example,dc=com',
+                                               'BINDDN': 'cn=admin,dc=example,dc=com',
+                                               'BINDPW': 'ldap_secret_pw',
+                                               'HOSTNAMEATTRIBUTE': 'cn',
+                                               'IDATTRIBUTE': 'cn',
+                                           },
+                                           method='POST',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200)
+            result = res.json.get("result")
+            self.assertTrue(result["status"])
+
+        # Now GET the machine resolver - BINDPW must be censored
+        with self.app.test_request_context('/machineresolver/ldap_mr',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200)
+            result = res.json.get("result")
+            value = result["value"]
+            resolver = value.get("ldap_mr")
+            self.assertIsNotNone(resolver, "Resolver 'ldap_mr' must be in the response")
+            # BINDPW must be censored
+            self.assertEqual(resolver["data"]["BINDPW"], CENSORED,
+                             "BINDPW must be censored in the API response")
+            # Non-password fields must NOT be censored
+            self.assertEqual(resolver["data"]["LDAPURI"], "ldap://ldap.example.com")
+            self.assertEqual(resolver["data"]["BINDDN"], "cn=admin,dc=example,dc=com")
+
+    def test_41_machineresolver_password_not_overwritten_by_censored(self):
+        """Updating a machine resolver with __CENSORED__ BINDPW must preserve the original."""
+        # Create an LDAP machine resolver with a BINDPW
+        with self.app.test_request_context('/machineresolver/ldap_mr2',
+                                           data={
+                                               'type': 'ldap',
+                                               'LDAPURI': 'ldap://ldap.example.com',
+                                               'LDAPBASE': 'dc=example,dc=com',
+                                               'BINDDN': 'cn=admin,dc=example,dc=com',
+                                               'BINDPW': 'original_ldap_pass',
+                                               'HOSTNAMEATTRIBUTE': 'cn',
+                                               'IDATTRIBUTE': 'cn',
+                                           },
+                                           method='POST',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200)
+
+        # Update the resolver with CENSORED as the password (simulating UI re-save)
+        with self.app.test_request_context('/machineresolver/ldap_mr2',
+                                           data={
+                                               'type': 'ldap',
+                                               'LDAPURI': 'ldap://new-ldap.example.com',
+                                               'LDAPBASE': 'dc=example,dc=com',
+                                               'BINDDN': 'cn=admin,dc=example,dc=com',
+                                               'BINDPW': CENSORED,
+                                               'HOSTNAMEATTRIBUTE': 'cn',
+                                               'IDATTRIBUTE': 'cn',
+                                           },
+                                           method='POST',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200)
+
+        # Verify the password was preserved by checking the DB directly
+        from privacyidea.lib.machineresolver import get_resolver_list
+        resolvers = get_resolver_list(filter_resolver_name="ldap_mr2")
+        resolver = resolvers.get("ldap_mr2")
+        # The decrypted password should still be "original_ldap_pass"
+        self.assertEqual(resolver["data"]["BINDPW"], "original_ldap_pass")
+        # Other fields should be updated
+        self.assertEqual(resolver["data"]["LDAPURI"], "ldap://new-ldap.example.com")

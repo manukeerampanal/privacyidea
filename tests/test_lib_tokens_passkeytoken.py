@@ -1,0 +1,911 @@
+# (c) NetKnights GmbH 2024,  https://netknights.it
+#
+# This code is free software; you can redistribute it and/or
+# modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+# as published by the Free Software Foundation; either
+# version 3 of the License, or any later version.
+#
+# This code is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+#
+# You should have received a copy of the GNU Affero General Public
+# License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# SPDX-FileCopyrightText: 2024 Nils Behlen <nils.behlen@netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+import json
+from dataclasses import dataclass
+from unittest.mock import patch
+
+from webauthn import base64url_to_bytes
+from webauthn.helpers import bytes_to_base64url
+from webauthn.helpers.cose import COSEAlgorithmIdentifier
+from webauthn.helpers.structs import AttestationConveyancePreference
+
+from privacyidea.lib.challenge import get_challenges
+from privacyidea.lib.error import EnrollmentError, ParameterError, ResourceNotFoundError, PolicyError
+from privacyidea.lib.fido2.challenge import create_fido2_challenge, verify_fido2_challenge
+from privacyidea.lib.fido2.policy_action import FIDO2PolicyAction, PasskeyAction
+from privacyidea.lib.fido2.token_info import FIDO2TokenInfo
+from privacyidea.lib.fido2.util import (get_credential_ids_for_user, get_fido2_token_by_credential_id,
+                                        hash_credential_id, save_credential_id_hash)
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.policy import SCOPE
+from privacyidea.lib.token import (init_token, remove_token, unassign_token, import_tokens, get_tokens)
+from privacyidea.lib.tokenclass import TokenClass
+from privacyidea.lib.tokenrolloutstate import RolloutState
+from privacyidea.lib.tokens.passkeytoken import PasskeyTokenClass
+from privacyidea.lib.user import User
+from privacyidea.models import TokenCredentialIdHash, db
+from tests.base import MyTestCase
+from tests.passkey_base import PasskeyTestBase
+
+
+class PasskeyTokenTestCase(PasskeyTestBase, MyTestCase):
+    """
+    The tests in this class are meant to be run consecutively, because they build on each other.
+    """
+
+    def setUp(self):
+        PasskeyTestBase.setUp(self)
+        self.setUp_user_realms()
+        self.user = User(login="hans", realm=self.realm1, resolver=self.resolvername1)
+
+    def _create_token(self) -> TokenClass:
+        registration_request = self._initialize_registration()
+        token = registration_request.token
+        token.update(registration_request.registration_response)
+        self.assertEqual(token.token.rollout_state, RolloutState.ENROLLED)
+        return token
+
+    @dataclass(frozen=True)
+    class RegistrationRequest:
+        token: TokenClass
+        init_detail: dict
+        registration_response: dict
+
+    def _initialize_registration(self, get_init_detail_options: dict = None) -> RegistrationRequest:
+        if get_init_detail_options is None:
+            get_init_detail_options = {}
+        token = init_token({"type": "passkey"}, user=self.user)
+        self.assertIsInstance(token, PasskeyTokenClass)
+        self.assertEqual(token.rollout_state, RolloutState.CLIENTWAIT)
+        param = {}
+        if get_init_detail_options:
+            param.update(get_init_detail_options)
+        # Overwrite these values if they have been in options
+        param.update({
+            FIDO2PolicyAction.RELYING_PARTY_ID: self.rp_id,
+            FIDO2PolicyAction.RELYING_PARTY_NAME: self.rp_id
+        })
+        with patch('privacyidea.lib.fido2.challenge.get_fido2_nonce') as get_nonce:
+            get_nonce.return_value = self.registration_challenge
+            init_detail = token.get_init_detail(param)
+        self.assertIn("serial", init_detail)
+        self.assertIn("passkey_registration", init_detail)
+        self.assertIn("transaction_id", init_detail)
+        registration_response = {
+            "attestationObject": self.registration_attestation,
+            "clientDataJSON": self.registration_client_data,
+            "credential_id": self.credential_id,
+            "rawId": self.credential_id,
+            "authenticatorAttachment": self.authenticator_attachment,
+            "HTTP_ORIGIN": self.expected_origin,
+            FIDO2PolicyAction.RELYING_PARTY_ID: self.rp_id,
+            "transaction_id": init_detail["transaction_id"]
+        }
+
+        return self.RegistrationRequest(token, init_detail, registration_response)
+
+    def _initialize_authentication(self) -> dict:
+        with patch('privacyidea.lib.fido2.challenge.get_fido2_nonce') as get_nonce:
+            get_nonce.return_value = self.authentication_challenge_no_uv
+            challenge = create_fido2_challenge(self.rp_id)
+            self.assertEqual(challenge["challenge"], self.authentication_challenge_no_uv)
+            return challenge
+
+    def _create_token_multi_device(self) -> TokenClass:
+        token = init_token({"type": "passkey"}, user=self.user)
+        self.assertIsInstance(token, PasskeyTokenClass)
+        param = {
+            FIDO2PolicyAction.RELYING_PARTY_ID: self.rp_id,
+            FIDO2PolicyAction.RELYING_PARTY_NAME: self.rp_id
+        }
+        with patch('privacyidea.lib.fido2.challenge.get_fido2_nonce') as get_nonce:
+            get_nonce.return_value = self.registration_challenge_multi_device
+            init_detail = token.get_init_detail(param)
+        registration_response = {
+            "attestationObject": self.registration_attestation_multi_device,
+            "clientDataJSON": self.registration_client_data_multi_device,
+            "credential_id": self.credential_id_multi_device,
+            "rawId": self.credential_id_multi_device,
+            "authenticatorAttachment": self.authenticator_attachment_multi_device,
+            "HTTP_ORIGIN": self.expected_origin,
+            FIDO2PolicyAction.RELYING_PARTY_ID: self.rp_id,
+            "transaction_id": init_detail["transaction_id"]
+        }
+        token.update(registration_response)
+        self.assertEqual(token.token.rollout_state, RolloutState.ENROLLED)
+        return token
+
+    def _initialize_authentication_multi_device(self, challenge_value: str) -> dict:
+        with patch('privacyidea.lib.fido2.challenge.get_fido2_nonce') as get_nonce:
+            get_nonce.return_value = challenge_value
+            challenge = create_fido2_challenge(self.rp_id)
+            self.assertEqual(challenge["challenge"], challenge_value)
+            return challenge
+
+    def test_01_class_values(self):
+        class_prefix = PasskeyTokenClass.get_class_prefix()
+        self.assertEqual(class_prefix, "PIPK")
+
+        class_type = PasskeyTokenClass.get_class_type()
+        self.assertEqual(class_type, "passkey")
+
+        class_info = PasskeyTokenClass.get_class_info()
+        self.assertEqual(class_info["type"], "passkey")
+        self.assertIn("title", class_info)
+        self.assertIn("description", class_info)
+        self.assertIn("user", class_info)
+        self.assertEqual(class_info["user"], ["enroll"])
+        self.assertIn("ui_enroll", class_info)
+        self.assertEqual(class_info["ui_enroll"], ["admin", "user"])
+
+        self.assertIn("policy", class_info)
+        policy = class_info["policy"]
+        self.assertIn(SCOPE.AUTH, policy)
+        policy_auth = policy[SCOPE.AUTH]
+        self.assertIn(PolicyAction.CHALLENGETEXT, policy_auth)
+        self.assertIn(SCOPE.ENROLL, policy)
+        policy_enroll = policy[SCOPE.ENROLL]
+        self.assertIn(PasskeyAction.AttestationConveyancePreference, policy_enroll)
+        self.assertIn(PasskeyAction.UserLabel, policy_enroll)
+
+    def test_02_init_defaults(self):
+        """
+        Test the basic enrollment with just the settings that are required to make it work. The token is persisted for
+        the next test.
+        """
+        registration_request = self._initialize_registration()
+        token = registration_request.token
+        init_detail = registration_request.init_detail
+        self.assertTrue(token.get_serial())
+        self.first_serial = token.get_serial()
+
+        self.validate_default_passkey_registration(init_detail["passkey_registration"])
+        passkey_registration = init_detail["passkey_registration"]
+
+        self.assertEqual(len(passkey_registration["pubKeyCredParams"]), 2)
+        self.assertEqual(passkey_registration["pubKeyCredParams"][0]["type"], "public-key")
+        self.assertEqual(passkey_registration["pubKeyCredParams"][1]["type"], "public-key")
+        self.assertIn(passkey_registration["pubKeyCredParams"][0]["alg"], [-7, -257])
+        self.assertIn(passkey_registration["pubKeyCredParams"][1]["alg"], [-7, -257])
+        # ExcludeCredentials should be empty because no other passkey token is registered for the user
+        self.assertEqual(len(passkey_registration["excludeCredentials"]), 0)
+
+        # Complete the registration
+        update_response = token.update(registration_request.registration_response)
+        self.assertTrue(update_response)
+        self.assertIn("details", update_response)
+        self.assertEqual(update_response["details"]["serial"], self.first_serial)
+        # Verify that the token is enrolled and token info was written
+        self.assertEqual(token.rollout_state, RolloutState.ENROLLED)
+        token_info = token.get_tokeninfo()
+        self.assertTrue(token_info["credential_id_hash"])
+        self.assertTrue(token_info["public_key"])
+        self.assertTrue(token_info["aaguid"])
+        self.assertTrue(token_info["sign_count"])
+        self.assertTrue(token_info["fido2_user_id"])
+        # Since attestation was passed, the cert should be present and the description should be set from the cert CN
+        self.assertTrue(token_info["attestation_certificate"])
+        self.assertEqual(token.token.description, "Yubico U2F EE Serial 2109467376")
+        # The token key is the credential id
+        self.assertEqual(token.token.get_otpkey().getKey().decode('utf-8'), self.credential_id)
+        # Verify that the credential_id hash has been written to the database
+        tcih = TokenCredentialIdHash.query.filter(
+            TokenCredentialIdHash.credential_id_hash == token_info["credential_id_hash"]).one()
+        self.assertEqual(tcih.token_id, token.token.id)
+        # Kep the token for the next test
+
+    def test_03_init_custom_settings(self):
+        """
+        Test enrollment with all custom settings. The settings that are not changeable are not checked again.
+        This also just tests the registration options generated by the server, because in the previous test, the
+        registration was done with attestation.
+        This basically tests that the policies for enrollment are loaded by the prepolicy 'fido2_enroll', that they work
+        and that excludeCredentials is set correctly.
+        """
+        # UserVerification is ignored by most browsers when residentKey is set to required
+        # However, it can still be configured and is tested here
+        # The Key Algorithm are all that are selectable in the policy via
+        # privacyidea.lib.tokens.webauthntoken.PUBLIC_KEY_CREDENTIAL_ALGORITHMS
+        key_algorithms = [COSEAlgorithmIdentifier.ECDSA_SHA_256,
+                          COSEAlgorithmIdentifier.RSASSA_PKCS1_v1_5_SHA_256,
+                          COSEAlgorithmIdentifier.RSASSA_PSS_SHA_256]
+        # Because of how token are created currently (API level calls functions on the token object directly),
+        # this has to be done here instead of on the lib level
+        # There should be the credential_id of the token created in the previous test
+        registered_credential_ids = get_credential_ids_for_user(self.user)
+        self.assertEqual(len(registered_credential_ids), 1)
+
+        options = {
+            FIDO2PolicyAction.PUBLIC_KEY_CREDENTIAL_ALGORITHMS: key_algorithms,
+            PasskeyAction.AttestationConveyancePreference: AttestationConveyancePreference.ENTERPRISE,
+            FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT: "required",
+            "registered_credential_ids": registered_credential_ids
+        }
+        registration_request = self._initialize_registration(options)
+        token = registration_request.token
+        init_detail = registration_request.init_detail
+        passkey_registration = init_detail["passkey_registration"]
+        # Verify that the custom settings are set in the registration options
+        self.assertIn("pubKeyCredParams", passkey_registration)
+        self.assertEqual(len(passkey_registration["pubKeyCredParams"]), 3)
+        for element in passkey_registration["pubKeyCredParams"]:
+            self.assertEqual(element["type"], "public-key")
+            self.assertIn(element["alg"], key_algorithms)
+        self.assertEqual(passkey_registration["attestation"], "enterprise")
+        self.assertEqual(passkey_registration["authenticatorSelection"]["userVerification"], "required")
+        # excludeCredentials have the format [{'id': 'credential_id', 'type': 'public-key'}, {...}, ...]
+        # The type is always 'public-key'
+        self.assertEqual(passkey_registration["excludeCredentials"][0]["id"], registered_credential_ids[0])
+        remove_token(serial=token.get_serial())
+        # Remove the token from the previous test
+        token = get_fido2_token_by_credential_id(registered_credential_ids[0])
+        remove_token(serial=token.get_serial())
+        # Verify that the hashed credential has been removed
+        credential_id_hash = hash_credential_id(registered_credential_ids[0])
+        tcih = TokenCredentialIdHash.query.filter(
+            TokenCredentialIdHash.credential_id_hash == credential_id_hash).first()
+        self.assertFalse(tcih)
+
+    def test_04_init_fail_wrong_data(self):
+        registration_request = self._initialize_registration()
+        token = registration_request.token
+
+        # Complete the registration with tampered data
+        with self.assertRaises(EnrollmentError):
+            registration_response = registration_request.registration_response
+            registration_response["attestationObject"] = self.registration_attestation.replace("e", "f")
+            token.update(registration_response)
+
+        # Change the origin, should be reflected in the error message
+        client_data = base64url_to_bytes(self.registration_client_data).decode('utf-8')
+        client_data_json = json.loads(client_data)
+        self.assertTrue(client_data_json["origin"])
+        client_data_json["origin"] = "https://evil.nils:5000"
+        tampered_client_data = bytes_to_base64url(json.dumps(client_data_json).encode('utf-8'))
+        registration_response["clientDataJSON"] = tampered_client_data
+        with self.assertRaises(EnrollmentError) as ex:
+            token.update(registration_response)
+        self.assertIn('Unexpected client data origin "https://evil.nils:5000",'
+                      ' expected "https://cool.nils:5000"',
+                      ex.exception.message)
+        # Invalid client data (json format)
+        with self.assertRaises(EnrollmentError) as ex:
+            registration_response["clientDataJSON"] = self.registration_client_data.replace("a", "b")
+            token.update(registration_response)
+        self.assertIn("clientDataJSON was malformed", ex.exception.message)
+
+    def test_05_init_exceptions(self):
+        # Also test setting a description in the first step
+        token: TokenClass = init_token({"type": "passkey", "description": "test"}, user=self.user)
+        self.assertEqual(token.token.description, "test")
+        param = {FIDO2PolicyAction.RELYING_PARTY_ID: self.rp_id,
+                 FIDO2PolicyAction.RELYING_PARTY_NAME: self.rp_id}
+
+        # Remove the user before the registration
+        unassign_token(token.get_serial())
+        with self.assertRaises(ParameterError) as ex:
+            token.get_init_detail(param)
+        self.assertIn("User must be provided", ex.exception.message)
+
+        # Invalid enrollment state returns empty init detail
+        token.token.rollout_state = RolloutState.PENDING
+        init_detail = token.get_init_detail(param)
+        self.assertFalse(init_detail)
+        remove_token(serial=token.get_serial())
+
+        # Registration challenge expired/deleted
+        registration_request = self._initialize_registration()
+        challenges = get_challenges(registration_request.token.get_serial())
+        self.assertEqual(len(challenges), 1)
+        challenges[0].delete()
+        with self.assertRaises(EnrollmentError) as ex:
+            registration_request.token.update(registration_request.registration_response)
+        self.assertIn("The enrollment challenge does not exist", ex.exception.message)
+        remove_token(serial=registration_request.token.get_serial())
+
+    def test_06_authenticate_success(self):
+        token = self._create_token()
+        challenge = self._initialize_authentication()
+        # UserVerification is preferred by default
+        authentication_response = self.authentication_response_no_uv
+        authentication_response["HTTP_ORIGIN"] = self.expected_origin
+        verification_result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response)
+        self.assertEqual(verification_result.success, 1)
+        remove_token(serial=token.get_serial())
+
+    def test_07_authenticate_fails(self):
+        token = self._create_token()
+
+        # Challenge does not exist
+        with self.assertRaises(ResourceNotFoundError):
+            verify_fido2_challenge("10039292755795086078", token, {})
+
+        # Wrong signature
+        challenge = self._initialize_authentication()
+        authentication_response = self.authentication_response_no_uv
+        authentication_response["HTTP_ORIGIN"] = self.expected_origin
+        authentication_response["signature"] = authentication_response["signature"].replace("a", "b")
+        verification_result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response)
+        self.assertEqual(verification_result.success, -1)
+        remove_token(serial=token.get_serial())
+
+    def test_07b_legacy_challenge_data_key_is_still_enforced(self):
+        """
+        Challenges stored with the old "user_verification" key (before the storage key was changed
+        to FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT) must still be read correctly by
+        verify_fido2_challenge. The bug was that check_otp only knows the constant, so without
+        the translation the UV requirement would silently fall back to "preferred".
+        """
+        from privacyidea.lib.challenge import get_challenges
+        from unittest.mock import patch
+
+        token = self._create_token()
+
+        # Simulate a challenge written by old code — overwrite the data with the legacy key
+        challenge = self._initialize_authentication()
+        db_challenges = get_challenges(transaction_id=challenge["transaction_id"])
+        self.assertEqual(len(db_challenges), 1)
+        db_challenges[0].set_data({"user_verification": "preferred"})
+        db_challenges[0].save()
+
+        # capture check_otp to confirm the key is translated before being passed on
+        captured_options = {}
+        original_check_otp = token.check_otp
+
+        def capturing_check_otp(otpval, options=None, **kwargs):
+            captured_options.update(options or {})
+            return original_check_otp(otpval, options=options, **kwargs)
+
+        authentication_response = self.authentication_response_no_uv
+        authentication_response["HTTP_ORIGIN"] = self.expected_origin
+
+        with patch.object(token, "check_otp", side_effect=capturing_check_otp):
+            result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response)
+
+        # check_otp must receive the right key with the value read from the legacy challenge
+        self.assertIn(FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT, captured_options)
+        self.assertEqual(captured_options[FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT], "preferred")
+        # and the old key must not leak through
+        self.assertNotIn("user_verification", captured_options)
+
+        # "preferred" + no UV bit -> success
+        self.assertEqual(result.success, 1)
+
+        # "required" + no UV bit -> fail. recreate token since successful auth deletes the challenge
+        remove_token(serial=token.get_serial())
+        token = self._create_token()
+        challenge = self._initialize_authentication()
+        db_challenges = get_challenges(transaction_id=challenge["transaction_id"])
+        self.assertEqual(len(db_challenges), 1)
+        db_challenges[0].set_data({"user_verification": "required"})
+        db_challenges[0].save()
+
+        authentication_response = self.authentication_response_no_uv
+        authentication_response["HTTP_ORIGIN"] = self.expected_origin
+        result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response)
+        self.assertEqual(result.success, -1)
+
+        remove_token(serial=token.get_serial())
+
+    def test_08_no_tokencredentialidhash_entry(self):
+        created_token = self._create_token()
+        # Remove the tokencredentialidhash entry
+        credential_id_hash = hash_credential_id(self.credential_id)
+        tcih = TokenCredentialIdHash.query.filter(
+            TokenCredentialIdHash.credential_id_hash == credential_id_hash).one()
+        self.assertTrue(tcih)
+        tcih.delete()
+        # Try to get the token by credential id
+        token = get_fido2_token_by_credential_id(self.credential_id)
+        self.assertEqual(created_token.get_serial(), token.get_serial())
+        # Check that the credential id hash has been added again
+        tcih = TokenCredentialIdHash.query.filter(
+            TokenCredentialIdHash.credential_id_hash == credential_id_hash).one()
+        self.assertTrue(tcih)
+        remove_token(serial=created_token.get_serial())
+
+    def test_09_duplicate_tokencredentialidhash_entry(self):
+        token1 = self._create_token()
+        # Get the tokencredentialidhash entry
+        credential_id_hash = hash_credential_id(self.credential_id)
+        tcih = TokenCredentialIdHash.query.filter(
+            TokenCredentialIdHash.credential_id_hash == credential_id_hash).one()
+        self.assertTrue(tcih)
+        self.assertEqual(tcih.token_id, token1.token.id)
+        # A second registration of the same credential is refused and the entry keeps pointing to the first token
+        registration_request = self._initialize_registration()
+        token2 = registration_request.token
+        with self.assertRaises(EnrollmentError):
+            token2.update(registration_request.registration_response)
+        self.assertEqual(RolloutState.CLIENTWAIT, token2.token.rollout_state)
+        tcih = TokenCredentialIdHash.query.filter(
+            TokenCredentialIdHash.credential_id_hash == credential_id_hash).one()
+        self.assertEqual(tcih.token_id, token1.token.id)
+        self.assertEqual(token1.get_serial(), get_fido2_token_by_credential_id(self.credential_id).get_serial())
+        remove_token(serial=token1.get_serial())
+        remove_token(serial=token2.get_serial())
+
+    def test_10_passkey_token_export(self):
+        # Set up the passkey token for testing
+        token = self._create_token()
+
+        # Test that all expected keys are present in the exported dictionary
+        exported_data = token.export_token()
+
+        expected_keys = ["serial", "type", "description", "otpkey"]
+        self.assertTrue(set(expected_keys).issubset(exported_data.keys()))
+
+        expected_tokeninfo_keys = ["public_key", "attestation_certificate"]
+        self.assertTrue(set(expected_tokeninfo_keys).issubset(exported_data["info_list"].keys()))
+
+        # Test that the exported values match the token's data
+        exported_data = token.export_token()
+        self.assertEqual(exported_data["serial"], token.token.serial)
+        self.assertEqual(exported_data["type"], "passkey")
+        self.assertEqual(exported_data["description"], "Yubico U2F EE Serial 2109467376")
+        self.assertEqual(exported_data["otpkey"], "T9TJpDbUuq0TIdIpErltERuboEdR1GBa7pVtdYMQYTQZ582wmBwp5TWuZ_sE_Ag4")
+        self.assertEqual(exported_data["issuer"], "privacyIDEA")
+
+        # Clean up
+        remove_token(token.token.serial)
+
+    def test_11_passkey_token_import(self):
+        # Define the token data to be imported
+        attestation_certificate = ('-----BEGIN CERTIFICATE-----MIIC2TCCAcGgAwIBAgIJAPDqu31oBEyKMA0GCSqGSIb3DQEBCwUAMC'
+                                   '4xLDAqBgNVBAMTI1l1YmljbyBVMkYgUm9vdCBDQSBTZXJpYWwgNDU3MjAwNjMxMCAXDTE0MDgwMTAwMDA'
+                                   'wMFoYDzIwNTAwOTA0MDAwMDAwWjBvMQswCQYDVQQGEwJTRTESMBAGA1UECgwJWXViaWNvIEFCMSIwIAYD'
+                                   'VQQLDBlBdXRoZW50aWNhdG9yIEF0dGVzdGF0aW9uMSgwJgYDVQQDDB9ZdWJpY28gVTJGIEVFIFNlcmlhb'
+                                   'CAyMTA5NDY3Mzc2MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE5mfTO7qcRZuAnvzLaguuLFz8S9eB1X'
+                                   'NIPZb96SUfZCzN5sIGVRTzM4JGrJlSgAAq0jivvANxttf6w7/LnnnSMKOBgTB/MBMGCisGAQQBgsQKDQE'
+                                   'EBQQDBQQDMCIGCSsGAQQBgsQKAgQVMS4zLjYuMS40LjEuNDE0ODIuMS43MBMGCysGAQQBguUcAgEBBAQDA'
+                                   'gQwMCEGCysGAQQBguUcAQEEBBIEEC/AV5+BE0fqsRa7Wo25ICowDAYDVR0TAQH/BAIwADANBgkqhkiG9w'
+                                   '0BAQsFAAOCAQEAtjGoKNeTOK0pAIoNf3mjoD3PLgybH2L6z7SKnlWVd6dRbJWbZCsY8AxMdyKNGfnUQiJ'
+                                   'cEmi9IxigjGoXcwZPApnJm7JDike7Z7HQ2yUrlJZ+EgFamivp5C3UVCaIkGH+HyJW/vh23XOZMkaDcRqw'
+                                   'beq8b0Voavnu4YF5bCM7PtnsPcCsvfL5DahPGSfpc9YyANG49OQBOZolNF3MBKKrspOAI7RfW0JSQY0NU'
+                                   'nWFYx9hxFbNuYsKFN4NblJ/Zz9tMk1YYSkTJ6VfxHTo5tfIcaLfZ1dIrMeY12+WevjMufFW/qB4ErY5Gj'
+                                   'ft3cbiZBELmbQ9QLUyLX78lHiLC9pJIg==-----END CERTIFICATE-----')
+        fido2_user_id = ('UpXCQyj0vXH06j3QRgKrOVYfaB7pstU9apV57SeHMUOtq3HLcbfzZx2mGdWxD4OF8-_0BEFUf_7qe-Lf'
+                         'HAptag')
+        token_data = [{
+            "serial": 'PIPK0004EFE2',
+            "type": 'passkey',
+            "description": 'Yubico U2F EE Serial 2109467376',
+            "otpkey": 'T9TJpDbUuq0TIdIpErltERuboEdR1GBa7pVtdYMQYTQZ582wmBwp5TWuZ_sE_Ag4',
+            "issuer": "privacyIDEA",
+            "user": {
+                "login": self.user.login,
+                "realm": self.user.realm,
+                "resolver": self.user.resolver,
+            },
+            "info_list": {
+                'aaguid': '2fc0579f-8113-47ea-b116-bb5a8db9202a',
+                'attestation_certificate': attestation_certificate,
+                'backed_up': 'False',
+                'credential_id_hash': '80a8d88c16b2808e9f52b9d14354432fd5205af665ea9a0878035c2b6cdba259',
+                'device_type': 'single_device',
+                'fido2_user_id': fido2_user_id,
+                'public_key': 'pQECAyYgASFYIE_UyaQ21LqtEyHSKRJpShO-wOGDv7qDWURk30_U26xtIlgglAzzrE4UkAFqhrNdg2OToNFk6it8'
+                              'EAzLuZwfWM8neyc',
+                'relying_party_id': 'cool.nils',
+                'relying_party_name': 'cool.nils',
+                'sign_count': '4'
+            }
+        }]
+
+        # Import the token
+        import_tokens(token_data)
+
+        # Retrieve the imported token
+        token = get_tokens(serial=token_data[0]["serial"])[0]
+
+        # Verify that the token data matches the imported data
+        self.assertEqual(token.token.serial, token_data[0]["serial"])
+        self.assertEqual(token.type, token_data[0]["type"])
+        self.assertEqual(token.token.description, token_data[0]["description"])
+        self.assertEqual(token.token.get_otpkey().getKey().decode("utf-8"), token_data[0]["otpkey"])
+        # The fido2_user_id from the imported token info should be cached as an internal user
+        # attribute so the next passkey enrollment for this user reuses the same id.
+        self.assertEqual(fido2_user_id, self.user.internal_attributes.get(FIDO2TokenInfo.USER_ID))
+
+        # Check that the token actually works
+        challenge = self._initialize_authentication()
+        # UserVerification is preferred by default
+        authentication_response = self.authentication_response_no_uv
+        authentication_response["HTTP_ORIGIN"] = self.expected_origin
+        verification_result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response)
+        self.assertEqual(verification_result.success, 1)
+
+        # Clean up
+        remove_token(token.token.serial)
+
+    def test_12_user_name_default(self):
+        """
+        Without a passkey_user_label policy, the user name and display name default to the login name.
+        """
+        registration_request = self._initialize_registration()
+        token = registration_request.token
+        passkey_registration = registration_request.init_detail["passkey_registration"]
+        self.assertEqual("hans", passkey_registration["user"]["name"])
+        self.assertEqual("hans", passkey_registration["user"]["displayName"])
+        remove_token(token.get_serial())
+
+    def test_13_user_name_with_tags(self):
+        """
+        The passkey_user_label policy value supports the tags {user} and {realm} and is applied to both the
+        user name (shown in the credential selection during login) and the display name.
+        """
+        registration_request = self._initialize_registration(
+            {PasskeyAction.UserLabel: "{user}@{realm}"})
+        token = registration_request.token
+        passkey_registration = registration_request.init_detail["passkey_registration"]
+        self.assertEqual("hans@realm1", passkey_registration["user"]["name"])
+        self.assertEqual("hans@realm1", passkey_registration["user"]["displayName"])
+        remove_token(token.get_serial())
+
+    def test_14_resolve_user_label_tags(self):
+        token = self._initialize_registration().token
+        serial = token.get_serial()
+
+        class FakeUser:
+            login = "hans"
+            realm = "realm1"
+            resolver = "resolver1"
+            info = {"givenname": "Hans", "surname": "Müller", "email": "hans@example.com"}
+
+        fake_user = FakeUser()
+        # Built-in tags
+        self.assertEqual("hans@realm1", token._resolve_user_label_tags("{user}@{realm}", fake_user))
+        self.assertEqual(serial, token._resolve_user_label_tags("{serial}", fake_user))
+        self.assertEqual("resolver1", token._resolve_user_label_tags("{resolver}", fake_user))
+        # Resolver / LDAP attributes
+        self.assertEqual("Hans Müller", token._resolve_user_label_tags("{givenname} {surname}", fake_user))
+        self.assertEqual("hans@example.com", token._resolve_user_label_tags("{email}", fake_user))
+        # Unknown tag is replaced with an empty string
+        self.assertEqual("Hans ", token._resolve_user_label_tags("{givenname} {unknown}", fake_user))
+        # Built-in tags win over resolver attributes with the same name
+        fake_user.info = {"user": "should-not-be-used"}
+        self.assertEqual("hans", token._resolve_user_label_tags("{user}", fake_user))
+        # Static text and non-tag braces are preserved
+        self.assertEqual("My Passkey", token._resolve_user_label_tags("My Passkey", fake_user))
+        # A template that resolves to an empty (or whitespace-only) value falls back to the login name, so the
+        # WebAuthn user.name is never empty
+        self.assertEqual("hans", token._resolve_user_label_tags("{unknown}", fake_user))
+        self.assertEqual("hans", token._resolve_user_label_tags("", fake_user))
+        self.assertEqual("hans", token._resolve_user_label_tags("  ", fake_user))
+        # The result is truncated to 64 bytes
+        resolved = token._resolve_user_label_tags("x" * 100, fake_user)
+        self.assertEqual(64, len(resolved.encode("utf-8")))
+
+        remove_token(serial)
+
+    def test_15_resolve_user_label_tags_user_info_unavailable(self):
+        """
+        If reading the user info fails (e.g. the resolver is unavailable), tag resolution must not break: the
+        built-in tags still resolve and resolver attribute tags fall back to an empty string.
+        """
+        token = self._initialize_registration().token
+        serial = token.get_serial()
+
+        class BrokenUser:
+            login = "hans"
+            realm = "realm1"
+            resolver = "resolver1"
+
+            @property
+            def info(self):
+                raise Exception("resolver unavailable")
+
+        broken_user = BrokenUser()
+        self.assertEqual("hans@realm1", token._resolve_user_label_tags("{user}@{realm}", broken_user))
+        # A resolver attribute that cannot be read resolves to an empty value; since that leaves the whole
+        # label empty, it falls back to the login name
+        self.assertEqual("hans", token._resolve_user_label_tags("{givenname}", broken_user))
+
+        remove_token(serial)
+
+    def test_16_enroll_restrict_authenticator_device_type(self):
+        """
+        The fixture credential is single_device (not backed up). Enrollment must be rejected if the
+        SCOPE.ENROLL policy only allows multi_device authenticators, and must succeed if it allows
+        single_device (or is not set at all).
+        """
+        registration_request = self._initialize_registration()
+        registration_request.registration_response[PasskeyAction.AllowedAuthenticatorDeviceTypes] = ["multi_device"]
+        with self.assertRaises(PolicyError):
+            registration_request.token.update(registration_request.registration_response)
+        # The token is left in CLIENTWAIT, as with any other failed enrollment
+        self.assertEqual(RolloutState.CLIENTWAIT, registration_request.token.rollout_state)
+        remove_token(serial=registration_request.token.get_serial())
+
+        registration_request = self._initialize_registration()
+        registration_request.registration_response[PasskeyAction.AllowedAuthenticatorDeviceTypes] = ["single_device"]
+        registration_request.token.update(registration_request.registration_response)
+        self.assertEqual(RolloutState.ENROLLED, registration_request.token.rollout_state)
+        remove_token(serial=registration_request.token.get_serial())
+
+    def test_17_authenticate_restrict_authenticator_device_type(self):
+        """
+        The fixture credential is single_device. The SCOPE.AUTH policy is independent of the SCOPE.ENROLL one:
+        it is evaluated fresh, cryptographically, on every authentication. A policy-denied response returns -1
+        rather than raising, since passkey check_otp can also be reached through the passkey_trigger_by_pin /
+        check_token_list path, which does not catch exceptions and would abort evaluation of other tokens.
+        """
+        token = self._create_token()
+        challenge = self._initialize_authentication()
+        authentication_response = dict(self.authentication_response_no_uv)
+        authentication_response["HTTP_ORIGIN"] = self.expected_origin
+        authentication_response[PasskeyAction.AllowedAuthenticatorDeviceTypes] = ["multi_device"]
+        with self.assertLogs("privacyidea.lib.tokens.passkeytoken", level="WARNING") as log_capture:
+            verification_result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response)
+        self.assertEqual(-1, verification_result.success)
+        # check_otp answers every kind of refusal with -1 (an invalid signature, a sign count regression, any
+        # other policy), so only the log entry pins the rejection to this policy in particular.
+        self.assertTrue(any(f"is not allowed to authenticate due to policy restriction "
+                            f"{PasskeyAction.AllowedAuthenticatorDeviceTypes!s}" in message
+                            for message in log_capture.output), log_capture.output)
+
+        # A different, higher-sign-count fixture is used here: the sign count of a cryptographically valid
+        # response is persisted even when a policy above then still denies it (it is genuine proof of possession,
+        # not evidence of a replay), so the "no_uv" fixture's sign count has already been consumed.
+        with patch('privacyidea.lib.fido2.challenge.get_fido2_nonce') as get_nonce:
+            get_nonce.return_value = self.authentication_challenge_uv
+            challenge = create_fido2_challenge(self.rp_id)
+        authentication_response = dict(self.authentication_response_uv)
+        authentication_response["HTTP_ORIGIN"] = self.expected_origin
+        authentication_response[PasskeyAction.AllowedAuthenticatorDeviceTypes] = ["single_device"]
+        verification_result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response)
+        self.assertEqual(1, verification_result.success)
+        remove_token(serial=token.get_serial())
+
+    def test_18_authenticate_enforce_user_handle(self):
+        """
+        With PasskeyAction.EnforceUserHandle enabled, authentication must fail if the userHandle returned by the
+        authenticator does not match the FIDO2 user ID recorded for the token's assigned user (e.g. after the
+        token was unassigned and re-assigned to a different user), and must succeed if it matches - even though
+        the two are encoded with different base64 alphabets/padding on the wire. The default/off behavior
+        (mismatches are not checked at all) is already covered by every other authentication test in this file
+        that never sets this policy.
+        """
+        token = self._create_token()
+
+        # Mismatch: the recorded FIDO2 user ID does not correspond to self.user_handle at all
+        self.user.set_internal_attribute(FIDO2TokenInfo.USER_ID, bytes_to_base64url(b"some-other-users-id"))
+        challenge = self._initialize_authentication()
+        authentication_response = dict(self.authentication_response_no_uv)
+        authentication_response["HTTP_ORIGIN"] = self.expected_origin
+        authentication_response[PasskeyAction.EnforceUserHandle] = True
+        with self.assertLogs("privacyidea.lib.tokens.passkeytoken", level="WARNING") as log_capture:
+            verification_result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response)
+        self.assertEqual(-1, verification_result.success)
+        self.assertTrue(any("userHandle does not match the FIDO2 user ID recorded" in message
+                            for message in log_capture.output), log_capture.output)
+
+        # Match: self.user_handle is standard base64 (with padding), the stored value is base64url (unpadded) -
+        # same bytes, different alphabet. Uses the "uv" fixture (higher sign count) since the "no_uv" fixture's
+        # sign count was already consumed by the (cryptographically valid, if policy-denied) attempt above.
+        self.user.set_internal_attribute(FIDO2TokenInfo.USER_ID, bytes_to_base64url(
+            base64url_to_bytes(self.user_handle)))
+        with patch('privacyidea.lib.fido2.challenge.get_fido2_nonce') as get_nonce:
+            get_nonce.return_value = self.authentication_challenge_uv
+            challenge = create_fido2_challenge(self.rp_id)
+        authentication_response = dict(self.authentication_response_uv)
+        authentication_response["HTTP_ORIGIN"] = self.expected_origin
+        authentication_response[PasskeyAction.EnforceUserHandle] = True
+        verification_result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response)
+        self.assertEqual(1, verification_result.success)
+        remove_token(serial=token.get_serial())
+
+    def test_19_authenticate_genuine_multi_device_credential(self):
+        """
+        Unlike test_17, which reuses the single_device fixture and only varies the requested policy value,
+        this credential is genuinely signed as backup-eligible (multi_device) by a locally simulated
+        authenticator, verified against the real py_webauthn verification functions at fixture-generation
+        time. This proves credential_device_type is derived from the real signed flag for a multi_device
+        credential too, not just compared against whatever policy value happens to be passed in.
+        """
+        token = self._create_token_multi_device()
+
+        challenge = self._initialize_authentication_multi_device(self.authentication_challenge_multi_device_reject)
+        authentication_response = dict(self.authentication_response_multi_device_reject)
+        authentication_response["HTTP_ORIGIN"] = self.expected_origin
+        authentication_response[PasskeyAction.AllowedAuthenticatorDeviceTypes] = ["single_device"]
+        with self.assertLogs("privacyidea.lib.tokens.passkeytoken", level="WARNING") as log_capture:
+            verification_result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response)
+        self.assertEqual(-1, verification_result.success)
+        self.assertTrue(any(f"is not allowed to authenticate due to policy restriction "
+                            f"{PasskeyAction.AllowedAuthenticatorDeviceTypes!s}" in message
+                            for message in log_capture.output), log_capture.output)
+
+        challenge = self._initialize_authentication_multi_device(self.authentication_challenge_multi_device_accept)
+        authentication_response = dict(self.authentication_response_multi_device_accept)
+        authentication_response["HTTP_ORIGIN"] = self.expected_origin
+        authentication_response[PasskeyAction.AllowedAuthenticatorDeviceTypes] = ["multi_device"]
+        verification_result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response)
+        self.assertEqual(1, verification_result.success)
+        remove_token(serial=token.get_serial())
+
+    def test_20_authenticate_device_type_cannot_be_spoofed(self):
+        """
+        The backup flags that determine credential_device_type live inside the signed region of
+        authenticatorData, so they cannot be changed without invalidating the signature over them. This uses
+        a genuine multi_device response downgraded to single_device (both backup flags cleared, keeping the
+        original signature - as an attacker with no private key would have to) and confirms authentication is
+        rejected outright, independent of any AllowedAuthenticatorDeviceTypes policy.
+        """
+        token = self._create_token_multi_device()
+
+        challenge = self._initialize_authentication_multi_device(self.authentication_challenge_multi_device_tamper)
+        authentication_response = dict(self.authentication_response_multi_device_tamper)
+        authentication_response["HTTP_ORIGIN"] = self.expected_origin
+        with self.assertLogs("privacyidea.lib.tokens.passkeytoken", level="ERROR") as log_capture:
+            verification_result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response)
+        self.assertEqual(-1, verification_result.success)
+        # The tampered authenticatorData is a structurally valid single_device assertion (clearing only the
+        # backup-eligible bit would leave the forbidden backed-up-but-single-device state), so the rejection
+        # has to come from the signature over the original flags, not from a complaint about the flags.
+        self.assertTrue(any("Could not verify authentication signature" in message for message in log_capture.output),
+                        log_capture.output)
+        remove_token(serial=token.get_serial())
+
+    def test_21_authenticate_unusable_sign_count_or_public_key(self):
+        """
+        The sign count and the public key are read back from the token info. A value that is not of the
+        expected shape makes the token unusable, which has to fail the authentication instead of raising out
+        of the request.
+        """
+        for key, value in [(FIDO2TokenInfo.SIGN_COUNT, "not-a-number"),
+                           (FIDO2TokenInfo.PUBLIC_KEY, "not-base64url!")]:
+            token = self._create_token()
+            token.write_tokeninfo(key, value)
+            challenge = self._initialize_authentication()
+            authentication_response = dict(self.authentication_response_no_uv)
+            authentication_response["HTTP_ORIGIN"] = self.expected_origin
+            with self.assertLogs("privacyidea.lib.tokens.passkeytoken", level="ERROR") as log_capture:
+                verification_result = verify_fido2_challenge(challenge["transaction_id"], token,
+                                                             authentication_response)
+            self.assertEqual(-1, verification_result.success)
+            self.assertTrue(any("unusable sign count or public key" in message
+                                for message in log_capture.output), log_capture.output)
+            remove_token(serial=token.get_serial())
+
+    def test_22_minimum_user_verification(self):
+        """
+        A minimum user verification raises the requirement stored in the challenge, and a stricter requirement in the
+        challenge is kept.
+        """
+        token = self._create_token()
+        authentication_response = dict(self.authentication_response_no_uv)
+        authentication_response["HTTP_ORIGIN"] = self.expected_origin
+
+        challenge = self._initialize_authentication()
+        result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response,
+                                        minimum_user_verification="required")
+        self.assertEqual(-1, result.success)
+
+        result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response,
+                                        minimum_user_verification="discouraged")
+        self.assertEqual(1, result.success)
+
+        token.write_tokeninfo(FIDO2TokenInfo.SIGN_COUNT, 0)
+        with patch('privacyidea.lib.fido2.challenge.get_fido2_nonce') as get_nonce:
+            get_nonce.return_value = self.authentication_challenge_no_uv
+            challenge = create_fido2_challenge(self.rp_id, user_verification="required")
+        result = verify_fido2_challenge(challenge["transaction_id"], token, authentication_response,
+                                        minimum_user_verification="discouraged")
+        self.assertEqual(-1, result.success)
+        remove_token(serial=token.get_serial())
+
+    def test_23_registration_credential_id_must_match_attestation(self):
+        """
+        The credential_id in the registration request has to be the one in the attestation. A registration that
+        names the credential of another token with its own attestation is refused, and the other token keeps its
+        credential.
+        """
+        victim_token = self._create_token_multi_device()
+        self.assertEqual(victim_token.get_serial(),
+                         get_fido2_token_by_credential_id(self.credential_id_multi_device).get_serial())
+
+        registration_request = self._initialize_registration()
+        registration_response = dict(registration_request.registration_response)
+        registration_response["credential_id"] = self.credential_id_multi_device
+        registration_response["rawId"] = self.credential_id_multi_device
+        with self.assertRaises(EnrollmentError):
+            registration_request.token.update(registration_response)
+        self.assertEqual(RolloutState.CLIENTWAIT, registration_request.token.token.rollout_state)
+        self.assertEqual(victim_token.get_serial(),
+                         get_fido2_token_by_credential_id(self.credential_id_multi_device).get_serial())
+        self.assertIsNone(get_fido2_token_by_credential_id(self.credential_id))
+
+        # The same token can be registered with its own credential
+        registration_request.token.update(registration_request.registration_response)
+        self.assertEqual(RolloutState.ENROLLED, registration_request.token.token.rollout_state)
+        self.assertEqual(registration_request.token.get_serial(),
+                         get_fido2_token_by_credential_id(self.credential_id).get_serial())
+        remove_token(serial=victim_token.get_serial())
+        remove_token(serial=registration_request.token.get_serial())
+
+    def test_24_registration_of_credential_known_from_token_info(self):
+        """
+        A token that is not in the TokenCredentialIdHash table yet, like an imported one, is found by the credential
+        id hash in its token info. Registering its credential for another token is refused.
+        """
+        token = self._create_token()
+        TokenCredentialIdHash.query.filter(TokenCredentialIdHash.token_id == token.token.id).delete()
+        db.session.commit()
+        self.assertEqual(hash_credential_id(self.credential_id), token.get_tokeninfo(FIDO2TokenInfo.CREDENTIAL_ID_HASH))
+
+        registration_request = self._initialize_registration()
+        with self.assertRaises(EnrollmentError):
+            registration_request.token.update(registration_request.registration_response)
+        self.assertEqual(RolloutState.CLIENTWAIT, registration_request.token.token.rollout_state)
+        self.assertEqual(token.get_serial(), get_fido2_token_by_credential_id(self.credential_id).get_serial())
+        remove_token(serial=token.get_serial())
+        remove_token(serial=registration_request.token.get_serial())
+
+    def test_25_save_credential_id_hash_keeps_mapping_of_other_token(self):
+        """
+        save_credential_id_hash does not map a credential that is registered to one token to another token. Saving
+        it again for the same token changes nothing.
+        """
+        token = self._create_token()
+        other_token = init_token({"type": "passkey"}, user=self.user)
+        credential_id_hash = hash_credential_id(self.credential_id)
+
+        save_credential_id_hash(credential_id_hash, token.token.id)
+        with self.assertRaises(EnrollmentError):
+            save_credential_id_hash(credential_id_hash, other_token.token.id)
+
+        entries = TokenCredentialIdHash.query.filter(
+            TokenCredentialIdHash.credential_id_hash == credential_id_hash).all()
+        self.assertEqual([token.token.id], [entry.token_id for entry in entries])
+        self.assertEqual(token.get_serial(), get_fido2_token_by_credential_id(self.credential_id).get_serial())
+        remove_token(serial=token.get_serial())
+        remove_token(serial=other_token.get_serial())
+
+    def test_26_registration_needs_waiting_token_and_complete_data(self):
+        """
+        update() only takes a complete registration for a token that waits for one and otherwise raises, leaving the
+        token as it is. Without registration data, it starts a new enrollment.
+        """
+        token = self._create_token()
+        for registration_data in ({"attestationObject": self.registration_attestation,
+                                   "clientDataJSON": self.registration_client_data},
+                                  {"attestationObject": self.registration_attestation},
+                                  {"clientDataJSON": self.registration_client_data}):
+            with self.subTest(fields=list(registration_data)):
+                with self.assertRaises(EnrollmentError):
+                    token.update(registration_data)
+                self.assertEqual(RolloutState.ENROLLED, token.token.rollout_state)
+                self.assertTrue(token.is_active())
+
+        token.update({})
+        self.assertEqual(RolloutState.CLIENTWAIT, token.token.rollout_state)
+        self.assertFalse(token.is_active())
+        remove_token(serial=token.get_serial())
+
+        registration_request = self._initialize_registration()
+        for registration_data in ({"attestationObject": self.registration_attestation},
+                                  {"clientDataJSON": self.registration_client_data}):
+            with self.subTest(fields=list(registration_data), rollout_state=RolloutState.CLIENTWAIT):
+                with self.assertRaises(EnrollmentError):
+                    registration_request.token.update(registration_data)
+                self.assertEqual(RolloutState.CLIENTWAIT, registration_request.token.token.rollout_state)
+        registration_request.token.update(registration_request.registration_response)
+        self.assertEqual(RolloutState.ENROLLED, registration_request.token.token.rollout_state)
+        remove_token(serial=registration_request.token.get_serial())

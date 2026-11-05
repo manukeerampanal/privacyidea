@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2016-04-08 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Avoid consecutive if-statements
 #  2015-12-12 Cornelius Kölbel <cornelius.koelbel@netknights.it>
@@ -25,7 +23,10 @@
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-__doc__="""The config module takes care about storing server configuration in
+# SPDX-FileCopyrightText: 2025 Paul Lettich <paul.lettich@netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+__doc__ = """The config module takes care about storing server configuration in
 the Config database table.
 
 It provides functions to retrieve (get) and and set configuration.
@@ -34,29 +35,33 @@ The code is tested in tests/test_lib_config
 """
 
 import copy
-import sys
-import logging
+import datetime
+import importlib
 import inspect
+import json
+import logging
+import sys
 import threading
 import traceback
 
-from .log import log_with
-from ..models import (Config, db, Resolver, Realm, PRIVACYIDEA_TIMESTAMP,
-                      save_config_timestamp, Policy, EventHandler, CAConnector)
+from sqlalchemy import select, delete
+
+from privacyidea.config import DefaultConfigValues, ConfigKey
 from privacyidea.lib.framework import get_request_local_store, get_app_config_value, get_app_local_store
-from privacyidea.lib.utils import to_list
+from privacyidea.lib.utils import to_list, censor_connect_string
 from privacyidea.lib.utils.export import (register_import, register_export)
-from .crypto import encryptPassword
-from .crypto import decryptPassword
-from .resolvers.UserIdResolver import UserIdResolver
-from .machines.base import BaseMachineResolver
 from .caconnectors.baseca import BaseCAConnector
-# We need these imports to return the list of CA connector types. Bummer: New import for each new Class anyways.
-from .caconnectors import localca, msca
+from .crypto import decryptPassword, FAILED_TO_DECRYPT_PASSWORD
+from .crypto import encryptPassword
+from .crypto import CENSORED, is_censored
+from .log import log_with
+from .machines.base import BaseMachineResolver
+from .resolvers.UserIdResolver import UserIdResolver
+# We need these imports to return the list of CA connector types. Bummer: New import for each new Class anyway.
 from .utils import reload_db, is_true
-import importlib
-import datetime
-from six import with_metaclass, string_types
+from ..models import (Config, db, Resolver, Realm, PRIVACYIDEA_TIMESTAMP,
+                      save_config_timestamp, Policy, EventHandler, CAConnector,
+                      NodeName)
 
 log = logging.getLogger(__name__)
 
@@ -68,7 +73,7 @@ this = sys.modules[__name__]
 this.config = {}
 
 
-class SharedConfigClass(object):
+class SharedConfigClass:
     """
     A shared config class object is shared between threads and is supposed
     to store the current configuration with resolvers, realms, policies
@@ -83,6 +88,7 @@ class SharedConfigClass(object):
     Instead, it must use ``reload_and_clone()`` to retrieve
     a ``LocalConfigClass`` object which holds a local configuration snapshot.
     """
+
     def __init__(self):
         self._config_lock = threading.Lock()
         self.config = {}
@@ -100,12 +106,14 @@ class SharedConfigClass(object):
         the internal timestamp, then read the complete data
         :return:
         """
+        from .resolver import get_resolver_class
         check_reload_config = get_app_config_value("PI_CHECK_RELOAD_CONFIG", 0)
-        if not self.timestamp or \
-            self.timestamp + datetime.timedelta(seconds=check_reload_config) < datetime.datetime.now():
-            db_ts = Config.query.filter_by(Key=PRIVACYIDEA_TIMESTAMP).first()
+        if not self.timestamp or self.timestamp + datetime.timedelta(
+                seconds=check_reload_config) < datetime.datetime.now():
+            stmt = select(Config).filter_by(Key=PRIVACYIDEA_TIMESTAMP)
+            db_ts = db.session.scalars(stmt).first()
             if reload_db(self.timestamp, db_ts):
-                log.debug(u"Reloading shared config from database")
+                log.debug("Reloading shared config from database")
                 config = {}
                 resolverconfig = {}
                 realmconfig = {}
@@ -124,13 +132,38 @@ class SharedConfigClass(object):
                     resolverdef = {"type": resolver.rtype,
                                    "resolvername": resolver.name,
                                    "censor_keys": []}
+                    resolver_class = get_resolver_class(resolver.rtype)
+                    class_descriptor_config = resolver_class.getResolverClassDescriptor()[resolver.rtype]["config"]
                     data = {}
                     for rconf in resolver.config_list:
                         if rconf.Type == "password":
                             value = decryptPassword(rconf.Value)
                             resolverdef["censor_keys"].append(rconf.Key)
+                        elif rconf.Type == "dict":
+                            try:
+                                value = json.loads(rconf.Value)
+                            except json.JSONDecodeError as error:
+                                log.warning(
+                                    f"Could not load {rconf.Key} ({rconf.Value}) from resolver config as JSON: {error}")
+                                value = rconf.Value
+                        elif rconf.Type == "dict_with_password":
+                            # An entry in the dict is a password which needs to be decrypted
+                            try:
+                                value = json.loads(rconf.Value)
+                                for key, val in value.items():
+                                    if class_descriptor_config.get(f"{rconf.Key}.{key}", "") == "password":
+                                        value[key] = decryptPassword(val)
+                                        resolverdef["censor_keys"].append(f"{rconf.Key}.{key}")
+                            except json.JSONDecodeError as error:
+                                log.warning(
+                                    f"Could not load {rconf.Key} ({rconf.Value}) from resolver config as JSON: {error}")
+                                value = rconf.Value
                         else:
                             value = rconf.Value
+                            if class_descriptor_config.get(rconf.Key) == "password":
+                                # Stored in plain text before the resolver class declared the entry a password, it
+                                # is encrypted the next time the resolver is saved and censored until then as well.
+                                resolverdef["censor_keys"].append(rconf.Key)
                         data[rconf.Key] = value
                     resolverdef["data"] = data
                     resolverconfig[resolver.name] = resolverdef
@@ -139,23 +172,26 @@ class SharedConfigClass(object):
                     if realm.default:
                         default_realm = realm.name
                     realmdef = {"id": realm.id,
-                                "option": realm.option,
                                 "default": realm.default,
                                 "resolver": []}
                     for x in realm.resolver_list:
                         realmdef["resolver"].append({"priority": x.priority,
                                                      "name": x.resolver.name,
-                                                     "type": x.resolver.rtype})
+                                                     "type": x.resolver.rtype,
+                                                     "node": x.node_uuid})
                     realmconfig[realm.name] = realmdef
                 # Load all policies
-                for pol in Policy.query.all():
+                policies_db = db.session.scalars(select(Policy)).unique().all()
+                for pol in policies_db:
                     policies.append(pol.get())
                 # Load all events
-                for event in EventHandler.query.order_by(EventHandler.ordering):
+                event_handlers = db.session.scalars(select(EventHandler).order_by(EventHandler.ordering)).all()
+                for event in event_handlers:
                     events.append(event.get())
                 # Load all CA connectors
                 from privacyidea.lib.caconnector import get_caconnector_object
-                for ca in CAConnector.query.all():
+                ca_connectors_db = db.session.scalars(select(CAConnector)).all()
+                for ca in ca_connectors_db:
                     try:
                         ca_obj = get_caconnector_object(ca.name)
                         caconnectors.append({"connectorname": ca.name,
@@ -163,7 +199,7 @@ class SharedConfigClass(object):
                                              "data": ca_obj.config,
                                              "templates": ca_obj.get_templates()})
                     except Exception as exx:  # pragma: no cover
-                        log.debug(u"{0!s}".format(traceback.format_exc()))
+                        log.debug(f"{traceback.format_exc()!s}")
                         log.error(exx)
 
                 # Finally, set the current timestamp
@@ -204,7 +240,7 @@ class SharedConfigClass(object):
         return self._clone()
 
 
-class LocalConfigClass(object):
+class LocalConfigClass:
     """
     The Config_Object will contain all database configuration of system
     config, resolvers, realms, policies and event handler definitions.
@@ -212,6 +248,7 @@ class LocalConfigClass(object):
     It will be cloned from the shared config object at the beginning of the
     request and is supposed to stay alive and unchanged during the request.
     """
+
     def __init__(self, config, resolver, realm, default_realm, policies, events, caconnectors, timestamp):
         self.config = config
         self.resolver = resolver
@@ -238,14 +275,14 @@ class LocalConfigClass(object):
             is given a string/bool is returned.
         """
         default_true_keys = [SYSCONF.PREPENDPIN, SYSCONF.SPLITATSIGN,
-                             SYSCONF.INCFAILCOUNTER, SYSCONF.RETURNSAML]
+                             SYSCONF.INCFAILCOUNTER]
 
         r_config = {}
 
         # reduce the dictionary to only public keys!
         reduced_config = {}
         for ckey, cvalue in self.config.items():
-            if role == "admin" or cvalue.get("Type") == "public":
+            if role == "admin" or cvalue.get("Type") == "public" or ckey.endswith(".identifier"):
                 reduced_config[ckey] = self.config[ckey]
         if not reduced_config and role == "admin":
             reduced_config = self.config
@@ -270,23 +307,22 @@ class LocalConfigClass(object):
                 pass
             if isinstance(r_config, int):
                 r_config = r_config > 0
-            if isinstance(r_config, string_types):
+            if isinstance(r_config, str):
                 r_config = is_true(r_config.lower())
 
         return r_config
 
 
-class SYSCONF(object):
+class SYSCONF:
     __doc__ = """This is a list of system config attributes"""
     OVERRIDECLIENT = "OverrideAuthorizationClient"
     PREPENDPIN = "PrependPin"
     SPLITATSIGN = "splitAtSign"
     INCFAILCOUNTER = "IncFailCountOnFalsePin"
-    RETURNSAML = "ReturnSamlAttributes"
     RESET_FAILCOUNTER_ON_PIN_ONLY = "ResetFailcounterOnPIN"
 
 
-#@cache.cached(key_prefix="allConfig")
+# @cache.cached(key_prefix="allConfig")
 def get_privacyidea_config():
     # timestamp = Config.query.filter_by(Key="privacyidea.timestamp").first()
     return get_from_config()
@@ -301,7 +337,7 @@ def get_shared_config_object():
         # It might happen that two threads create SharedConfigClass() instances in parallel.
         # However, as setting dictionary values is atomic, one of the two objects will "win",
         # and the next request handled by the second thread will use the winning config object.
-        log.debug(u"Creating new shared config object")
+        log.debug("Creating new shared config object")
         store['shared_config_object'] = SharedConfigClass()
     return store['shared_config_object']
 
@@ -319,7 +355,7 @@ def invalidate_config_object():
     """
     store = get_request_local_store()
     if 'config_object' in store:
-        log.debug(u"Invalidating request-local config object")
+        log.debug("Invalidating request-local config object")
         del store['config_object']
 
 
@@ -333,7 +369,7 @@ def ensure_no_config_object():
     """
     store = get_request_local_store()
     if 'config_object' in store:
-        log.warning(u"Request-local store already contains config object, even though it should not")
+        log.warning("Request-local store already contains config object, even though it should not")
         del store['config_object']
 
 
@@ -344,14 +380,14 @@ def get_config_object():
     """
     store = get_request_local_store()
     if 'config_object' not in store:
-        log.debug(u"Cloning request-local config from shared config object")
+        log.debug("Cloning request-local config from shared config object")
         shared_config = get_shared_config_object()
         store['config_object'] = shared_config.reload_and_clone()
     return store['config_object']
 
 
 @log_with(log)
-#@cache.cached(key_prefix="singleConfig")
+# @cache.cached(key_prefix="singleConfig")
 def get_from_config(key=None, default=None, role="admin", return_bool=False):
     """
     :param key: A key to retrieve
@@ -361,17 +397,16 @@ def get_from_config(key=None, default=None, role="admin", return_bool=False):
         "admin" or "public". If "public", only values with type="public"
         are returned.
     :type role: string
-    :param return_bool: If the a boolean value should be returned. Returns
+    :param return_bool: Whether a boolean value should be returned. Returns
         True if value is "True", "true", 1, "1", True...
     :return: If key is None, then a dictionary is returned. If a certain key
         is given a string/bool is returned.
     """
     config_object = get_config_object()
-    return config_object.get_config(key=key, default=default, role=role,
-                                    return_bool=return_bool)
+    return config_object.get_config(key=key, default=default, role=role, return_bool=return_bool)
 
 
-#@cache.cached(key_prefix="resolver")
+# @cache.cached(key_prefix="resolver")
 def get_resolver_types():
     """
     Return a simple list of the type names of the resolvers.
@@ -391,13 +426,12 @@ def get_caconnector_types():
     Returns a list of valid CA connector types
     :return:
     """
-    caconnector_types = []
-    for cacon in BaseCAConnector.__subclasses__():
-        caconnector_types.append(cacon.connector_type)
-    return caconnector_types
+    _, type_dict = get_caconnector_class_dict()
+    types = sorted(type_dict.values())
+    return types
 
 
-#@cache.cached(key_prefix="classes")
+# @cache.cached(key_prefix="classes")
 def get_resolver_classes():
     """
     Returns a list of the available resolver classes like:
@@ -407,7 +441,6 @@ def get_resolver_classes():
     :return: array of resolver classes
     :rtype: array
     """
-    resolver_classes = {}
     if "pi_resolver_classes" not in this.config:
         (r_classes, r_types) = get_resolver_class_dict()
         this.config["pi_resolver_types"] = r_types
@@ -416,7 +449,7 @@ def get_resolver_classes():
     return list(this.config["pi_resolver_classes"].values())
 
 
-#@cache.cached(key_prefix="classes")
+# @cache.cached(key_prefix="classes")
 def get_token_class_dict():
     """
     get a dictionary of the token classes and a dictionary of the
@@ -444,25 +477,26 @@ def get_token_class_dict():
             obj = getattr(module, name)
             # We must not process imported classes!
             if (inspect.isclass(obj) and issubclass(obj, TokenClass) and
-                        obj.__module__ == module.__name__):
+                    obj.__module__ == module.__name__):
                 try:
-                    class_name = "{0!s}.{1!s}".format(module.__name__, obj.__name__)
+                    class_name = f"{module.__name__!s}.{obj.__name__!s}"
                     tokenclass_dict[class_name] = obj
                     if hasattr(obj, 'get_class_type'):
                         tokentype_dict[class_name] = obj.get_class_type()
                 except Exception as e:  # pragma: no cover
-                    log.error("error constructing token_class_dict: {0!r}".format(e))
+                    log.error(f"error constructing token_class_dict: {e!r}")
 
     return tokenclass_dict, tokentype_dict
 
 
-#@cache.cached(key_prefix="classes")
+# @cache.cached(key_prefix="classes")
 def get_token_class(tokentype):
     """
     This takes a token type like "hotp" and returns a class
     like <class privacidea.lib.tokens.hotptoken.HotpTokenClass>
+
     :return: The tokenclass for the given type
-    :rtype: tokenclass
+    :rtype: tokenclass.TokenClass
     """
     if tokentype.lower() == "hmac":
         tokentype = "hotp"
@@ -477,7 +511,7 @@ def get_token_class(tokentype):
     return tokenclass
 
 
-#@cache.cached(key_prefix="types")
+# @cache.cached(key_prefix="types")
 def get_token_types():
     """
     Return a simple list of the type names of the tokens.
@@ -492,7 +526,38 @@ def get_token_types():
     return list(this.config["pi_token_types"].values())
 
 
-#@cache.cached(key_prefix="prefix")
+def get_enrollable_token_types() -> list[str]:
+    """
+    Returns a list of token types which can be enrolled.
+
+    A token type can be excluded from enrollment (but still allowed for existing
+    tokens) by adding its name to ``disabled_token_types`` below. That list can be
+    overridden via the ``PI_ENABLE_TOKEN_TYPE_ENROLLMENT`` pi.cfg setting.
+
+    As of v3.14 no token types use this mechanism: fully removed types are
+    migrated to ``tokentype='deprecated'`` by a schema migration instead. See
+    ``dev/token-deprecation-strategy.md``. The hook is kept for the partial-
+    deprecation use case where a type stays functional but can no longer be
+    freshly enrolled.
+
+    The ``deprecated`` sentinel type itself is never enrollable and cannot be
+    re-enabled via pi.cfg, because ``DeprecatedTokenClass`` refuses every
+    enrollment anyway.
+
+    :return: list of enrollable token types
+    """
+    token_types = get_token_types()
+    disabled_token_types: list[str] = []
+    enable_token_types = get_app_config_value("PI_ENABLE_TOKEN_TYPE_ENROLLMENT", [])
+    effectively_disabled = set(disabled_token_types) - set(enable_token_types)
+
+    # Remove the disabled token types
+    enrollable_token_types = list(set(token_types) - effectively_disabled - {"deprecated"})
+
+    return enrollable_token_types
+
+
+# @cache.cached(key_prefix="prefix")
 def get_token_prefix(tokentype=None, default=None):
     """
     Return the token prefix for a tokentype as it is defined in the
@@ -516,7 +581,7 @@ def get_token_prefix(tokentype=None, default=None):
     return ret
 
 
-#@cache.cached(key_prefix="classes")
+# @cache.cached(key_prefix="classes")
 def get_token_classes():
     """
     Returns a list of the available token classes like:
@@ -524,7 +589,7 @@ def get_token_classes():
     <class 'privacyidea.lib.tokens.hotptoken.HotpTokenClass'>]
 
     :return: array of token classes
-    :rtype: array
+    :rtype: list
     """
     if "pi_token_classes" not in this.config:
         (t_classes, t_types) = get_token_class_dict()
@@ -551,20 +616,20 @@ def get_machine_resolver_class_dict():
 
     modules = get_machine_resolver_module_list()
     for module in modules:
-        log.debug("module: {0!s}".format(module))
+        log.debug(f"module: {module!s}")
         for name in dir(module):
             obj = getattr(module, name)
             if inspect.isclass(obj) and \
                     (issubclass(obj, BaseMachineResolver)) and \
                     (obj != BaseMachineResolver):
                 try:
-                    class_name = "{0!s}.{1!s}".format(module.__name__, obj.__name__)
+                    class_name = f"{module.__name__!s}.{obj.__name__!s}"
                     resolverclass_dict[class_name] = obj
                     resolvertype_dict[class_name] = obj.type
 
                 except Exception as e:  # pragma: no cover
                     log.error("error constructing machine resolver "
-                              "class_list: %r" % e)
+                              f"class_list: {e!r}")
 
     return resolverclass_dict, resolvertype_dict
 
@@ -586,30 +651,30 @@ def get_caconnector_class_dict():
 
     modules = get_caconnector_module_list()
     for module in modules:
-        log.debug("module: {0!s}".format(module))
+        log.debug(f"module: {module!s}")
         for name in dir(module):
             obj = getattr(module, name)
             if inspect.isclass(obj) and \
                     (issubclass(obj, BaseCAConnector)) and \
                     (obj != BaseCAConnector):
                 try:
-                    class_name = "{0!s}.{1!s}".format(module.__name__, obj.__name__)
+                    class_name = f"{module.__name__!s}.{obj.__name__!s}"
                     class_dict[class_name] = obj
                     type_dict[class_name] = obj.connector_type
 
                 except Exception as e:  # pragma: no cover
                     log.error("error constructing CA connector "
-                              "class_list: %r" % e)
+                              f"class_list: {e!r}")
 
     return class_dict, type_dict
 
 
-#@cache.cached(key_prefix="resolver")
+# @cache.cached(key_prefix="resolver")
 def get_resolver_class_dict():
     """
     get a dictionary of the resolver classes and a dictionary
     of the resolver types:
-    
+
     ({'privacyidea.lib.resolvers.PasswdIdResolver.IdResolver':
       <class 'privacyidea.lib.resolvers.PasswdIdResolver.IdResolver'>,
       'privacyidea.lib.resolvers.PasswdIdResolver.UserIdResolver':
@@ -627,17 +692,17 @@ def get_resolver_class_dict():
 
     modules = get_resolver_module_list()
     for module in modules:
-        log.debug("module: {0!s}".format(module))
+        log.debug(f"module: {module!s}")
         for name in dir(module):
             obj = getattr(module, name)
             # There are other classes like HMAC in the lib.tokens module,
             # which we do not want to load.
             if inspect.isclass(obj) and (issubclass(obj, UserIdResolver) or
-                                             obj == UserIdResolver):
+                                         obj == UserIdResolver):
                 # We must not process imported classes!
                 # if obj.__module__ == module.__name__:
                 try:
-                    class_name = "{0!s}.{1!s}".format(module.__name__, obj.__name__)
+                    class_name = f"{module.__name__!s}.{obj.__name__!s}"
                     resolverclass_dict[class_name] = obj
 
                     prefix = class_name.split('.')[1]
@@ -647,13 +712,13 @@ def get_resolver_class_dict():
                     resolverprefix_dict[class_name] = prefix
 
                 except Exception as e:  # pragma: no cover
-                    log.error("error constructing resolverclass_list: {0!r}".format(e))
+                    log.error(f"error constructing resolverclass_list: {e!r}")
 
     return resolverclass_dict, resolverprefix_dict
 
 
 @log_with(log)
-#@cache.cached(key_prefix="resolver")
+# @cache.cached(key_prefix="resolver")
 def get_resolver_list():
     """
     get the list of the module names of the resolvers like
@@ -669,12 +734,14 @@ def get_resolver_list():
     module_list.add("privacyidea.lib.resolvers.SCIMIdResolver")
     module_list.add("privacyidea.lib.resolvers.SQLIdResolver")
     module_list.add("privacyidea.lib.resolvers.HTTPResolver")
+    module_list.add("privacyidea.lib.resolvers.EntraIDResolver")
+    module_list.add("privacyidea.lib.resolvers.KeycloakResolver")
 
     # Dynamic Resolver modules
     # TODO: Migration
     # config_modules = config.get("privacyideaResolverModules", '')
     config_modules = None
-    log.debug("{0!s}".format(config_modules))
+    log.debug(f"{config_modules!s}")
     if config_modules:
         # in the config *.ini files we have some line continuation slashes,
         # which will result in ugly module names, but as they are followed by
@@ -690,7 +757,7 @@ def get_resolver_list():
 
 
 @log_with(log)
-#@cache.memoize(1)
+# @cache.memoize(1)
 def get_machine_resolver_class_list():
     """
     get the list of the class names of the machine resolvers like
@@ -709,7 +776,7 @@ def get_machine_resolver_class_list():
 
 
 @log_with(log)
-#@cache.cached(key_prefix="token")
+# @cache.cached(key_prefix="token")
 def get_token_list():
     """
     get the list of the tokens
@@ -721,7 +788,9 @@ def get_token_list():
     module_list.add("privacyidea.lib.tokens.hotptoken")
     module_list.add("privacyidea.lib.tokens.motptoken")
     module_list.add("privacyidea.lib.tokens.passwordtoken")
+    module_list.add("privacyidea.lib.tokens.applicationspecificpasswordtoken")
     module_list.add("privacyidea.lib.tokens.remotetoken")
+    module_list.add("privacyidea.lib.tokens.daypasswordtoken")
     module_list.add("privacyidea.lib.tokens.spasstoken")
     module_list.add("privacyidea.lib.tokens.sshkeytoken")
     module_list.add("privacyidea.lib.tokens.totptoken")
@@ -735,7 +804,6 @@ def get_token_list():
     module_list.add("privacyidea.lib.tokens.foureyestoken")
     module_list.add("privacyidea.lib.tokens.tiqrtoken")
     module_list.add("privacyidea.lib.tokens.ocratoken")
-    module_list.add("privacyidea.lib.tokens.u2ftoken")
     module_list.add("privacyidea.lib.tokens.papertoken")
     module_list.add("privacyidea.lib.tokens.questionnairetoken")
     module_list.add("privacyidea.lib.tokens.vascotoken")
@@ -743,6 +811,8 @@ def get_token_list():
     module_list.add("privacyidea.lib.tokens.pushtoken")
     module_list.add("privacyidea.lib.tokens.indexedsecrettoken")
     module_list.add("privacyidea.lib.tokens.webauthntoken")
+    module_list.add("privacyidea.lib.tokens.passkeytoken")
+    module_list.add("privacyidea.lib.tokens.deprecated")
 
     # Dynamic token modules
     dynamic_token_modules = get_app_config_value("PI_TOKEN_MODULES")
@@ -754,8 +824,42 @@ def get_token_list():
     return module_list
 
 
+def get_email_validators():
+    """
+    Return a dict of available email validator modules and its functions
+
+    The list be configured in "PI_EMAIL_VALIDATOR_MODULES" in pi.cfg.
+
+    The return value looks like:
+    { "privacyidea.lib.utils.emailvalidation": func:validate_email }
+
+    :return: a dict
+    """
+    if "pi_email_validators" not in this.config:
+        validator_dict = {}
+        validator_list = to_list(get_app_config_value("PI_EMAIL_VALIDATOR_MODULES"))
+        # Add our default validator
+        validator_list.append("privacyidea.lib.utils.emailvalidation")
+        # Remove empty entries
+        validator_list = [x for x in validator_list if x]
+
+        for mod_name in validator_list:
+            if mod_name == '\\' or len(mod_name.strip()) == 0:
+                continue
+            try:
+                log.debug(f"import module: {mod_name!s}")
+                module = importlib.import_module(mod_name)
+                validator_dict[mod_name] = module.validate_email
+            except Exception as exx:  # pragma: no cover
+                log.warning('unable to load validate module with function "validate_email": '
+                            f'{mod_name!r} ({exx!r})')
+        this.config["pi_email_validators"] = validator_dict
+
+    return this.config["pi_email_validators"]
+
+
 @log_with(log)
-#@cache.cached(key_prefix="modules")
+# @cache.cached(key_prefix="modules")
 def get_token_module_list():
     """
     return the list of modules of the available token classes
@@ -764,31 +868,24 @@ def get_token_module_list():
     """
     # def load_resolver_modules
     module_list = get_token_list()
-    log.debug("using the module list: {0!s}".format(module_list))
+    log.debug(f"using the module list: {module_list!s}")
 
     modules = []
     for mod_name in module_list:
         if mod_name == '\\' or len(mod_name.strip()) == 0:
             continue
 
-        # load all token class implementations
-        #if mod_name in sys.modules:
-        #    module = sys.modules[mod_name]
-        #    log.debug('module %s loaded' % (mod_name))
-        #    modules.append(module)
-        #else:
         try:
-            log.debug("import module: {0!s}".format(mod_name))
+            log.debug(f"import module: {mod_name!s}")
             module = importlib.import_module(mod_name)
             modules.append(module)
         except Exception as exx:  # pragma: no cover
-            module = None
-            log.warning('unable to load token module : {0!r} ({1!r})'.format(mod_name, exx))
+            log.warning(f'unable to load token module : {mod_name!r} ({exx!r})')
 
     return modules
 
 
-#@cache.cached(key_prefix="modules")
+# @cache.cached(key_prefix="modules")
 def get_resolver_module_list():
     """
     return the list of modules of the available resolver classes
@@ -799,7 +896,7 @@ def get_resolver_module_list():
 
     # def load_resolver_modules
     module_list = get_resolver_list()
-    log.debug("using the module list: {0!s}".format(module_list))
+    log.debug(f"using the module list: {module_list!s}")
 
     modules = []
     for mod_name in module_list:
@@ -807,12 +904,12 @@ def get_resolver_module_list():
             continue
 
         try:
-            log.debug("import module: {0!s}".format(mod_name))
+            log.debug(f"import module: {mod_name!s}")
             module = importlib.import_module(mod_name)
 
         except Exception as exx:  # pragma: no cover
             module = None
-            log.warning('unable to load resolver module : {0!r} ({1!r})'.format(mod_name, exx))
+            log.warning(f'unable to load resolver module : {mod_name!r} ({exx!r})')
 
         if module is not None:
             modules.append(module)
@@ -820,7 +917,7 @@ def get_resolver_module_list():
     return modules
 
 
-#@cache.cached(key_prefix="module")
+# @cache.cached(key_prefix="module")
 def get_caconnector_module_list():
     """
     return the list of modules of the available CA connector classes
@@ -833,14 +930,13 @@ def get_caconnector_module_list():
     modules = []
     for mod_name in module_list:
         mod_name = ".".join(mod_name.split(".")[:-1])
-        class_name = mod_name.split(".")[-1:]
         try:
-            log.debug("import module: {0!s}".format(mod_name))
+            log.debug(f"import module: {mod_name!s}")
             module = importlib.import_module(mod_name)
 
         except Exception as exx:  # pragma: no cover
             module = None
-            log.warning('unable to load ca connector module : {0!r} ({1!r})'.format(mod_name, exx))
+            log.warning(f'unable to load ca connector module : {mod_name!r} ({exx!r})')
 
         if module is not None:
             modules.append(module)
@@ -848,7 +944,7 @@ def get_caconnector_module_list():
     return modules
 
 
-#@cache.cached(key_prefix="module")
+# @cache.cached(key_prefix="module")
 def get_machine_resolver_module_list():
     """
     return the list of modules of the available machines resolver classes
@@ -859,18 +955,18 @@ def get_machine_resolver_module_list():
 
     # def load_resolver_modules
     class_list = get_machine_resolver_class_list()
-    log.debug("using the class list: {0!s}".format(class_list))
+    log.debug(f"using the class list: {class_list!s}")
 
     modules = []
     for class_name in class_list:
         try:
             module_name = ".".join(class_name.split(".")[:-1])
-            log.debug("import module: {0!s}".format(module_name))
+            log.debug(f"import module: {module_name!s}")
             module = importlib.import_module(module_name)
 
         except Exception as exx:  # pragma: no cover
             module = None
-            log.warning('unable to load machine resolver module : {0!r} ({1!r})'.format(module_name, exx))
+            log.warning(f'unable to load machine resolver module : {module_name!r} ({exx!r})')
 
         if module is not None:
             modules.append(module)
@@ -878,11 +974,81 @@ def get_machine_resolver_module_list():
     return modules
 
 
+# Fragments in the name of a pi.cfg key that say its value is a secret. Matched as
+# case-insensitive substrings rather than against a list of known keys, because the pi.cfg key
+# space is open-ended: an installation and a plugin may define their own keys, and a key named
+# after what it holds is then covered without privacyIDEA having to know about it.
+#
+# Only fragments that no harmless key contains are listed. "KEY" for instance is deliberately
+# absent: it appears in PI_AUDIT_KEY_PRIVATE and PI_AUDIT_KEY_PUBLIC, which hold file paths, and
+# in the PI_AUDIT_NO_PRIVATE_KEY_CHECK flag, none of which is a secret.
+SENSITIVE_APP_CONFIG_FRAGMENTS = ("PASSWORD", "SECRET", "PEPPER", "PASSPHRASE", "CREDENTIAL")
+
+# Keys whose value is a secret although their name does not say so. A new key that the fragments
+# above do not catch belongs here.
+SENSITIVE_APP_CONFIG_KEYS = frozenset({"PI_HSM_MODULE_KEY"})
+
+# Keys whose value is a database connect string. The credential sits inside the value rather
+# than being the whole of it, so these are shortened with censor_connect_string() instead of
+# being replaced: the host and the driver are what the report is read for.
+CONNECT_STRING_APP_CONFIG_KEYS = frozenset({"PI_AUDIT_SQL_URI"})
+
+
+def censor_app_config(app_config: dict) -> dict:
+    """
+    Return a copy of the app configuration with the secret values replaced by ``__CENSORED__``.
+
+    This is for rendering the configuration into a report that is read by somebody other than
+    the person who wrote ``pi.cfg`` - the value of a key that holds a credential must not be
+    part of it.
+
+    The decision is made on the name of the key, which cannot be complete: a custom key that is
+    named after neither its content nor anything in SENSITIVE_APP_CONFIG_FRAGMENTS still has its
+    value rendered. It is a denylist because the alternative, rendering only the values of keys
+    privacyIDEA knows, would hide most of what the report is read for.
+
+    :param app_config: the application configuration
+    :return: a dict with the same keys, and the secret values replaced
+    """
+    censored = {}
+    for key, value in app_config.items():
+        upper_key = str(key).upper()
+        if upper_key in CONNECT_STRING_APP_CONFIG_KEYS:
+            censored[key] = censor_connect_string(value) if value else value
+        elif (upper_key in SENSITIVE_APP_CONFIG_KEYS
+                or any(fragment in upper_key for fragment in SENSITIVE_APP_CONFIG_FRAGMENTS)):
+            censored[key] = CENSORED
+        else:
+            censored[key] = value
+    return censored
+
+
+def get_stored_config_type(key: str) -> str:
+    """
+    Return the type a config entry is stored under, or "" when there is no such entry.
+
+    Read from the database rather than from the config object, because the config object is a
+    request-local snapshot that is only refreshed every ``PI_CHECK_RELOAD_CONFIG`` seconds - an
+    entry written moments ago may not be in it yet, and the type decides whether a value may be
+    written to a log in clear.
+
+    :param key: the name of the config entry
+    :return: the type of the entry, or "" if it does not exist
+    """
+    stmt = select(Config).where(Config.Key == key)
+    pi_config = db.session.scalars(stmt).first()
+    return (pi_config.Type or "") if pi_config else ""
+
+
 def set_privacyidea_config(key, value, typ="", desc=""):
     """
     Set a config value and writes it to the Config database table.
     Can be of type "password" or "public". "password" gets encrypted.
     """
+    # We need to check, if the value already exist
+    stmt = select(Config).where(Config.Key == key)
+    pi_config = db.session.scalars(stmt).first()
+
     if not typ:
         # check if this is a token specific config and if it should be public
         try:
@@ -892,50 +1058,49 @@ def set_privacyidea_config(key, value, typ="", desc=""):
         except Exception:
             log.debug("This seems to be no token specific setting")
 
+    if not typ and pi_config:
+        # An update that names no type keeps the type of the existing entry, so that the stored
+        # type and the stored value stay consistent: a "password" entry is written the way it is
+        # read back, whether or not the caller repeats the type on every update.
+        typ = pi_config.Type
+
     if typ == "password":
         # store value in encrypted way
         value = encryptPassword(value)
-    # We need to check, if the value already exist
-    c1 = Config.query.filter_by(Key=key).first()
-    if c1:
+    if pi_config:
         # The value already exist, we need to update
-        c1.Value = value
+        pi_config.Value = value
         if typ:
-            c1.Type = typ
+            pi_config.Type = typ
         if desc:
-            c1.Description = desc
+            pi_config.Description = desc
         save_config_timestamp()
         db.session.commit()
         ret = "update"
     else:
-        #new_entry = Config(key, value, typ, desc)
+        # new_entry = Config(key, value, typ, desc)
         # ``save`` will call ``save_config_timestamp`` for us
         Config(key, value, typ, desc).save()
-        #db.session.add(new_entry)
+        # db.session.add(new_entry)
         ret = "insert"
 
-    #save_config_timestamp()
-    #db.session.commit()
+    # save_config_timestamp()
+    # db.session.commit()
     return ret
 
 
-def delete_privacyidea_config(key):
+def delete_privacyidea_config(key: str) -> bool:
     """
     Delete a config entry
     """
-    ret = 0
-    # We need to check, if the value already exist
-    if Config.query.filter_by(Key=key).first().delete():
-        ret = True
-    #if q:
-    #    db.session.delete(q)
-    #    db.session.commit()
-    #    ret = True
-    #    save_config_timestamp()
-    return ret
+    delete_stmt = delete(Config).where(Config.Key == key)
+    result = db.session.execute(delete_stmt)
+    db.session.commit()
+    save_config_timestamp()
+    return result.rowcount > 0
 
 
-#@cache.cached(key_prefix="pin")
+# @cache.cached(key_prefix="pin")
 def get_inc_fail_count_on_false_pin():
     """
     Return if the Failcounter should be increased if only tokens
@@ -948,7 +1113,7 @@ def get_inc_fail_count_on_false_pin():
     return r
 
 
-#@cache.cached(key_prefix="pin")
+# @cache.cached(key_prefix="pin")
 def get_prepend_pin():
     """
     Get the status of the "PrependPin" Config
@@ -969,74 +1134,139 @@ def set_prepend_pin(prepend=True):
     set_privacyidea_config("PrependPin", prepend)
 
 
-def return_saml_attributes():
-    r = get_from_config(key="ReturnSamlAttributes", default= False,
-                        return_bool=True)
-    return r
-
-
-def return_saml_attributes_on_fail():
-    r = get_from_config(key="ReturnSamlAttributesOnFail", default=False,
-                        return_bool=True)
-    return r
-
-
-def get_privacyidea_node():
+def get_privacyidea_node(default=DefaultConfigValues.NODE_NAME) -> str:
     """
     This returns the node name of the privacyIDEA node as found in the pi.cfg
     file in PI_NODE.
     If it does not exist, the PI_AUDIT_SERVERNAME is used.
+
     :return: the distinct node name
+    :rtype: str
     """
-    node_name = get_app_config_value("PI_NODE", get_app_config_value("PI_AUDIT_SERVERNAME", "localnode"))
+    node_name = get_app_config_value(ConfigKey.NODE,
+                                     get_app_config_value(ConfigKey.AUDIT_SERVERNAME, default))
     return node_name
 
 
-def get_privacyidea_nodes():
+def get_privacyidea_nodes() -> list:
     """
-    This returns the list of the nodes, including the own local node name
-    :return: list of nodes
+    This returns the list of the nodes known to privacyIDEA.
+    It includes the own local node name and returns the name and the
+    corresponding UUID
+
+    :return: list of nodes as dicts with name and uuid
+    :rtype: list
     """
-    own_node_name = get_privacyidea_node()
-    nodes = get_app_config_value("PI_NODES", [])[:]
-    if own_node_name not in nodes:
-        nodes.append(own_node_name)
-    return nodes
+    nodes_list = []
+    nodes = db.session.scalars(select(NodeName)).all()
+
+    for node in nodes:
+        nodes_list.append({
+            "uuid": node.id,
+            "name": node.name})
+
+    return nodes_list
+
+
+def get_privacyidea_node_names() -> list:
+    """
+    This returns the list of the node names known to privacyIDEA.
+    It includes the own local node name.
+
+    :return: list of node names as strings
+    :rtype: list
+    """
+    return [node.get("name") for node in get_privacyidea_nodes()]
+
+
+def check_node_uuid_exists(node_uuid) -> bool:
+    """
+    Check if a node with the given UUID exists in the database.
+
+    :param node_uuid: the UUID of the node
+    :return: True if the node exists in the database, False otherwise
+    """
+    stmt = select(NodeName).where(NodeName.id == node_uuid)
+    return db.session.scalars(stmt).first() is not None
+
+
+def _export_password(key: str, encrypted_value: str) -> str:
+    """
+    The value of a password-type entry of the global configuration as it goes into an export: decrypted, as the
+    importing instance encrypts it with its own encryption key, like the secrets of every other exported object.
+    A value that can not be decrypted is exported as the ``__CENSORED__`` placeholder, so that an import does not
+    store the error text as the password.
+    """
+    value = decryptPassword(encrypted_value)
+    if value == FAILED_TO_DECRYPT_PASSWORD:
+        log.warning(f"Could not decrypt the configuration entry {key!r}, it is exported censored.")
+        return CENSORED
+    return value
 
 
 @register_export()
-def export_config(name=None):
-    """Export the global configuration"""
+def export_config(name=None, censor=False):
+    """Export the global configuration
+
+    The value of a password-type entry is exported decrypted, so that the importing
+    instance can encrypt it with its own encryption key.
+
+    :param censor: If True, the value of password-type entries is replaced with
+        the ``__CENSORED__`` placeholder instead of being exported.
+    """
     c = copy.copy(get_config_object().config)
     if name:
         c = {name: c[name]} if name in c.keys() else {}
+    # copy.copy is shallow, so build new dicts for the password-type entries
+    # instead of mutating the cached config object
+    c = {key: ({**values, "Value": CENSORED if censor else _export_password(key, values.get("Value"))}
+               if isinstance(values, dict) and values.get("Type") == "password"
+               else values)
+         for key, values in c.items()}
     return c
 
 
 @register_import()
 def import_config(data, name=None):
     """Import given server configuration"""
-    log.debug('Import server config: {0!s}'.format(data))
+    log.debug(f'Import server config: {data!s}')
     res = {}
     data.pop('__timestamp__', None)
     for key, values in data.items():
         if name and name != key:
             continue
+        if is_censored(values.get('Value')):
+            # A censored value means "keep the stored secret". On the same
+            # instance the existing value is kept untouched; on a fresh instance
+            # there is nothing to keep, so the entry is skipped.
+            log.info(f'Skipping import of censored configuration entry "{key}".')
+            continue
         r = set_privacyidea_config(key, values['Value'],
                                    desc=values['Description'] if 'Description' in values else None,
                                    typ=values['Type'] if 'Type' in values else None)
         res[key] = r
-    log.info('Added configuration: {0!s}'.format(
+    log.info('Added configuration: {!s}'.format(
         ', '.join([k for k, v in res.items() if v == 'insert'])))
-    log.info('Updated configuration: {0!s}'.format(
+    log.info('Updated configuration: {!s}'.format(
         ', '.join([k for k, v in res.items() if v == 'update'])))
 
 
-def get_multichallenge_enrollable_tokentypes():
-    enrollable_tokentypes = []
-    # If the token is enrollable via multichallenge
-    for tclass in get_token_classes():
-        if tclass.is_multichallenge_enrollable:
-            enrollable_tokentypes.append(tclass.get_class_type())
+def get_multichallenge_enrollable_types() -> list[str]:
+    """
+    Returns a list of token and container types which can be enrolled during a successful authentication using the
+    policy "enroll_via_multichallenge"
+    """
+    if "pi_multichallenge_enrollable_types" not in this.config:
+        from .container import get_container_classes
+        enrollable_types = []
+        # Get token types enrollable via multichallenge
+        for tclass in get_token_classes():
+            if tclass.is_multichallenge_enrollable():
+                enrollable_types.append(tclass.get_class_type())
+        # Get container types enrollable via multichallenge
+        for class_name, container_class in get_container_classes().items():
+            if container_class.is_multi_challenge_enrollable():
+                enrollable_types.append(container_class.get_class_type())
 
-    return enrollable_tokentypes
+        this.config["pi_multichallenge_enrollable_types"] = enrollable_types
+    return this.config["pi_multichallenge_enrollable_types"]

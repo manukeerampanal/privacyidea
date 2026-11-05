@@ -1,0 +1,131 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+
+import { provideHttpClient } from "@angular/common/http";
+import { provideHttpClientTesting } from "@angular/common/http/testing";
+import { ComponentFixture, TestBed } from "@angular/core/testing";
+import { Router, provideRouter } from "@angular/router";
+import { ROUTE_PATHS } from "@app/route_paths";
+import { AuthService } from "@services/auth/auth.service";
+import { DialogService } from "@services/dialog/dialog.service";
+import { RadiusServer, RadiusServerService } from "@services/radius-server/radius-server.service";
+import { TableUtilsService } from "@services/table-utils/table-utils.service";
+import { MockMatDialogRef } from "@testing/mock-mat-dialog-ref";
+import { expectsTableStateGating } from "@testing/table-state-gating";
+import { MockAuthService, MockDialogService, MockRadiusService, MockTableUtilsService } from "@testing/mock-services";
+import { Subject } from "rxjs";
+import { RadiusServersComponent } from "./radius-servers.component";
+
+describe("RadiusServersComponent", () => {
+  let component: RadiusServersComponent;
+  let fixture: ComponentFixture<RadiusServersComponent>;
+  let radiusServiceMock: MockRadiusService;
+  let dialogServiceMock: MockDialogService;
+  let confirmClosed: Subject<boolean>;
+  let router: Router;
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [RadiusServersComponent],
+      providers: [
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        provideRouter([]),
+        { provide: RadiusServerService, useClass: MockRadiusService },
+        { provide: AuthService, useClass: MockAuthService },
+        { provide: DialogService, useClass: MockDialogService },
+        { provide: TableUtilsService, useClass: MockTableUtilsService }
+      ]
+    }).compileComponents();
+
+    radiusServiceMock = TestBed.inject(RadiusServerService) as unknown as MockRadiusService;
+    radiusServiceMock.radiusServers.set([
+      { identifier: "server1", server: "1.1.1.1" },
+      { identifier: "server2", server: "2.2.2.2" }
+    ] as unknown as RadiusServer[]);
+
+    fixture = TestBed.createComponent(RadiusServersComponent);
+    dialogServiceMock = TestBed.inject(DialogService) as unknown as MockDialogService;
+    router = TestBed.inject(Router);
+    confirmClosed = new Subject();
+    const dialogRefMock = new MockMatDialogRef();
+    dialogRefMock.afterClosed.mockReturnValue(confirmClosed);
+    dialogServiceMock.openDialog.mockReturnValue(dialogRefMock);
+
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+  });
+
+  it("gates the table on its read right, row count and filter", () => {
+    expectsTableStateGating({
+      state: component.tableState,
+      right: "radiusserver_read"
+    });
+  });
+
+  it("should create", () => {
+    expect(component).toBeTruthy();
+  });
+
+  it("should only select the servers left by the filter", async () => {
+    component.onFilterInput("server1");
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    component.selector.selectAllRows();
+
+    expect(component.selector.selectedRows().map((row) => row.identifier)).toEqual(["server1"]);
+  });
+
+  it("should display servers from service", () => {
+    expect(component.radiusDataSource().data.length).toBe(2);
+    expect(component.radiusDataSource().data[0].identifier).toBe("server1");
+  });
+
+  it("should filter servers", () => {
+    component.onFilterInput("server1");
+    expect(component.radiusDataSource().filter).toBe("server1");
+  });
+
+  it("should navigate to new server route on onCreateNewServer", () => {
+    const spy = jest.spyOn(router, "navigateByUrl").mockResolvedValue(true);
+    component.onCreateNewServer();
+    expect(spy).toHaveBeenCalledWith(ROUTE_PATHS.EXTERNAL_SERVICES_RADIUS_NEW);
+  });
+
+  it("should navigate to details route on onEditServer", () => {
+    const spy = jest.spyOn(router, "navigateByUrl").mockResolvedValue(true);
+    const server = radiusServiceMock.radiusServers()[0];
+    component.onEditServer(server);
+    expect(spy).toHaveBeenCalledWith(ROUTE_PATHS.EXTERNAL_SERVICES_RADIUS_DETAILS + server.identifier);
+  });
+
+  it("should delete server after confirmation", () => {
+    const server = radiusServiceMock.radiusServers()[0];
+
+    component.selector.selectRow(server);
+    component.deleteSelected();
+
+    expect(dialogServiceMock.openDialog).toHaveBeenCalled();
+    confirmClosed.next(true);
+    confirmClosed.complete();
+
+    expect(radiusServiceMock.deleteRadiusServer).toHaveBeenCalledWith("server1");
+  });
+});

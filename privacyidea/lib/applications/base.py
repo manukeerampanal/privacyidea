@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  privacyIDEA
 #  Jul 18, 2014 Cornelius Kölbel
 #  License:  AGPLv3
@@ -18,11 +16,15 @@
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
+# SPDX-FileCopyrightText: 2025 Paul Lettich <paul.lettich@netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
 import logging
 import sys
 import os
 from privacyidea.lib.log import log_with
 import privacyidea.lib.applications
+from privacyidea.lib.policy import TYPE
 from importlib import import_module
 log = logging.getLogger(__name__)
 
@@ -42,7 +44,7 @@ def get_machine_application_class_list():
     modules = [f.split(".")[0] for f in files if f.endswith(".py") and f !=
                "__init__.py"]
     for module in modules:
-        class_list.append("privacyidea.lib.applications.{0!s}.MachineApplication".format(module))
+        class_list.append(f"privacyidea.lib.applications.{module!s}.MachineApplication")
     return class_list
 
 
@@ -50,18 +52,20 @@ def get_machine_application_class_dict():
     """
     get a dictionary of the application classes with the type as the key.
 
-    :return: {'base':
-                <class
-                'privacyidea.lib.applications.base.MachineApplicationBase'>
-              'luks': <class
-              'privacyidea.lib.applications.base.MachineApplication'>
-              }
+    Example::
+
+        {
+          "base": <class 'privacyidea.lib.applications.base.MachineApplicationBase'>
+          "luks": <class 'privacyidea.lib.applications.base.MachineApplication'>
+        }
+
+    :return: Dictionary of application classes
+    :rtype: dict
     """
     ret = {}
     long_class_names = get_machine_application_class_list()
     for long_class_name in long_class_names:
         module_name = ".".join(long_class_name.split(".")[:-1])
-        class_name = long_class_name.split(".")[-1:]
 
         mod = import_module(module_name)
         # should be able to run as class or as object
@@ -72,7 +76,7 @@ def get_machine_application_class_dict():
     return ret
 
 
-class MachineApplication(object):
+class MachineApplication:
 
     application_name = "base"
     '''If bulk_call is false, the administrator may
@@ -91,8 +95,10 @@ class MachineApplication(object):
     @staticmethod
     def get_authentication_item(token_type,
                                 serial,
-                                challenge=None, options=None,
-                                filter_param=None):
+                                challenge=None,
+                                options=None,
+                                filter_param=None,
+                                user_agent=None):
         """
         returns a dictionary of authentication items
         like public keys, challenges, responses...
@@ -107,13 +113,18 @@ class MachineApplication(object):
         """
         returns a dictionary with a list of required and optional options
         """
-        return {'required': [],
-                'optional': []}
+        return {"tokentype":
+                    {
+                        'optionA': {'type': TYPE.BOOL,
+                                    'required': True},
+                        'optionB': {'type': TYPE.STRING,
+                                    'value': ["val1", "val2"]}}
+                    }
 
 
 @log_with(log)
 def get_auth_item(application, token_type,serial,
-                  challenge=None, options=None, filter_param=None):
+                  challenge=None, options=None, filter_param=None, user_agent=None):
 
     options = options or {}
     # application_module from application
@@ -124,7 +135,8 @@ def get_auth_item(application, token_type,serial,
                                                    serial,
                                                    challenge=challenge,
                                                    options=options,
-                                                   filter_param=filter_param)
+                                                   filter_param=filter_param,
+                                                   user_agent=user_agent)
     return auth_item
 
 
@@ -141,13 +153,22 @@ def get_application_types():
     This function returns a dictionary of application types with the
     corresponding available attributes.
 
-    {"luks": {"options": {"required": [],
-                          "optional": ["slot", "partition"]}}
-     "ssh": {"options": {"required": [],
-                         "optional": ["user"]}}
-    }
+    Example::
+
+        {
+          "luks": {
+            "options": {
+              "totp": {
+                "slot": {"type": "int"},
+                "partition": {"type": "str"}}}},
+           "ssh": {
+             "options": {
+               "sshkey": {
+                 "user": {"type": "str"}}}}
+        }
 
     :return: dictionary describing the applications
+    :rtype: dict
     """
     ret = {}
     current_module = sys.modules[__name__]
@@ -159,11 +180,11 @@ def get_application_types():
     for f in files:
         if f not in ["base", "__init__"]:
             try:
-                mod = import_module("privacyidea.lib.applications.{0!s}".format(f))
+                mod = import_module(f"privacyidea.lib.applications.{f!s}")
                 name = mod.MachineApplication.application_name
-                options = mod.MachineApplication.get_options()
-                ret[name] = {"options": options}
+                token_options = mod.MachineApplication.get_options()
+                ret[name] = {"options": token_options}
             except Exception as exx:
-                log.info("Can not get application type: {0!s}".format(exx))
+                log.info(f"Can not get application type: {exx}")
 
     return ret

@@ -1,16 +1,15 @@
-# -*- coding: utf-8 -*-
-
 """
 This test file tests the lib.tokens.questionnairetoken
 This depends on lib.tokenclass
 """
 
-from .base import MyTestCase
-from privacyidea.lib.tokens.questionnairetoken import QuestionnaireTokenClass
-from privacyidea.lib.token import init_token
-from privacyidea.lib.config import set_privacyidea_config
-from privacyidea.models import Token
 import json
+
+from privacyidea.lib.config import set_privacyidea_config
+from privacyidea.lib.token import init_token, import_tokens, get_tokens, get_one_token
+from privacyidea.lib.tokens.questionnairetoken import QuestionnaireTokenClass
+from privacyidea.models import Token
+from .base import MyTestCase
 
 
 class QuestionnaireTokenTestCase(MyTestCase):
@@ -24,6 +23,7 @@ class QuestionnaireTokenTestCase(MyTestCase):
 
     dumb_questions = {"dumb questiontype": "answer"}
     j_dumb_questions = json.dumps(dumb_questions)
+
     # add_user, get_user, reset, set_user_identifiers
 
     def test_00_users(self):
@@ -74,8 +74,14 @@ class QuestionnaireTokenTestCase(MyTestCase):
         token.delete_token()
 
     def test_03_get_setting_type(self):
-        r = QuestionnaireTokenClass.get_setting_type("question.question.1")
-        self.assertEqual(r, "public")
+        setting_type = QuestionnaireTokenClass.get_setting_type("question.question.1")
+        self.assertEqual("public", setting_type)
+
+        setting_type = QuestionnaireTokenClass.get_setting_type("question.num_answers")
+        self.assertEqual("public", setting_type)
+
+        setting_type = QuestionnaireTokenClass.get_setting_type("question")
+        self.assertEqual("", setting_type)
 
     def test_04_dumb_question(self):
         set_privacyidea_config("question.num_answers", 1)
@@ -91,9 +97,9 @@ class QuestionnaireTokenTestCase(MyTestCase):
         token.delete_token()
 
     def test_05_unicode_question(self):
-        questions = {u'cité': u'Nîmes',
-                     u'城市': u'北京',
-                     'ciudad': u'Almería'}
+        questions = {'cité': 'Nîmes',
+                     '城市': '北京',
+                     'ciudad': 'Almería'}
         set_privacyidea_config("question.num_answers", 2)
         token = init_token({"type": "question",
                             "pin": self.pin,
@@ -115,7 +121,7 @@ class QuestionnaireTokenTestCase(MyTestCase):
         token.delete_token()
 
     def test_06_wrong_answer(self):
-        questions = {'ciudad': u'Almería'}
+        questions = {'ciudad': 'Almería'}
         set_privacyidea_config("question.num_answers", 1)
         token = init_token({"type": "question",
                             "pin": self.pin,
@@ -131,11 +137,109 @@ class QuestionnaireTokenTestCase(MyTestCase):
         self.assertTrue(question in questions)
 
         # What happens if the answer is wrong?
-        r = token.check_challenge_response(passw=u'Málaga',
+        r = token.check_challenge_response(passw='Málaga',
                                            options={"transaction_id": transactionid})
         self.assertEqual(r, -1)
         # Try to answer again
-        r = token.check_challenge_response(passw=u'Almería',
+        r = token.check_challenge_response(passw='Almería',
                                            options={"transaction_id": transactionid})
         self.assertEqual(r, 1)
+        token.delete_token()
+
+    def test_07_questionnaire_token_export(self):
+        # Set up the QuestionnaireTokenClass for testing
+        set_privacyidea_config("question.num_answers", 3)
+        token = init_token({"type": "question",
+                            "pin": self.pin,
+                            "serial": self.serial1,
+                            "user": "cornelius",
+                            "realm": self.realm1,
+                            "questions": self.j_questions,
+                            "description": "this is a questionnaire token export test"
+                            })
+
+        # Test that all expected keys are present in the exported dictionary
+        exported_data = token.export_token()
+        expected_keys = ["serial", "type", "description", "issuer"]
+        self.assertTrue(set(expected_keys).issubset(exported_data.keys()))
+
+        expected_tokeninfo_keys = ["tokenkind", "frage1", "frage2", "frage3"]
+        self.assertTrue(set(expected_tokeninfo_keys).issubset(exported_data["info_list"].keys()))
+
+        # Test that the exported values match the token's data
+        self.assertEqual(exported_data["serial"], "QUST1234")
+        self.assertEqual(exported_data["type"], "question")
+        self.assertEqual(exported_data["description"], "this is a questionnaire token export test")
+        self.assertEqual(exported_data["info_list"]["tokenkind"], "software")
+        self.assertEqual(exported_data["issuer"], "privacyIDEA")
+        self.assertEqual(exported_data["info_list"]["frage1"], "antwort1")
+        self.assertEqual(exported_data["info_list"]["frage2"], "antwort2")
+        self.assertEqual(exported_data["info_list"]["frage3"], "antwort3")
+
+        # Clean up
+        token.delete_token()
+
+    def test_08_questionnaire_token_import(self):
+        # Define the token data to be imported
+        token_data = [{'description': 'this is a questionnaire token export test',
+                       'issuer': 'privacyIDEA',
+                       'serial': 'QUST1234',
+                       'type': 'question',
+                       'info_list': {'frage1': 'antwort1',
+                                     'frage1.type': 'password',
+                                     'frage2': 'antwort2',
+                                     'frage2.type': 'password',
+                                     'frage3': 'antwort3',
+                                     'frage3.type': 'password',
+                                     'tokenkind': 'software'}
+                       }]
+
+        # Import the token
+        import_tokens(token_data)
+
+        # Retrieve the imported token
+        token = get_tokens(serial=token_data[0]["serial"])[0]
+
+        # Verify that the token data matches the imported data
+        self.assertEqual(token.token.serial, token_data[0]["serial"])
+        self.assertEqual(token.type, token_data[0]["type"])
+        self.assertEqual(token.token.description, token_data[0]["description"])
+        self.assertEqual(token.get_tokeninfo("frage1"), 'antwort1')
+        self.assertEqual(token.get_tokeninfo("frage2"), 'antwort2')
+
+        # cheak that the token can be used
+        r = token.create_challenge()
+        question = r[1]
+        transactionid = r[2]
+        r = token.check_challenge_response(passw=self.questions[question],
+                                           options={"transaction_id":
+                                                        transactionid})
+        self.assertEqual(r, 1)
+
+        # Clean up
+        token.delete_token()
+
+    def test_09_enrolling_again_replaces_the_questions(self):
+        set_privacyidea_config("question.num_answers", 3)
+        serial = "QUST_REPLACE"
+        init_token({"type": "question", "serial": serial, "pin": self.pin,
+                    "questions": self.j_questions})
+
+        # Enrolling the same token again with a different set of questions replaces them. A question of the
+        # previous set would otherwise still be asked and its answer would still authenticate.
+        other_questions = {"neu1": "antwort1", "neu2": "antwort2", "neu3": "antwort3"}
+        init_token({"type": "question", "serial": serial, "pin": self.pin,
+                    "questions": json.dumps(other_questions)})
+
+        token = get_one_token(serial=serial)
+        token_info = token.get_tokeninfo()
+        stored = [key for key in token_info if token_info.get(f"{key}.type") == "password"]
+        self.assertEqual(sorted(other_questions), sorted(stored), stored)
+        for question in self.questions:
+            self.assertNotIn(question, stored, stored)
+
+        # Only a question of the current set is asked
+        for _ in range(5):
+            r = token.create_challenge()
+            self.assertIn(r[1], other_questions, r[1])
         token.delete_token()

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #    2020-06-04 Cornelius Kölbel <cornelius.koelbel@netknights.i>
 #               Initial Code
 #
@@ -19,10 +17,11 @@
 __doc__ = """This is the SMSClass to send SMS via a script.
 """
 
-from privacyidea.lib.smsprovider.SMSProvider import (ISMSProvider, SMSError)
+from privacyidea.lib.smsprovider.SMSProvider import ALLOW_PUSH, ISMSProvider, SMSError
 from privacyidea.lib import _
 from privacyidea.lib.framework import get_app_config_value
-import subprocess
+import json
+import subprocess  # nosec B404 # We know what we are doing and only allow trusted scripts
 import logging
 import traceback
 log = logging.getLogger(__name__)
@@ -33,6 +32,8 @@ SCRIPT_WAIT = "wait"
 
 
 class ScriptSMSProvider(ISMSProvider):
+
+    supports_push_messages = True
 
     def __init__(self, db_smsprovider_object=None, smsgateway=None, directory=None):
         """
@@ -59,40 +60,42 @@ class ScriptSMSProvider(ISMSProvider):
         :param message: the message to submit to the phone
         :return:
         """
-        log.debug("submitting message {0!s} to {1!s}".format(message, phone))
         if not self.smsgateway:
             # this should not happen. We now always use sms gateway definitions.
             log.warning("Missing smsgateway definition!")
             raise SMSError(-1, "Missing smsgateway definition!")
 
+        if not isinstance(message, dict):
+            phone = self._mangle_phone(phone, self.smsgateway.option_dict)
+        log.debug(f"submitting message {message!s} to {phone!s}")
+
         script = self.smsgateway.option_dict.get("script")
         background = self.smsgateway.option_dict.get("background")
 
         script_name = self.script_directory + "/" + script
-        proc_args = [script_name]
-        proc_args.append(phone)
+        proc_args = [script_name, phone]
+        serialized_message = json.dumps(message) if isinstance(message, dict) else message
 
         # As the message can contain blanks... it is passed via stdin
         rcode = 0
         try:
-            log.info("Starting script {script!r}.".format(script=script_name))
-            p = subprocess.Popen(proc_args, cwd=self.script_directory, universal_newlines=True, stdin=subprocess.PIPE)
-            p.communicate(message)
+            log.info(f"Starting script {script_name!r}.")
+            # Trusted input/no user input: The scripts are created by user root and read from hard disk
+            p = subprocess.Popen(proc_args, cwd=self.script_directory,   # nosec B603
+                                 universal_newlines=True, stdin=subprocess.PIPE)
+            p.communicate(serialized_message)
             if background == SCRIPT_WAIT:
                 rcode = p.wait()
         except Exception as e:
-            log.warning("Failed to execute script {0!r}: {1!r}".format(
-                script_name, e))
+            log.warning(f"Failed to execute script {script_name!r}: {e!r}")
             log.warning(traceback.format_exc())
-            if background == SCRIPT_WAIT:
-                raise SMSError(-1, "Failed to start script for sending SMS.")
+            raise SMSError(-1, "Failed to start script for sending SMS.")
 
         if rcode:
-            log.warning("Script {script!r} failed to execute with error code {error!r}".format(script=script_name,
-                                                                                               error=rcode))
+            log.warning(f"Script {script_name!r} failed to execute with error code {rcode!r}")
             raise SMSError(-1, "Error during execution of the script.")
         else:
-            log.info("SMS delivered to {0!s}.".format(phone))
+            log.info(f"SMS delivered to {phone!s}.")
 
         return True
 
@@ -110,8 +113,13 @@ class ScriptSMSProvider(ISMSProvider):
                       "script": {
                           "required": True,
                           "description": _("The script in script directory PI_SCRIPT_SMSPROVIDER_DIRECTORY to call. "
-                                           "Expects phone as the parameter and the message from stdin.")
+                                           "Expects phone as the parameter and the message from stdin. Structured "
+                                           "push messages are passed as JSON.")
                       },
+                      "REGEXP": {
+                          "description": cls.regexp_description
+                      },
+                      ALLOW_PUSH: cls.allow_push_parameter(),
                       "background": {
                           "required": True,
                           "description": _("Wait for script to complete or run script in background. This will "

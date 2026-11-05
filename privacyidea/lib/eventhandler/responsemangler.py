@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2019-09-14 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Initial writup
 #
@@ -24,7 +22,7 @@ __doc__ = """This is the event handler module that can mangle the JSON response.
 We can add or delete key or even subtrees in the JSON response of a request.
 
 The key is identified by a JSON Pointer
-(see https://tools.ietf.org/html/rfc6901)
+(see https://www.rfc-editor.org/rfc/rfc6901)
 """
 from privacyidea.lib.eventhandler.base import BaseEventHandler
 from privacyidea.lib.utils import is_true
@@ -36,7 +34,7 @@ import logging
 log = logging.getLogger(__name__)
 
 
-class ACTION_TYPE(object):
+class ACTION_TYPE:
     """
     Allowed actions
     """
@@ -50,7 +48,7 @@ class ResponseManglerEventHandler(BaseEventHandler):
 
     It also returns a list of allowed action and conditions
 
-    It returns an identifier, which can be used in the eventhandlig definitions
+    It returns an identifier, which can be used in the event handling definitions
     """
 
     identifier = "ResponseMangler"
@@ -140,10 +138,10 @@ class ResponseManglerEventHandler(BaseEventHandler):
                 elif len(comp) == 3:
                     del (content[comp[0]][comp[1]][comp[2]])
                 else:
-                    log.warning("JSON pointer length of {0!s} not supported.".format(len(comp)))
+                    log.warning(f"JSON pointer length of {len(comp)!s} not supported.")
                 options.get("response").data = json.dumps(content)
             except KeyError:
-                log.warning("Can not delete response JSON Pointer {0!s}.".format(json_pointer))
+                log.warning(f"Can not delete response JSON Pointer {json_pointer!s}.")
         elif action.lower() == ACTION_TYPE.SET:
             try:
                 if type == "integer":
@@ -163,7 +161,7 @@ class ResponseManglerEventHandler(BaseEventHandler):
                 content[comp[0]][comp[1]] = content[comp[0]].get(comp[1]) or {}
                 content[comp[0]][comp[1]][comp[2]] = value
             else:
-                log.warning("JSON pointer of length {0!s} not supported.".format(len(comp)))
+                log.warning(f"JSON pointer of length {len(comp)!s} not supported.")
             options.get("response").data = json.dumps(content)
 
         return ret

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2018-12-19 Paul Lettich <paul.lettich@netknights.it>
 #             Change public functions to accept and return unicode
 #  2017-11-24 Cornelius Kölbel <cornelius.koelbel@netknights.it>
@@ -44,51 +42,49 @@ calling function handle the data.
 
 This lib.crypto is tested in tests/test_lib_crypto.py
 """
-from __future__ import division
 import hmac
+import importlib
 import logging
+from dataclasses import dataclass
 from hashlib import sha256
+import secrets
 import random
 import string
 import binascii
-import six
 import ctypes
-
 import base64
 import traceback
-from six import PY2
+import warnings
+from threading import Lock
+
+from cryptography.hazmat.primitives._serialization import NoEncryption
+from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey, EllipticCurvePrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.hashes import HashAlgorithm
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from privacyidea.lib import passlib_compat  # noqa: F401 - patches bcrypt, which PI_HASH_ALGO_LIST may contain
 from passlib.context import CryptContext
+from passlib.exc import MissingBackendError, PasslibWarning, PasswordSizeError
+from privacyidea.config import ConfigKey
 from privacyidea.lib.log import log_with
-from privacyidea.lib.error import HSMException
+from privacyidea.lib.error import HSMException, ParameterError
 from privacyidea.lib.framework import (get_app_local_store, get_app_config_value,
                                        get_app_config)
 from privacyidea.lib.utils import (to_unicode, to_bytes, hexlify_and_unicode,
                                    b64encode_and_unicode)
 
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 
-import passlib.hash
-from passlib.hash import argon2
-try:
-    # For Python 3.6 and above
-    from secrets import compare_digest
-except ImportError:
-    # For Python 2.7 and above
-    from hmac import compare_digest
-
 
 def safe_compare(a, b):
-    return compare_digest(to_bytes(a), to_bytes(b))
+    return hmac.compare_digest(to_bytes(a), to_bytes(b))
 
-
-if not PY2:
-    long = int
 
 ROUNDS = 9
 
@@ -100,12 +96,52 @@ ROUNDS = 9
 DEFAULT_HASH_ALGO_LIST = ['argon2', 'pbkdf2_sha512']
 DEFAULT_HASH_ALGO_PARAMS = {'argon2__rounds': ROUNDS}
 
-FAILED_TO_DECRYPT_PASSWORD = "FAILED TO DECRYPT PASSWORD!"
+FAILED_TO_DECRYPT_PASSWORD = "FAILED TO DECRYPT PASSWORD!"  # nosec B105 # placeholder in case of error
+CENSORED = "__CENSORED__"  # nosec B105 # placeholder for censored secrets in API responses
 
 log = logging.getLogger(__name__)
 
 
-class SecretObj(object):
+def is_censored(value) -> bool:
+    """Return True if ``value`` is the :data:`CENSORED` placeholder a client echoed
+    back for a secret it never received in clear text.
+
+    Use this on the *save* path to decide whether to keep the existing stored
+    value instead of overwriting it. Centralising the check (instead of
+    ``value == CENSORED`` scattered across modules) keeps it consistent and
+    type-safe (a non-string value can never accidentally match).
+    """
+    return isinstance(value, str) and value == CENSORED
+
+
+def censor_dict(data: dict, secret_keys) -> dict:
+    """Return a shallow copy of ``data`` with every key in ``secret_keys`` that is
+    present replaced by :data:`CENSORED`.
+
+    Use this on the *read*/serialisation path to keep secrets out of API
+    responses. ``data`` is never mutated, so it is safe to call on cached config
+    objects. ``secret_keys`` is any iterable of key names that hold secrets.
+    """
+    if not data:
+        return data
+    censored = dict(data)
+    for key in secret_keys:
+        if key in censored:
+            censored[key] = CENSORED
+    return censored
+
+
+@dataclass
+class KeyPair:
+    public_key = None
+    private_key = None
+
+    def __init__(self, public_key=None, private_key=None):
+        self.public_key = public_key
+        self.private_key = private_key
+
+
+class SecretObj:
     def __init__(self, val, iv, preserve=True):
         self.val = val
         self.iv = iv
@@ -140,7 +176,8 @@ class SecretObj(object):
         '''
         self._setupKey_()
         backend = default_backend()
-        cipher = Cipher(algorithms.AES(self.bkey), modes.ECB(), backend=backend)
+        cipher = Cipher(algorithms.AES(self.bkey), modes.ECB(),  # nosec B305 # part of Yubikey specification
+                        backend=backend)
         decryptor = cipher.decryptor()
         msg_bin = decryptor.update(enc_data) + decryptor.finalize()
         self._clearKey_(preserve=self.preserve)
@@ -183,27 +220,90 @@ def hash(val, seed, algo=None):
     return hexlify_and_unicode(m.digest())
 
 
+_HASH_CONTEXT_KEY = "hash_context"
+
+
+def build_pass_context() -> CryptContext:
+    """
+    Build the CryptContext for password and PIN hashes from ``PI_HASH_ALGO_LIST`` and
+    ``PI_HASH_ALGO_PARAMS`` of the current app and keep it in the app local store.
+
+    The app factories call this at startup. Building the context rejects an unknown scheme or
+    parameter name and a value that can not be converted, but not a missing backend or a value
+    that only fails when hashing. So this also requires a backend for every scheme, hashes once
+    with the default scheme, turns every passlib warning (a clipped or deprecated parameter) into
+    an error and rejects a parameter for a scheme that is not in the list.
+
+    :return: the CryptContext
+    :raises RuntimeError: if the configuration does not give a usable CryptContext
+    """
+    hash_algo_list = get_app_config_value(ConfigKey.HASH_ALGO_LIST, default=DEFAULT_HASH_ALGO_LIST)
+    try:
+        handlers = CryptContext(hash_algo_list).schemes(resolve=True)
+    except (KeyError, ValueError, TypeError) as e:
+        raise RuntimeError(f"'{ConfigKey.HASH_ALGO_LIST}' is not usable: {e.args[0] if e.args else e}") from e
+    if not handlers:
+        raise RuntimeError(f"'{ConfigKey.HASH_ALGO_LIST}' must contain at least one hash algorithm")
+    for handler in handlers:
+        try:
+            if hasattr(handler, "get_backend"):
+                handler.get_backend()
+        except MissingBackendError as e:
+            raise RuntimeError(f"'{ConfigKey.HASH_ALGO_LIST}' is not usable: {e}") from e
+        except ValueError as e:
+            # passlib 1.7 fails to load the backend of an incompatible bcrypt release with a ValueError
+            # (passlib_compat keeps the pinned bcrypt loadable)
+            raise RuntimeError(f"'{ConfigKey.HASH_ALGO_LIST}' is not usable: {handler.name}: {e}") from e
+
+    # Merge into a copy: updating DEFAULT_HASH_ALGO_PARAMS in place would let the first app that
+    # configures PI_HASH_ALGO_PARAMS decide the parameters for every app created later in the same
+    # process, since the module-level default is shared.
+    hash_algo_params = dict(DEFAULT_HASH_ALGO_PARAMS)
+    try:
+        configured_params = dict(get_app_config_value(ConfigKey.HASH_ALGO_PARAMS, default={}))
+        hash_algo_params.update(configured_params)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", PasslibWarning)
+            pass_ctx = CryptContext(hash_algo_list, **hash_algo_params)
+            pass_ctx.hash(secrets.token_hex(8))
+    except (KeyError, ValueError, TypeError, OverflowError, PasslibWarning) as e:
+        raise RuntimeError(f"'{ConfigKey.HASH_ALGO_PARAMS}' is not usable: {e.args[0] if e.args else e}") from e
+
+    # passlib ignores a parameter for a scheme that is not in the context, e.g. "argon2id__rounds"
+    # instead of "argon2__rounds", so the configured value would silently have no effect.
+    known_schemes = (*pass_ctx.schemes(), "all", "context")
+    unused_params = sorted(key for key in configured_params
+                           if len(parts := key.replace(".", "__").split("__")) > 1
+                           and parts[-2] not in known_schemes)
+    if unused_params:
+        raise RuntimeError(f"'{ConfigKey.HASH_ALGO_PARAMS}' is not usable: {', '.join(unused_params)} "
+                           f"names a hash algorithm that is not in '{ConfigKey.HASH_ALGO_LIST}'")
+
+    get_app_local_store()[_HASH_CONTEXT_KEY] = pass_ctx
+    return pass_ctx
+
+
+def _get_pass_context() -> CryptContext:
+    return get_app_local_store().get(_HASH_CONTEXT_KEY) or build_pass_context()
+
+
 @log_with(log, log_entry=False, log_exit=False)
 def pass_hash(password):
     """
     Hash password with crypt context
+
     :param password: The password to hash
     :type password: str
     :return: The hash string of the password
     """
-    DEFAULT_HASH_ALGO_PARAMS.update(get_app_config_value("PI_HASH_ALGO_PARAMS",
-                                                         default={}))
-    pass_ctx = CryptContext(get_app_config_value("PI_HASH_ALGO_LIST",
-                                                 default=DEFAULT_HASH_ALGO_LIST),
-                            **DEFAULT_HASH_ALGO_PARAMS)
-    pw_dig = pass_ctx.hash(password)
-    return pw_dig
+    return _get_pass_context().hash(password)
 
 
 @log_with(log, log_entry=False, log_exit=False)
 def verify_pass_hash(password, hvalue):
     """
     Verify the hashed password value
+
     :param password: The plaintext password to verify
     :type password: str
     :param hvalue: The hashed password
@@ -211,9 +311,15 @@ def verify_pass_hash(password, hvalue):
     :return: True if the password matches
     :rtype: bool
     """
-    pass_ctx = CryptContext(get_app_config_value("PI_HASH_ALGO_LIST",
-                                                 default=DEFAULT_HASH_ALGO_LIST))
-    return pass_ctx.verify(password, hvalue)
+    try:
+        return _get_pass_context().verify(password, hvalue)
+    except PasswordSizeError:
+        # A password beyond the size limit of the algorithm can not be hashed, so it can not
+        # match any stored hash. This says something about the value that was presented and
+        # nothing about the hash it was compared against, so it must not reach a caller that
+        # reads an error as a broken hash.
+        log.info("The given password is longer than the hash algorithm accepts.")
+        return False
 
 
 def hash_with_pepper(password):
@@ -265,7 +371,7 @@ def init_hsm():
         config = get_app_config()
         HSM_config = {"obj": create_hsm_object(config)}
         app_store["pi_hsm"] = HSM_config
-        log.info("Initialized HSM object {0}".format(HSM_config))
+        log.debug(f"Initialized HSM object {HSM_config}")
     return app_store["pi_hsm"]["obj"]
 
 
@@ -304,7 +410,7 @@ def encryptPassword(password):
 
     This function returns a unicode string with a
     hexlified contents of the IV and the encrypted data separated by a
-    colon like u"4956:44415441"
+    colon like "4956:44415441"
 
     :param password: the password
     :type password: bytes or str
@@ -313,6 +419,7 @@ def encryptPassword(password):
     """
     hsm = get_hsm()
     try:
+        password = password or ""
         ret = hsm.encrypt_password(to_bytes(password))
     except Exception as exx:  # pragma: no cover
         log.warning(exx)
@@ -403,7 +510,7 @@ def decrypt(enc_data, iv, key_id=0):
     return res
 
 
-@log_with(log, log_exit=False)
+@log_with(log, log_exit=False, hide_args=[0])
 def aes_cbc_decrypt(key, iv, enc_data):
     """
     Decrypts the given cipherdata with AES (CBC Mode) using the key/iv.
@@ -444,7 +551,8 @@ def aes_cbc_encrypt(key, iv, data):
     :return: plain text in binary data
     :rtype: bytes
     """
-    assert len(data) % (algorithms.AES.block_size // 8) == 0
+    if len(data) % (algorithms.AES.block_size // 8) != 0:  # pragma: no cover
+        raise ParameterError("Invalid length of input data")
     # do the encryption
     backend = default_backend()
     mode = modes.CBC(iv)
@@ -513,16 +621,16 @@ def geturandom(length=20, hex=False):
     '''
     hsm = get_hsm()
     ret = hsm.random(length)
-        
+
     if hex:
         ret = to_unicode(binascii.hexlify(ret))
     return ret
 
+
 # some random functions based on geturandom #################################
 
 
-class urandom(object):
-
+class urandom:
     precision = 12
 
     @staticmethod
@@ -645,7 +753,7 @@ def get_rand_digit_str(length=16):
         raise ValueError("get_rand_digit_str only works for values > 1")
     clen = int(length / 2.4 + 0.5)
     randd = geturandom(clen, hex=True)
-    s = "{0:d}".format((int(randd, 16)))
+    s = f"{int(randd, 16):d}"
     if len(s) < length:
         s = "0" * (length - len(s)) + s
     elif len(s) > length:
@@ -662,7 +770,7 @@ def get_alphanum_str(length=16):
     """
     ret = ""
     for i in range(length):
-        ret += random.choice(string.ascii_letters + string.digits)
+        ret += secrets.choice(string.ascii_letters + string.digits)
     return ret
 
 
@@ -686,8 +794,8 @@ def zerome(bufferObject):
 
 
 def _slow_rsa_verify_raw(key, sig, msg):
-    assert isinstance(sig, six.integer_types)
-    assert isinstance(msg, six.integer_types)
+    if not (isinstance(sig, int) and isinstance(msg, int)):  # pragma: no cover
+        raise ParameterError("Message and signature need to be integer")
     if hasattr(key, 'public_numbers'):
         pn = key.public_numbers()
     elif hasattr(key, 'private_numbers'):  # pragma: no cover
@@ -699,19 +807,24 @@ def _slow_rsa_verify_raw(key, sig, msg):
     return msg == pow(sig, pn.e, pn.n)
 
 
-class Sign(object):
+class Sign:
     """
     Signing class that is used to sign Audit Entries and to sign API responses.
     """
     sig_ver = 'rsa_sha256_pss'
 
-    def __init__(self, private_key=None, public_key=None):
+    def __init__(self, private_key=None, public_key=None, check_private_key=True):
         """
+        Initialize the Sign object with the given Keys.
+
         :param private_key: The private Key data in PEM format
         :type private_key: bytes or None
         :param public_key:  The public key data in PEM format
         :type public_key: bytes or None
-        :return: Sign Object
+        :param check_private_key: Check the private key when loading (default: True)
+        :type check_private_key: bool
+        :return: The Sign Object
+        :rtype: Sign
         """
         self.private = None
         self.public = None
@@ -720,9 +833,10 @@ class Sign(object):
             try:
                 self.private = serialization.load_pem_private_key(private_key,
                                                                   password=None,
-                                                                  backend=backend)
+                                                                  backend=backend,
+                                                                  unsafe_skip_rsa_key_validation=not check_private_key)
             except Exception as e:
-                log.error("Error loading private key: ({0!r})".format(e))
+                log.error(f"Error loading private key: ({e!r})")
                 log.debug(traceback.format_exc())
                 raise e
 
@@ -731,7 +845,7 @@ class Sign(object):
                 self.public = serialization.load_pem_public_key(public_key,
                                                                 backend=backend)
             except Exception as e:
-                log.error("Error loading public key: ({0!r})".format(e))
+                log.error(f"Error loading public key: ({e!r})")
                 log.debug(traceback.format_exc())
                 raise e
 
@@ -745,7 +859,7 @@ class Sign(object):
         :rtype: str
         """
         if not self.private:
-            log.info('Could not sign message {0!s}, no private key!'.format(s))
+            log.info(f'Could not sign message {s!s}, no private key!')
             # TODO: should we throw an exception in this case?
             return ''
 
@@ -773,13 +887,13 @@ class Sign(object):
         """
         r = False
         if not self.public:
-            log.info('Could not verify signature for message {0!s}, '
-                     'no public key!'.format(s))
+            log.info(f'Could not verify signature for message {s!s}, '
+                     'no public key!')
             return r
 
         sver = ''
         try:
-            sver, signature = six.text_type(signature).split(':')
+            sver, signature = str(signature).split(':')
         except ValueError:
             # if the signature does not contain a colon we assume an old style signature.
             pass
@@ -799,13 +913,102 @@ class Sign(object):
                     int_s = int(binascii.hexlify(sha256(to_bytes(s)).digest()), 16)
                     r = _slow_rsa_verify_raw(self.public, int(signature), int_s)
                 else:
-                    log.debug('Could not verify old style signature {0!s} '
-                              'for data {1:s}'.format(signature, s))
+                    log.debug(f'Could not verify old style signature {signature!s} '
+                              f'for data {s:s}')
         except Exception:
-            log.error("Failed to verify signature: {0!r}".format(s))
-            log.debug("{0!s}".format(traceback.format_exc()))
+            log.error(f"Failed to verify signature: {s!r}")
+            log.debug(f"{traceback.format_exc()!s}")
 
         return r
+
+
+_sign_object_lock = Lock()
+
+
+@dataclass
+class _CachedSignObject:
+    """
+    A Sign object together with a fingerprint of the key material it was loaded from.
+    """
+    key_material_version: tuple
+    sign_object: Sign
+
+
+def _read_key_file(key_file: str | None) -> bytes | None:
+    """
+    Read a key file, if one was given.
+
+    :param key_file: Name of a key file or None
+    :return: The contents of the file, or None if no file was given
+    """
+    if not key_file:
+        return None
+    with open(key_file, "rb") as key_file_handle:
+        return key_file_handle.read()
+
+
+def get_sign_object(private_key_file: str, public_key_file: str | None = None,
+                    check_private_key: bool = True) -> Sign:
+    """
+    Return a Sign object for the given key files and keep it in the app-local store.
+
+    Loading an RSA private key validates it, which takes about a hundred times longer than
+    creating the signature it enables. The audit log and the response signature use the same
+    key for every request, so the loaded key is kept in the app-local store and shared among
+    all threads of the application. This is safe because a loaded key holds no state between
+    operations: every signature builds its own context.
+
+    The key files are read on every call and the cached key is used only while their contents
+    still hash to the same value, so a key file that is replaced while the server is running
+    is picked up. Reading a key file costs a thousandth of parsing it, which is why the
+    contents are compared instead of the modification time: tools that rotate a key preserve
+    the modification time (``cp -p``, ``rsync -a``, restoring a backup), and two RSA keys of
+    the same size usually have the same file size. The key material is also read through the
+    configured name every time, so a key file that can no longer be read stops being used
+    instead of being served from the cache.
+
+    Failures are not cached, and a failed load drops the entry it was meant to replace: a key
+    file that is temporarily unavailable must not disable signing until the next restart, and
+    must not keep the superseded key in use either.
+
+    :param private_key_file: Name of the file containing the private key in PEM format
+    :param public_key_file: Name of the file containing the public key in PEM format. A Sign
+        object without a public key can sign, but it can not verify a signature.
+    :param check_private_key: Check the private key while loading it
+    :return: a Sign object
+    """
+    if not private_key_file:
+        # Without this, a missing PI_AUDIT_KEY_PRIVATE would yield a Sign object that has no
+        # key and signs everything with an empty signature.
+        raise TypeError("get_sign_object() needs the name of a file containing a private key.")
+    private_key = _read_key_file(private_key_file)
+    public_key = _read_key_file(public_key_file)
+    # The fingerprint describes the very bytes that are parsed below, so a key file that
+    # changes while this runs can not end up stored under the wrong fingerprint.
+    key_material_version = tuple(sha256(key).digest() if key is not None else None
+                                 for key in (private_key, public_key))
+    cache_key = (private_key_file, public_key_file, check_private_key)
+    sign_objects = get_app_local_store().setdefault("sign_objects", {})
+    cached = sign_objects.get(cache_key)
+    if cached is not None and cached.key_material_version == key_material_version:
+        return cached.sign_object
+    # Loading the key is the expensive part, so it happens under the lock. Otherwise every
+    # thread that arrives before the first one is done would load the key again.
+    with _sign_object_lock:
+        cached = sign_objects.get(cache_key)
+        if cached is not None and cached.key_material_version == key_material_version:
+            return cached.sign_object
+        was_cached = cached is not None
+        # The key files no longer hold what this entry was built from, so it must not survive
+        # a load that fails.
+        sign_objects.pop(cache_key, None)
+        sign_object = Sign(private_key, public_key, check_private_key=check_private_key)
+        sign_objects[cache_key] = _CachedSignObject(key_material_version, sign_object)
+        if was_cached:
+            log.info(f"The signing key in {private_key_file!s} changed and was loaded again.")
+        else:
+            log.debug(f"Loaded the signing keys from {private_key_file!s} and {public_key_file!s}.")
+        return sign_object
 
 
 def create_hsm_object(config):
@@ -825,7 +1028,7 @@ def create_hsm_object(config):
                                  "privacyidea.lib.security.default.DefaultSecurityModule")
     package_name, class_name = hsm_module_name.rsplit(".", 1)
     hsm_class = get_module_class(package_name, class_name, "setup_module")
-    log.info("initializing HSM class: {0!s}".format(hsm_class))
+    log.debug(f"initializing HSM class: {hsm_class}")
     if class_name == "DefaultSecurityModule":
         hsm_parameters = {"file": config.get("PI_ENCFILE")}
     else:
@@ -838,8 +1041,8 @@ def create_hsm_object(config):
                 hsm_parameters[param] = config.get(key)
         logging_params = dict(hsm_parameters)
         if "password" in logging_params:
-            logging_params["password"] = "XXXX"
-        log.info("calling HSM module with parameters {0}".format(logging_params))
+            logging_params["password"] = "XXXX"  # nosec B105 # Hide password
+        log.debug(f"calling HSM module with parameters {logging_params}")
 
     return hsm_class(hsm_parameters)
 
@@ -853,12 +1056,12 @@ def generate_otpkey(key_size=20):
     :return: hexlified key
     :rtype: str
     """
-    log.debug("generating key of size {0!s}".format(key_size))
+    log.debug(f"generating key of size {key_size!s}")
     return hexlify_and_unicode(geturandom(key_size))
 
 
-def generate_password(size=6, characters=string.ascii_lowercase +
-                        string.ascii_uppercase + string.digits, requirements=[]):
+def generate_password(size=6, characters=string.ascii_lowercase + string.ascii_uppercase + string.digits,
+                      requirements=[]):
     """
     Generate a random password of the specified length of the given characters
     with optional requirements
@@ -874,10 +1077,10 @@ def generate_password(size=6, characters=string.ascii_lowercase +
     if len(requirements) > size:
         log.info('The number of requirements is larger then the password length.')
     # add one random character from each string in the requirements list
-    passwd = [urandom.choice(str) for str in requirements]
+    passwd = [secrets.choice(str) for str in requirements]
     # fill the password until size with allowed characters
-    passwd.extend(urandom.choice(characters) for _x in range(size - len(requirements)))
-    # return shuffled password
+    passwd.extend(secrets.choice(characters) for _x in range(size - len(requirements)))
+    # Shuffle, so that we mix the requirements and the generic characters
     random.shuffle(passwd)
     return "".join(passwd)
 
@@ -896,7 +1099,7 @@ def generate_keypair(rsa_keysize=2048):
         public_exponent=65537,
         key_size=rsa_keysize,
         backend=default_backend()
-        )
+    )
     public_key = private_key.public_key()
     pem_priv = to_unicode(private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -906,3 +1109,276 @@ def generate_keypair(rsa_keysize=2048):
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.PKCS1))
     return pem_pub, pem_priv
+
+
+def get_elliptic_curve_instance(curve_name: str):
+    """
+    Returns an instance of the elliptic curve class for the given curve name.
+    It does not support x25519, x448, ed25519, ed448.
+
+    :param curve_name: The name of the elliptic curve to use, e.g. 'secp384r1'
+    :return: An EllipticCurve instance or None if the curve is not supported
+    """
+    class_instance = None
+    mod = "cryptography.hazmat.primitives.asymmetric.ec"
+    try:
+        m = importlib.import_module(mod)
+        cls = curve_name.upper()
+        class_obj = getattr(m, cls)
+        class_instance = class_obj()
+    except Exception as ex:  # pragma: no cover
+        log.debug(f"Could not import module {cls}: {ex}")
+
+    return class_instance
+
+
+def get_private_key_class(curve_name):
+    """
+    Returns the private key class of the given curve.
+    Only supports x25519, x448, ed25519, ed448
+
+    :param curve_name: The name of the elliptic curve to use, e.g. 'x25519'
+    :return: The private key class object (e.g. X25519PrivateKey) or None if the curve is not supported
+    """
+    class_obj = None
+    mod = "cryptography.hazmat.primitives.asymmetric"
+    try:
+        cls = f"{curve_name.capitalize()}PrivateKey"
+        m = importlib.import_module(f"{mod}.{curve_name.lower()}")
+        class_obj = getattr(m, cls)
+    except Exception as ex:  # pragma: no cover
+        log.debug(f"Could not import module {cls}: {ex}")
+
+    return class_obj
+
+
+def generate_keypair_ecc(curve_name: str) -> KeyPair:
+    """
+    Generates a key pair using the given elliptic curve.
+
+    :param curve_name: The name of the elliptic curve to use, e.g. 'secp384r1'
+    :return: A KeyPair dataclass containing the public_key and private_key which are either instances of the generic
+             classes EllipticCurvePrivateKey and EllipticCurvePublicKey or of a specific class for the curve such as
+             X25519PrivateKey and X25519PublicKey.
+    """
+    ecc_keys = KeyPair()
+    # private key
+    # first try to use the generic class passing the curve instance
+    curve = get_elliptic_curve_instance(curve_name)
+    if curve:
+        ecc_keys.private_key = ec.generate_private_key(curve)
+    else:
+        # try to use the specific class
+        key_class = get_private_key_class(curve_name)
+        if key_class:
+            ecc_keys.private_key = key_class.generate()
+        else:
+            raise ParameterError(f"Unsupported elliptic curve {curve_name}!")
+
+    # Generate public key based on private key
+    ecc_keys.public_key = ecc_keys.private_key.public_key()
+
+    return ecc_keys
+
+
+def ecc_key_pair_to_b64url_str(public_key: EllipticCurvePublicKey = None,
+                               private_key: EllipticCurvePrivateKey = None) -> KeyPair:
+    """
+    Encodes the given ECC key (pair) in urlsafe base64 to a string. If one key is None, an empty string is returned for
+    this key.
+
+    :param private_key: An EllipticCurvePrivateKey object or None if only a public key shall be encoded
+    :param public_key: An EllipticCurvePublicKey object or None if only a private key shall be encoded
+    :return: A KeyPair dataclass containing the private_key and public_key as strings in base64 encoding
+    """
+    str_keys = KeyPair("", "")
+    # Note: PEM only uses b64 not urlsafe
+    # TODO: Make this applicable for different encoding formats?
+    if private_key:
+        private_key_b64 = private_key.private_bytes(encoding=serialization.Encoding.PEM,
+                                                    format=serialization.PrivateFormat.PKCS8,
+                                                    encryption_algorithm=NoEncryption())
+        str_keys.private_key = private_key_b64.decode("utf-8")
+
+    if public_key:
+        public_key_b64 = public_key.public_bytes(encoding=serialization.Encoding.PEM,
+                                                 format=serialization.PublicFormat.SubjectPublicKeyInfo)
+        str_keys.public_key = public_key_b64.decode("utf-8")
+    return str_keys
+
+
+def b64url_str_key_pair_to_ecc_obj(public_key_str: str = None, private_key_str: str = None) -> KeyPair:
+    """
+    Converts public and private keys as base64url encoded strings to ECC key objects.
+    If only one key is given, None is returned for the other one.
+
+    :param public_key_str: The public key in base64url encoding
+    :param private_key_str: The private key in base64url encoding
+    :return: A tuple of (public_key, private_key) ecc public/private key objects or None if no string is provided
+    """
+    ecc_keys = KeyPair()
+    if private_key_str:
+        ecc_keys.private_key = serialization.load_pem_private_key(private_key_str.encode("utf-8"), password=None)
+
+    if public_key_str:
+        ecc_keys.public_key = serialization.load_pem_public_key(public_key_str.encode("utf-8"))
+
+    return ecc_keys
+
+
+def get_hash_algorithm_object(algorithm_name: str, default: HashAlgorithm = None) -> HashAlgorithm:
+    """
+    Returns the HashAlgorithm object for the given algorithm name.
+
+    :param algorithm_name: The name of the hash algorithm
+    :param default: The default hash algorithm object to use if the given one is not found
+    :return: The hash algorithm object
+    """
+    hash_algorithm = default
+    classes = hashes.__all__
+
+    # Find correct spelling
+    if algorithm_name not in classes:
+        # Try with capitalize and uppercase
+        if algorithm_name.capitalize() in classes:
+            algorithm_name = algorithm_name.capitalize()
+        elif algorithm_name.upper() in classes:
+            algorithm_name = algorithm_name.upper()
+
+    if algorithm_name in classes:
+        hash_class = getattr(hashes, algorithm_name)
+        hash_algorithm = hash_class()
+    else:
+        log.info(f"Unknown hash algorithm {algorithm_name}! Uses {default} instead.")
+    return hash_algorithm
+
+
+def sign_ecc(message: bytes, private_key: EllipticCurvePrivateKey, algorithm_name: str) -> dict[str, bytes | str]:
+    """
+    Signs a message with the given ecc private key.
+
+    :param message: The message to sign
+    :param private_key: The private key ecc object to sign the message
+    :param algorithm_name: The name of the hash algorithm to use
+    :return: The signature and the name of the hash algorithm that was used as dictionary such as:
+
+        ::
+            {
+                "signature": <signature, bytes>,
+                "hash_algorithm": <algorithm_name, str>
+            }
+    """
+    if isinstance(message, str):
+        message = message.encode("utf-8")
+    hash_algorithm = get_hash_algorithm_object(algorithm_name, default=hashes.SHA256())
+    ecdsa_algorithm = ec.ECDSA(hash_algorithm)
+    signature = private_key.sign(message, ecdsa_algorithm)
+    return {"signature": signature, "hash_algorithm": hash_algorithm.name}
+
+
+def verify_ecc(message: bytes, signature: bytes, public_key: EllipticCurvePublicKey,
+               algorithm_name: str) -> dict[str, bool | str]:
+    """
+    Verifies a signature with the given public key.
+    Raises InvalidSignature if the signature is invalid.
+
+    :param message: The message that was signed
+    :param signature: The signature to verify
+    :param public_key: The public key ecc object to verify the signature
+    :param algorithm_name: The name of the hash algorithm to use
+    :return: Dictionary containing the key "valid" which is True if the signature is valid
+        and the key "hash_algorithm" containing the name of the hash algorithm that was used.
+    """
+    if isinstance(message, str):
+        message = message.encode("utf-8")
+    hash_algorithm = get_hash_algorithm_object(algorithm_name, default=hashes.SHA256())
+    ecdsa_algorithm = ec.ECDSA(hash_algorithm)
+    if public_key:
+        public_key.verify(signature, message, ecdsa_algorithm)
+        valid = True
+    else:
+        valid = False
+        log.debug("No public key provided for signature verification!")
+    return {"valid": valid, "hash_algorithm": hash_algorithm.name}
+
+
+def ecdh_key_exchange(private_key: X25519PrivateKey, public_key: X25519PublicKey) -> bytes:
+    """
+    Performs an ECDH key exchange.
+    The shared key is calculated from the private and public key. Afterward, a key derivation is performed.
+
+    :param private_key: The private key ecc object
+    :param public_key: The public key ecc object
+    :return: The shared key as bytes
+    """
+    shared_key = private_key.exchange(public_key)
+
+    # Perform key derivation.
+    derived_key = HKDF(algorithm=hashes.SHA256(),
+                       length=32,
+                       salt=None,
+                       info=None,
+                       ).derive(shared_key)
+    return derived_key
+
+
+def encrypt_aes(message: bytes, shared_key: bytes) -> dict[str, str]:
+    """
+    Encrypts a message with the given shared key using AES (Advanced Encryption Standard) and GCM (Galois Counter Mode).
+
+    :param message: The message to encrypt
+    :param shared_key: The shared key to use for encryption
+    :return: Dictionary containing the encrypted message and further parameters required for the decryption such as:
+
+        ::
+            {
+                "cipher": <encrypted message base64 encoded, str>,
+                "algorithm": <algorithm_name, str>,
+                "mode": <mode_name, str>,
+                "init_vector": <init_vector base64 encoded, str>,
+                "tag": <tag base64 encoded, str>
+            }
+    """
+    init_vector = geturandom(16)
+    cipher = Cipher(algorithms.AES(shared_key), modes.GCM(init_vector))
+    encryptor = cipher.encryptor()
+    secret = encryptor.update(message) + encryptor.finalize()
+
+    # convert to strings
+    secret_str = base64.urlsafe_b64encode(secret).decode("utf-8")
+    init_vector_str = base64.urlsafe_b64encode(init_vector).decode("utf-8")
+    tag_str = base64.urlsafe_b64encode(encryptor.tag).decode("utf-8")
+
+    res = {"cipher": secret_str, "algorithm": "AES", "mode": "GCM", "init_vector": init_vector_str,
+           "tag": tag_str}
+    return res
+
+
+def decrypt_aes(secret: bytes, shared_key: bytes, params: dict) -> bytes:
+    """
+    Decrypts a message with the given key.
+
+    :param secret: The encrypted message
+    :param shared_key: The shared key to use for decryption
+    :param params: The Further parameters for the decryption depending on the algorithm like
+
+        ::
+            {
+                "mode": "GCM",
+                "init_vector": "VPJwIAUl8IYVdbKAb6vu1w==",
+                "tag": "Wzuu8O5WYI_xf4Hb14rEBA=="
+            }
+
+    :return: The decrypted message
+    """
+    if isinstance(secret, str):
+        secret = base64.urlsafe_b64decode(secret)
+
+    init_vector = base64.urlsafe_b64decode(params['init_vector'])
+    tag = base64.urlsafe_b64decode(params['tag'])
+    decryptor = Cipher(algorithms.AES(shared_key), modes.GCM(init_vector, tag), ).decryptor()
+
+    # Decryption gets us the authenticated plaintext.
+    # If the tag does not match an InvalidTag exception will be raised.
+    message = decryptor.update(secret) + decryptor.finalize()
+    return message

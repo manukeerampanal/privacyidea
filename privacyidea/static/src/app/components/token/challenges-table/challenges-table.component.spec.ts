@@ -1,0 +1,85 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { ComponentFixture, TestBed } from "@angular/core/testing";
+
+import { provideHttpClient } from "@angular/common/http";
+import { provideHttpClientTesting } from "@angular/common/http/testing";
+import { NotificationService } from "@services/notification/notification.service";
+import { ChallengesService } from "@services/token/challenges/challenges.service";
+import {
+  MockChallengesService,
+  MockContentService,
+  MockNotificationService,
+  MockTableUtilsService,
+  MockTokenService
+} from "@testing/mock-services";
+import { ChallengesTableComponent } from "./challenges-table.component";
+import { TokenService } from "@services/token/token.service";
+import { TableUtilsService } from "@services/table-utils/table-utils.service";
+import { ContentService } from "@services/content/content.service";
+import { AuthService } from "@services/auth/auth.service";
+import { MockAuthService } from "@testing/mock-services/mock-auth-service";
+import { FilterValue } from "@core/models/filter_value/filter_value";
+import { expectsTableStateGating } from "@testing/table-state-gating";
+
+describe("ChallengesTableComponent", () => {
+  let component: ChallengesTableComponent;
+  let fixture: ComponentFixture<ChallengesTableComponent>;
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [ChallengesTableComponent],
+      providers: [
+        { provide: AuthService, useClass: MockAuthService },
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        { provide: NotificationService, useClass: MockNotificationService },
+        { provide: TokenService, useClass: MockTokenService },
+        { provide: TableUtilsService, useClass: MockTableUtilsService },
+        { provide: ChallengesService, useClass: MockChallengesService },
+        { provide: ContentService, useClass: MockContentService }
+      ]
+    }).compileComponents();
+
+    fixture = TestBed.createComponent(ChallengesTableComponent);
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+  });
+
+  it("gates the table on its read right, row count and filter", () => {
+    expectsTableStateGating({
+      state: component.tableState,
+      right: "getchallenges"
+    });
+  });
+
+  it("should create", () => {
+    expect(component).toBeTruthy();
+  });
+
+  describe("inline cell filter", () => {
+    it("replaces the column's filter with the clicked value, matched exactly", () => {
+      const challengesService = TestBed.inject(ChallengesService) as unknown as MockChallengesService;
+      challengesService.activeFilter.set(new FilterValue({ value: "serial: OLD" }));
+
+      component.addFilterValue("serial", "HOTP1");
+
+      expect(challengesService.activeFilter().getValueOfKey("serial")).toBe("=HOTP1");
+    });
+  });
+});

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2016-04-04 Cornelius Kölbel <cornelius@privacyidea.org>
 #             Move the API signature static methods to functions.
 #  2016-03-23 Jochen Hein <jochen@jochen.org>
@@ -53,59 +51,73 @@ This code is tested in tests/test_lib_tokens_yubikey.py
 """
 
 import logging
+
+from privacyidea.lib.error import EnrollmentError
 from privacyidea.lib.log import log_with
 from privacyidea.lib.policydecorators import challenge_response_allowed
 from privacyidea.lib.tokenclass import TokenClass
 from privacyidea.lib.utils import (modhex_decode, hexlify_and_unicode, checksum,
                                    to_bytes, b64encode_and_unicode)
-import binascii
-from privacyidea.lib.decorators import check_token_locked
-from privacyidea.api.lib.utils import getParam
+from privacyidea.lib.decorators import check_token_locked, check_token_otp_length
+from privacyidea.lib.params import get_optional
 import datetime
 import base64
 import hmac
 from hashlib import sha1
 from privacyidea.lib.config import get_from_config
-from privacyidea.lib.tokenclass import TOKENKIND
+from privacyidea.lib.tokenclass import Tokenkind
 from privacyidea.lib import _
-from privacyidea.lib.policy import SCOPE, ACTION, GROUP
+from privacyidea.lib.policy import SCOPE, GROUP
+from privacyidea.lib.policies.actions import PolicyAction
 
-optional = True
-required = False
 
 
 log = logging.getLogger(__name__)
 
 
+
+# Keys that are part of the Yubico Validation Protocol v2 and must be included
+# in the HMAC signature.  Everything else in request.all_data (e.g. 'ttype',
+# or any future privacyIDEA-internal key) is silently ignored.  This set is the
+# union of request fields (id, nonce, otp, sl, timeout, timestamp) and response
+# fields (otp, nonce, t, status, timestamp, sessioncounter, sessionuse, sl), so
+# the same helper can both sign outgoing requests and verify server responses.
+# https://developers.yubico.com/OTP/Specifications/OTP_validation_protocol.html
+_YUBICO_PROTOCOL_KEYS = frozenset({
+    "id", "nonce", "otp", "sl", "timeout", "timestamp",
+    "t", "status", "sessioncounter", "sessionuse",
+})
+
+
 def yubico_api_signature(data, api_key):
     """
-    Get a dictionary "data", sort the dictionary by the keys
-    and sign it HMAC-SHA1 with the api_key
+    Sign a subset of *data* with HMAC-SHA1 using *api_key*.
 
-    :param data: The data to be signed
+    Only the keys defined by the Yubico Validation Protocol v2 are included in
+    the signature.  All other keys (e.g. ``h``, ``ttype``, or any
+    privacyIDEA-internal key that may be present in ``request.all_data``) are
+    ignored, so adding new parameters to the request can never silently corrupt
+    signature verification.
+
+    :param data: The request parameters (may contain extra keys)
     :type data: dict
-    :param api_key: base64 encoded API key
-    :type api_key: basestring
-    :return: base64 encoded signature
+    :param api_key: base64-encoded API key
+    :type api_key: str
+    :return: base64-encoded HMAC-SHA1 signature
+    :rtype: str
     """
-    r = dict(data)
-    if 'h' in r:
-        del r['h']
-    keys = sorted(r.keys())
-    data_string = ""
-    for key in keys:
-        data_string += "{0!s}={1!s}&".format(key, r.get(key))
-    data_string = data_string.strip("&")
+    r = {k: v for k, v in data.items() if k in _YUBICO_PROTOCOL_KEYS}
+    data_string = "&".join(
+        f"{k!s}={r[k]!s}" for k in sorted(r)
+    )
     api_key_bin = base64.b64decode(api_key)
-    # generate the signature
     h = hmac.new(api_key_bin, to_bytes(data_string), sha1).digest()
-    h_b64 = b64encode_and_unicode(h)
-    return h_b64
+    return b64encode_and_unicode(h)
 
 
 def yubico_check_api_signature(data, api_key, signature=None):
     """
-    Verfiy the signature of the data.
+    Verify the signature of the data.
     Either provide the signature as parameter or take it from the data
 
     :param data: The data to be signed
@@ -125,12 +137,12 @@ class YubikeyTokenClass(TokenClass):
     """
     The Yubikey Token in the Yubico AES mode
     """
+    owned_tokeninfo_prefixes = frozenset({"yubikey."})
 
     def __init__(self, db_token):
         TokenClass.__init__(self, db_token)
-        self.set_type(u"yubikey")
+        self.set_type("yubikey")
         self.hKeyRequired = True
-
 
     @staticmethod
     def get_class_type():
@@ -165,12 +177,12 @@ class YubikeyTokenClass(TokenClass):
                'ui_enroll': ["admin", "user"],
                'policy': {
                    SCOPE.ENROLL: {
-                       ACTION.MAXTOKENUSER: {
+                       PolicyAction.MAXTOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of Yubikey tokens assigned."),
                            'group': GROUP.TOKEN
                        },
-                       ACTION.MAXACTIVETOKENUSER: {
+                       PolicyAction.MAXACTIVETOKENUSER: {
                            'type': 'int',
                            'desc': _(
                                "The user may only have this maximum number of active Yubikey tokens assigned."),
@@ -212,7 +224,7 @@ class YubikeyTokenClass(TokenClass):
 
         return res
 
-    @log_with(log)
+    @log_with(log, hide_args=[1])
     @challenge_response_allowed
     def is_challenge_request(self, passw, user=None, options=None):
         """
@@ -230,13 +242,12 @@ class YubikeyTokenClass(TokenClass):
         trigger_challenge = False
         options = options or {}
         pin_match = self.check_pin(passw, user=user, options=options)
-        if pin_match is True:
+        if pin_match:
             trigger_challenge = True
-
         return trigger_challenge
 
-
     @log_with(log)
+    @check_token_otp_length
     @check_token_locked
     def check_otp(self, anOtpVal, counter=None, window=None, options=None):
         """
@@ -257,12 +268,14 @@ class YubikeyTokenClass(TokenClass):
         :type window: int
 
         :param options: the dict, which could contain token specific info
-        :type options: dict
+        :type options: dict or None
 
         :return: the counter state or an error code (< 0):
-        -1 if the OTP is old (counter < stored counter)
-        -2 if the private_uid sent in the OTP is wrong (different from the one stored with the token)
-        -3 if the CRC verification fails
+
+            * -1 if the OTP is old (counter < stored counter)
+            * -2 if the private_uid sent in the OTP is wrong (different from the one stored with the token)
+            * -3 if the CRC verification fails
+
         :rtype: int
 
         """
@@ -270,6 +283,8 @@ class YubikeyTokenClass(TokenClass):
 
         serial = self.token.serial
         secret = self.token.get_otpkey()
+
+        anOtpVal = anOtpVal.lower()
 
         # The prefix is the characters in front of the last 32 chars
         yubi_prefix = anOtpVal[:-32]
@@ -280,6 +295,7 @@ class YubikeyTokenClass(TokenClass):
             otp_bin = modhex_decode(yubi_otp)
         except KeyError:
             # The OTP value is no yubikey aes otp value and can not be decoded
+            log.debug("OTP could not be decoded")
             return -4
 
         msg_bin = secret.aes_ecb_decrypt(otp_bin)
@@ -289,53 +305,51 @@ class YubikeyTokenClass(TokenClass):
         # occupies the last 2 bytes of the decrypted OTP value. Calculating the
         # CRC-16 checksum of the whole decrypted OTP should give a fixed
         # residual
-        # of 0xf0b8 (see Yubikey-Manual - Chapter 6: Implementation details).
+        # of 0xf0b8 (see Yubikey-Manual - Chapter 6: Implementation details,
+        # https://downloads.yubico.com/support/yubico_YubiKey-Technical-Manual-v3.3_2014.pdf).
         crc16 = checksum(msg_bin)
-        log.debug("calculated checksum (61624): {0!r}".format(crc16))
+        log.debug(f"calculated checksum (61624): {crc16!r}")
         if crc16 != 0xf0b8:  # pragma: no cover
-            log.warning("CRC checksum for token {0!r} failed".format(serial))
+            log.info(f"CRC checksum for token {serial!r} failed")
             return -3
 
         uid = msg_hex[0:12]
-        log.debug("uid: {0!r}".format(uid))
-        log.debug("prefix: {0!r}".format(yubi_prefix))
+        log.debug(f"prefix: {yubi_prefix!r}")
         # usage_counter can go from 1 – 0x7fff
         usage_counter = msg_hex[12:16]
-        timestamp = msg_hex[16:22]
+        _timestamp = msg_hex[16:22]
         # session counter can go from 00 to 0xff
         session_counter = msg_hex[22:24]
-        random = msg_hex[24:28]
-        crc = msg_hex[28:]
-        log.debug("decrypted: usage_count: {0!r}, session_count: {1!r}".format(usage_counter, session_counter))
+        _random = msg_hex[24:28]
+        _crc = msg_hex[28:]
+        log.debug(f"decrypted: usage_count: {usage_counter!r}, session_count: {session_counter!r}")
 
         # create the counter as integer
         # Note: The usage counter is stored LSB!
 
         count_hex = usage_counter[2:4] + usage_counter[0:2] + session_counter
         count_int = int(count_hex, 16)
-        log.debug('decrypted counter: {0!r}'.format(count_int))
+        log.debug(f'decrypted counter: {count_int!r}')
 
         tokenid = self.get_tokeninfo("yubikey.tokenid")
         if not tokenid:
-            log.debug("Got no tokenid for {0!r}. Setting to {1!r}.".format(serial, uid))
+            log.debug(f"Got no tokenid for {serial!r}. Initializing.")
             tokenid = uid
-            self.add_tokeninfo("yubikey.tokenid", tokenid)
+            self.write_tokeninfo("yubikey.tokenid", tokenid)
 
         prefix = self.get_tokeninfo("yubikey.prefix")
         if not prefix:
-            log.debug("Got no prefix for {0!r}. Setting to {1!r}.".format(serial, yubi_prefix))
-            self.add_tokeninfo("yubikey.prefix", yubi_prefix)
+            log.debug(f"Got no prefix for {serial!r}. Setting to {yubi_prefix!r}.")
+            self.write_tokeninfo("yubikey.prefix", yubi_prefix)
 
         if tokenid != uid:
             # wrong token!
-            log.warning("The wrong token was presented for %r. "
-                        "Got %r, expected %r."
-                        % (serial, uid, tokenid))
+            log.warning(f"The wrong token was presented for {serial!r}.")
             return -2
 
         # TODO: We also could check the timestamp
         # see http://www.yubico.com/wp-content/uploads/2013/04/YubiKey-Manual-v3_1.pdf
-        log.debug('compare counter to database counter: {0!r}'.format(self.token.count))
+        log.debug(f'compare counter to database counter: {self.token.count!r}')
         if count_int >= self.token.count:
             res = count_int
             # on success we save the used counter
@@ -351,7 +365,7 @@ class YubikeyTokenClass(TokenClass):
         :param api_id: The base64 encoded API ID
         :return: the base64 encoded API Key or None
         """
-        api_key = get_from_config("yubikey.apiid.{0!s}".format(api_id))
+        api_key = get_from_config(f"yubikey.apiid.{api_id!s}")
         return api_key
 
     @classmethod
@@ -362,7 +376,7 @@ class YubikeyTokenClass(TokenClass):
 
         The endpoint /ttype/yubikey is used for the Yubico validate request
         according to
-        https://developers.yubico.com/yubikey-val/Validation_Protocol_V2.0.html
+        https://developers.yubico.com/OTP/Specifications/OTP_validation_protocol.html
 
         :param request: The Flask request
         :param g: The Flask global object g
@@ -374,13 +388,13 @@ class YubikeyTokenClass(TokenClass):
         :query otp: The OTP from the yubikey in the yubikey mode
         :query nonce: 16-40 bytes of random data
 
-        Optional parameters h, timestamp, sl, timeout are not supported at the
+        Optional parameters timestamp, sl, timeout are not supported at the
         moment.
         """
-        id = getParam(request.all_data, "id")
-        otp = getParam(request.all_data, "otp")
-        nonce = getParam(request.all_data, "nonce")
-        signature = getParam(request.all_data, "h")
+        id = get_optional(request.all_data, "id")
+        otp = get_optional(request.all_data, "otp")
+        nonce = get_optional(request.all_data, "nonce")
+        signature = get_optional(request.all_data, "h")
         status = "MISSING_PARAMETER"
 
         timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ%f")
@@ -449,26 +463,24 @@ h={h}
         if prefix[:2] != "vv" and prefix[:2] != "cc":
             try:
                 # Keep the backward compatibility
-                serialnum = "UBAM" + modhex_decode(prefix)
+                serialnum = "UBAM" + str(modhex_decode(prefix))
                 for i in range(1, 3):
-                    s = "{0!s}_{1!s}".format(serialnum, i)
+                    s = f"{serialnum!s}_{i!s}"
                     toks = get_tokens(serial=s, tokentype='yubikey')
                     token_list.extend(toks)
             except TypeError as exx:  # pragma: no cover
-                log.error("Failed to convert serialnumber: {0!r}".format(exx))
+                log.error(f"Failed to convert serialnumber: {exx!r}")
 
         # Now, we see, if the prefix matches the new version
         if not token_list:
             # If we did not find the token via the serial number, we also
             # search for the yubikey.prefix in the tokeninfo.
             token_candidate_list = get_tokens(tokentype='yubikey',
-                                              tokeninfo={"yubikey.prefix":
-                                                             prefix})
+                                              tokeninfo={"yubikey.prefix": prefix})
             token_list.extend(token_candidate_list)
 
         if not token_list:
-            opt['action_detail'] = ("The prefix {0!s} could not be found!".format(
-                                    prefix))
+            opt['action_detail'] = (f"The prefix {prefix!s} could not be found!")
             return res, opt
 
         (res, opt) = check_token_list(token_list, passw, allow_reset_all_tokens=True)
@@ -477,9 +489,12 @@ h={h}
     @log_with(log)
     def update(self, param, reset_failcount=True):
         update_params = param.copy()
+
         # As the secret is usually copy-pasted from the Yubikey personalization GUI,
         # which separates hexlified bytes by spaces, we remove all spaces from the OTP key.
         if "otpkey" in update_params:
             update_params["otpkey"] = update_params["otpkey"].replace(" ", "")
+        if not len(update_params["otpkey"]) == 32:
+            raise EnrollmentError("The otpkey must be 32 characters long for yubikey token in AES mode")
         TokenClass.update(self, update_params, reset_failcount)
-        self.add_tokeninfo("tokenkind", TOKENKIND.HARDWARE)
+        self.write_tokeninfo("tokenkind", Tokenkind.HARDWARE)

@@ -1,0 +1,110 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { HttpClient, HttpHeaders } from "@angular/common/http";
+import { inject, Injectable, signal, WritableSignal } from "@angular/core";
+import { PiResponse } from "@app/app.component";
+import { BEARER_TOKEN_STORAGE_KEY } from "@core/constants";
+import { environment } from "@env/environment";
+import { LocalService, LocalServiceInterface } from "@services/local/local.service";
+import { VersioningService, VersioningServiceInterface } from "@services/version/version.service";
+import { of } from "rxjs";
+import { catchError } from "rxjs/operators";
+
+export interface AppConfig {
+  remote_user: string;
+  force_remote_user: boolean;
+  password_reset: boolean;
+  hsm_ready: boolean;
+  customization: string;
+  realms: string;
+  logo: string;
+  show_node: string;
+  external_links: boolean;
+  login_text: string;
+  gdpr_link: string;
+  translation_warning: boolean;
+  passkey_login: string;
+}
+
+export interface ConfigServiceInterface {
+  config: WritableSignal<AppConfig>;
+
+  loadConfig(): void;
+}
+
+@Injectable({ providedIn: "root" })
+export class ConfigService implements ConfigServiceInterface {
+  private readonly versioningService: VersioningServiceInterface = inject(VersioningService);
+  private readonly localService: LocalServiceInterface = inject(LocalService);
+  private readonly http = inject(HttpClient);
+  config = signal({
+    remote_user: "",
+    force_remote_user: false,
+    password_reset: false,
+    hsm_ready: false,
+    customization: "",
+    realms: "",
+    logo: "",
+    show_node: "",
+    external_links: false,
+    login_text: "",
+    gdpr_link: "",
+    translation_warning: false,
+    passkey_login: "show"
+  });
+
+  loadConfig() {
+    // loadConfig() runs at app bootstrap, before authData is populated, so read
+    // the stored bearer token directly. Sending it lets the backend recognize an
+    // authenticated reload and keep returning the version even when the
+    // hide_version policy is active; an anonymous first load sends an empty
+    // header and correctly receives the hidden (blanked) version.
+    const token = this.localService.getData(BEARER_TOKEN_STORAGE_KEY);
+    const headers = token ? new HttpHeaders({ "PI-Authorization": token }) : undefined;
+    this.http
+      .get<PiResponse<AppConfig>>(`${environment.proxyUrl}/config`, { headers })
+      .pipe(
+        catchError((error) => {
+          console.error("Failed to load config:", error);
+          return of({
+            id: 0,
+            jsonrpc: "",
+            detail: {},
+            result: { status: false, value: this.config() },
+            signature: "",
+            time: 0,
+            version: "",
+            versionnumber: ""
+          });
+        })
+      )
+      .subscribe((data) => {
+        const configValue = data.result?.value;
+
+        if (data.result?.status && configValue) {
+          this.config.set(configValue);
+        } else {
+          console.error("Failed to load config: Invalid response", data);
+          return;
+        }
+
+        this.versioningService.rawVersion.set(data.versionnumber ?? "");
+      });
+  }
+}

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 # 2018-01-15 friedrich.weber@netknights.it
 #            Remove unused routines, redesign serialization step,
 #            adapt to privacyIDEA, refactoring
@@ -50,22 +48,23 @@ vasco_dll = None
 try:
     vasco_library_path = get_app_config_value("PI_VASCO_LIBRARY")
     if vasco_library_path is not None: # pragma: no cover
-        log.info(u"Loading VASCO library from {!s} ...".format(vasco_library_path))
+        log.info(f"Loading VASCO library from {vasco_library_path!s} ...")
         vasco_dll = CDLL(vasco_library_path)
     else:
-        log.info(u"PI_VASCO_LIBRARY option is not set, functionality disabled")
+        log.debug("PI_VASCO_LIBRARY option is not set, functionality disabled")
 except Exception as exx:
-    log.warning(u"Could not load VASCO library: {!r}".format(exx))
+    log.warning(f"Could not load VASCO library: {exx!r}")
+
 
 def check_vasco(fn):
-    '''
+    """
     This is a decorator:
     checks if vasco dll is defined,
     it then runs the function otherwise raises RuntimeError
 
     :param fn: function - the to be called function
     :return: return the function call result
-    '''
+    """
     def new(*args, **kw):
         if not vasco_dll:
             raise RuntimeError("No VASCO library available")
@@ -119,26 +118,29 @@ def vasco_verify(data, params, password, challenge=b"\0" * 16):
                                        password_buffer,
                                        challenge_buffer)
 
-    return (res, data)
+    return res, data
 
 
 def vasco_serialize(datablob):
     """
     Convert the given ``TDigipassBlob`` object to a bytestring and return it
+
     :param datablob: Digipass blob
     :return: bytestring
     """
     tokendata = memoryview(datablob).tobytes()
-    assert len(tokendata) == 248
+    if len(tokendata) != 248:  # pragma: no cover
+        raise ParameterError("Datablob has incorrect size")
     return tokendata
 
+
 def vasco_deserialize(tokendata):
-    '''
+    """
     Convert the given bytestring to a ``TDigipassBlob`` object and return it
 
     :param tokendata: A string of 248 bytes
     :return: The Vasco data blob
-    '''
+    """
     if len(tokendata) != 248:
         raise ParameterError("Data blob has incorrect size")
     return TDigipassBlob.from_buffer_copy(tokendata)
@@ -178,4 +180,4 @@ def vasco_otp_check(otpkey, otp):
     (res, data) = vasco_verify(data, kp, otp)
     otpkey = vasco_serialize(data)
 
-    return (res, otpkey)
+    return res, otpkey

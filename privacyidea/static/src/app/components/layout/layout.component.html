@@ -1,0 +1,68 @@
+<!--
+ (c) NetKnights GmbH 2025,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div
+  aria-label="Layout"
+  class="layout"
+  [class.with-secondary-toolbar]="hasSecondaryToolbar()"
+  i18n-aria-label="@@nav.layout">
+  <main
+    aria-label="Main Router Outlet"
+    i18n-aria-label="@@nav.mainRouterOutlet">
+    @if (authService.role() === "admin") {
+      <div class="admin-layout">
+        <app-navigation />
+        <div
+          class="admin-content"
+          [class.admin-content-flush]="contentService.onDashboard()">
+          <router-outlet></router-outlet>
+        </div>
+      </div>
+    } @else {
+      <div class="self-service-layout">
+        @if (authService.tokenWizard() || authService.containerWizard().enabled) {
+          <app-navigation-self-service-wizard class="flex-size-1" />
+        } @else {
+          <app-navigation-self-service class="flex-size-1" />
+        }
+        <div class="selfservice-content-container width-100">
+          <router-outlet></router-outlet>
+        </div>
+      </div>
+    }
+    @if (showProgressBar()) {
+      @if (showLoadingUrls()) {
+        <div class="loading-urls-container">
+          @for (group of loadingGroups(); track group.endpoint) {
+            <span class="loading-url">
+              {{ group.endpoint.slice(1) }}
+              @if (group.count > 1) {
+                <span class="loading-url__count">&times;{{ group.count }}</span>
+              }
+            </span>
+            <br />
+          }
+        </div>
+      }
+      <mat-progress-bar
+        class="progress-bar"
+        mode="indeterminate" />
+    }
+    <app-debug-notice />
+  </main>
+</div>

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2018-06-11 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Add dynamic email
 #  2018-04-14 Paul Lettich <paul.lettich@netknights.it>
@@ -38,34 +36,39 @@ You can attach token actions like enable, disable, delete, unassign,... of the
  * all disabled tokens
  * ...
 """
+
+from privacyidea.lib.container import add_token_to_container
+from privacyidea.lib.error import ParameterError, PolicyError, ResourceNotFoundError
 from privacyidea.lib.eventhandler.base import BaseEventHandler
+from privacyidea.lib.machine import attach_token
 from privacyidea.lib.token import (get_token_types, set_validity_period_end,
                                    set_validity_period_start, set_pin)
 from privacyidea.lib.crypto import generate_password
 from privacyidea.lib.realm import get_realms
 from privacyidea.lib.token import (set_realms, remove_token, enable_token,
                                    unassign_token, init_token, set_description,
-                                   set_count_window, add_tokeninfo,
+                                   set_count_window, add_tokeninfo, get_tokeninfo,
                                    set_failcounter, delete_tokeninfo,
                                    get_one_token, set_max_failcount,
-                                   assign_tokengroup, unassign_tokengroup)
+                                   assign_tokengroup, unassign_tokengroup,
+                                   set_token_type_info)
 from privacyidea.lib.utils import (parse_date, is_true,
-                                   parse_time_offset_from_now)
-from privacyidea.lib.tokenclass import DATE_FORMAT, AUTH_DATE_FORMAT
+                                   parse_time_offset_from_now,
+                                   create_tag_dict)
+from privacyidea.lib.tokenclass import DATE_FORMAT
+from privacyidea.lib.user import User
 from privacyidea.lib.smtpserver import get_smtpservers
 from privacyidea.lib.smsprovider.SMSProvider import get_smsgateway
 from privacyidea.lib.tokengroup import get_tokengroups
 from privacyidea.lib import _
 import logging
-import datetime
 import yaml
 import json
-from dateutil.tz import tzlocal
 
 log = logging.getLogger(__name__)
 
 
-class ACTION_TYPE(object):
+class ACTION_TYPE:
     """
     Allowed actions
     """
@@ -79,6 +82,7 @@ class ACTION_TYPE(object):
     SET_VALIDITY = "set validity"
     SET_COUNTWINDOW = "set countwindow"
     SET_TOKENINFO = "set tokeninfo"
+    INCREASE_TOKENINFO = "increase tokeninfo"
     SET_FAILCOUNTER = "set failcounter"
     SET_MAXFAIL = "set max failcount"
     CHANGE_FAILCOUNTER = "change failcounter"
@@ -86,14 +90,64 @@ class ACTION_TYPE(object):
     SET_RANDOM_PIN = "set random pin"
     ADD_TOKENGROUP = "add tokengroup"
     REMOVE_TOKENGROUP = "remove tokengroup"
+    ATTACH_APPLICATION = "attach application"
 
 
-class VALIDITY(object):
+class TOKEN_APPLICATIONS:
+    SSH = "ssh"
+    OFFLINE = "offline"
+    LUKS = "luks"
+
+
+class VALIDITY:
     """
     Allowed validity options
     """
     START = "valid from"
     END = "valid till"
+
+
+def _write_tokeninfo_of_handler(serial: str, key: str, value: str) -> None:
+    """
+    Write a token info entry on behalf of a token event handler.
+
+    A handler is configured by an administrator and runs on the server, so it may write the entries a token
+    class maintains but allows to be set, e.g. the acceptance window of a TOTP token, which is the documented
+    way to widen that window while a token is synchronized for the first time. An entry that carries what the
+    token authenticates with is refused, and the handler logs it instead of failing.
+
+    Whether a key belongs to the token depends on its type, e.g. "timeWindow" is what a TOTP token accepts an
+    OTP within, while it is free-form on an HOTP token, so the free-form write is tried first and only a
+    refusal leads to the write of a maintained entry.
+
+    :param serial: The serial number of the token
+    :param key: The token info key to write
+    :param value: The value to write
+    """
+    try:
+        add_tokeninfo(serial, key, value)
+        return
+    except PolicyError as error:
+        refusal = str(error)
+    try:
+        if set_token_type_info(serial, {key: value}):
+            return
+    except ParameterError:
+        pass
+    log.warning(f"The event handler can not set the token info '{key}' of token {serial}: {refusal}")
+
+
+def _delete_tokeninfo_of_handler(serial: str, key: str) -> None:
+    """
+    Delete a token info entry on behalf of a token event handler, see _write_tokeninfo_of_handler().
+
+    :param serial: The serial number of the token
+    :param key: The token info key to delete
+    """
+    try:
+        delete_tokeninfo(serial, key)
+    except PolicyError as error:
+        log.warning(f"The event handler can not delete the token info '{key}' of token {serial}: {error!s}")
 
 
 class TokenEventHandler(BaseEventHandler):
@@ -102,14 +156,14 @@ class TokenEventHandler(BaseEventHandler):
 
     It also returns a list of allowed action and conditions
 
-    It returns an identifier, which can be used in the eventhandlig definitions
+    It returns an identifier, which can be used in the event handling definitions
     """
 
     identifier = "Token"
     description = "This event handler can trigger new actions on tokens."
 
     @property
-    def allowed_positions(cls):
+    def allowed_positions(self):
         """
         This returns the allowed positions of the event handler definition.
         :return: list of allowed positions
@@ -117,7 +171,7 @@ class TokenEventHandler(BaseEventHandler):
         return ["post", "pre"]
 
     @property
-    def actions(cls):
+    def actions(self):
         """
         This method returns a dictionary of allowed actions and possible
         options in this handler module.
@@ -125,196 +179,363 @@ class TokenEventHandler(BaseEventHandler):
         :return: dict with actions
         """
         realm_list = list(get_realms())
-        actions = {ACTION_TYPE.SET_TOKENREALM:
-                       {"realm":
-                            {"type": "str",
-                             "required": True,
-                             "description": _("set a new realm of the token"),
-                             "value": realm_list},
-                        "only_realm":
-                            {"type": "bool",
-                             "description": _("The new realm will be the only "
-                                              "realm of the token. I.e. all "
-                                              "other realms will be removed "
-                                              "from this token. Otherwise the "
-                                              "realm will be added to the token.")
-                            }
+        actions = {
+            ACTION_TYPE.SET_TOKENREALM:
+                {
+                    "realm":
+                        {
+                            "type": "str",
+                            "required": True,
+                            "description": _("set a new realm of the token"),
+                            "value": realm_list
                         },
-                   ACTION_TYPE.DELETE: {},
-                   ACTION_TYPE.UNASSIGN: {},
-                   ACTION_TYPE.DISABLE: {},
-                   ACTION_TYPE.ENABLE: {},
-                   ACTION_TYPE.SET_RANDOM_PIN: {
-                       "length":
-                           {"type": "int",
+                    "only_realm":
+                        {
+                            "type": "bool",
+                            "description": _("The new realm will be the only "
+                                             "realm of the token. I.e. all "
+                                             "other realms will be removed "
+                                             "from this token. If disabled, the "
+                                             "realm will be added to the token.")
+                        }
+                },
+            ACTION_TYPE.DELETE: {},
+            ACTION_TYPE.UNASSIGN: {},
+            ACTION_TYPE.DISABLE: {},
+            ACTION_TYPE.ENABLE: {},
+            ACTION_TYPE.SET_RANDOM_PIN:
+                {
+                    "length":
+                        {
+                            "type": "int",
                             "required": True,
                             "description": _("set the PIN of the token to a random PIN of this length."),
-                            "value": list(range(1,32))}
-                   },
-                   ACTION_TYPE.INIT:
-                       {"tokentype":
-                            {"type": "str",
-                             "required": True,
-                             "description": _("Token type to create"),
-                             "value": get_token_types()
-                             },
-                        "user":
-                            {"type": "bool",
-                             "description": _("Assign token to user in "
-                                              "request or to tokenowner.")},
-                        "realm":
-                            {"type": "str",
-                             "required": False,
-                             "description": _("Set the realm of the newly "
-                                              "created token."),
-                             "value": realm_list},
-                        "dynamic_phone": {
+                            "value": list(range(1, 32))
+                        }
+                },
+            ACTION_TYPE.INIT:
+                {
+                    "tokentype":
+                        {
+                            "type": "str",
+                            "required": True,
+                            "description": _("Token type to create"),
+                            "value": get_token_types()
+                        },
+                    "user":
+                        {
+                            "type": "bool",
+                            "description": _("Assign token to user in "
+                                             "request or to tokenowner.")
+                        },
+                    "realm":
+                        {
+                            "type": "str",
+                            "required": False,
+                            "description": _("Set the realm of the newly "
+                                             "created token."),
+                            "value": realm_list
+                        },
+                    "dynamic_phone":
+                        {
                             "type": "bool",
                             "visibleIf": "tokentype",
                             "visibleValue": "sms",
                             "description": _("Dynamically read the mobile number "
                                              "from the user store.")
                         },
-                        "dynamic_email": {
+                    "dynamic_email":
+                        {
                             "type": "bool",
                             "visibleIf": "tokentype",
                             "visibleValue": "email",
                             "description": _("Dynamically read the email address "
                                              "from the user store.")
                         },
-                        "smtp_identifier": {
+                    "smtp_identifier":
+                        {
                             "type": "str",
                             "visibleIf": "tokentype",
                             "visibleValue": "email",
                             "description": _("Use a specific SMTP server configuration for this token."),
                             "value": [server.config.identifier for server in get_smtpservers()]
                         },
-                        "sms_identifier": {
+                    "sms_identifier":
+                        {
                             "type": "str",
                             "visibleIf": "tokentype",
                             "visibleValue": "sms",
                             "description": _("Use a specific SMS gateway configuration for this token."),
                             "value": [gateway.identifier for gateway in get_smsgateway()]
                         },
-                        "additional_params": {
+                    "additional_params":
+                        {
                             "type": "str",
                             "description": _("A dictionary of additional init parameters.")
                         },
-                        "motppin": {
+                    "motppin":
+                        {
                             "type": "str",
                             "visibleIf": "tokentype",
                             "visibleValue": "motp",
                             "description": _("Set the MOTP PIN of the MOTP "
                                              "token during enrollment. This "
                                              "is a required value for "
-                                             "enrolling MOTP tokens.")}
+                                             "enrolling MOTP tokens.")},
+                    "container":
+                        {
+                            "type": "bool",
+                            "description": _(
+                                "Add the token to the container if there is one identifiable in the request.")
+                        }
+                },
+            ACTION_TYPE.SET_DESCRIPTION:
+                {
+                    "description":
+                        {
+                            "type": "str",
+                            "description": _("The new description of the "
+                                             "token. It may contain tags like "
+                                             "{now} (with offsets such as "
+                                             "{now}+5d), {client_ip}, "
+                                             "{ua_browser}, {ua_string}, "
+                                             "{serial}, {tokentype}, {username}, {realm} "
+                                             "and {userrealm}.")
+                        }
+                },
+            ACTION_TYPE.SET_VALIDITY:
+                {
+                    VALIDITY.START:
+                        {
+                            "type": "str",
+                            "description": _("The token will be valid starting "
+                                             "at the given date. Can be a fixed "
+                                             "date or an offset like +10m, "
+                                             "+24h, +7d.")
                         },
-                   ACTION_TYPE.SET_DESCRIPTION:
-                       {"description":
-                            {
-                                "type": "str",
-                                "description": _("The new description of the "
-                                                 "token.")
-                            }
-                       },
-                   ACTION_TYPE.SET_VALIDITY:
-                       {VALIDITY.START: {
-                           "type": "str",
-                           "description": _("The token will be valid starting "
-                                            "at the given date. Can be a fixed "
-                                            "date or an offset like +10m, "
-                                            "+24h, +7d.")
-                       },
-                        VALIDITY.END: {
+                    VALIDITY.END:
+                        {
                             "type": "str",
                             "description": _("The token will be valid until "
                                              "the given date. Can be a fixed "
                                              "date or an offset like +10m, "
                                              "+24h, +7d.")
                         }
-                       },
-                   ACTION_TYPE.SET_COUNTWINDOW:
-                       {"count window":
-                            {
-                                # TODO: should be "int" but we do not support
-                                #  this at the moment.
-                                "type": "str",
-                                "required": True,
-                                "description": _("Set the new count window of "
-                                                 "the token.")
-                            }
-                       },
-                   ACTION_TYPE.SET_FAILCOUNTER:
-                       {
-                           "fail counter":
-                               {
-                                   "type": "str",
-                                   "required": True,
-                                   "description": _("Set the failcounter of "
-                                                    "the token.")
-                               }
-                       },
-                   ACTION_TYPE.CHANGE_FAILCOUNTER:
-                       {
-                           "change fail counter":
-                               {
-                                   "type": "str",
-                                   "required": True,
-                                   "description": _("Increase or decrease the fail counter of the token. "
-                                                    "Values of +n, -n with n being an integer are accepted.")
-                               }
-                       },
-                   ACTION_TYPE.SET_MAXFAIL:
-                       {
-                            "max failcount":
-                                {
-                                    "type": "str",
-                                    "required": True,
-                                    "description": _("Set the maximum failcounter of the token.")
-                                }
-                       },
-                   ACTION_TYPE.SET_TOKENINFO:
-                       {"key":
-                           {
-                               "type": "str",
-                               "required": True,
-                               "description": _("Set this tokeninfo key.")
-                           },
-                        "value":
-                            {
-                                "type": "str",
-                                "description": _("Set the above key the this "
-                                                 "value.")
-                            }
-                       },
-                   ACTION_TYPE.DELETE_TOKENINFO:
-                       {"key":
-                            {
-                                "type": "str",
-                                "required": True,
-                                "description": _("Delete this tokeninfo key.")
-                            }
-                       },
-                   ACTION_TYPE.ADD_TOKENGROUP:
-                       {"tokengroup":
-                            {
-                                "type": "string",
-                                "required": True,
-                                "description": _("Add a tokengroup to the token."),
-                                "value": [tg.name for tg in get_tokengroups()]
-                            }
-                       },
-                   ACTION_TYPE.REMOVE_TOKENGROUP:
-                       {"tokengroup":
-                            {
-                                "type": "string",
-                                "required": True,
-                                "description": _("Remote a tokengroup from the token."),
-                                "value": [tg.name for tg in get_tokengroups()]
-                            }
+                },
+            ACTION_TYPE.SET_COUNTWINDOW:
+                {
+                    "count window":
+                        {
+                            # TODO: should be "int" but we do not support
+                            # this at the moment.
+                            "type": "str",
+                            "required": True,
+                            "description": _("Set the new count window of "
+                                             "the token.")
                         }
-                   }
+                },
+            ACTION_TYPE.SET_FAILCOUNTER:
+                {
+                    "fail counter":
+                        {
+                            "type": "str",
+                            "required": True,
+                            "description": _("Set the failcounter of "
+                                             "the token.")
+                        }
+                },
+            ACTION_TYPE.CHANGE_FAILCOUNTER:
+                {
+                    "change fail counter":
+                        {
+                            "type": "str",
+                            "required": True,
+                            "description": _("Increase or decrease the fail counter of the token. "
+                                             "Values of +n, -n with n being an integer are accepted.")
+                        }
+                },
+            ACTION_TYPE.SET_MAXFAIL:
+                {
+                    "max failcount":
+                        {
+                            "type": "str",
+                            "required": True,
+                            "description": _("Set the maximum failcounter of the token.")
+                        }
+                },
+            ACTION_TYPE.SET_TOKENINFO:
+                {
+                    "key":
+                        {
+                            "type": "str",
+                            "required": True,
+                            "description": _("Set this tokeninfo key.")
+                        },
+                    "value":
+                        {
+                            "type": "str",
+                            "description": _("Set the above key to this "
+                                             "value. It may contain tags like "
+                                             "{now} (with offsets such as "
+                                             "{now}+5d), {client_ip}, "
+                                             "{ua_browser}, {ua_string}, "
+                                             "{serial}, {tokentype}, {username} "
+                                             "and {userrealm}.")
+                        }
+                },
+            ACTION_TYPE.INCREASE_TOKENINFO:
+                {
+                    "key":
+                        {
+                            "type": "str",
+                            "required": True,
+                            "description": _("Interpret the tokeninfo as 'int' and increase the tokeninfo value "
+                                             "by the given offset.")
+                        },
+                    "increment":
+                        {
+                            "type": "str",
+                            "description": _("The increment the tokeninfo key should be increased. "
+                                             "Can be positive or negative, s.th. like +1 or -7.")
+                        }
+                },
+            ACTION_TYPE.DELETE_TOKENINFO:
+                {
+                    "key":
+                        {
+                            "type": "str",
+                            "required": True,
+                            "description": _("Delete this tokeninfo key.")
+                        }
+                },
+            ACTION_TYPE.ADD_TOKENGROUP:
+                {
+                    "tokengroup":
+                        {
+                            "type": "str",
+                            "required": True,
+                            "description": _("Add a tokengroup to the token."),
+                            "value": [tg.name for tg in get_tokengroups()]
+                        }
+                },
+            ACTION_TYPE.REMOVE_TOKENGROUP:
+                {
+                    "tokengroup":
+                        {
+                            "type": "str",
+                            "required": True,
+                            "description": _("Remove a tokengroup from the token."),
+                            "value": [tg.name for tg in get_tokengroups()]
+                        }
+                },
+            ACTION_TYPE.ATTACH_APPLICATION:
+                {
+                    "machine ID":
+                        {
+                            "type": "str",
+                            "required": False,
+                            "description": _("The ID of the machine you want to attach the token to")
+
+                        },
+                    "service_id":
+                        {
+                            "type": "str",
+                            "required": False,
+                            "description": _("Set the service_id for an SSH application."),
+                            "visibleIf": "application",
+                            "visibleValue": TOKEN_APPLICATIONS.SSH
+                        },
+                    "application":
+                        {
+                            "type": "str",
+                            "required": True,
+                            "description": _(
+                                "Set a token application like 'offline' or 'SSH'. Note: Not all tokens"
+                                " work well with all applications!"),
+                            "value": [TOKEN_APPLICATIONS.SSH, TOKEN_APPLICATIONS.OFFLINE,
+                                      TOKEN_APPLICATIONS.LUKS]
+                        },
+                    "count":
+                        {
+                            "type": "str",
+                            "visibleIf": "application",
+                            "visibleValue": TOKEN_APPLICATIONS.OFFLINE,
+                            "description": _("The number of offline OTP values available"),
+                            "required": False
+                        },
+                    "rounds":
+                        {
+                            "type": "str",
+                            "visibleIf": "application",
+                            "visibleValue": TOKEN_APPLICATIONS.OFFLINE,
+                            "description": _("The number of rounds for password hashing"),
+                            "required": False
+                        },
+                    "user":
+                        {
+                            "type": "str",
+                            "visibleIf": "application",
+                            "visibleValue": TOKEN_APPLICATIONS.SSH,
+                            "required": False
+                        },
+                    "slot":
+                        {
+                            "type": "str",
+                            "visibleIf": "application",
+                            "visibleValue": TOKEN_APPLICATIONS.LUKS,
+                            "required": False
+                        },
+                    "partition":
+                        {
+                            "type": "str",
+                            "visibleIf": "application",
+                            "visibleValue": TOKEN_APPLICATIONS.LUKS,
+                            "required": False
+                        },
+                }
+        }
         return actions
+
+    def _get_tags(self, g, request, serial, text):
+        """
+        Create the tag dictionary for the text of the "set description" and
+        "set tokeninfo" actions.
+
+        A possible time offset (like ``{now}+5d``) is parsed from the text and
+        removed from it. The returned text must be formatted with the returned
+        tags.
+
+        :param g: The flask g object
+        :param request: The request object
+        :param serial: The serial number of the token that is handled
+        :param text: The description or tokeninfo value, may contain tags
+        :return: tuple of the text without the offset and the tag dictionary
+        """
+        text, time_delta = parse_time_offset_from_now(text)
+        tokenowner = self._get_tokenowner(request)
+        tokentype = tokendescription = None
+        if serial:
+            # The handler can act on several tokens, so the tags describe the token
+            # that is handled and its owner, not the token or user of the request.
+            try:
+                token = get_one_token(serial=serial)
+                tokenowner = token.user or User()
+                tokentype = token.get_tokentype()
+                tokendescription = token.token.description
+            except ResourceNotFoundError:
+                log.info(f"Could not read the token {serial} for the tags.")
+        else:
+            serial, tokentype, tokendescription = self._get_token_data(serial, tokenowner)
+        logged_in_user = g.logged_in_user if hasattr(g, "logged_in_user") else None
+        tags = create_tag_dict(logged_in_user=logged_in_user,
+                               request=request,
+                               client_ip=getattr(g, "client_ip", None),
+                               serial=serial,
+                               tokenowner=tokenowner,
+                               tokentype=tokentype,
+                               tokendescription=tokendescription,
+                               time_offset=time_delta)
+        return text, tags
 
     def do(self, action, options=None):
         """
@@ -333,11 +554,10 @@ class TokenEventHandler(BaseEventHandler):
         content = self._get_response_content(response)
         handler_def = options.get("handler_def")
         handler_options = handler_def.get("options", {})
+        context = options.get("context")
 
-        serial = request.all_data.get("serial") or \
-                 content.get("detail", {}).get("serial") or \
-                 g.audit_object.audit_data.get("serial")
-
+        serial_list = context.token_serials
+        log.debug(f"Serial list for event handling: {serial_list}")
         if action.lower() in [ACTION_TYPE.SET_TOKENREALM,
                               ACTION_TYPE.SET_DESCRIPTION,
                               ACTION_TYPE.DELETE, ACTION_TYPE.DISABLE,
@@ -345,26 +565,23 @@ class TokenEventHandler(BaseEventHandler):
                               ACTION_TYPE.SET_VALIDITY,
                               ACTION_TYPE.SET_COUNTWINDOW,
                               ACTION_TYPE.SET_TOKENINFO,
+                              ACTION_TYPE.INCREASE_TOKENINFO,
                               ACTION_TYPE.SET_FAILCOUNTER,
                               ACTION_TYPE.SET_MAXFAIL,
                               ACTION_TYPE.CHANGE_FAILCOUNTER,
                               ACTION_TYPE.SET_RANDOM_PIN,
                               ACTION_TYPE.DELETE_TOKENINFO,
                               ACTION_TYPE.ADD_TOKENGROUP,
-                              ACTION_TYPE.REMOVE_TOKENGROUP]:
-            if serial:
-                if ',' in serial:
-                    serials = [t.strip() for t in serial.split(',')]
-                else:
-                    serials = [serial]
-                for serial in serials:
-                    log.info("{0!s} for token {1!s}".format(action, serial))
+                              ACTION_TYPE.REMOVE_TOKENGROUP,
+                              ACTION_TYPE.ATTACH_APPLICATION]:
+            if serial_list:
+                for serial in serial_list:
+                    log.info(f"{action} for token {serial}")
                     if action.lower() == ACTION_TYPE.SET_TOKENREALM:
                         realm = handler_options.get("realm")
                         only_realm = is_true(handler_options.get("only_realm"))
-                        # Set the realm..
-                        log.info("Setting realm of token {0!s} to {1!s}".format(
-                            serial, realm))
+                        # Set the realm.
+                        log.info(f"Setting realm of token {serial} to {realm}")
                         # Add the token realm
                         set_realms(serial, [realm], add=not only_realm)
                     elif action.lower() == ACTION_TYPE.SET_RANDOM_PIN:
@@ -384,42 +601,29 @@ class TokenEventHandler(BaseEventHandler):
                         unassign_token(serial)
                     elif action.lower() == ACTION_TYPE.SET_DESCRIPTION:
                         description = handler_options.get("description") or ""
-                        description, td = parse_time_offset_from_now(description)
-                        s_now = (datetime.datetime.now(tzlocal()) + td).strftime(
-                            AUTH_DATE_FORMAT)
+                        text, tags = self._get_tags(g, request, serial, description)
                         set_description(serial,
-                                        description.format(
-                                            current_time=s_now,
-                                            now=s_now,
-                                            client_ip=g.client_ip,
-                                            ua_browser=request.user_agent.browser,
-                                            ua_string=request.user_agent.string))
+                                        self._format_with_tags(text, tags, description))
                     elif action.lower() == ACTION_TYPE.SET_COUNTWINDOW:
                         set_count_window(serial,
                                          int(handler_options.get("count window",
                                                                  50)))
                     elif action.lower() == ACTION_TYPE.SET_TOKENINFO:
                         tokeninfo = handler_options.get("value") or ""
-                        tokeninfo, td = parse_time_offset_from_now(tokeninfo)
-                        s_now = (datetime.datetime.now(tzlocal()) + td).strftime(
-                            AUTH_DATE_FORMAT)
+                        text, tags = self._get_tags(g, request, serial, tokeninfo)
+                        _write_tokeninfo_of_handler(serial, handler_options.get("key"),
+                                                    self._format_with_tags(text, tags, tokeninfo))
+                    elif action.lower() == ACTION_TYPE.INCREASE_TOKENINFO:
                         try:
-                            username = request.User.loginname
-                            realm = request.User.realm
-                        except Exception:
-                            username = "N/A"
-                            realm = "N/A"
-                        add_tokeninfo(serial, handler_options.get("key"),
-                                      tokeninfo.format(
-                                          current_time=s_now,
-                                          now=s_now,
-                                          client_ip=g.client_ip,
-                                          username=username,
-                                          realm=realm,
-                                          ua_browser=request.user_agent.browser,
-                                          ua_string=request.user_agent.string))
+                            # We assume that the tokeninfo is an integer
+                            increment = int(handler_options.get("increment") or 1)
+                            current_value = int(get_tokeninfo(serial, handler_options.get("key")) or 0)
+                            _write_tokeninfo_of_handler(serial, handler_options.get("key"),
+                                                        f"{current_value + increment}")
+                        except ValueError:
+                            log.warning("Can not increase the tokeninfo {!s}".format(handler_options.get("key")))
                     elif action.lower() == ACTION_TYPE.DELETE_TOKENINFO:
-                        delete_tokeninfo(serial, handler_options.get("key"))
+                        _delete_tokeninfo_of_handler(serial, handler_options.get("key"))
                     elif action.lower() == ACTION_TYPE.SET_VALIDITY:
                         start_date = handler_options.get(VALIDITY.START)
                         end_date = handler_options.get(VALIDITY.END)
@@ -435,80 +639,119 @@ class TokenEventHandler(BaseEventHandler):
                         try:
                             set_failcounter(serial,
                                             int(handler_options.get("fail counter")))
-                        except Exception as exx:
+                        except Exception:
                             log.warning("Misconfiguration: Failed to set fail "
                                         "counter!")
                     elif action.lower() == ACTION_TYPE.SET_MAXFAIL:
                         try:
                             set_max_failcount(serial,
                                               int(handler_options.get("max failcount")))
-                        except Exception as exx:
+                        except Exception:
                             log.warning("Misconfiguration: Failed to set max failcount!")
                     elif action.lower() == ACTION_TYPE.CHANGE_FAILCOUNTER:
                         try:
                             token_obj = get_one_token(serial=serial)
                             token_obj.set_failcount(
                                 token_obj.token.failcount + int(handler_options.get("change fail counter")))
-                        except Exception as exx:
+                            token_obj.save()
+                        except Exception:
                             log.warning("Misconfiguration: Failed to increase or decrease fail "
                                         "counter!")
                     elif action.lower() == ACTION_TYPE.ADD_TOKENGROUP:
                         try:
                             assign_tokengroup(serial, handler_options.get("tokengroup"))
-                        except Exception as exx:
+                        except Exception:
                             log.warning("Misconfiguration: Failed to add tokengroup "
-                                        "to token {0!s}!".format(serial))
+                                        f"to token {serial!s}!")
                     elif action.lower() == ACTION_TYPE.REMOVE_TOKENGROUP:
                         try:
                             unassign_tokengroup(serial, handler_options.get("tokengroup"))
-                        except Exception as exx:
+                        except Exception:
                             log.warning("Misconfiguration: Failed to remove tokengroup "
-                                        "from token {0!s}!".format(serial))
+                                        f"from token {serial!s}!")
+                    elif action.lower() == ACTION_TYPE.ATTACH_APPLICATION:
+                        try:
+                            machine = handler_options.get("machine ID")
+                            application = handler_options.get("application")
+                            application_options = {}
+                            count = handler_options.get("count", None)
+                            if count is not None:
+                                application_options.update({"count": count})
+                            rounds = handler_options.get("rounds", None)
+                            if rounds is not None:
+                                application_options.update({"rounds": rounds})
+                            slot = handler_options.get("slot", None)
+                            if slot is not None:
+                                application_options.update({"slot": slot})
+                            partition = handler_options.get("partition", None)
+                            if partition is not None:
+                                application_options.update({"partition": partition})
+                            user = handler_options.get("user", None)
+                            if user is not None:
+                                application_options.update({"user": user})
+                            attach_token(serial, application, machine_id=machine, options=application_options)
+                        except Exception:
+                            log.warning(f"Misconfiguration: Failed to attach token "
+                                        f"to machine. Token serial: {serial}")
+            else:
+                log.info(f"No token serials found for token event handling action '{action}'.")
+                ret = False
+        elif action.lower() == ACTION_TYPE.INIT:
+            try:
+                log.info("Initializing new token")
+                init_param = {"type": handler_options.get("tokentype"),
+                              "genkey": 1,
+                              "realm": handler_options.get("realm", "")}
+                user = None
 
-                else:
-                    log.info("Action {0!s} requires serial number. But no serial "
-                             "number could be found in request {1!s}.".format(action, request))
-
-        if action.lower() == ACTION_TYPE.INIT:
-            log.info("Initializing new token")
-            init_param = {"type": handler_options.get("tokentype"),
-                          "genkey": 1,
-                          "realm": handler_options.get("realm", "")}
-            user = None
-            if is_true(handler_options.get("user")):
-                user = self._get_tokenowner(request)
-                tokentype = handler_options.get("tokentype")
                 # Some tokentypes need additional parameters
                 if handler_options.get("additional_params"):
                     add_params = yaml.safe_load(handler_options.get("additional_params"))
-                    if type(add_params) == dict:
+                    if add_params:
                         init_param.update(add_params)
 
-                if tokentype == "sms":
-                    if is_true(handler_options.get("dynamic_phone")):
-                        init_param["dynamic_phone"] = 1
-                    else:
-                        init_param['phone'] = user.get_user_phone(
-                            phone_type='mobile', index=0)
-                        if not init_param['phone']:
-                            log.warning("Enrolling SMS token. But the user "
-                                        "{0!r} has no mobile number!".format(user))
-                    if handler_options.get("sms_identifier"):
-                        init_param["sms.identifier"] = handler_options.get("sms_identifier")
-                elif tokentype == "email":
-                    if is_true(handler_options.get("dynamic_email")):
-                        init_param["dynamic_email"] = 1
-                    else:
-                        init_param['email'] = user.info.get("email", "")
-                        if not init_param['email']:
-                            log.warning("Enrolling EMail token. But the user {0!s}"
-                                        "has no email address!".format(user))
-                    if handler_options.get("smtp_identifier"):
-                        init_param["email.identifier"] = handler_options.get("smtp_identifier")
-                elif tokentype == "motp":
-                    init_param['motppin'] = handler_options.get("motppin")
+                if is_true(handler_options.get("user")):
+                    user = self._get_tokenowner(request)
+                    tokentype = handler_options.get("tokentype")
 
-            t = init_token(param=init_param, user=user)
-            log.info("New token {0!s} enrolled.".format(t.token.serial))
+                    if tokentype == "sms":
+                        if is_true(handler_options.get("dynamic_phone")):
+                            init_param["dynamic_phone"] = 1
+                        else:
+                            init_param['phone'] = user.get_user_phone(
+                                phone_type='mobile', index=0)
+                            if not init_param['phone']:
+                                log.warning("Enrolling SMS token. But the user "
+                                            f"{user!r} has no mobile number!")
+                        if handler_options.get("sms_identifier"):
+                            init_param["sms.identifier"] = handler_options.get("sms_identifier")
+                    elif tokentype == "email":
+                        if is_true(handler_options.get("dynamic_email")):
+                            init_param["dynamic_email"] = 1
+                        else:
+                            init_param['email'] = user.get_specific_info(["email"]).get("email", "")
+                            if not init_param['email']:
+                                log.warning(f"Enrolling EMail token. But the user {user!s}"
+                                            "has no email address!")
+                        if handler_options.get("smtp_identifier"):
+                            init_param["email.identifier"] = handler_options.get("smtp_identifier")
+                    elif tokentype == "motp":
+                        init_param['motppin'] = handler_options.get("motppin")
+
+                t = init_token(param=init_param, user=user)
+                log.info(f"New token {t.token.serial!s} enrolled.")
+
+                if is_true(handler_options.get("container")):
+                    container_serial = self._get_container_serial(request, content)
+                    if container_serial:
+                        add_token_to_container(container_serial, t.get_serial())
+                    else:
+                        log.info(f"No container serial is found to add the token {t.get_serial()} to the container.")
+            except Exception as e:
+                log.error(f"Failed to initialize token: {e}")
+                ret = False
+        else:
+            log.warning(f"Action '{action}' is not supported by the token handler.")
+            ret = False
 
         return ret

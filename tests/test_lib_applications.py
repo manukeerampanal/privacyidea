@@ -2,7 +2,6 @@
 This test file tests the applications definitions standalone
 lib/applications/*
 """
-import six
 from privacyidea.lib.error import ParameterError
 from .base import MyTestCase
 from privacyidea.lib.applications import MachineApplicationBase
@@ -19,6 +18,7 @@ from privacyidea.lib.applications import (get_auth_item,
 from privacyidea.lib.token import init_token, get_tokens
 from privacyidea.lib.user import User
 import passlib.hash
+from unittest import mock
 
 
 SSHKEY = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDO1rx377" \
@@ -38,13 +38,18 @@ SSHKEY = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDO1rx377" \
          "TyCOpYi1BxN47c/kccxyNgjPw== user@example.com"
 OTPKEY = "3132333435363738393031323334353637383930"
 
+
 class SSHApplicationTestCase(MyTestCase):
 
     def test_01_get_options(self):
         # Can run as class
-        options = SSHApplication.get_options()
-        self.assertEqual(options["required"], [])
-        self.assertEqual(options["optional"], ["user"])
+        tokenoptions = SSHApplication.get_options()
+        self.assertIn("sshkey", tokenoptions)
+        sshkeyoptions = tokenoptions.get("sshkey")
+        self.assertIn("user", sshkeyoptions)
+        self.assertIn("service_id", sshkeyoptions)
+        self.assertEqual("str", sshkeyoptions.get("user").get("type"))
+        self.assertEqual("str", sshkeyoptions.get("service_id").get("type"))
 
     def test_02_get_auth_item(self):
         serial = "ssh1"
@@ -59,6 +64,13 @@ class SSHApplicationTestCase(MyTestCase):
         self.assertEqual(auth_item.get("sshkey"), SSHKEY)
         self.assertEqual(auth_item.get("username"), "cornelius")
 
+        # Get with no matching user
+        with mock.patch("logging.Logger.debug") as mock_log:
+            auth_item = SSHApplication.get_authentication_item("sshkey", serial, filter_param={"user": "Idefix"})
+            self.assertFalse(auth_item)
+            mock_log.assert_called_with('The requested user Idefix does '
+                                        'not match the user option (None) of the SSH application.')
+
     def test_03_get_auth_item_unsupported(self):
         # unsupported token type
         auth_item = SSHApplication.get_authentication_item("unsupported", "s")
@@ -69,9 +81,13 @@ class LUKSApplicationTestCase(MyTestCase):
 
     def test_01_get_options(self):
         # Can run as class
-        options = LUKSApplication.get_options()
-        self.assertEqual(options["required"], [])
-        self.assertEqual(options["optional"], ['slot', 'partition'])
+        tokenoptions = LUKSApplication.get_options()
+        self.assertIn("totp", tokenoptions)
+        totpoptions = tokenoptions.get("totp")
+        self.assertIn("slot", totpoptions)
+        self.assertIn("partition", totpoptions)
+        self.assertEqual("int", totpoptions.get("slot").get("type"))
+        self.assertEqual("str", totpoptions.get("partition").get("type"))
 
     def test_02_get_auth_item(self):
         serial = "UBOM12345"
@@ -84,7 +100,7 @@ class LUKSApplicationTestCase(MyTestCase):
 
         auth_item = LUKSApplication.get_authentication_item("totp", serial)
         self.assertEqual(len(auth_item.get("challenge")), 64, auth_item)
-        self.assertIsInstance(auth_item.get('challenge'), six.text_type, auth_item)
+        self.assertIsInstance(auth_item.get('challenge'), str, auth_item)
         self.assertEqual(len(auth_item.get("response")), 40, auth_item)
 
         auth_item = LUKSApplication.get_authentication_item("totp", serial,
@@ -103,9 +119,14 @@ class OfflineApplicationTestCase(MyTestCase):
 
     def test_01_get_options(self):
         # Can run as class
-        options = OfflineApplication.get_options()
-        self.assertEqual(options["required"], [])
-        self.assertEqual(options["optional"], ['count', 'rounds'])
+        tokenoptions = OfflineApplication.get_options()
+        self.assertIn("hotp", tokenoptions)
+        self.assertIn("webauthn", tokenoptions)
+        hotpoptions = tokenoptions.get("hotp")
+        self.assertIn("count", hotpoptions)
+        self.assertIn("rounds", hotpoptions)
+        self.assertEqual("str", hotpoptions.get("count").get("type"))
+        self.assertEqual("str", hotpoptions.get("rounds").get("type"))
 
     def test_02_get_auth_item(self):
         serial = "OATH1"
@@ -166,9 +187,10 @@ class BaseApplicationTestCase(MyTestCase):
         self.assertEqual(base_app.get_name(), "base")
         self.assertEqual(base_app.get_authentication_item("hotp", "serial"),
                          "nothing")
-        options = base_app.get_options()
-        self.assertEqual(options["required"], [])
-        self.assertEqual(options["optional"], [])
+        tokens = base_app.get_options()
+        options = tokens.get("tokentype")
+        self.assertEqual(options["optionA"].get("type"), "bool")
+        self.assertTrue(options["optionA"].get("required"))
 
     def test_02_get_auth_item(self):
         auth_item = get_auth_item("base", "hotp", "serial")
@@ -179,13 +201,19 @@ class BaseApplicationTestCase(MyTestCase):
             "privacyidea.lib.applications.base")
         self.assertFalse(bulk)
 
-
     def test_04_get_application_types(self):
         apps = get_application_types()
         self.assertTrue("luks" in apps)
         self.assertTrue("ssh" in apps)
-        self.assertEqual(apps["ssh"]["options"]["optional"], ["user"])
-        self.assertEqual(apps["luks"]["options"]["optional"], ["slot",
-                                                               "partition"])
+        sshoptions = apps["ssh"]["options"]
+        offlineoptions = apps["offline"]["options"]
+        luksoptions = apps["luks"]["options"]
+        self.assertIn("service_id", sshoptions["sshkey"])
+        self.assertIn("user", sshoptions["sshkey"])
+        self.assertIn("slot", luksoptions["totp"])
+        self.assertIn("partition", luksoptions["totp"])
+        self.assertIn("count", offlineoptions["hotp"])
+        self.assertIn("rounds", offlineoptions["hotp"])
+        self.assertEqual({}, offlineoptions["webauthn"])
 
 

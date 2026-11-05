@@ -1,4 +1,5 @@
-# -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: 2026 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # http://www.privacyidea.org
 # (c) cornelius kölbel, privacyidea.org
@@ -27,20 +28,27 @@ Flask endpoints.
 It also contains the error handlers.
 """
 
-import six
-from .lib.utils import (send_error, get_all_params)
+import copy
+
+from .lib.utils import (get_all_params, get_before_request_config, get_optional, map_error_to_code,
+                        get_auth_error_status_code, send_error, verify_auth_token, get_auth_token_from_request,
+                        logged_in_user_from_token, hide_specific_error_message, construct_radius_response,
+                        resolve_token_owner, report_owner_lookup_error)
+from .container import container_blueprint
+from ..lib.container import find_container_for_token, find_container_by_serial
+from .lib.conditional_access import restore_rejection_audit
+from ..lib.conditional_access.request_context import peek_ca_context, reset_ca_context
+from ..lib.framework import get_app_config_value
+from ..lib.clients import identify_client_by_key, touch_client
+from ..models import ClientStatus, db
 from ..lib.user import get_user_from_param
 import logging
-from .lib.utils import getParam
 from flask import request, g
-from privacyidea.lib.audit import getAudit
-from flask import current_app
-from privacyidea.lib.policy import PolicyClass
-from privacyidea.lib.event import EventConfiguration
 from privacyidea.lib.lifecycle import call_finalizers
+from privacyidea.lib.log import redact_url
 from privacyidea.api.auth import (user_required, admin_required, jwtauth)
-from privacyidea.lib.config import get_from_config, SYSCONF, ensure_no_config_object
-from privacyidea.lib.token import get_token_type, get_token_owner
+from privacyidea.lib.config import ensure_no_config_object, get_privacyidea_node
+from privacyidea.lib.token import get_token_type
 from privacyidea.api.ttype import ttype_blueprint
 from privacyidea.api.validate import validate_blueprint
 from .resolver import resolver_blueprint
@@ -49,6 +57,8 @@ from .realm import realm_blueprint
 from .realm import defaultrealm_blueprint
 from .user import user_blueprint
 from .audit import audit_blueprint
+from .authentication_log import authentication_log_blueprint
+from .conditional_access import conditional_access_blueprint
 from .machineresolver import machineresolver_blueprint
 from .machine import machine_blueprint
 from .application import application_blueprint
@@ -67,16 +77,46 @@ from .clienttype import client_blueprint
 from .subscriptions import subscriptions_blueprint
 from .monitoring import monitoring_blueprint
 from .tokengroup import tokengroup_blueprint
-from privacyidea.api.lib.postpolicy import postrequest, sign_response
-from ..lib.error import (privacyIDEAError,
+from .serviceid import serviceid_blueprint
+from .clients import clients_blueprint
+from .healthcheck import healthz_blueprint
+from .info import info_blueprint
+from privacyidea.api.lib.postpolicy import postrequest, sign_response, hide_version
+from ..lib.error import (PrivacyIDEAError,
                          AuthError, UserError,
                          PolicyError, ResourceNotFoundError)
-from privacyidea.lib.utils import get_client_ip
+from privacyidea.lib.utils import get_plugin_info_from_useragent, AUTH_RESPONSE
+from privacyidea.lib.conditional_access.authentication_event_types import AuthEventType
+from privacyidea.api.lib.utils import log_authentication
 from privacyidea.lib.user import User
 import datetime
 import threading
 
 log = logging.getLogger(__name__)
+
+# Endpoints whose response can contain a token secret - an ``otpkey``, the enrollment URL and
+# QR code built from it, or a batch of usable OTP values. A response from one of these is marked
+# "no-store" rather than "no-cache", and a new endpoint that can return one belongs here.
+#
+# These are endpoint names, not paths, so one entry covers every route that reaches the view:
+# "validate_blueprint.check" is both /validate/check and /validate/radiuscheck. radiuscheck
+# answers with an empty body, so covering it too costs nothing - an authentication response is
+# not something a client should be writing to disk either.
+NO_STORE_ENDPOINTS = frozenset({
+    "token_blueprint.init",
+    # enroll_via_validate returns the enrollment details of the new token inside the challenge
+    "validate_blueprint.check",
+    "validate_blueprint.trigger_challenge",
+    "validate_blueprint.initialize",
+    # returns a batch of OTP values for offline use
+    "validate_blueprint.offlinerefill",
+    # the container registration and synchronisation responses carry enrollment URLs for the
+    # tokens in the container, see regenerate_enroll_url() in api/container.py
+    "container_blueprint.synchronize",
+    "container_blueprint.registration_init",
+    "container_blueprint.registration_finalize",
+    "container_blueprint.rollover",
+})
 
 
 # ``before_app_request`` and ``teardown_app_request`` register the functions
@@ -84,40 +124,178 @@ log = logging.getLogger(__name__)
 # The decorated functions are called before and after *every* request.
 @token_blueprint.before_app_request
 def log_begin_request():
-    log.debug(u"Begin handling of request {!r}".format(request.full_path))
+    log.debug(f"Begin handling of request {redact_url(request.full_path)!r}")
     g.startdate = datetime.datetime.now()
+
+
+@token_blueprint.before_app_request
+def identify_api_client():
+    """
+    Identify the API client from the ``X-API-Key`` header for *every* request
+    and expose it as ``g.client_id`` (``None`` when no valid client).
+
+    The header is an *optional* identification mechanism, so an absent, unknown
+    or disabled key simply leaves the request unidentified (``g.client_id =
+    None``) rather than rejecting it - otherwise a stale key sent to an endpoint
+    that does not use API-key auth (e.g. the WebUI) would break that request.
+    Endpoints that require an identified client (``/validate/capabilities``,
+    ``/validate/remember_device``) enforce it themselves.
+
+    A *known* key whose client is disabled (``suspended``) is stashed on
+    ``g.rejected_api_client``, and :func:`record_suspended_api_client` turns it
+    into an audit note and an authentication-log row once the response is on its
+    way out - which is where the audit object and the source IP exist, neither of
+    which this hook has yet. An unknown/invalid key is only logged (auditing every
+    probe would flood the audit log).
+    """
+    g.client_id = None
+    g.rejected_api_client = None
+    api_key = request.headers.get("X-API-Key")
+    if not api_key:
+        return
+
+    try:
+        client = identify_client_by_key(api_key)
+    except Exception as exc:
+        # Identification is optional and runs in a global before-request hook, so
+        # a failure here (e.g. a transient DB error) must never turn an otherwise
+        # valid request into a 500. Leave the request unidentified and continue.
+        log.warning(f"Could not resolve the X-API-Key; treating the request as unidentified: {exc}")
+        g.client_id = None
+        g.rejected_api_client = None
+        return
+
+    if client is None:
+        # Unknown key_id or wrong secret: do not reject app-wide, do not audit.
+        # DEBUG, not WARNING: a spoofable header on every request would flood logs.
+        log.debug("Ignoring an unknown or invalid X-API-Key.")
+    elif client.status == ClientStatus.ACTIVE:
+        g.client_id = client.id
+        # Refresh the client's usage timestamp, throttled so a busy client does
+        # not issue a DB write on every request. This is best-effort and isolated:
+        # a write failure here must not un-identify an otherwise valid client.
+        try:
+            touch_client(client)
+        except Exception as exc:
+            # touch_client commits; a failed commit leaves the session in a failed
+            # transaction, so roll back or the real endpoint dies with
+            # PendingRollbackError - defeating the best-effort intent.
+            db.session.rollback()
+            log.warning(f"Could not update the client's last_used_at timestamp: {exc}")
+    else:
+        # Known key, valid secret, but the client is disabled.
+        g.rejected_api_client = {"client_id": client.id, "status": client.status}
+        log.warning(f"A {client.status} API key was presented (client {client.id}).")
 
 
 @token_blueprint.teardown_app_request
 def teardown_request(exc):
+    _finalize_conditional_access()
     try:
         if g.audit_object.has_data:
             g.audit_object.finalize_log()
     except AttributeError:
         # In certain error cases the before_request was not handled
         # completely so that we do not have an audit_object
-        # Also during calling webui, there is not audit_object, yet.
+        # Also during calling webui, there is no audit_object, yet.
         pass
     call_finalizers()
-    log.debug(u"End handling of request {!r}".format(request.full_path))
+    log.debug(f"End handling of request {redact_url(request.full_path)!r}")
+
+
+def _finalize_conditional_access():
+    """
+    Write the authentication-log rows this request staged, then let the conditional-access engine react to them.
+
+    This runs before the audit entry is written, so a later change can record the engine's outcome on it, and before
+    ``call_finalizers`` closes the conditional-access session. Requests that logged no authentication event have no
+    buffer and skip it entirely.
+
+    The buffer is then discarded, because it describes *this* request. It lives on ``g``, and ``g`` is per app
+    context rather than per request: Flask reuses an app context that is already pushed, so several requests can share
+    one - every request dispatched by a test, for instance. Without the reset the second request would re-flush the
+    first one's events and find its policy evaluation already done. The conditional-access session is released the
+    same way, by ``call_finalizers`` below.
+    """
+    context = peek_ca_context()
+    if context is None:
+        return
+    try:
+        if context.has_data:
+            context.finalize()
+    except Exception as ex:
+        # Teardown must not raise: the response has already been sent.
+        log.warning(f"Finalizing the conditional-access work of this request failed: {ex!r}")
+    finally:
+        reset_ca_context()
 
 
 @token_blueprint.before_request
 @audit_blueprint.before_request
+@authentication_log_blueprint.before_request
 @system_blueprint.before_request
+@info_blueprint.before_request
+@serviceid_blueprint.before_request
 @user_required
 def before_user_request():
     before_request()
 
 
+def before_create_user_request():
+    """
+    This function is executed before the create user endpoint.
+    It removes the user parameter from the request to avoid that before_request tries to resolve the user.
+    """
+    ensure_no_config_object()
+    # Save the request data
+    g.request_data = get_all_params(request)
+    request.all_data = copy.deepcopy(g.request_data)
+    request.User = None
+    get_before_request_config()
+
+    privacyidea_server = get_app_config_value("PI_AUDIT_SERVERNAME", get_privacyidea_node(request.host))
+
+    # Already get some typical parameters to log
+    audit_realm = get_optional(request.all_data, "realm")
+    audit_resolver = get_optional(request.all_data, "resolver")
+    audit_username = get_optional(request.all_data, "user")
+
+    ua_name, ua_version, _ua_comment = get_plugin_info_from_useragent(request.user_agent.string)
+    g.user_agent = ua_name
+    g.audit_object.log({"success": False,
+                        "user": audit_username,
+                        "realm": audit_realm,
+                        "resolver": audit_resolver,
+                        "client": g.client_ip,
+                        "user_agent": ua_name,
+                        "user_agent_version": ua_version,
+                        "privacyidea_server": privacyidea_server,
+                        "action": f"{request.method!s} {request.url_rule!s}",
+                        "action_detail": "",
+                        "thread_id": f"{threading.current_thread().ident!s}",
+                        "info": ""})
+
+    if g.logged_in_user.get("role") == "admin":
+        # An administrator is calling this API
+        g.audit_object.log({"administrator": g.logged_in_user.get("username")})
+        # TODO: Check if there are realm specific admin policies, so that the
+        #  admin is only allowed to act on certain realms
+        #  If now realm is specified, we need to add "filterrealms".
+        #  If the admin tries to view realms, he is not allowed to, we need to
+        #  raise an exception.
+
+
 @user_blueprint.before_request
 @user_required
 def before_userendpoint_request():
-    before_request()
-    # DEL /user/ has no realm parameter and thus we need to create the user object this way.
+    if request.endpoint == "user_blueprint.create_user_api":
+        before_create_user_request()
+    else:
+        before_request()
+    # DEL /user/ has no realm parameter, and thus we need to create the user object this way.
     if not request.User and request.method == "DELETE":
-        resolvername = getParam(request.all_data, "resolvername")
-        username = getParam(request.all_data, "username")
+        resolvername = get_optional(request.all_data, "resolvername")
+        username = get_optional(request.all_data, "username")
         if resolvername and username:
             request.User = User(login=username, resolver=resolvername)
 
@@ -140,9 +318,131 @@ def before_userendpoint_request():
 @subscriptions_blueprint.before_request
 @monitoring_blueprint.before_request
 @tokengroup_blueprint.before_request
+@clients_blueprint.before_request
+@conditional_access_blueprint.before_request
 @admin_required
 def before_admin_request():
     before_request()
+
+
+@container_blueprint.before_request
+def before_container_request():
+    """
+    This function is executed before a request to a container endpoint.
+    It defines a list of endpoints that do not require an auth token and verifies the auth token for all other
+    endpoints.
+    The user is resolved either from the logged-in user or from the container owner. The user and some information
+    about the container are stored in the audit log.
+    Additionally, the policy object, the audit object and the event configuration object are set to the global variable.
+    """
+    # auth free endpoints
+    ensure_no_config_object()
+    # Save the request data
+    g.request_data = get_all_params(request)
+    request.all_data = copy.deepcopy(g.request_data)
+    auth_token_free_endpoints = ["/container/register/finalize",
+                                 "/container/register/terminate/client",
+                                 "/container/challenge",
+                                 "/container/synchronize",
+                                 "/container/rollover"]
+    is_auth_free = request.path in auth_token_free_endpoints
+
+    # Get auth token
+    auth_token = get_auth_token_from_request()
+
+    # Verify auth token for all non-auth-token-free endpoints anyway
+    if not is_auth_free:
+        r = verify_auth_token(auth_token, ["user", "admin"])
+        g.logged_in_user = logged_in_user_from_token(r)
+        resolve_logged_in_user()
+    else:
+        if auth_token:
+            # if an auth token is present, but it is not mandatory for the endpoint, write it in the params to be
+            # verified later
+            request.all_data["auth_token"] = auth_token
+        # Client requests does not provide a logged-in user, hence it cannot be resolved
+        # (container owner will be set later)
+        request.User = User()
+
+    get_before_request_config()
+    g.serial = None
+    privacyidea_server = get_app_config_value("PI_AUDIT_SERVERNAME", get_privacyidea_node(request.host))
+    # Get info about the container and resolve user from the container if not yet set
+    container_serial = get_optional(request.all_data, "container_serial")
+    container = None
+    container_type = None
+    if container_serial and "*" not in container_serial:
+        try:
+            container = find_container_by_serial(container_serial)
+        except ResourceNotFoundError:
+            # The container serial might not exist
+            pass
+    if container:
+        container_type = container.type
+        if request.User is None or request.User.is_empty():
+            owners = container.get_users()
+            if len(owners) == 1:
+                request.User = owners[0]
+
+    if request.User:
+        audit_username = request.User.login
+        audit_realm = request.User.realm
+        audit_resolver = request.User.resolver
+    else:
+        audit_realm = get_optional(request.all_data, "realm")
+        audit_resolver = get_optional(request.all_data, "resolver")
+        audit_username = get_optional(request.all_data, "user")
+
+    ua_name, ua_version, _ua_comment = get_plugin_info_from_useragent(request.user_agent.string)
+    g.user_agent = ua_name
+    g.audit_object.log({"success": False,
+                        "user": audit_username,
+                        "realm": audit_realm,
+                        "resolver": audit_resolver,
+                        "container_serial": container_serial,
+                        "container_type": container_type,
+                        "client": g.client_ip,
+                        "user_agent": ua_name,
+                        "user_agent_version": ua_version,
+                        "privacyidea_server": privacyidea_server,
+                        "action": f"{request.method} {request.url_rule}",
+                        "action_detail": "",
+                        "thread_id": threading.current_thread().ident,
+                        "info": ""})
+
+
+def resolve_logged_in_user():
+    """
+    Resolve the user attributes (username, realm and resolver) from the logged-in user and set them in the request
+    object.
+    """
+    if g.logged_in_user.get("role") == "user":
+        # A user is calling this API. First thing we do is restricting the user parameter.
+        # ...to restrict token view, audit view or token actions.
+        request.all_data["user"] = g.logged_in_user.get("username")
+        request.all_data["realm"] = g.logged_in_user.get("realm")
+        # The resolver is part of the identity of the logged-in user and is determined below. It has to be
+        # removed before the user object is created, because get_user_from_param() would otherwise build
+        # a user object with the resolver taken from the request.
+        request.all_data.pop("resolver", None)
+        # The userid is a stand-alone filter on the token owner and is not part of the forced user
+        # identity. A user-role caller's list is already scoped to their own tokens, so it is dropped
+        # here as well: for them it could only ever match their own uid or nothing.
+        request.all_data.pop("userid", None)
+
+    try:
+        request.User = get_user_from_param(request.all_data)
+        # overwrite or set the resolver parameter in case of a logged-in user
+        if g.logged_in_user.get("role") == "user":
+            request.all_data["resolver"] = request.User.resolver
+    except AttributeError:
+        # Some endpoints do not need users OR e.g. the setPolicy endpoint
+        # takes a list as the user object
+        request.User = None
+    except UserError:
+        # In cases like the policy API, the parameter "user" is part of the
+        # policy and will not resolve to a user object
+        request.User = User()
 
 
 def before_request():
@@ -151,51 +451,30 @@ def before_request():
 
     user_required checks if there is a logged in admin or user
 
-    The checks for ONLY admin are preformed in api/system.py
+    The checks for ONLY admin are performed in api/system.py
     """
     # remove session from param and gather all parameters, either
     # from the Form data or from JSON in the request body.
     ensure_no_config_object()
-    request.all_data = get_all_params(request)
-    if g.logged_in_user.get("role") == "user":
-        # A user is calling this API. First thing we do is restricting the user parameter.
-        # ...to restrict token view, audit view or token actions.
-        request.all_data["user"] = g.logged_in_user.get("username")
-        request.all_data["realm"] = g.logged_in_user.get("realm")
+    # Save the request data
+    g.request_data = get_all_params(request)
+    request.all_data = copy.deepcopy(g.request_data)
+    resolve_logged_in_user()
+    get_before_request_config()
 
-    try:
-        request.User = get_user_from_param(request.all_data)
-        # overwrite or set the resolver parameter in case of a logged in user
-        if g.logged_in_user.get("role") == "user":
-            request.all_data["resolver"] = request.User.resolver
-    except AttributeError:
-        # Some endpoints do not need users OR e.g. the setPolicy endpoint
-        # takes a list as the userobject
-        request.User = None
-    except UserError:
-        # In cases like the policy API, the parameter "user" is part of the
-        # policy and will not resolve to a user object
-        request.User = User()
-
-    g.policy_object = PolicyClass()
-    g.audit_object = getAudit(current_app.config, g.startdate)
-    g.event_config = EventConfiguration()
-    # access_route contains the ip adresses of all clients, hops and proxies.
-    g.client_ip = get_client_ip(request,
-                                get_from_config(SYSCONF.OVERRIDECLIENT))
-    # Save the HTTP header in the localproxy object
-    g.request_headers = request.headers
-    privacyidea_server = current_app.config.get("PI_AUDIT_SERVERNAME") or \
-                         request.host
+    privacyidea_server = get_app_config_value("PI_AUDIT_SERVERNAME", get_privacyidea_node(request.host))
     # Already get some typical parameters to log
-    serial = getParam(request.all_data, "serial")
-    if serial and not "*" in serial:
+    serial = get_optional(request.all_data, "serial")
+    if serial and "*" not in serial and "," not in serial:
         g.serial = serial
         tokentype = get_token_type(serial)
         if not request.User:
-            # We determine the user object by the given serial number
+            # We determine the user object by the given serial number. If the owner can not be looked up, because
+            # the resolver of the owner was deleted or is unreachable, this is the owner as far as the database
+            # knows them: the token can still be managed, and the policies of the realm of the owner still apply
+            # to it. The failed lookup is reported below, once the audit entry of the request exists.
             try:
-                request.User = get_token_owner(serial) or User()
+                request.User = resolve_token_owner(serial) or User()
             except ResourceNotFoundError:
                 # The serial might not exist! This would raise an exception
                 pass
@@ -204,28 +483,66 @@ def before_request():
         g.serial = None
         tokentype = None
 
+    # Container info
+    container_serial = get_optional(request.all_data, "container_serial")
+    container = None
+    container_type = None
+    if container_serial and "*" not in container_serial:
+        try:
+            container = find_container_by_serial(container_serial)
+        except ResourceNotFoundError:
+            # The container serial might not exist
+            pass
+    elif serial and "*" not in serial:
+        # Get container serial from token
+        # if a serial list is given, check if all tokens are in the same container
+        serial_list = serial.replace(" ", "").split(",")
+        for idx, t_serial in enumerate(serial_list):
+            try:
+                container = find_container_for_token(t_serial)
+            except ResourceNotFoundError:
+                # The container serial might not exist
+                continue
+            if container:
+                if idx == 0:
+                    container_serial = container.serial
+            if not container or container_serial != container.serial:
+                # If at least one token is in a different or no container, we do not set the container attributes.
+                container_serial = None
+                break
+    if container:
+        container_type = container.type
+
     if request.User:
         audit_username = request.User.login
         audit_realm = request.User.realm
         audit_resolver = request.User.resolver
     else:
-        audit_realm = getParam(request.all_data, "realm")
-        audit_resolver = getParam(request.all_data, "resolver")
-        audit_username = getParam(request.all_data, "user")
+        audit_realm = get_optional(request.all_data, "realm")
+        audit_resolver = get_optional(request.all_data, "resolver")
+        audit_username = get_optional(request.all_data, "user")
 
+    ua_name, ua_version, _ua_comment = get_plugin_info_from_useragent(request.user_agent.string)
+    g.user_agent = ua_name
     g.audit_object.log({"success": False,
                         "serial": serial,
                         "user": audit_username,
                         "realm": audit_realm,
                         "resolver": audit_resolver,
                         "token_type": tokentype,
+                        "container_serial": container_serial,
+                        "container_type": container_type,
                         "client": g.client_ip,
-                        "client_user_agent": request.user_agent.browser,
+                        "user_agent": ua_name,
+                        "user_agent_version": ua_version,
                         "privacyidea_server": privacyidea_server,
-                        "action": "{0!s} {1!s}".format(request.method, request.url_rule),
+                        "action": f"{request.method!s} {request.url_rule!s}",
                         "action_detail": "",
-                        "thread_id": u"{0!s}".format(threading.current_thread().ident),
+                        "thread_id": f"{threading.current_thread().ident!s}",
                         "info": ""})
+
+    if serial:
+        report_owner_lookup_error(serial)
 
     if g.logged_in_user.get("role") == "admin":
         # An administrator is calling this API
@@ -245,6 +562,8 @@ def before_request():
 @user_blueprint.after_request
 @token_blueprint.after_request
 @audit_blueprint.after_request
+@authentication_log_blueprint.after_request
+@conditional_access_blueprint.after_request
 @application_blueprint.after_request
 @machine_blueprint.after_request
 @machineresolver_blueprint.after_request
@@ -263,6 +582,10 @@ def before_request():
 @register_blueprint.after_request
 @recover_blueprint.after_request
 @tokengroup_blueprint.after_request
+@serviceid_blueprint.after_request
+@clients_blueprint.after_request
+@container_blueprint.after_request
+@info_blueprint.after_request
 @jwtauth.after_request
 @postrequest(sign_response, request=request)
 def after_request(response):
@@ -270,8 +593,116 @@ def after_request(response):
     This function is called after a request
     :return: The response
     """
-    # No caching!
-    response.headers['Cache-Control'] = 'no-cache'
+    response = mask_authentication_error_response(request, response)
+
+    # Re-apply the audit entry of a request the pre-check refused, which the endpoint's own view may since have
+    # overwritten. Central rather than per endpoint for two reasons: this also runs for a response an *error
+    # handler* built, where every post-policy is skipped, and no gated endpoint can forget to opt in. Only the
+    # audit entry is touched, never the body, so unlike the shaping steps around it this carries no ordering
+    # constraint beyond running before teardown finalizes the entry.
+    response = restore_rejection_audit(response)
+
+    response = record_suspended_api_client(response)
+
+    response = shape_radius_response(request, response)
+
+    # Strip version information before signing if the hide_version policy
+    # is active and no user is logged in.
+    response = hide_version(request, response)
+
+    # No caching! Applied last, to the final response object, so a shaped
+    # replacement response still carries the no-cache guarantee.
+    # An enrollment response carries the token seed, as the QR code and as the enrollment URL,
+    # so it gets "no-store": "no-cache" still allows a client to keep the response and revalidate
+    # it, while "no-store" asks it not to write the response to disk at all.
+    if request.endpoint in NO_STORE_ENDPOINTS:
+        response.headers['Cache-Control'] = 'no-store'
+    else:
+        response.headers['Cache-Control'] = 'no-cache'
+
+    return response
+
+
+def record_suspended_api_client(response):
+    """
+    Record that a real, previously issued API key was presented after its client was disabled.
+
+    Central, and on the way out rather than on the way in, for three reasons. The middleware that detects it
+    (:func:`identify_api_client`) is a ``before_app_request`` and runs before any blueprint has built the audit
+    object or resolved the source IP, so a row written there would name neither. Every blueprint attached to the
+    shared ``after_request`` below reaches here, so the signal no longer depends on which ``before_request``
+    happens to look for it - it used to be recorded by ``/validate``'s alone, which meant a suspended key was
+    reported on a password reset and not on ``/auth`` or ``/token``. And this also runs for a response an
+    *error handler* built, which is the normal case: the two endpoints that require an identified client
+    answer such a request with a ``401``.
+
+    The row names the **client**, never a user. The request was not identified by the key
+    (``g.client_id`` stays ``None``), so any user it carries is an unauthenticated claim the caller chose - and
+    with this event type trackable, attributing the row to that name would let whoever holds a disabled key
+    write authentication-log rows against any account, which a policy counting them per user would turn into a
+    lockout. The subject conditional access can act on here is the source IP, which is the integration still
+    calling with a key that was taken away.
+    """
+    rejected = g.get("rejected_api_client")
+    if not rejected:
+        return response
+    if "audit_object" in g:
+        g.audit_object.add_to_log(
+            {"action_detail": f"{rejected['status']} API key presented (client {rejected['client_id']})"},
+            add_with_comma=True)
+    log_authentication(AuthEventType.SUSPENDED_API_KEY_USED, request,
+                       other_info={"client_id": rejected["client_id"]})
+    return response
+
+
+def _shaped_rule(request) -> str | None:
+    """
+    The route whose response is about to be shaped, or ``None`` when there is nothing to shape.
+
+    Flask answers OPTIONS itself, without dispatching to the view, so such a request carries no authentication
+    outcome - only the Allow header, which must survive.
+    """
+    if request.method == "OPTIONS":
+        return None
+    return getattr(getattr(request, "url_rule", None), "rule", None)
+
+
+def mask_authentication_error_response(request, response):
+    """
+    Apply :func:`hide_specific_error_message` to the two endpoints that authenticate a credential.
+
+    It must run on *every* response - normal returns and the error responses built by the error handlers in this
+    module alike - but the ``@postpolicy`` chain of the view only runs when the view *returns*. ``after_request``
+    is the single choke point every response flows through (this is also how ``sign_response`` manages to sign
+    error responses), so it is applied here once instead of being duplicated as a ``@postpolicy`` decorator on the
+    views and, for the error path, inline in the error handlers.
+
+    A no-op for a successful authentication and only on the routes it belongs to, so unrelated endpoints (and
+    ``/auth/rights``, ``/validate/*`` other than ``check``) are left untouched.
+
+    :param request: the request object
+    :param response: the response object
+    :return: the (possibly modified) response
+    """
+    if _shaped_rule(request) in ("/validate/check", "/auth"):
+        return hide_specific_error_message(request, response)
+    return response
+
+
+def shape_radius_response(request, response):
+    """
+    Apply :func:`construct_radius_response` to ``/validate/radiuscheck``, shaping it into the RADIUS empty-body
+    ``204``/``400`` form.
+
+    Applied from ``after_request`` for the same reason as :func:`mask_authentication_error_response`: so an error
+    response built by an error handler is shaped too.
+
+    :param request: the request object
+    :param response: the response object
+    :return: the (possibly replaced) response
+    """
+    if _shaped_rule(request) == "/validate/radiuscheck":
+        return construct_radius_response(request, response)
     return response
 
 
@@ -289,22 +720,36 @@ def after_request(response):
 @subscriptions_blueprint.app_errorhandler(AuthError)
 @monitoring_blueprint.app_errorhandler(AuthError)
 @tokengroup_blueprint.app_errorhandler(AuthError)
+@serviceid_blueprint.app_errorhandler(AuthError)
+@container_blueprint.app_errorhandler(AuthError)
+@healthz_blueprint.app_errorhandler(AuthError)
+@info_blueprint.app_errorhandler(AuthError)
+@jwtauth.app_errorhandler(AuthError)
 def auth_error(error):
     if "audit_object" in g:
         message = ''
+
+        if request.blueprint == "jwtauth" and request.path.endswith("/auth"):
+            # Mark failed logins as REJECT like _finalize_auth_response() in
+            # validate.py does, so the "!CHALLENGE" filter in check_max_auth_fail
+            # matches them (SQL "!=" does not match NULL).
+            g.audit_object.log({"authentication": AUTH_RESPONSE.REJECT})
 
         if hasattr(error, 'message'):
             message = error.message
 
         if hasattr(error, 'details'):
-            if error.details:
-                if 'message' in error.details:
-                    message = u'{}|{}'.format(message, error.details['message'])
+            if not error.details:
+                error.details = {}
+            if "message" in error.details:
+                message = "{}|{}".format(message, error.details['message'])
 
+        # The specific message is written to the audit log here; masking the
+        # client-facing response (hide_specific_error_message) is applied
+        # centrally in mask_authentication_error_response (see after_request).
         g.audit_object.add_to_log({"info": message}, add_with_comma=True)
-    return send_error(error.message,
-                      error_code=error.id,
-                      details=error.details), 401
+
+    return send_error(error.message, error_code=error.id, details=error.details), get_auth_error_status_code(error)
 
 
 @system_blueprint.errorhandler(PolicyError)
@@ -324,10 +769,13 @@ def auth_error(error):
 @monitoring_blueprint.app_errorhandler(PolicyError)
 @ttype_blueprint.app_errorhandler(PolicyError)
 @tokengroup_blueprint.app_errorhandler(PolicyError)
+@serviceid_blueprint.app_errorhandler(PolicyError)
+@container_blueprint.app_errorhandler(PolicyError)
+@info_blueprint.app_errorhandler(PolicyError)
 def policy_error(error):
     if "audit_object" in g:
         g.audit_object.add_to_log({"info": error.message}, add_with_comma=True)
-    return send_error(error.message, error_code=error.id), 403
+    return send_error(error.message, error_code=error.id), get_auth_error_status_code(error)
 
 
 @system_blueprint.app_errorhandler(ResourceNotFoundError)
@@ -346,6 +794,9 @@ def policy_error(error):
 @subscriptions_blueprint.app_errorhandler(ResourceNotFoundError)
 @ttype_blueprint.app_errorhandler(ResourceNotFoundError)
 @tokengroup_blueprint.errorhandler(ResourceNotFoundError)
+@serviceid_blueprint.errorhandler(ResourceNotFoundError)
+@container_blueprint.app_errorhandler(ResourceNotFoundError)
+@info_blueprint.app_errorhandler(ResourceNotFoundError)
 def resource_not_found_error(error):
     """
     This function is called when an ResourceNotFoundError occurs.
@@ -353,34 +804,66 @@ def resource_not_found_error(error):
     """
     if "audit_object" in g:
         g.audit_object.log({"info": error.message})
-    return send_error(error.message, error_code=error.id), 404
+    return send_error(error.message, error_code=error.id), get_auth_error_status_code(error)
 
 
-@system_blueprint.app_errorhandler(privacyIDEAError)
-@realm_blueprint.app_errorhandler(privacyIDEAError)
-@defaultrealm_blueprint.app_errorhandler(privacyIDEAError)
-@resolver_blueprint.app_errorhandler(privacyIDEAError)
-@policy_blueprint.app_errorhandler(privacyIDEAError)
-@user_blueprint.app_errorhandler(privacyIDEAError)
-@token_blueprint.app_errorhandler(privacyIDEAError)
-@audit_blueprint.app_errorhandler(privacyIDEAError)
-@application_blueprint.app_errorhandler(privacyIDEAError)
-@smtpserver_blueprint.app_errorhandler(privacyIDEAError)
-@eventhandling_blueprint.app_errorhandler(privacyIDEAError)
-@register_blueprint.app_errorhandler(privacyIDEAError)
-@recover_blueprint.app_errorhandler(privacyIDEAError)
-@subscriptions_blueprint.app_errorhandler(privacyIDEAError)
-@monitoring_blueprint.app_errorhandler(privacyIDEAError)
-@ttype_blueprint.app_errorhandler(privacyIDEAError)
-@tokengroup_blueprint.app_errorhandler(privacyIDEAError)
+@system_blueprint.app_errorhandler(PrivacyIDEAError)
+@realm_blueprint.app_errorhandler(PrivacyIDEAError)
+@defaultrealm_blueprint.app_errorhandler(PrivacyIDEAError)
+@resolver_blueprint.app_errorhandler(PrivacyIDEAError)
+@policy_blueprint.app_errorhandler(PrivacyIDEAError)
+@user_blueprint.app_errorhandler(PrivacyIDEAError)
+@token_blueprint.app_errorhandler(PrivacyIDEAError)
+@audit_blueprint.app_errorhandler(PrivacyIDEAError)
+@application_blueprint.app_errorhandler(PrivacyIDEAError)
+@smtpserver_blueprint.app_errorhandler(PrivacyIDEAError)
+@eventhandling_blueprint.app_errorhandler(PrivacyIDEAError)
+@register_blueprint.app_errorhandler(PrivacyIDEAError)
+@recover_blueprint.app_errorhandler(PrivacyIDEAError)
+@subscriptions_blueprint.app_errorhandler(PrivacyIDEAError)
+@monitoring_blueprint.app_errorhandler(PrivacyIDEAError)
+@ttype_blueprint.app_errorhandler(PrivacyIDEAError)
+@tokengroup_blueprint.app_errorhandler(PrivacyIDEAError)
+@serviceid_blueprint.app_errorhandler(PrivacyIDEAError)
+@container_blueprint.app_errorhandler(PrivacyIDEAError)
+@info_blueprint.app_errorhandler(PrivacyIDEAError)
 def privacyidea_error(error):
     """
     This function is called when an privacyIDEAError occurs.
     These are not that critical exceptions.
     """
     if "audit_object" in g:
-        g.audit_object.log({"info": six.text_type(error)})
-    return send_error(six.text_type(error), error_code=error.id), 400
+        g.audit_object.log({"info": str(error)})
+    return send_error(str(error), error_code=error.id), get_auth_error_status_code(error)
+
+
+@system_blueprint.app_errorhandler(NotImplementedError)
+@realm_blueprint.app_errorhandler(NotImplementedError)
+@defaultrealm_blueprint.app_errorhandler(NotImplementedError)
+@resolver_blueprint.app_errorhandler(NotImplementedError)
+@policy_blueprint.app_errorhandler(NotImplementedError)
+@user_blueprint.app_errorhandler(NotImplementedError)
+@token_blueprint.app_errorhandler(NotImplementedError)
+@audit_blueprint.app_errorhandler(NotImplementedError)
+@application_blueprint.app_errorhandler(NotImplementedError)
+@smtpserver_blueprint.app_errorhandler(NotImplementedError)
+@eventhandling_blueprint.app_errorhandler(NotImplementedError)
+@register_blueprint.app_errorhandler(NotImplementedError)
+@recover_blueprint.app_errorhandler(NotImplementedError)
+@subscriptions_blueprint.app_errorhandler(NotImplementedError)
+@monitoring_blueprint.app_errorhandler(NotImplementedError)
+@ttype_blueprint.app_errorhandler(NotImplementedError)
+@tokengroup_blueprint.app_errorhandler(NotImplementedError)
+@serviceid_blueprint.app_errorhandler(NotImplementedError)
+@container_blueprint.app_errorhandler(NotImplementedError)
+def not_implemented_error(error):
+    """
+    This function is called when an NotImplementedError occurs.
+    """
+    if "audit_object" in g:
+        g.audit_object.log({"info": str(error)})
+    http_status_code = map_error_to_code(error)
+    return send_error(str(error), error_code=-http_status_code), http_status_code
 
 
 # other errors
@@ -401,6 +884,9 @@ def privacyidea_error(error):
 @monitoring_blueprint.app_errorhandler(500)
 @ttype_blueprint.app_errorhandler(500)
 @tokengroup_blueprint.app_errorhandler(500)
+@serviceid_blueprint.app_errorhandler(500)
+@container_blueprint.app_errorhandler(500)
+@info_blueprint.app_errorhandler(500)
 def internal_error(error):
     """
     This function is called when an internal error (500) occurs.
@@ -408,5 +894,5 @@ def internal_error(error):
     occurs.
     """
     if "audit_object" in g:
-        g.audit_object.log({"info": six.text_type(error)})
-    return send_error(six.text_type(error), error_code=-500), 500
+        g.audit_object.log({"info": str(error)})
+    return send_error(str(error), error_code=-500), 500

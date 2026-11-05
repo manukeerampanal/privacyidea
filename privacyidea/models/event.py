@@ -1,0 +1,147 @@
+# SPDX-FileCopyrightText: (C) 2025 NetKnights GmbH <https://netknights.it>
+# SPDX-FileCopyrightText: (C) 2025 Paul Lettich <paul.lettich@netknights.it>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# This code is free software; you can redistribute it and/or
+# modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+# as published by the Free Software Foundation; either
+# version 3 of the License, or any later version.
+#
+# This code is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+#
+# You should have received a copy of the GNU Affero General Public
+# License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+from sqlalchemy import (
+    Sequence,
+    Unicode,
+    Integer,
+    Boolean,
+    ForeignKey,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from privacyidea.lib.utils import convert_column_to_unicode
+from privacyidea.models import db
+from privacyidea.models.utils import MethodsMixin
+
+
+class EventHandler(MethodsMixin, db.Model):
+    """
+    This model holds the list of defined events and actions of this eventhandler.
+    A handler module can be bound to an event with the corresponding condition and action.
+    """
+    __tablename__ = 'eventhandler'
+    id: Mapped[int] = mapped_column(Integer, Sequence("eventhandler_seq"), primary_key=True,
+                                    nullable=False)
+    # in fact the name is a description
+    name: Mapped[str | None] = mapped_column(Unicode(64), unique=False, nullable=True)
+    active: Mapped[bool | None] = mapped_column(Boolean, default=True)
+    ordering: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    position: Mapped[str | None] = mapped_column(Unicode(10), default="post")
+    # If the handler raises an exception, the request is aborted instead of continuing without the handler.
+    abort_on_error: Mapped[bool | None] = mapped_column(Boolean, default=False)
+    # This is the name of the event in the code
+    event: Mapped[str] = mapped_column(Unicode(255), nullable=False)
+    # This is the identifier of an event handler module
+    handlermodule: Mapped[str] = mapped_column(Unicode(255), nullable=False)
+    condition: Mapped[str | None] = mapped_column(Unicode(1024), default="")
+    action: Mapped[str | None] = mapped_column(Unicode(1024), default="")
+
+    # Relationships with cascade to automatically delete child records
+    options = relationship('EventHandlerOption', lazy='dynamic', backref='eventhandler', cascade="all, delete-orphan")
+    conditions = relationship('EventHandlerCondition', lazy='dynamic', backref='eventhandler',
+                              cascade="all, delete-orphan")
+
+    def __init__(self, name, event, handlermodule, action, condition="",
+                 ordering=0, options=None, id=None, conditions=None,
+                 active=True, position="post", abort_on_error=False):
+        self.name = name
+        self.ordering = ordering
+        self.event = event
+        self.handlermodule = handlermodule
+        self.condition = condition
+        self.action = action
+        self.active = active
+        self.position = position
+        self.abort_on_error = abort_on_error
+        if id == "":
+            id = None
+        self.id = id
+
+    def get(self):
+        """
+        Return the serialized eventhandler object including the options
+
+        :return: complete dict
+        :rtype: dict
+        """
+        d = {"active": self.active,
+             "name": self.name,
+             "handlermodule": self.handlermodule,
+             "id": self.id,
+             "ordering": self.ordering,
+             "position": self.position or "post",
+             "abort_on_error": bool(self.abort_on_error),
+             "action": self.action,
+             "condition": self.condition}
+        event_list = [x.strip() for x in self.event.split(",")]
+        d["event"] = event_list
+        option_dict = {}
+        # Fetching all options from the relationship
+        for option in self.options:
+            option_dict[option.Key] = option.Value
+        d["options"] = option_dict
+        condition_dict = {}
+        # Fetching all conditions from the relationship
+        for cond in self.conditions:
+            condition_dict[cond.Key] = cond.Value
+        d["conditions"] = condition_dict
+        return d
+
+
+class EventHandlerCondition(db.Model):
+    """
+    Each EventHandler entry can have additional conditions according to the
+    handler module
+    """
+    __tablename__ = "eventhandlercondition"
+    id: Mapped[int] = mapped_column(Integer, Sequence("eventhandlercond_seq"), primary_key=True)
+    eventhandler_id: Mapped[int | None] = mapped_column(Integer, ForeignKey('eventhandler.id'))
+    Key: Mapped[str] = mapped_column(Unicode(255), nullable=False)
+    Value: Mapped[str | None] = mapped_column(Unicode(2000), default='')
+    comparator: Mapped[str | None] = mapped_column(Unicode(255), default='equal')
+    __table_args__ = (UniqueConstraint('eventhandler_id', 'Key', name='ehcix_1'),)
+
+    def __init__(self, eventhandler_id, Key, Value, comparator="equal"):
+        self.eventhandler_id = eventhandler_id
+        self.Key = Key
+        self.Value = convert_column_to_unicode(Value)
+        self.comparator = comparator
+
+
+class EventHandlerOption(db.Model):
+    """
+    Each EventHandler entry can have additional options according to the
+    handler module.
+    """
+    __tablename__ = 'eventhandleroption'
+    id: Mapped[int] = mapped_column(Integer, Sequence("eventhandleropt_seq"), primary_key=True)
+    eventhandler_id: Mapped[int | None] = mapped_column(Integer, ForeignKey('eventhandler.id'))
+    Key: Mapped[str] = mapped_column(Unicode(255), nullable=False)
+    Value: Mapped[str | None] = mapped_column(Unicode(2000), default='')
+    Type: Mapped[str | None] = mapped_column(Unicode(2000), default='')
+    Description: Mapped[str | None] = mapped_column(Unicode(2000), default='')
+    __table_args__ = (UniqueConstraint('eventhandler_id', 'Key', name='ehoix_1'),)
+
+    def __init__(self, eventhandler_id, Key, Value, Type="", Description=""):
+        self.eventhandler_id = eventhandler_id
+        self.Key = Key
+        self.Value = convert_column_to_unicode(Value)
+        self.Type = Type
+        self.Description = Description

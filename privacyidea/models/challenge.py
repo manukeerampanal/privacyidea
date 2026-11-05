@@ -1,0 +1,243 @@
+# SPDX-FileCopyrightText: (C) 2025 NetKnights GmbH <https://netknights.it>
+# SPDX-FileCopyrightText: (C) 2025 Paul Lettich <paul.lettich@netknights.it>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# This code is free software; you can redistribute it and/or
+# modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+# as published by the Free Software Foundation; either
+# version 3 of the License, or any later version.
+#
+# This code is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+#
+# You should have received a copy of the GNU Affero General Public
+# License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import json
+import logging
+from datetime import datetime, timedelta
+
+from sqlalchemy import (
+    Sequence,
+    Unicode,
+    Integer,
+    Text,
+    DateTime,
+    Boolean,
+    delete,
+)
+from sqlalchemy.orm import Mapped, mapped_column
+
+from privacyidea.lib.challenge_types import is_challenge_open
+from privacyidea.lib.crypto import FAILED_TO_DECRYPT_PASSWORD, get_rand_digit_str, encryptPassword, decryptPassword
+from privacyidea.lib.log import log_with
+from privacyidea.lib.utils import convert_column_to_unicode
+from privacyidea.models import db
+from privacyidea.models.utils import MethodsMixin, utc_now
+
+log = logging.getLogger(__name__)
+
+
+class Challenge(MethodsMixin, db.Model):
+    """
+    Table for handling of the generic challenges.
+    """
+    __tablename__ = "challenge"
+    id: Mapped[int] = mapped_column(Integer, Sequence("challenge_seq"), primary_key=True, nullable=False)
+    transaction_id: Mapped[str] = mapped_column(Unicode(64), nullable=False, index=True)
+    _data: Mapped[str | None] = mapped_column("data", Text, default='')
+    challenge: Mapped[str | None] = mapped_column(Text, default='')
+    session: Mapped[str | None] = mapped_column(Unicode(512), default='', quote=True, name="session")
+    # The token serial number
+    serial: Mapped[str | None] = mapped_column(Unicode(40), default='', index=True)
+    timestamp: Mapped[datetime | None] = mapped_column(DateTime, default=utc_now, index=True)
+    expiration: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    received_count: Mapped[int | None] = mapped_column(Integer, default=0)
+    otp_valid: Mapped[bool | None] = mapped_column(Boolean, default=False)
+
+    @property
+    def data(self):
+        """Return the decrypted challenge data as a JSON string, or empty string."""
+        raw = self._data
+        if not raw:
+            return raw
+        decrypted = decryptPassword(raw)
+        if decrypted == FAILED_TO_DECRYPT_PASSWORD:
+            log.warning("Challenge %s: failed to decrypt data.", self.transaction_id)
+            return ''
+        return decrypted
+
+    @data.setter
+    def data(self, value):
+        """Allow direct assignment to data (encrypts before storing)."""
+        self.set_data(value)
+
+    @property
+    def encrypted_data(self) -> str:
+        """
+        Return the stored ciphertext of ``data``, without decrypting it.
+
+        For a caller that has to persist the very same value somewhere else - the
+        Redis cache stores this challenge instead of the row - so that it does not
+        have to decrypt and re-encrypt what is already encrypted here.
+        """
+        return self._data or ''
+
+    @log_with(log)
+    def __init__(self, serial, transaction_id=None,
+                 challenge='', data=None, session='', validitytime=120):
+        # We manually assign attributes here as they depend on the function parameters
+        self.transaction_id = transaction_id or self.create_transaction_id()
+        self.challenge = challenge
+        self.serial = serial
+        self.set_data(data)
+        self.timestamp = utc_now()
+        self.session = session
+        self.received_count = 0
+        self.otp_valid = False
+        self.expiration = self.timestamp + timedelta(seconds=validitytime)
+
+    @staticmethod
+    def create_transaction_id(length=20):
+        return get_rand_digit_str(length)
+
+    def is_valid(self):
+        """
+        Returns true, if the expiration time has not passed, yet.
+
+        :return: True if valid
+        :rtype: bool
+        """
+        c_now = utc_now()
+        if self.timestamp <= c_now < self.expiration:
+            return True
+        return False
+
+    def is_open(self) -> bool:
+        """
+        Returns true if the challenge can still be answered: it is not expired,
+        has not been answered yet, and has not been refused (declined or
+        cancelled). This is the guard the answering endpoints use before
+        mutating a challenge.
+
+        :return: True if the challenge is still open
+        :rtype: bool
+        """
+        return is_challenge_open(self.is_valid(), self.otp_valid, self.get_session())
+
+    def set_data(self, data: dict | None):
+        """
+        Set the internal data of the challenge.
+        The data is encrypted before being stored in the database since it
+        may contain OTP values.
+
+        :param data: The challenge data. Must be a dict (or None/empty).
+        """
+        if not data:
+            self._data = ''
+        else:
+            self._data = encryptPassword(json.dumps(data))
+
+    def get_data(self) -> dict:
+        """
+        Get the decrypted challenge data as a dict.
+
+        :return: The challenge data as a dict. Returns ``{}`` if no data is stored.
+        :rtype: dict
+        """
+        data = self.data
+        if not data:
+            return {}
+        try:
+            result = json.loads(data)
+        except (json.JSONDecodeError, ValueError):
+            log.warning("Challenge %s: failed to decode data as JSON.", self.transaction_id)
+            return {}
+        if not isinstance(result, dict):
+            log.warning("Challenge %s: data is not a dict (got %s). Returning empty dict.",
+                        self.transaction_id, type(result).__name__)
+            return {}
+        return result
+
+    def get_session(self):
+        return self.session
+
+    def set_session(self, session):
+        self.session = convert_column_to_unicode(session)
+
+    def set_challenge(self, challenge):
+        self.challenge = convert_column_to_unicode(challenge)
+
+    def get_challenge(self):
+        return self.challenge
+
+    def set_otp_status(self, valid=False):
+        self.received_count += 1
+        self.otp_valid = valid
+
+    def get_otp_status(self):
+        """
+        This returns how many OTPs were already received for this challenge.
+        and if a valid OTP was received.
+
+        :return: tuple of count and True/False
+        :rtype: tuple
+        """
+        return self.received_count, self.otp_valid
+
+    def get_transaction_id(self):
+        return self.transaction_id
+
+    def get(self, timestamp=False):
+        """
+        return a dictionary of all vars in the challenge class
+
+        :param timestamp: if true, the timestamp will be returned in a readable
+                          format like "2014-11-29 21:56:43.057293"
+        :type timestamp: bool
+        :return: dict of vars
+        """
+        # The SQL primary key is intentionally not part of the public
+        # challenge representation. transaction_id is the identity field
+        # callers should use. .id is a storage-layer artifact, and exposing
+        # it would let consumers diverge between the SQL backend (real int)
+        # and the Redis cache backend (no PK at all - ChallengeDTO doesn't
+        # expose .id).
+        descr = {
+            'transaction_id': self.transaction_id,
+            'challenge': self.challenge,
+            'serial': self.serial,
+            'data': self.get_data(),
+            'otp_received': self.received_count > 0,
+            'received_count': self.received_count,
+            'otp_valid': self.otp_valid,
+            'expiration': self.expiration,
+        }
+        if timestamp is True:
+            descr['timestamp'] = f"{self.timestamp}"
+        else:
+            descr['timestamp'] = self.timestamp
+        return descr
+
+    def __str__(self):
+        descr = self.get()
+        return f"{descr!s}"
+
+
+def cleanup_challenges(serial):
+    """
+    Delete all challenges, that have expired.
+
+    :return: None
+    """
+    c_now = utc_now()  # DB contains naive datetime
+    # Replaced the legacy .query.delete() with a modern delete statement
+    delete_stmt = delete(Challenge).where(
+        Challenge.expiration < c_now,
+        Challenge.serial == serial
+    )
+    db.session.execute(delete_stmt)
+    db.session.commit()

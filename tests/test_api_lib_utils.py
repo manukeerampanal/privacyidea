@@ -1,38 +1,77 @@
-# -*- coding: utf-8 -*-
 """
 This tests the file api.lib.utils
 """
 from .base import MyApiTestCase
 
-from privacyidea.api.lib.utils import (getParam,
-                                       check_policy_name,
-                                       verify_auth_token, is_fqdn, attestation_certificate_allowed,
-                                       get_priority_from_param, get_all_params)
+from privacyidea.api.lib.utils import (check_policy_name,
+                                       verify_auth_token, is_fqdn,
+                                       attestation_certificate_allowed, get_priority_from_param,
+                                       get_required_one_of, get_optional_one_of, get_required, get_optional,
+                                       to_list_param, build_ca_context, send_error, request_endpoint)
+from privacyidea.lib.conditional_access.authentication_event_types import (AuthEventType, AuthEventReason,
+                                                                           AUTH_EVENT_TYPE_KEY,
+                                                                           AUTH_EVENT_REASON_KEY,
+                                                                           AUTH_EVENT_REASON_DETAIL_KEY,
+                                                                           INTERNAL_CLASSIFICATION_KEYS,
+                                                                           LOG_TRANSACTION_ID_KEY)
+from privacyidea.lib.params import get_optional_timestamp, get_required_timestamp
+from privacyidea.config import pubtest_key
+from privacyidea.lib.utils import prepare_result
+from privacyidea.lib.policy import SCOPE, set_policy, delete_policy
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.user import User
 from privacyidea.lib.error import ParameterError
+from privacyidea.lib.params import MAX_PAGE_SIZE, get_optional_int, get_pagination_params
 import jwt
-import mock
+from unittest import mock
 import datetime
 import warnings
+from urllib.parse import quote
 from privacyidea.lib.error import AuthError
 from privacyidea.lib.token import init_token, remove_token
 
 
 class UtilsTestCase(MyApiTestCase):
 
+    def test_00_to_list_param(self):
+        # A not-supplied parameter stays None so callers can tell it apart from a supplied-but-blank one.
+        self.assertIsNone(to_list_param(None))
+        # Comma-separated string -> entries, stripped.
+        self.assertListEqual(["a", "b"], to_list_param("a,b"))
+        self.assertListEqual(["a", "b"], to_list_param(" a , b "))
+        # A single value is a one-element list, not a wrapped string.
+        self.assertListEqual(["a"], to_list_param("a"))
+        # Native JSON lists/tuples pass through, stringified and stripped.
+        self.assertListEqual(["a", "b"], to_list_param(["a", " b "]))
+        self.assertListEqual(["a", "b"], to_list_param(("a", "b")))
+        self.assertListEqual(["1", "2"], to_list_param([1, 2]))
+        # Empty entries are dropped, so a blank value yields [] rather than [""] — filtering on an
+        # empty string would otherwise match nothing (or everything, depending on the caller).
+        self.assertListEqual(["a"], to_list_param("a,"))
+        self.assertListEqual([], to_list_param(""))
+        self.assertListEqual([], to_list_param(","))
+        self.assertListEqual([], to_list_param("  "))
+        self.assertListEqual([], to_list_param([]))
+        self.assertListEqual(["a"], to_list_param(["a", "", "  "]))
+
     def test_01_getParam(self):
-        s = getParam({"serial": ""}, "serial", optional=False, allow_empty=True)
+        # allow_empty=True: empty string is returned as-is for required params
+        s = get_required({"serial": ""}, "serial", allow_empty=True)
         self.assertEqual(s, "")
 
-        self.assertRaises(ParameterError, getParam, {"serial": ""}, "serial", optional=False, allow_empty=False)
+        # allow_empty=False (default): empty string raises ParameterError
+        self.assertRaises(ParameterError, get_required, {"serial": ""}, "serial")
 
-        # check for allowed values
-        v = getParam({"sslverify": "0"}, "sslverify", allowed_values=["0", "1"], default="1")
+        # check for allowed_values: value in list is returned
+        v = get_optional({"sslverify": "0"}, "sslverify", allowed_values=["0", "1"], default="1")
         self.assertEqual("0", v)
 
-        v = getParam({"sslverify": "rogue value"}, "sslverify", allowed_values=["0", "1"], default="1")
+        # check for allowed_values: rogue value falls back to default
+        v = get_optional({"sslverify": "rogue value"}, "sslverify", allowed_values=["0", "1"], default="1")
         self.assertEqual("1", v)
 
-        v = getParam({}, "sslverify", allowed_values=["0", "1"], default="1")
+        # check for allowed_values: missing key returns default
+        v = get_optional({}, "sslverify", allowed_values=["0", "1"], default="1")
         self.assertEqual("1", v)
 
     def test_02_check_policy_name(self):
@@ -52,8 +91,13 @@ class UtilsTestCase(MyApiTestCase):
         check_policy_name("pi-update-policysomething")
 
     def test_03_verify_auth_token(self):
+        # check broken JWT
+        self.assertRaises(AuthError, verify_auth_token,
+                          auth_token='not_valid_jwt',
+                          required_role="user")
+
         # create a jwt with a trusted private key
-        with open("tests/testdata/jwt_sign.key", "r") as f:
+        with open("tests/testdata/jwt_sign.key") as f:
             key = f.read()
 
         # successful authentication with wildcard user, starting with an "h" and ending with "s"
@@ -79,7 +123,7 @@ class UtilsTestCase(MyApiTestCase):
                                 algorithm="RS256")
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', category=DeprecationWarning)
-            self.assertRaisesRegexp(
+            self.assertRaisesRegex(
                 AuthError,
                 "The username hanswurst is not allowed to impersonate via JWT.",
                 verify_auth_token, auth_token=auth_token, required_role="user")
@@ -94,7 +138,7 @@ class UtilsTestCase(MyApiTestCase):
                                 algorithm="RS256")
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', category=DeprecationWarning)
-            self.assertRaisesRegexp(
+            self.assertRaisesRegex(
                 AuthError,
                 "The username kleinerhans is not allowed to impersonate via JWT.",
                 verify_auth_token, auth_token=auth_token, required_role="user")
@@ -131,23 +175,62 @@ class UtilsTestCase(MyApiTestCase):
                                              "resolver": "resolverX"},
                                     key=key,
                                     algorithm="RS256")
-            r = verify_auth_token(auth_token=auth_token,
-                                  required_role="user")
+            verify_auth_token(auth_token=auth_token,
+                              required_role="user")
             mock_log.assert_any_call("A given JWT definition does not match.")
+
+    def test_03b_verify_auth_token_requires_username(self):
+        with open("tests/testdata/jwt_sign.key") as f:
+            key = f.read()
+        secret = self.app.config["SECRET_KEY"]
+        wildcard_entry = {"public_key": pubtest_key, "algorithm": "RS256", "role": "user", "realm": "realm1",
+                          "username": ".*"}
+        no_user = "The Authorization token does not name a user."
+
+        with mock.patch.dict(self.app.config, {"PI_TRUSTED_JWT": [wildcard_entry]}):
+            # The regex ".*" matches the empty string
+            empty_username_token = jwt.encode(payload={"role": "user", "username": "", "realm": "realm1"}, key=key,
+                                              algorithm="RS256")
+            self.assertRaisesRegex(AuthError, no_user, verify_auth_token, auth_token=empty_username_token,
+                                   required_role=["user"])
+
+            # A missing username must not reach the regex
+            auth_token = jwt.encode(payload={"role": "user", "realm": "realm1"}, key=key, algorithm="RS256")
+            self.assertRaises(AuthError, verify_auth_token, auth_token=auth_token, required_role=["user"])
+
+            auth_token = jwt.encode(payload={"role": "user", "username": ["userA"], "realm": "realm1"}, key=key,
+                                    algorithm="RS256")
+            self.assertRaises(AuthError, verify_auth_token, auth_token=auth_token, required_role=["user"])
+
+            # Raise on trying to use a JWT without a username
+            self.setUp_user_realms()
+            with self.app.test_request_context('/token/', method='GET',
+                                               headers={"Authorization": empty_username_token}):
+                res = self.app.full_dispatch_request()
+            self.assertEqual(401, res.status_code, res.json)
+
+        for payload in ({"role": "user", "username": "", "realm": "realm1"},
+                        {"role": "user", "realm": "realm1"},
+                        {"role": "user", "username": 123, "realm": "realm1"},
+                        {"role": "admin", "realm": ""}):
+            auth_token = jwt.encode(payload=payload, key=secret, algorithm="HS256")
+            self.assertRaisesRegex(AuthError, no_user, verify_auth_token, auth_token=auth_token,
+                                   required_role=["user", "admin"])
 
     def test_04_check_jwt_username_in_audit(self):
         # Here we check, if the username from the trusted JWT appears in the audit log.
         # This means that the username is read in the correct way from the JWT and
         # also used in the correct way for policy handling.
-        with open("tests/testdata/jwt_sign.key", "r") as f:
+        with open("tests/testdata/jwt_sign.key") as f:
             key = f.read()
+        self.setUp_user_realms()
 
         auth_token = jwt.encode(payload={"role": "user", "username": "userA", "realm": "realm1",
                                          "resolver": "resolverX"},
                                 key=key,
                                 algorithm="RS256")
 
-        # The authenticated but non-existing user tries for fetch his tokens
+        # The authenticated but non-existing user tries to fetch his tokens
         with self.app.test_request_context('/token/',
                                            method='GET',
                                            headers={"Authorization": auth_token}):
@@ -156,7 +239,7 @@ class UtilsTestCase(MyApiTestCase):
 
         # We see the user from the trusted JWT in the audit log.
         ae = self.find_most_recent_audit_entry(action="GET /token/")
-        self.assertEqual(ae.get("user"), u"userA")
+        self.assertEqual(ae.get("user"), "userA")
 
     def test_05_is_fqdn(self):
         self.assertTrue(is_fqdn('example.com'))
@@ -218,13 +301,13 @@ class UtilsTestCase(MyApiTestCase):
         init_token(params)
         # Test viewargs
         with mock.patch("logging.Logger.debug") as mock_log:
-            with self.app.test_request_context('/token/{0!s}'.format(serial),
+            with self.app.test_request_context(f'/token/{serial!s}',
                                                method='DELETE',
                                                headers={"Authorization": self.at}):
                 res = self.app.full_dispatch_request()
                 self.assertTrue(res.status_code == 200, res)
             # We see the message in the log, that the viewargs was read
-            mock_log.assert_any_call(u"Update params in request DELETE http://localhost/token/TTEST with view_args.")
+            mock_log.assert_any_call("Update params in request DELETE http://localhost/token/TTEST with view_args.")
 
         # test json data
         with mock.patch("logging.Logger.debug") as mock_log:
@@ -235,7 +318,7 @@ class UtilsTestCase(MyApiTestCase):
                 res = self.app.full_dispatch_request()
                 self.assertTrue(res.status_code == 200, res)
             # We see the message in the log, that the JSON data was read
-            mock_log.assert_any_call(u"Update params in request POST http://localhost/token/init with JSON data.")
+            mock_log.assert_any_call("Update params in request POST http://localhost/token/init with JSON data.")
 
         remove_token(serial)
         # test raw body, which defaults to x-www-form-encoded
@@ -246,5 +329,290 @@ class UtilsTestCase(MyApiTestCase):
                 res = self.app.full_dispatch_request()
                 self.assertTrue(res.status_code == 200, res)
             # We see the message in the log, that the JSON data was read
-            mock_log.assert_any_call(u"Update params in request POST http://localhost/token/init with values.")
+            mock_log.assert_any_call("Update params in request POST http://localhost/token/init with values.")
         remove_token(serial)
+
+    def test_08b_build_ca_context_without_client_ip(self):
+        # g.client_ip is not guaranteed by a request context alone: an early error, or reaching the engine from
+        # post-response/error-handling paths, can leave it unset. Reading it must never crash the authentication -
+        # an absent client IP yields source_ip=None (source_ip-target policies then simply do not apply), not an
+        # AttributeError.
+        with self.app.test_request_context('/auth', method='POST'):
+            # The app context is pushed once per class, so without this an earlier test's /auth leaves
+            # resolved_user.is_local_admin set and the role below comes back as admin-internal.
+            self.reset_flask_g()
+            # A bare g.client_ip read would raise AttributeError here; build_ca_context must not.
+            context = build_ca_context(User())
+            self.assertIsNone(context.source_ip)
+            # An empty user object is collapsed to None, so a condition on the user reads "no value"
+            # rather than an empty string (see _resolve_user_realm).
+            self.assertIsNone(context.user)
+            # Nothing marks this principal as a local admin, so it classifies as a regular user.
+            self.assertEqual("user", context.user_role)
+
+    def test_08e_request_endpoint_outside_a_request_context(self):
+        # Read from the request, so lib code that records an event without one (tests, a CLI caller) gets None
+        # instead of an exception - the column is then simply empty, and the event is not lost over it.
+        self.assertIsNone(request_endpoint())
+        with self.app.test_request_context('/validate/check/', method='POST'):
+            # The trailing slash is normalized away, so one endpoint is one value however it was called.
+            self.assertEqual("/validate/check", request_endpoint())
+
+    def _classified_details(self) -> dict:
+        # What a lib call hands the api layer: the client-facing message plus the classification, which is only ever
+        # meant for the authentication log.
+        return {"message": "wrong otp pin",
+                AUTH_EVENT_TYPE_KEY: AuthEventType.PIN_FAIL,
+                AUTH_EVENT_REASON_KEY: [str(AuthEventReason.WRONG_OTP)],
+                AUTH_EVENT_REASON_DETAIL_KEY: {"reasons": {"TOK1": str(AuthEventReason.WRONG_OTP)}},
+                LOG_TRANSACTION_ID_KEY: "0123456789"}
+
+    def test_08c_a_forgotten_pop_cannot_leak_the_classification(self):
+        # The lib layer hands its classification to the api layer in the very dict the response body is built from,
+        # and a view reads it by popping. This asserts the backstop rather than the habit: a view that popped nothing
+        # still answers without the internal keys, so a new caller cannot leak them by forgetting.
+        details = self._classified_details()
+
+        result = prepare_result(False, rid=2, details=details)
+
+        self.assertEqual("wrong otp pin", result["detail"]["message"], result)
+        for key in INTERNAL_CLASSIFICATION_KEYS:
+            self.assertNotIn(key, result["detail"], result)
+
+    def test_08d_an_error_response_strips_the_classification_too(self):
+        # An error carries the same dict: AuthError hands a lib call's reply straight to the error handler, so the
+        # rejection path needs the same backstop as the successful one.
+        with self.app.test_request_context('/auth', method='POST'):
+            response = send_error("Authentication failure.", rid=2, error_code=403,
+                                  details=self._classified_details())
+
+        detail = response.json["detail"]
+        self.assertEqual("wrong otp pin", detail["message"], detail)
+        for key in INTERNAL_CLASSIFICATION_KEYS:
+            self.assertNotIn(key, detail, detail)
+
+    def test_09_check_unquote(self):
+        self.setUp_user_realms()
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={'username': 'pwpercent',
+                                                 'password': 'pw%45#test'},
+                                           headers={'User-Agent': 'some-generic-agent/1.0'}):
+            res = self.app.full_dispatch_request()
+            # when using a generic user agent, we assume unquoting is required.
+            # This will lead to a failed /auth request since the password is changed
+            self.assertTrue(res.status_code == 401, res)
+
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={'username': 'pwpercent',
+                                                 'password': quote('pw%45#test')},
+                                           headers={'User-Agent': 'some-generic-agent/1.0'}):
+            res = self.app.full_dispatch_request()
+            # When quoting the password before sending, this should be fine
+            self.assertTrue(res.status_code == 200, res)
+
+        # The LDAP-Proxy does not quote the parameters before sending
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={'username': 'pwpercent',
+                                                 'password': 'pw%45#test'},
+                                           headers={'User-Agent': 'privacyIDEA-LDAP-Proxy'}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+
+        # We might be versioning the user-agent in the future
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={'username': 'pwpercent',
+                                                 'password': 'pw%45#test'},
+                                           headers={'User-Agent': 'privacyIDEA-LDAP-Proxy/1.0'}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+
+        # Also check the simplesaml plugin
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={'username': 'pwpercent',
+                                                 'password': 'pw%45#test'},
+                                           headers={'User-Agent': 'simpleSAMLphp'}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+
+        # And check the Credential Provider plugin
+        with self.app.test_request_context('/auth',
+                                           method='POST',
+                                           data={'username': 'pwpercent',
+                                                 'password': 'pw%45#test'},
+                                           headers={'User-Agent': 'privacyidea-cp/2.0'}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+
+        # now check the /validate/check endpoint
+        set_policy(name="otppin",
+                   scope=SCOPE.AUTH,
+                   action=f"{PolicyAction.OTPPIN}=userstore")
+        init_token({"type": "spass", "serial": "spass1d"},
+                   user=User("pwpercent", self.realm1))
+        # fist the request fails due to a wrong otp pin
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "pwpercent",
+                                                 "realm": self.realm1,
+                                                 "pass": "pw%45#test"}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json.get("result")
+            self.assertFalse(result.get("value"), res.json)
+            self.assertEqual('wrong otp pin', res.json['detail']['message'], res.json)
+
+        # when quoting the password before sending, the request succeeds
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "pwpercent",
+                                                 "realm": self.realm1,
+                                                 "pass": quote("pw%45#test")}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("value"), res.json)
+
+        # when using the correct user-agent, quoting is not necessary
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "pwpercent",
+                                                 "realm": self.realm1,
+                                                 "pass": "pw%45#test"},
+                                           headers={'User-Agent': 'simpleSAMLphp'}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("value"), res.json)
+
+        # when using the correct user-agent (CredentialProvider), quoting is not necessary
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "pwpercent",
+                                                 "realm": self.realm1,
+                                                 "pass": "pw%45#test"},
+                                           headers={'User-Agent': 'privacyidea-cp/3.0'}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            result = res.json.get("result")
+            self.assertTrue(result.get("value"), res.json)
+
+        # cleanup
+        remove_token(serial='spass1d')
+        delete_policy('otppin')
+        # TODO: check if unquoting of url-params (view-args) should be considered as well
+
+
+    def test_10_get_required_one_of(self):
+        params = {"a": "1", "b": "2", "e": ""}
+        self.assertEqual(get_required_one_of(params, ["a", "b"]), "1")
+        self.assertEqual(get_required_one_of(params, ["b", "a"]), "2")
+        self.assertEqual(get_required_one_of(params, ["c", "b"]), "2")
+
+        self.assertRaises(ParameterError, get_required_one_of, params, ["c", "d"])
+
+        # e is empty, so it is skipped
+        self.assertEqual(get_required_one_of(params, ["e", "b"]), "2")
+        # e is empty, but allowed
+        self.assertEqual(get_required_one_of(params, ["e", "b"], allow_empty=True), "")
+        # e is empty, so it is skipped and no other key is found
+        self.assertRaises(ParameterError, get_required_one_of, params, ["e"])
+
+    def test_11_get_optional_one_of(self):
+        params = {"a": "1", "b": "2"}
+        self.assertEqual(get_optional_one_of(params, ["a", "b"]), "1")
+        self.assertEqual(get_optional_one_of(params, ["b", "a"]), "2")
+        self.assertEqual(get_optional_one_of(params, ["c", "b"]), "2")
+
+        self.assertIsNone(get_optional_one_of(params, ["c", "d"]))
+        self.assertEqual(get_optional_one_of(params, ["c", "d"], default="3"), "3")
+
+    def test_12_get_required(self):
+        params = {"a": "1", "b": ""}
+        # Works
+        self.assertEqual(get_required(params, "a"), "1")
+        # c is not in params raises
+        self.assertRaises(ParameterError, get_required, params, "c")
+        # Empty value of b also raises
+        self.assertRaises(ParameterError, get_required, params, "b")
+        # Empty value of b is allowed
+        self.assertEqual(get_required(params, "b", allow_empty=True), "")
+
+    def test_13_get_optional(self):
+        params = {"a": "1", "b": ""}
+        self.assertEqual(get_optional(params, "a"), "1")
+        self.assertEqual(get_optional(params, "b"), "")
+        self.assertIsNone(get_optional(params, "c"))
+        self.assertEqual(get_optional(params, "c", default="default_val"), "default_val")
+
+    def test_14_get_required_timestamp(self):
+        self.assertEqual(datetime.datetime(2026, 3, 1, 12, 30, tzinfo=datetime.UTC),
+                         get_required_timestamp({"start": "2026-03-01T12:30:00+00:00"}, "start"))
+        # Naive values parse too, and keep no timezone of their own.
+        self.assertEqual(datetime.datetime(2026, 3, 1, 12, 30),
+                         get_required_timestamp({"start": "2026-03-01T12:30:00"}, "start"))
+        self.assertEqual(datetime.datetime(2026, 3, 1), get_required_timestamp({"start": "2026-03-01"}, "start"))
+
+        # Missing and empty are the ParameterError get_required already raises.
+        self.assertRaises(ParameterError, get_required_timestamp, {}, "start")
+        self.assertRaises(ParameterError, get_required_timestamp, {"start": ""}, "start")
+        # A malformed value must not escape as the ValueError isoparse raises.
+        for value in ("not-a-time", "31-12-2026", "2026-13-01", "2026-03-01T25:00:00"):
+            self.assertRaises(ParameterError, get_required_timestamp, {"start": value}, "start")
+        # The message names the parameter, so several timestamps in one request stay distinguishable.
+        with self.assertRaises(ParameterError) as caught:
+            get_required_timestamp({"end_time": "nope"}, "end_time")
+        self.assertIn("end_time", str(caught.exception))
+
+    def test_15_get_optional_timestamp(self):
+        self.assertEqual(datetime.datetime(2026, 3, 1, 12, 30, tzinfo=datetime.UTC),
+                         get_optional_timestamp({"start": "2026-03-01T12:30:00+00:00"}, "start"))
+
+        # Absent and empty both fall back, since neither expresses a filter.
+        self.assertIsNone(get_optional_timestamp({}, "start"))
+        self.assertIsNone(get_optional_timestamp({"start": ""}, "start"))
+        fallback = datetime.datetime(2020, 1, 1)
+        self.assertEqual(fallback, get_optional_timestamp({}, "start", default=fallback))
+        self.assertEqual(fallback, get_optional_timestamp({"start": ""}, "start", default=fallback))
+
+        # A present but malformed value is an error rather than a silent fallback: ignoring it would answer a
+        # different question than the caller asked.
+        for value in ("not-a-time", "31-12-2026", "2026-13-01"):
+            self.assertRaises(ParameterError, get_optional_timestamp, {"start": value}, "start")
+
+    def test_16_get_optional_int(self):
+        params = {"a": "1", "b": "", "c": "abc", "d": "1.5", "e": -3, "f": "-3"}
+        self.assertEqual(get_optional_int(params, "a"), 1)
+        self.assertEqual(get_optional_int(params, "e"), -3)
+        self.assertEqual(get_optional_int(params, "f"), -3)
+        # A missing key yields the default
+        self.assertIsNone(get_optional_int(params, "missing"))
+        self.assertEqual(get_optional_int(params, "missing", default=7), 7)
+        # An empty value counts as absent, so a caller that always appends the
+        # parameter gets the default rather than an error
+        self.assertIsNone(get_optional_int(params, "b"))
+        self.assertEqual(get_optional_int(params, "b", default=7), 7)
+        # A non-integer value is a parameter error, not an unhandled ValueError
+        self.assertRaises(ParameterError, get_optional_int, params, "c")
+        self.assertRaises(ParameterError, get_optional_int, params, "d")
+
+    def test_17_get_pagination_params(self):
+        self.assertEqual(get_pagination_params({"page": "3", "pagesize": "20"}), (3, 20))
+        # Defaults apply when the parameters are absent
+        self.assertEqual(get_pagination_params({}), (1, 15))
+        self.assertEqual(get_pagination_params({}, default_page_size=50), (1, 50))
+        # Values below 1 are floored: the paginating queries derive their offset
+        # from (page - 1) * pagesize, and PostgreSQL rejects a negative OFFSET
+        self.assertEqual(get_pagination_params({"page": "0"}), (1, 15))
+        self.assertEqual(get_pagination_params({"page": "-7"}), (1, 15))
+        self.assertEqual(get_pagination_params({"pagesize": "0"}), (1, 1))
+        self.assertEqual(get_pagination_params({"pagesize": "-7"}), (1, 1))
+        # The page size is capped so one request cannot ask for unbounded rows
+        self.assertEqual(get_pagination_params({"pagesize": str(MAX_PAGE_SIZE + 1)}), (1, MAX_PAGE_SIZE))
+        # A non-integer value is a parameter error
+        self.assertRaises(ParameterError, get_pagination_params, {"page": "abc"})
+        self.assertRaises(ParameterError, get_pagination_params, {"pagesize": "abc"})

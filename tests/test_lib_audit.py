@@ -1,21 +1,26 @@
-# -*- coding: utf-8 -*-
 """
 This tests the files
   lib/audit.py and
   lib/auditmodules/sqlaudit.py
 """
+import csv
 import datetime
+import io
 import os
 import types
+import unittest
 
-import sqlalchemy.engine
-from mock import mock
+from unittest import mock
+from sqlalchemy import event, text
+from sqlalchemy.pool import NullPool
 
 from privacyidea.config import TestingConfig
 from privacyidea.lib.audit import getAudit, search
 from privacyidea.lib.auditmodules.containeraudit import Audit as ContainerAudit
 from privacyidea.lib.auditmodules.loggeraudit import Audit as LoggerAudit
-from privacyidea.lib.auditmodules.sqlaudit import column_length
+from privacyidea.lib.auditmodules import sqlaudit
+from privacyidea.lib.auditmodules.sqlaudit import Audit as SQLAudit, column_length, LogEntry
+from privacyidea.lib.utils import AUTH_RESPONSE
 from .base import MyTestCase, OverrideConfigTestCase
 from testfixtures import log_capture
 
@@ -54,7 +59,7 @@ class AuditTestCase(MyTestCase):
 
         # read audit entry
         audit_log = self.Audit.search({})
-        self.assertTrue(audit_log.total == 3, audit_log.total)
+        self.assertEqual(3, audit_log.total)
 
     def test_01_get_total(self):
         self.Audit.log({"action": "action1"})
@@ -71,21 +76,22 @@ class AuditTestCase(MyTestCase):
         tot = self.Audit.get_total({})
         self.assertTrue(tot == 3, tot)
         audit_log = self.Audit.search({}, sortorder="desc")
+        self.assertEqual(3, audit_log.total, audit_log)
 
         # with search filter
         tot = self.Audit.get_total({"action": "action2",
                                     "bullshit": "value"})
-        self.assertTrue(tot == 2, "Total numbers: {0!s}".format(tot))
+        self.assertTrue(tot == 2, f"Total numbers: {tot!s}")
 
     def test_02_filter_search(self):
         # Prepare some audit entries:
-        self.Audit.log({"serial": "serial1"})
+        self.Audit.log({"serial": "serial1", "realm": "realm1", "administrator": "local_admin"})
         self.Audit.finalize_log()
 
-        self.Audit.log({"serial": "serial1"})
+        self.Audit.log({"serial": "serial1", "realm": "realm1", "administrator": "external_admin"})
         self.Audit.finalize_log()
 
-        self.Audit.log({"serial": "serial2"})
+        self.Audit.log({"serial": "serial2", "realm": "realm2"})
         self.Audit.finalize_log()
 
         self.Audit.log({"serial": "oath"})
@@ -104,9 +110,52 @@ class AuditTestCase(MyTestCase):
         self.assertTrue(audit_log.total == 1, audit_log.total)
 
         # Search audit entries one minute in the future
-        audit_log = self.Audit.search({}, timelimit=datetime.timedelta(
-            minutes=-1))
+        audit_log = self.Audit.search({}, timelimit=datetime.timedelta(minutes=-1))
         self.assertEqual(len(audit_log.auditdata), 0)
+
+        # Admin params
+        self.Audit.log({"action": "GET /auth", "administrator": "local_admin"})
+        self.Audit.finalize_log()
+
+        self.Audit.log({"action": "GET /auth", "administrator": "external_admin", "realm": "admin_realm"})
+        self.Audit.finalize_log()
+
+        # get all audit entries without admin limitations
+        audit_log = self.Audit.search({}, admin_params={})
+        self.assertEqual(6, audit_log.total)
+
+        # only setting admin and admin realm still gives all entries (no limitations to the realms)
+        audit_log = self.Audit.search({}, admin_params={"admin": "local_admin", "admin_realm": "admin_realm"})
+        self.assertEqual(6, audit_log.total)
+        # An empty list of allowed realms admits no realm, so only the admin's own entries are left
+        audit_log = self.Audit.search({}, admin_params={"admin": "local_admin", "admin_realm": "",
+                                                        "allowed_audit_realms": []})
+        self.assertEqual(2, audit_log.total)
+        self.assertEqual({"local_admin"}, {audit.get("administrator") for audit in audit_log.auditdata})
+
+        # Get audit entries for local_admin who is allowed to only see realm1
+        audit_log = self.Audit.search({}, admin_params={"admin": "local_admin", "admin_realm": "",
+                                                        "allowed_audit_realms": ["realm1"]})
+        self.assertEqual(3, audit_log.total, audit_log)
+        realm_1_audits = [audit for audit in audit_log.auditdata if audit.get("realm") == "realm1"]
+        self.assertEqual(2, len(realm_1_audits))
+        admin_audits = [audit for audit in audit_log.auditdata if audit.get("action") == "GET /auth"]
+        # also contains the own auth audit entry
+        self.assertEqual(1, len(admin_audits))
+        self.assertEqual("local_admin", admin_audits[0].get("administrator"))
+        self.assertEqual("", admin_audits[0].get("realm"))
+
+        # Get audit entries for external admin who is allowed to only see realm1
+        audit_log = self.Audit.search({}, admin_params={"admin": "external_admin", "admin_realm": "admin_realm",
+                                                        "allowed_audit_realms": ["realm1"]})
+        self.assertEqual(3, audit_log.total, audit_log)
+        realm_1_audits = [audit for audit in audit_log.auditdata if audit.get("realm") == "realm1"]
+        self.assertEqual(2, len(realm_1_audits))
+        admin_audits = [audit for audit in audit_log.auditdata if audit.get("action") == "GET /auth"]
+        # also contains the own auth audit entry
+        self.assertEqual(1, len(admin_audits))
+        self.assertEqual("external_admin", admin_audits[0].get("administrator"))
+        self.assertEqual("admin_realm", admin_audits[0].get("realm"))
 
     def test_02_get_count(self):
         # Prepare some audit entries:
@@ -114,11 +163,23 @@ class AuditTestCase(MyTestCase):
                         "success": True})
         self.Audit.finalize_log()
 
+        self.Audit = getAudit(self.app.config)  # fresh audit object for each request
         self.Audit.log({"action": "/validate/check",
                         "success": True})
         self.Audit.finalize_log()
 
-        self.Audit.log({"action": "/validate/check",
+        self.Audit = getAudit(self.app.config)  # fresh audit object for each request
+        self.Audit.log({"action": "/validate/check", "authentication": AUTH_RESPONSE.REJECT,
+                        "success": False})
+        self.Audit.finalize_log()
+
+        self.Audit = getAudit(self.app.config)  # fresh audit object for each request
+        self.Audit.log({"action": "/validate/check", "authentication": AUTH_RESPONSE.DECLINED,
+                        "success": False})
+        self.Audit.finalize_log()
+
+        self.Audit = getAudit(self.app.config)  # fresh audit object for each request
+        self.Audit.log({"action": "/validate/check", "authentication": AUTH_RESPONSE.CHALLENGE,
                         "success": False})
         self.Audit.finalize_log()
 
@@ -126,10 +187,15 @@ class AuditTestCase(MyTestCase):
         current_timestamp = datetime.datetime.now()
 
         # create a new audit log entry 2 seconds after the previous ones
-        with mock.patch('privacyidea.models.datetime') as mock_dt:
+        with mock.patch('privacyidea.lib.auditmodules.base.datetime.datetime') as mock_dt:
             mock_dt.now.return_value = current_timestamp + datetime.timedelta(seconds=2)
+            self.Audit = getAudit(self.app.config)
             self.Audit.log({"action": "/validate/check",
                             "success": True})
+        # with mock.patch('privacyidea.models.audit._now',
+        #                 return_value=current_timestamp + datetime.timedelta(seconds=2)) as mock_dt:
+        with mock.patch("privacyidea.lib.auditmodules.sqlaudit._now",
+                        return_value=current_timestamp + datetime.timedelta(seconds=2)):
             self.Audit.finalize_log()
 
         # freeze time at ``current_timestamp`` + 2.5s.
@@ -139,18 +205,101 @@ class AuditTestCase(MyTestCase):
         with mock.patch('datetime.datetime') as mock_dt:
             mock_dt.now.return_value = current_timestamp + datetime.timedelta(seconds=2.5)
 
-            # get 4 authentications
+            # get 6 authentications
             r = self.Audit.get_count({"action": "/validate/check"})
-            self.assertEqual(r, 4)
+            self.assertEqual(6, r)
 
             # get one failed authentication
             r = self.Audit.get_count({"action": "/validate/check"}, success=False)
-            self.assertEqual(r, 1)
+            self.assertEqual(3, r)
+
+            # get one challenge authentication
+            r = self.Audit.get_count({"action": "/validate/check", "authentication": AUTH_RESPONSE.CHALLENGE},
+                                     success=False)
+            self.assertEqual(1, r)
+
+            # get failed authentication
+            r = self.Audit.get_count({"action": "/validate/check", "authentication": f"!{AUTH_RESPONSE.CHALLENGE}"},
+                                     success=False)
+            self.assertEqual(2, r)
+
+            # get failed authentication: '*' is the wildcard, so "!CHAL*" excludes CHALLENGE
+            r = self.Audit.get_count({"action": "/validate/check", "authentication": "!CHAL*"},
+                                     success=False)
+            self.assertEqual(2, r)
+
+            # '*' expands: "CHAL*" matches CHALLENGE
+            r = self.Audit.get_count({"action": "/validate/check", "authentication": "CHAL*"},
+                                     success=False)
+            self.assertEqual(1, r)
+
+            # '%' is literal, not a wildcard: "CHAL%" matches nothing (no such literal value)
+            r = self.Audit.get_count({"action": "/validate/check", "authentication": "CHAL%"},
+                                     success=False)
+            self.assertEqual(0, r)
+
+            # A non-string filter value is coerced to a string and still applied,
+            # rather than silently dropped: "12345" matches no action, so no entries.
+            r = self.Audit.get_count({"action": 12345})
+            self.assertEqual(0, r)
 
             # get one authentication during the last second
             r = self.Audit.get_count({"action": "/validate/check"}, success=True,
                                      timedelta=datetime.timedelta(seconds=1))
-            self.assertEqual(r, 1)
+            self.assertEqual(1, r)
+
+    def test_02a_negation_matches_unset_columns(self):
+        # Columns that are unset are written as "" by the audit module, but entries that
+        # were written before a column existed contain NULL (the migration adds the column
+        # without a default). A negated filter must not silently drop those entries.
+        self.Audit.log({"action": "/validate/check", "authentication": AUTH_RESPONSE.CHALLENGE,
+                        "user": "alice", "success": False})
+        self.Audit.finalize_log()
+
+        self.Audit = getAudit(self.app.config)
+        self.Audit.log({"action": "/validate/check", "authentication": AUTH_RESPONSE.REJECT,
+                        "user": "bob", "success": False})
+        self.Audit.finalize_log()
+
+        self.Audit = getAudit(self.app.config)
+        self.Audit.log({"action": "/validate/check", "success": False})
+        self.Audit.finalize_log()
+        # turn the entry with the unset columns into a pre-migration one
+        self.Audit.session.query(LogEntry).filter(LogEntry.authentication == "").update(
+            {LogEntry.authentication: None, LogEntry.user: None})
+        self.Audit.session.commit()
+
+        # the NULL entry is counted as "not a challenge", in the exact and the wildcard branch
+        r = self.Audit.get_count({"action": "/validate/check", "authentication": f"!{AUTH_RESPONSE.CHALLENGE}"},
+                                 success=False)
+        self.assertEqual(2, r)
+        r = self.Audit.get_count({"action": "/validate/check", "authentication": "!CHAL*"}, success=False)
+        self.assertEqual(2, r)
+
+        # a positive filter still does not match the NULL entry
+        r = self.Audit.get_count({"action": "/validate/check", "authentication": AUTH_RESPONSE.CHALLENGE},
+                                 success=False)
+        self.assertEqual(1, r)
+        r = self.Audit.get_count({"action": "/validate/check", "authentication": "CHAL*"}, success=False)
+        self.assertEqual(1, r)
+
+        # this is not specific to the "authentication" column
+        r = self.Audit.get_count({"action": "/validate/check", "user": "!alice"}, success=False)
+        self.assertEqual(2, r)
+        r = self.Audit.get_count({"action": "/validate/check", "user": "!ali*"}, success=False)
+        self.assertEqual(2, r)
+
+        # the download uses the same filter
+        csv_lines = list(self.Audit.csv_generator({"action": "/validate/check",
+                                                   "authentication": f"!{AUTH_RESPONSE.CHALLENGE}"}))
+        self.assertEqual(2, len(csv_lines), csv_lines)
+
+        # the date columns are cast to a string before comparing, the NULL check runs on the
+        # column itself. The dates are set, so all three entries match the negation.
+        r = self.Audit.get_count({"action": "/validate/check", "date": "!1970-01-01 00:00:00"})
+        self.assertEqual(3, r)
+        r = self.Audit.get_count({"action": "/validate/check", "date": "!1970-01-01*"})
+        self.assertEqual(3, r)
 
     def test_03_lib_search(self):
         res = search(self.app.config, {"page": 1, "page_size": 10,
@@ -165,7 +314,7 @@ class AuditTestCase(MyTestCase):
         self.Audit.log({"action": "/validate/check",
                         "success": False})
         self.Audit.finalize_log()
-        hidden_columns = [u"number", u"action_detail"]
+        hidden_columns = ["number", "action_detail"]
         res = search(self.app.config, {"hidden_columns": hidden_columns})
         self.assertTrue(res.get("count") == 1, res)
         # hidden columns are not returned in the auditdata
@@ -186,7 +335,7 @@ class AuditTestCase(MyTestCase):
         self.Audit.log({"serial": "oath"})
         self.Audit.finalize_log()
 
-        self.Audit.log({"serial": "oath", "user": u"nöäscii"})
+        self.Audit.log({"serial": "oath", "user": "nöäscii"})
         self.Audit.finalize_log()
 
         audit_log = self.Audit.csv_generator()
@@ -199,8 +348,88 @@ class AuditTestCase(MyTestCase):
             count += 1
         self.assertEqual(count, 5)
 
+    def test_04a_download_is_valid_csv(self):
+        # Values that carry a comma, a double quote or a line break are quoted and escaped by the
+        # csv module, so that a reader gets back exactly the value that was written.
+        awkward = 'a,b "quoted" c\nsecond line'
+        self.Audit.log({"serial": "CSV001", "info": awkward})
+        self.Audit.finalize_log()
+
+        rows = list(csv.reader(io.StringIO("".join(self.Audit.csv_generator()))))
+        self.assertEqual(1, len(rows), rows)
+        columns = list(self.Audit.audit_entry_to_dict(
+            self.Audit.session.query(LogEntry).one()).keys())
+        self.assertEqual(awkward, rows[0][columns.index("info")], rows[0])
+
+    def test_04b_download_marks_formula_cells_as_text(self):
+        # A value a spreadsheet would read as a formula is prefixed with an apostrophe, the
+        # conventional marker for a text cell. Numbers keep their own leading sign.
+        self.Audit.log({"serial": "CSV002", "info": "=1+1", "action": "-cmd", "user": "@here"})
+        self.Audit.finalize_log()
+
+        rows = list(csv.reader(io.StringIO("".join(self.Audit.csv_generator()))))
+        columns = list(self.Audit.audit_entry_to_dict(
+            self.Audit.session.query(LogEntry).one()).keys())
+        row = rows[0]
+        self.assertEqual("'=1+1", row[columns.index("info")], row)
+        self.assertEqual("'-cmd", row[columns.index("action")], row)
+        self.assertEqual("'@here", row[columns.index("user")], row)
+        # The entry number is a plain number and stays one
+        self.assertEqual(str(self.Audit.session.query(LogEntry).one().id), row[columns.index("number")], row)
+
+    def test_04c_download_spans_read_rounds(self):
+        # More entries than one round holds, all sharing a date, so the export has to page
+        # through them on the id alone. Every entry must appear exactly once.
+        entry_count = sqlaudit._CSV_EXPORT_CHUNK_SIZE * 2 + 7
+        same_date = datetime.datetime(2026, 3, 1, 12, 0, 0)
+        self.Audit.session.bulk_insert_mappings(
+            LogEntry, [{"date": same_date, "serial": f"ROUND{index:05d}", "signature": ""}
+                       for index in range(entry_count)])
+        self.Audit.session.commit()
+
+        rows = list(csv.reader(io.StringIO("".join(self.Audit.csv_generator()))))
+        self.assertEqual(entry_count, len(rows))
+        columns = list(self.Audit.audit_entry_to_dict(
+            self.Audit.session.query(LogEntry).first()).keys())
+        serials = [row[columns.index("serial")] for row in rows]
+        self.assertEqual(entry_count, len(set(serials)), "an entry was exported twice or skipped")
+        self.assertEqual(sorted(serials), serials, "the export lost its order")
+
+    def test_04d_download_does_not_query_per_entry(self):
+        # The number of queries an export costs must not grow with the number of entries, or a
+        # large audit log cannot be exported at all.
+        entry_count = sqlaudit._CSV_EXPORT_CHUNK_SIZE + 20
+        self.Audit.session.bulk_insert_mappings(
+            LogEntry, [{"date": datetime.datetime(2026, 3, 2, 12, 0, index % 60),
+                        "serial": f"COUNT{index:05d}", "signature": ""}
+                       for index in range(entry_count)])
+        self.Audit.session.commit()
+
+        statements = []
+
+        def record(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+
+        bind = self.Audit.session.get_bind()
+        event.listen(bind, "before_cursor_execute", record)
+        try:
+            generator = self.Audit.csv_generator()
+            first_row = next(generator)
+            queries_before_first_row = len(statements)
+            rows = 1 + sum(1 for _ in generator)
+        finally:
+            event.remove(bind, "before_cursor_execute", record)
+
+        self.assertTrue(first_row)
+        self.assertEqual(entry_count, rows)
+        # A handful of queries per round, not one per entry
+        self.assertLess(len(statements), entry_count / 10,
+                        f"{len(statements)} queries for {entry_count} entries")
+        # The first row is produced from the first round alone, not after reading everything
+        self.assertLessEqual(queries_before_first_row, 5, statements[:10])
+
     def test_06_truncate_data(self):
-        long_serial = "This serial is much to long, you know it!"
+        long_serial = "S" * (column_length.get("serial") + 1)
         token_type = "12345678901234567890"
         self.Audit.log({"serial": long_serial,
                         "token_type": token_type})
@@ -209,6 +438,15 @@ class AuditTestCase(MyTestCase):
                          column_length.get("serial"))
         self.assertEqual(len(self.Audit.audit_data.get("token_type")),
                          column_length.get("token_type"))
+
+        # A serial column that holds a list of serials, e.g. of all the tokens that were
+        # challenged, is shortened per entry, so that every token is still recognizable
+        serial_count = column_length.get("serial") // 8
+        self.Audit.log({"serial": ",".join(f"OATH{index:08d}" for index in range(serial_count))})
+        self.Audit._truncate_data()
+        truncated_serials = self.Audit.audit_data.get("serial")
+        self.assertLessEqual(len(truncated_serials), column_length.get("serial"))
+        self.assertEqual(serial_count, len(truncated_serials.split(",")), truncated_serials)
 
         # check treatment of None and boolean values
         self.Audit.log({"token_type": None, "info": True})
@@ -219,18 +457,18 @@ class AuditTestCase(MyTestCase):
         # check treatment of policy entries:
         self.Audit.log({"serial": long_serial,
                         "token_type": token_type,
-                        "policies": u"Berlin,Hamburg,München,Köln,Frankfurt am Main,"
-                                    u"Stuttgart,Düsseldorf,Dortmund,Essen,Leipzig,"
-                                    u"Bremen,Dresden,Hannover,Nürnberg,Duisburg,Bochum,"
-                                    u"Wuppertal,Bielefeld,Bonn,Münster,Karlsruhe,"
-                                    u"Mannheim,Augsburg,Wiesbaden,Gelsenkirchen,Mönchengladbach,"
-                                    u"Braunschweig,Kiel,Chemnitz,Aachen,Magdeburg"})
+                        "policies": "Berlin,Hamburg,München,Köln,Frankfurt am Main,"
+                                    "Stuttgart,Düsseldorf,Dortmund,Essen,Leipzig,"
+                                    "Bremen,Dresden,Hannover,Nürnberg,Duisburg,Bochum,"
+                                    "Wuppertal,Bielefeld,Bonn,Münster,Karlsruhe,"
+                                    "Mannheim,Augsburg,Wiesbaden,Gelsenkirchen,Mönchengladbach,"
+                                    "Braunschweig,Kiel,Chemnitz,Aachen,Magdeburg"})
         self.Audit._truncate_data()
         self.assertTrue(len(self.Audit.audit_data.get("policies")) <= 255)
         # Some cities like Stuttgart and Düsseldorf already get truncated :-)
-        self.assertEqual(u"Berlin,Hamburg,München,Köln,Frankfu+,Stuttga+,Düsseld+,Dortmund,Essen,Leipzig,Bremen,"
-                         u"Dresden,Hannover,Nürnberg,Duisburg,Bochum,Wuppert+,Bielefe+,Bonn,Münster,Karlsru+,"
-                         u"Mannheim,Augsburg,Wiesbaden,Gelsenki+,Möncheng+,Braunsch+,Kiel,Chemnitz,Aachen,Magdeburg",
+        self.assertEqual("Berlin,Hamburg,München,Köln,Frankfu+,Stuttga+,Düsseld+,Dortmund,Essen,Leipzig,Bremen,"
+                         "Dresden,Hannover,Nürnberg,Duisburg,Bochum,Wuppert+,Bielefe+,Bonn,Münster,Karlsru+,"
+                         "Mannheim,Augsburg,Wiesbaden,Gelsenki+,Möncheng+,Braunsch+,Kiel,Chemnitz,Aachen,Magdeburg",
                          self.Audit.audit_data.get("policies"))
 
     def test_07_sign_and_verify(self):
@@ -240,18 +478,24 @@ class AuditTestCase(MyTestCase):
         with self.assertRaises(Exception):
             getAudit(self.app.config)
         self.app.config["PI_AUDIT_KEY_PRIVATE"] = PRIVATE
+        # Without a public key the module signs entries but verifies every one of them as
+        # FAIL, which can not be told apart from a tampered log, so it has to be an error
+        self.app.config.pop("PI_AUDIT_KEY_PUBLIC")
+        with self.assertRaises(TypeError):
+            getAudit(self.app.config)
+        self.app.config["PI_AUDIT_KEY_PUBLIC"] = PUBLIC
         # Log a username as unicode with a non-ascii character
         self.Audit.log({"serial": "1234",
                         "action": "token/assign",
                         "success": True,
-                        "user": u"kölbel"})
+                        "user": "kölbel"})
         self.Audit.finalize_log()
-        audit_log = self.Audit.search({"user": u"kölbel"})
+        audit_log = self.Audit.search({"user": "kölbel"})
         self.assertEqual(audit_log.total, 1)
-        self.assertEqual(audit_log.auditdata[0].get("user"), u"kölbel")
+        self.assertEqual(audit_log.auditdata[0].get("user"), "kölbel")
         self.assertEqual(audit_log.auditdata[0].get("sig_check"), "OK")
         # check the raw data from DB
-        db_entries = self.Audit.search_query({'user': u'kölbel'})
+        db_entries = self.Audit.search_query({'user': 'kölbel'})
         db_entry = next(db_entries)
         self.assertTrue(db_entry.signature.startswith('rsa_sha256_pss'), db_entry)
         # modify the table data
@@ -259,24 +503,31 @@ class AuditTestCase(MyTestCase):
         self.Audit.session.merge(db_entry)
         self.Audit.session.commit()
         # and check if we get a failed signature check
-        audit_log = self.Audit.search({"user": u"kölbel"})
+        audit_log = self.Audit.search({"user": "kölbel"})
         self.assertEqual(audit_log.total, 1)
         self.assertEqual(audit_log.auditdata[0].get("sig_check"), "FAIL")
 
     def test_08_policies(self):
         self.Audit.log({"action": "validate/check"})
-        self.Audit.add_policy(["rule1", "rule2"])
+        self.Audit.add_policy(["rule1", "rule2", "rule1"])
         self.Audit.add_policy("rule3")
         self.Audit.finalize_log()
         audit_log = self.Audit.search({"policies": "*rule1*"})
         self.assertEqual(audit_log.total, 1)
-        self.assertEqual(audit_log.auditdata[0].get("policies"), "rule1,rule2,rule3")
+        self.assertEqual(len("rule1,rule2,rule3"), len(audit_log.auditdata[0].get("policies")))
+        self.assertIn("rule1", audit_log.auditdata[0].get("policies"))
+        self.assertIn("rule2", audit_log.auditdata[0].get("policies"))
+        self.assertIn("rule3", audit_log.auditdata[0].get("policies"))
 
-        self.Audit.add_policy(["rule4", "rule5"])
+        self.Audit.add_policy({"rule4", "rule5"})
+        self.Audit.add_policy({"rule4", "rule6"})
         self.Audit.finalize_log()
         audit_log = self.Audit.search({"policies": "*rule4*"})
         self.assertEqual(audit_log.total, 1)
-        self.assertEqual(audit_log.auditdata[0].get("policies"), "rule4,rule5")
+        self.assertEqual(len("rule4,rule5,rule6"), len(audit_log.auditdata[0].get("policies")))
+        self.assertIn("rule4", audit_log.auditdata[0].get("policies"))
+        self.assertIn("rule5", audit_log.auditdata[0].get("policies"))
+        self.assertIn("rule6", audit_log.auditdata[0].get("policies"))
 
     def test_09_check_external_audit_db(self):
         self.app.config["PI_AUDIT_SQL_URI"] = AUDIT_DB
@@ -346,6 +597,179 @@ class AuditTestCase(MyTestCase):
                          set(self.Audit.available_audit_columns),
                          audit_log.auditdata[0].keys())
 
+    def test_12_check_missing_with_id_stride(self):
+        from privacyidea.models import Audit as LogEntry
+        # Simulate ids as generated by a Galera cluster with
+        # wsrep_auto_increment_control enabled (auto_increment_increment=3):
+        # entries written through one node land 3 ids apart, not 1.
+        for entry_id in (1000, 1003, 1006):
+            self.Audit.session.add(LogEntry(id=entry_id))
+        self.Audit.session.commit()
+
+        # With the default stride of 1, the 3-apart neighbours are not found and
+        # the entry is reported as missing.
+        self.Audit._id_stride = 1
+        self.assertFalse(self.Audit._check_missing(1003))
+
+        # once the stride matches the actual gap between entries, they are
+        # correctly recognized as not missing
+        self.Audit._id_stride = 3
+        self.assertTrue(self.Audit._check_missing(1003))
+        # the outer two still have no 3-apart neighbour on one side
+        self.assertFalse(self.Audit._check_missing(1000))
+        self.assertFalse(self.Audit._check_missing(1006))
+
+        self.Audit.session.query(LogEntry).filter(LogEntry.id.in_((1000, 1003, 1006))).delete()
+        self.Audit.session.commit()
+
+    def test_13_get_id_stride_defaults_to_one(self):
+        # Without a configured auto_increment_increment (the default on a plain
+        # MySQL/MariaDB server, and the case for any dialect without the concept
+        # at all, e.g. sqlite/postgres), the stride stays at the historical default of 1.
+        self.Audit._id_stride = None
+        self.assertEqual(1, self.Audit._get_id_stride())
+
+    def test_14_get_id_stride_detects_configured_increment(self):
+        # Only meaningful against a real MySQL/MariaDB server (e.g. the
+        # unit-tests-mariadb.yml CI job, or a local mariadb-test container from
+        # compose-dev.yml) -- other dialects have no equivalent session variable.
+        if self.Audit.engine.dialect.name not in ("mysql", "mariadb"):
+            self.skipTest("auto_increment_increment only exists on MySQL/MariaDB")
+
+        self.Audit.session.execute(text("SET SESSION auto_increment_increment = 5"))
+        try:
+            self.Audit._id_stride = None
+            self.assertEqual(5, self.Audit._get_id_stride())
+        finally:
+            self.Audit.session.execute(text("SET SESSION auto_increment_increment = 1"))
+
+    def test_15_unreadable_table_is_read_again(self):
+        # A table that could not be read is not remembered as read, so that a database
+        # which was unreachable once does not leave the process sizing values to the
+        # model for the rest of its life
+        cache_key = str(self.Audit.engine.url)
+        sqlaudit._live_column_length.clear()
+        with mock.patch("privacyidea.lib.auditmodules.sqlaudit.sqlalchemy_inspect",
+                        side_effect=Exception("no such table: pidea_audit")):
+            self.assertEqual({}, sqlaudit.get_live_column_length(self.Audit.engine))
+        self.assertNotIn(cache_key, sqlaudit._live_column_length)
+
+        # The next look reaches the table and is cached
+        lengths = sqlaudit.get_live_column_length(self.Audit.engine)
+        self.assertEqual(column_length.get("serial"), lengths.get("serial"))
+        self.assertIn(cache_key, sqlaudit._live_column_length)
+
+    def test_16_column_length_follows_the_table(self):
+        audit = getAudit(self.app.config)
+
+        # A table that has not been migrated yet holds less than the model declares, and
+        # the table wins: a longer value would make the database reject the whole entry
+        audit._effective_column_length = None
+        with mock.patch("privacyidea.lib.auditmodules.sqlaudit.get_live_column_length",
+                        return_value={"serial": 40}):
+            self.assertEqual(40, audit.column_length.get("serial"))
+
+        # A column the table does not report keeps the length that is configured for it
+        audit._effective_column_length = None
+        with mock.patch("privacyidea.lib.auditmodules.sqlaudit.get_live_column_length",
+                        return_value={}):
+            self.assertEqual(column_length.get("serial"), audit.column_length.get("serial"))
+
+        # A column that holds a value of any length, e.g. TEXT, is not shortened at all
+        audit._effective_column_length = None
+        with mock.patch("privacyidea.lib.auditmodules.sqlaudit.get_live_column_length",
+                        return_value={"serial": None}):
+            self.assertNotIn("serial", audit.column_length)
+            audit.log({"serial": "S" * 500})
+            audit._truncate_data()
+            self.assertEqual(500, len(audit.audit_data.get("serial")))
+
+
+class AuditEngineOptionsTestCase(unittest.TestCase):
+    """
+    The audit engine is built from the pool defaults with the configured engine
+    options merged on top, and pool_size is only passed if the pool takes one. The
+    engine creation is mocked in most cases, so the recorded keyword arguments can be
+    checked without a reachable database server.
+    """
+
+    @staticmethod
+    def _engine_kwargs(config):
+        calls = []
+
+        def fake_create_engine(_connect_string, **kwargs):
+            calls.append(kwargs)
+            return "engine"
+
+        audit = types.SimpleNamespace(config=config)
+        with mock.patch("privacyidea.lib.auditmodules.sqlaudit.create_engine", fake_create_engine):
+            SQLAudit._create_engine(audit)
+        return calls[-1]
+
+    def test_01_pool_defaults(self):
+        kwargs = self._engine_kwargs({"SQLALCHEMY_DATABASE_URI": AUDIT_DB})
+        self.assertEqual(20, kwargs["pool_size"])
+        self.assertEqual(600, kwargs["pool_recycle"])
+
+    def test_02_engine_options_with_pool_recycle(self):
+        # A pool_recycle in SQLALCHEMY_ENGINE_OPTIONS must not collide with the audit
+        # pool default and take the whole pool configuration down with it
+        kwargs = self._engine_kwargs({"SQLALCHEMY_DATABASE_URI": AUDIT_DB,
+                                      "SQLALCHEMY_ENGINE_OPTIONS": {"pool_recycle": 3600,
+                                                                    "pool_pre_ping": True}})
+        self.assertEqual(20, kwargs["pool_size"])
+        self.assertEqual(3600, kwargs["pool_recycle"])
+        self.assertTrue(kwargs["pool_pre_ping"])
+
+    def test_03_audit_pool_settings_win_over_engine_options(self):
+        kwargs = self._engine_kwargs({"SQLALCHEMY_DATABASE_URI": AUDIT_DB,
+                                      "PI_AUDIT_POOL_SIZE": 7,
+                                      "PI_AUDIT_SQL_OPTIONS": {"pool_pre_ping": True},
+                                      "SQLALCHEMY_ENGINE_OPTIONS": {"pool_recycle": 3600}})
+        self.assertEqual(7, kwargs["pool_size"])
+        # PI_AUDIT_SQL_OPTIONS supersedes SQLALCHEMY_ENGINE_OPTIONS entirely
+        self.assertEqual(600, kwargs["pool_recycle"])
+        self.assertTrue(kwargs["pool_pre_ping"])
+
+    def test_04_configured_pool_size_is_kept(self):
+        kwargs = self._engine_kwargs({"SQLALCHEMY_DATABASE_URI": AUDIT_DB,
+                                      "PI_AUDIT_POOL_SIZE": 7,
+                                      "SQLALCHEMY_ENGINE_OPTIONS": {"pool_size": 3}})
+        self.assertEqual(3, kwargs["pool_size"])
+
+    def test_05_no_pool_size_for_pools_without_one(self):
+        # NullPool takes no pool_size, and it can be requested for any database
+        for uri in [AUDIT_DB, "sqlite://", "mysql+pymysql://pi:pi@localhost/pi"]:
+            kwargs = self._engine_kwargs({"SQLALCHEMY_DATABASE_URI": uri,
+                                          "SQLALCHEMY_ENGINE_OPTIONS": {"poolclass": NullPool,
+                                                                        "pool_recycle": 3600}})
+            self.assertNotIn("pool_size", kwargs, uri)
+            self.assertEqual(3600, kwargs["pool_recycle"], uri)
+
+    def test_06_pools_taking_a_pool_size(self):
+        # in-memory SQLite gets a SingletonThreadPool, which does take a pool_size
+        for uri in [AUDIT_DB, "sqlite://", "mysql+pymysql://pi:pi@localhost/pi"]:
+            kwargs = self._engine_kwargs({"SQLALCHEMY_DATABASE_URI": uri})
+            self.assertEqual(20, kwargs["pool_size"], uri)
+
+    def test_07_engine_is_created_for_real(self):
+        # the pool decision has to hold against the actual create_engine
+        audit = types.SimpleNamespace(config={"SQLALCHEMY_DATABASE_URI": AUDIT_DB,
+                                              "SQLALCHEMY_ENGINE_OPTIONS": {"poolclass": NullPool}})
+        self.assertIsInstance(SQLAudit._create_engine(audit).pool, NullPool)
+        audit = types.SimpleNamespace(config={"SQLALCHEMY_DATABASE_URI": AUDIT_DB})
+        self.assertEqual(20, SQLAudit._create_engine(audit).pool.size())
+
+
+class AuditToIsodateTestCase(unittest.TestCase):
+
+    def test_01_postgresql_and_oracle_use_calendar_year(self):
+        from sqlalchemy.dialects import oracle, postgresql
+        for dialect in (postgresql.dialect(), oracle.dialect()):
+            sql = str(sqlaudit.to_isodate(LogEntry.date).compile(dialect=dialect))
+            self.assertIn("'YYYY-MM-DD HH24:MI:SS'", sql)
+            self.assertNotIn("IYYY", sql)
+
 
 class AuditColumnLengthTestCase(OverrideConfigTestCase):
     class Config(TestingConfig):
@@ -388,7 +812,7 @@ class AuditFileTestCase(OverrideConfigTestCase):
         a.log({"action": "something"})
         a.finalize_log()
         r = a.search({"action": "something"})
-        # This is a non readable audit, so we got nothing
+        # This is a non-readable audit, so we got nothing
         self.assertEqual(r.auditdata, [])
         self.assertEqual(r.total, 0)
 
@@ -407,10 +831,9 @@ class AuditFileTestCase(OverrideConfigTestCase):
                 a.finalize_log()
                 capture.check_present(
                     ('privacyidea.lib.auditmodules.loggeraudit', 'INFO',
-                     '{{"action": "No PI_AUDIT_LOGGER_QUALNAME given", "duration": "0:00:02", '
-                     '"policies": "", "startdate": "{startdate}", '
-                     '"timestamp": "{timestamp}"}}'.format(timestamp=current_utc_time.isoformat(),
-                                                           startdate=startdate_time.isoformat())))
+                     '{"action": "No PI_AUDIT_LOGGER_QUALNAME given", "duration": "0:00:02", '
+                     f'"policies": "", "startdate": "{startdate_time.isoformat()}", '
+                     f'"timestamp": "{current_utc_time.isoformat()}"}}'))
 
         # Now change the qualname to 'pi-audit'
         current_utc_time = datetime.datetime(2020, 3, 4, 5, 6, 8)
@@ -424,10 +847,9 @@ class AuditFileTestCase(OverrideConfigTestCase):
                 a.finalize_log()
                 capture.check_present(
                     ('pi-audit', 'INFO',
-                     '{{"action": "PI_AUDIT_LOGGER_QUALNAME given", "duration": "0:00:08", '
-                     '"policies": "", "startdate": "{startdate}", '
-                     '"timestamp": "{timestamp}"}}'.format(timestamp=current_utc_time.isoformat(),
-                                                           startdate=startdate_time.isoformat())))
+                     '{"action": "PI_AUDIT_LOGGER_QUALNAME given", "duration": "0:00:08", '
+                     f'"policies": "", "startdate": "{startdate_time.isoformat()}", '
+                     f'"timestamp": "{current_utc_time.isoformat()}"}}'))
 
 
 class ContainerAuditTestCase(OverrideConfigTestCase):
@@ -436,8 +858,6 @@ class ContainerAuditTestCase(OverrideConfigTestCase):
         PI_LOGCONFIG = "tests/testdata/logging.cfg"
 
     def test_10_container_audit(self):
-        import os
-        basedir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
         a = ContainerAudit({"PI_AUDIT_CONTAINER_WRITE": ["privacyidea.lib.auditmodules.loggeraudit",
                                                          "privacyidea.lib.auditmodules.sqlaudit"],
                             "PI_AUDIT_CONTAINER_READ": "privacyidea.lib.auditmodules.sqlaudit",
@@ -456,7 +876,7 @@ class ContainerAuditTestCase(OverrideConfigTestCase):
         r = a.search({"action": "*something*"})
         # The search should go to the sql audit
         self.assertEqual(r.total, 1)
-        self.assertEqual(r.auditdata[0].get("action"), u"something_test_30")
+        self.assertEqual(r.auditdata[0].get("action"), "something_test_30")
 
         # Non readable read module!
         a = ContainerAudit({"PI_AUDIT_CONTAINER_WRITE": ["privacyidea.lib.auditmodules.loggeraudit"],
@@ -470,7 +890,6 @@ class ContainerAuditTestCase(OverrideConfigTestCase):
 
     def test_15_container_audit_check_audit(self):
         import os
-        basedir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
         a = ContainerAudit({"PI_AUDIT_CONTAINER_WRITE": ["privacyidea.lib.auditmodules.loggeraudit",
                                                          "privacyidea.lib.auditmodules.sqlaudit"],
                             "PI_AUDIT_CONTAINER_READ": "privacyidea.lib.auditmodules.sqlaudit",
@@ -478,14 +897,14 @@ class ContainerAuditTestCase(OverrideConfigTestCase):
                             "PI_AUDIT_SQL_URI": self.app.config['SQLALCHEMY_DATABASE_URI']})
         a.log({"action": "something_test_35"})
         a.add_to_log({'action_detail': 'some detail'})
-        a.add_policy('some policy')
+        a.add_policy({'some policy'})
         a.finalize_log()
         r = a.search({"action": "*something_test_35*"})
         # The search should go to the sql audit
         self.assertEqual(r.total, 1)
-        self.assertEqual(r.auditdata[0].get("action"), u"something_test_35")
-        self.assertEqual(r.auditdata[0].get("action_detail"), u"some detail")
-        self.assertEqual(r.auditdata[0].get("policies"), u"some policy")
+        self.assertEqual(r.auditdata[0].get("action"), "something_test_35")
+        self.assertEqual(r.auditdata[0].get("action_detail"), "some detail")
+        self.assertEqual(r.auditdata[0].get("policies"), "some policy")
         # now check the log file
         with open("audit.log") as file:
             c = file.readlines()
@@ -499,12 +918,10 @@ class ContainerAuditTestCase(OverrideConfigTestCase):
         self.assertIsInstance(csv, types.GeneratorType)
         csv_list = [c for c in csv]
         self.assertGreater(len(csv_list), 0, csv_list)
-        self.assertTrue(any(['something_test_35' in l for l in csv_list]))
+        self.assertTrue(any(['something_test_35' in line for line in csv_list]))
 
     def test_20_container_audit_wrong_module(self):
         # Test what happens with a non-existing module
-        import os
-        basedir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
         module_config = {
             "PI_AUDIT_CONTAINER_WRITE": ["privacyidea.lib.auditmodules.doesnotexist",
                                          "privacyidea.lib.auditmodules.sqlaudit"],

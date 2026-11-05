@@ -1,0 +1,74 @@
+<!--
+ (c) NetKnights GmbH 2025,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div class="flex-column">
+  <mat-checkbox
+    [checked]="checkPinLocally()"
+    (change)="checkPinLocally.set($event.checked)"
+    class="margin-bottom-16"
+    i18n="@@token.checkPinLocally"
+    >Check the PIN locally</mat-checkbox
+  >
+  <div class="flex-row gap-16 margin-bottom-16">
+    <mat-form-field
+      class="input-width-l"
+      [matTooltip]="enrollmentBlockedReason() ?? ''"
+      [matTooltipDisabled]="!enrollmentBlockedReason()">
+      <mat-label i18n="@@token.remoteServer">Remote Server</mat-label>
+      <mat-select [formField]="remoteServerIdForm">
+        @for (option of remoteServerOptions(); track option.id) {
+          <mat-option [value]="option.id">{{ option.name }}</mat-option>
+        }
+      </mat-select>
+      <mat-error
+        class="red"
+        i18n="@@token.remoteServerRequired"
+        >Remote Server is <strong>required</strong></mat-error
+      >
+    </mat-form-field>
+    <mat-form-field class="input-width-l">
+      <mat-label i18n="@@token.remoteSerial">Remote Serial</mat-label>
+      <input
+        [formField]="remoteSerialForm"
+        matInput />
+      <mat-error i18n="@@token.remoteSerialRequired">Remote Serial is <strong>required</strong></mat-error>
+    </mat-form-field>
+  </div>
+  <div class="flex-row gap-16">
+    <mat-form-field class="input-width-l">
+      <mat-label i18n="@@token.remoteUser">Remote User</mat-label>
+      <input
+        [formField]="remoteUserForm"
+        matInput />
+      <mat-error i18n="@@token.remoteUserRequired">Remote User is <strong>required</strong></mat-error>
+    </mat-form-field>
+    <mat-form-field class="input-width-l">
+      <mat-label i18n="@@token.remoteRealm">Remote Realm</mat-label>
+      <input
+        [formField]="remoteRealmForm"
+        matInput />
+    </mat-form-field>
+    <mat-form-field class="input-width-l">
+      <mat-label i18n="@@token.remoteResolver">Remote Resolver</mat-label>
+      <input
+        [formField]="remoteResolverForm"
+        matInput />
+      <mat-error i18n="@@token.remoteResolverRequired">Remote Resolver is <strong>required</strong></mat-error>
+    </mat-form-field>
+  </div>
+</div>

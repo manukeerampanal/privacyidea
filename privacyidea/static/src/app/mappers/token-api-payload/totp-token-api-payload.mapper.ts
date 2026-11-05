@@ -1,0 +1,96 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { Injectable } from "@angular/core";
+import { TokenDetails } from "@services/token/token.service";
+import { parseBooleanValue } from "@utils/parse-boolean-value";
+import {
+  BaseApiPayloadMapper,
+  TokenApiPayloadMapper,
+  TokenEnrollmentData,
+  TokenEnrollmentPayload
+} from "./_token-api-payload.mapper";
+
+export interface TotpEnrollmentData extends TokenEnrollmentData {
+  type: "totp";
+  generateOnServer?: boolean;
+  otpKey?: string;
+  otpLength?: number;
+  hashAlgorithm?: string;
+  timeStep?: number;
+  twoStepInit?: boolean;
+  otpKeyFormat?: string;
+}
+
+export interface TotpEnrollmentPayload extends TokenEnrollmentPayload {
+  otpkey: string;
+  genkey: 0 | 1;
+  otplen?: number;
+  hashlib?: string;
+  timeStep?: number | string;
+  serial?: string;
+  "2stepinit"?: boolean;
+  otpkeyformat?: string;
+}
+
+@Injectable({ providedIn: "root" })
+export class TotpApiPayloadMapper extends BaseApiPayloadMapper implements TokenApiPayloadMapper<TotpEnrollmentData> {
+  override toApiPayload(data: TotpEnrollmentData): TotpEnrollmentPayload {
+    const basePayload = super.toApiPayload(data);
+    const payload: TotpEnrollmentPayload = {
+      ...basePayload,
+      genkey: data.generateOnServer ? 1 : 0,
+      otpkey: data.generateOnServer === true ? "" : (data.otpKey ?? ""),
+      ...(data.otpLength !== undefined && { otplen: Number(data.otpLength) }),
+      ...(data.hashAlgorithm !== undefined && { hashlib: data.hashAlgorithm }),
+      ...(data.timeStep !== undefined && { timeStep: Number(data.timeStep) }),
+      ...(data.twoStepInit !== undefined && { "2stepinit": data.twoStepInit }),
+      ...(data.otpKey && data.otpKeyFormat && { otpkeyformat: data.otpKeyFormat })
+    };
+    if (data.onlyAddToRealm) {
+      payload.realm = data.realm;
+      delete payload.user;
+    }
+    return payload;
+  }
+
+  override fromApiPayload(payload: TotpEnrollmentPayload): TotpEnrollmentData {
+    const baseData = super.fromApiPayload(payload);
+    return {
+      ...baseData,
+      type: "totp",
+      ...(payload.genkey !== undefined && { generateOnServer: parseBooleanValue(payload.genkey) }),
+      otpKey: payload.otpkey ?? undefined,
+      otpLength: payload.otplen ? Number(payload.otplen) : undefined,
+      hashAlgorithm: payload.hashlib ?? undefined,
+      timeStep: payload.timeStep !== undefined ? Number(payload.timeStep) : undefined,
+      ...(payload["2stepinit"] !== undefined && { twoStepInit: payload["2stepinit"] }),
+      otpKeyFormat: payload.otpkeyformat ?? undefined
+    };
+  }
+
+  override fromTokenDetailsToEnrollmentData(details: TokenDetails): TotpEnrollmentData {
+    return {
+      ...super.fromTokenDetailsToEnrollmentData(details),
+      type: "totp",
+      otpLength: details.otplen ? Number(details.otplen) : undefined,
+      hashAlgorithm: details.info?.hashlib ?? undefined,
+      timeStep: details.info?.timeStep !== undefined ? Number(details.info.timeStep) : undefined
+    };
+  }
+}

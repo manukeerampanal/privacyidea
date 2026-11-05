@@ -1,13 +1,32 @@
-# -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: (C) 2015 NetKnights GmbH <https://netknights.it>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# This code is free software; you can redistribute it and/or
+# modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+# as published by the Free Software Foundation; either
+# version 3 of the License, or any later version.
+#
+# This code is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+#
+# You should have received a copy of the GNU Affero General Public
+# License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+from __future__ import annotations
 
-import os
 import logging
-import random
+import os
+import secrets
 import string
+import sys
+from pathlib import Path
+
 log = logging.getLogger(__name__)
+
 basedir = os.path.abspath(os.path.dirname(__file__))
 basedir = "/".join(basedir.split("/")[:-1]) + "/"
-
 
 pubtest_key = b"""-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0stF+PVh/qR7I82ywgDW
@@ -19,7 +38,7 @@ m+qnl1W6iD0z5ws/SrtWBJiMuFm3hGaXdQLZVABSqgmvaru3GZbldlQU/0pcV855
 NwIDAQAB
 -----END PUBLIC KEY-----"""
 
-non_matchin_pubkey = b"""-----BEGIN PUBLIC KEY-----
+non_matching_pubkey = b"""-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0R9Nos93gt6JdiY/Q+ac
 WuukYcwr+JlCDa+RX8UDuKfF3wVkSjwAl6s3ADrEnRIgi9qCQD52o29YEVugftVh
 HKiC+Gw5Cf95hkWKLl1MFoI6JUMDnNtPlPJrsCwLCi79TV+24BZ0v19P9ivxDa+c
@@ -31,27 +50,122 @@ WQIDAQAB
 """
 
 
+class ConfigKey:
+    ENABLE_CSP = "PI_ENABLE_CSP"
+    SESSION_COOKIE_SECURE = "PI_SESSION_COOKIE_SECURE"
+    FORCE_HTTPS = "PI_FORCE_HTTPS"
+    BASE_URL = "PI_BASE_URL"
+    SECRET_KEY = "SECRET_KEY"
+    PEPPER = "PI_PEPPER"
+    ENCFILE = "PI_ENCFILE"
+    HASH_ALGO_LIST = "PI_HASH_ALGO_LIST"
+    HASH_ALGO_PARAMS = "PI_HASH_ALGO_PARAMS"
+
+    SQLALCHEMY_DATABASE_URI = "SQLALCHEMY_DATABASE_URI"
+    SQLALCHEMY_ENGINE_OPTIONS = "SQLALCHEMY_ENGINE_OPTIONS"
+    DEV_DATABASE_URL = "DEV_DATABASE_URL"
+    TEST_DATABASE_URL = "TEST_DATABASE_URL"
+    DB_DRIVER = "PI_DB_DRIVER"
+    DB_USER = "PI_DB_USER"
+    DB_PASSWORD = "PI_DB_PASSWORD"
+    DB_HOST = "PI_DB_HOST"
+    DB_PORT = "PI_DB_PORT"
+    DB_NAME = "PI_DB_NAME"
+    DB_EXTRA_PARAMS = "PI_DB_EXTRA_PARAMS"
+
+    REDIS_URL = "PI_REDIS_URL"
+    REDIS_CACHE_CHALLENGES = "PI_REDIS_CACHE_CHALLENGES"
+    REDIS_CACHE_USERS = "PI_REDIS_CACHE_USERS"
+    REDIS_USER_CACHE_TTL = "PI_REDIS_USER_CACHE_TTL"
+    REDIS_CACHE_AUTH = "PI_REDIS_CACHE_AUTH"
+    REDIS_AUTH_CACHE_TTL = "PI_REDIS_AUTH_CACHE_TTL"
+    REDIS_CACHE_HEALTH = "PI_REDIS_CACHE_HEALTH"
+    REDIS_RETRY_COOLDOWN = "PI_REDIS_RETRY_COOLDOWN"
+
+    AUDIT_SQL_URI = "PI_AUDIT_SQL_URI"
+    AUDIT_SQL_OPTIONS = "PI_AUDIT_SQL_OPTIONS"
+    AUDIT_POOL_SIZE = "PI_AUDIT_POOL_SIZE"
+    AUDIT_POOL_RECYCLE = "PI_AUDIT_POOL_RECYCLE"
+    AUDIT_KEY_PRIVATE = "PI_AUDIT_KEY_PRIVATE"
+    AUDIT_KEY_PUBLIC = "PI_AUDIT_KEY_PUBLIC"
+    AUDIT_MODULE = "PI_AUDIT_MODULE"
+    AUDIT_SERVERNAME = "PI_AUDIT_SERVERNAME"
+    AUDIT_NO_SIGN = "PI_AUDIT_NO_SIGN"
+    AUDIT_NO_PRIVATE_KEY_CHECK = "PI_AUDIT_NO_PRIVATE_KEY_CHECK"
+    AUDIT_SQL_COLUMN_LENGTH = "PI_AUDIT_SQL_COLUMN_LENGTH"
+    CHECK_OLD_SIGNATURES = "PI_CHECK_OLD_SIGNATURES"
+
+    # A parameter that names a python class for the server to import is checked against the
+    # classes that ship with privacyIDEA plus the ones named here, so that an installation
+    # running its own class keeps working by naming it. MODULE_ALLOWLIST_MODE decides what
+    # happens to a class that is on neither list.
+    SMS_PROVIDER_MODULES = "PI_SMS_PROVIDER_MODULES"
+    PIN_HANDLER_MODULES = "PI_PIN_HANDLER_MODULES"
+    MODULE_ALLOWLIST_MODE = "PI_MODULE_ALLOWLIST_MODE"
+
+    LOGLEVEL = "PI_LOGLEVEL"
+    LOGCONFIG = "PI_LOGCONFIG"
+    LOGFILE = "PI_LOGFILE"
+
+    NODE = "PI_NODE"
+    NODE_UUID = "PI_NODE_UUID"
+    UUID_FILE = "PI_UUID_FILE"
+
+    VERBOSE = "VERBOSE"
+    SUPERUSER_REALM = "SUPERUSER_REALM"
+    APP_READY = "APP_READY"
+    HSM_INITIALIZE = "PI_INITIALIZE_HSM"
+    CONFIG_NAME = "PI_CONFIG_NAME"
+    STATIC_FOLDER = "PI_STATIC_FOLDER"
+    TEMPLATE_FOLDER = "PI_TEMPLATE_FOLDER"
+    NO_RESPONSE_SIGN = "PI_NO_RESPONSE_SIGN"
+    RESPONSE_NO_PRIVATE_KEY_CHECK = "PI_RESPONSE_NO_PRIVATE_KEY_CHECK"
+
+    ALLOWED_SSH_KEY_TYPES = "PI_ALLOWED_SSH_KEY_TYPES"
+
+
+class DefaultConfigValues:
+    UUID_FILE = "/etc/privacyidea/uuid.txt"
+    NODE_NAME = "localnode"
+
+    # "static/" holds the compiled Angular WebUI, which needs no Jinja templates. The server-side
+    # rendered pages (certificate request form, deactivated page, API documentation export) still
+    # live with the legacy WebUI in "static_old/".
+    STATIC_FOLDER = "static/"
+    LEGACY_STATIC_FOLDER = "static_old/"
+    TEMPLATE_FOLDER = f"{LEGACY_STATIC_FOLDER}templates/"
+
+    CFG_PATH = "/etc/privacyidea/pi.cfg"
+    LOGFILE_PATH = "/etc/privacyidea/privacyidea.log"
+    LOGGING_CFG = "/etc/privacyidea/logging.cfg"
+
+
 def _random_password(size):
     log.info("SECRET_KEY not set in config. Generating a random key.")
-    passwd = [random.choice(string.ascii_lowercase + \
-                            string.ascii_uppercase + string.digits) for _x in range(size)]
-    # return shuffled password
-    random.shuffle(passwd)
+    passwd = [secrets.choice(string.ascii_lowercase +
+                             string.ascii_uppercase + string.digits) for _x in range(size)]
     return "".join(passwd)
 
 
-class Config(object):
-    SECRET_KEY = os.environ.get('SECRET_KEY')
-    # SQL_ALCHEMY_DATABASE_URI = "mysql://privacyidea:XmbSrlqy5d4IS08zjz"
-    # "GG5HTt40Cpf5@localhost/privacyidea"
+def _env_flag(name: str) -> bool:
+    """
+    Parse a boolean-ish environment variable, defaulting to False.
+
+    A local stand-in for ``lib.utils.is_true``: this module cannot import
+    from ``privacyidea.lib`` without creating a circular import, since
+    ``lib.framework`` imports ``ConfigKey`` from here.
+    """
+    return os.environ.get(name, "false").strip().lower() in ("true", "1", "yes", "on")
+
+
+class Config:
+    SECRET_KEY = os.environ.get(ConfigKey.SECRET_KEY)
     PI_ENCFILE = os.path.join(basedir, "tests/testdata/enckey")
-    PI_HSM = "default"
     PI_AUDIT_MODULE = "privacyidea.lib.auditmodules.sqlaudit"
     PI_AUDIT_KEY_PRIVATE = os.path.join(basedir, "tests/testdata/private.pem")
     PI_AUDIT_KEY_PUBLIC = os.path.join(basedir, "tests/testdata/public.pem")
     PI_LOGFILE = "privacyidea.log"
     PI_LOGLEVEL = logging.INFO
-    CACHE_TYPE = "simple"
     PI_EXTERNAL_LINKS = True
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     # PI_GNUPG_HOME = "gpg"
@@ -63,9 +177,10 @@ class Config(object):
 
 class DevelopmentConfig(Config):
     DEBUG = True
-    SECRET_KEY = os.environ.get('SECRET_KEY') or 't0p s3cr3t'
-    SQLALCHEMY_DATABASE_URI = os.environ.get('DEV_DATABASE_URL') or \
-        'sqlite:///' + os.path.join(basedir, 'data-dev.sqlite')
+    SECRET_KEY = os.environ.get(ConfigKey.SECRET_KEY) or 't0p s3cr3t'
+    SQLALCHEMY_DATABASE_URI = os.environ.get(ConfigKey.DEV_DATABASE_URL) or \
+                              'sqlite:///' + os.path.join(basedir, 'data-dev.sqlite')
+    PI_REDIS_URL = os.environ.get(ConfigKey.REDIS_URL)
     PI_LOGLEVEL = logging.DEBUG
     PI_TRANSLATION_WARNING = "[Missing]"
 
@@ -74,29 +189,51 @@ class TestingConfig(Config):
     TESTING = True
     # This is used to encrypt the auth token
     SUPERUSER_REALM = ['adminrealm']
-    SECRET_KEY = 'secret'
-    SQLALCHEMY_DATABASE_URI = os.environ.get('TEST_DATABASE_URL') or \
-        'sqlite:///' + os.path.join(basedir, 'data-test.sqlite')
+    # At least 32 bytes so signing the auth JWT does not raise pyjwt's
+    # InsecureKeyLengthWarning on every test that authenticates.
+    SECRET_KEY = 'secret-key-for-testing-only-0123456789'  # nosec B105 # used for testing
+    SQLALCHEMY_DATABASE_URI = os.environ.get(ConfigKey.TEST_DATABASE_URL) or \
+                              'sqlite:///' + os.path.join(basedir, 'data-test.sqlite')
+    # Optional real-Redis challenge backend, driven by env so the dedicated
+    # CI job can run the whole suite against Redis while the default run stays
+    # DB-only (PI_REDIS_URL unset -> the cache feature is off).
+    PI_REDIS_URL = os.environ.get(ConfigKey.REDIS_URL)
+    PI_REDIS_CACHE_CHALLENGES = _env_flag(ConfigKey.REDIS_CACHE_CHALLENGES)
+    PI_REDIS_CACHE_USERS = _env_flag(ConfigKey.REDIS_CACHE_USERS)
+    PI_REDIS_CACHE_AUTH = _env_flag(ConfigKey.REDIS_CACHE_AUTH)
+    PI_REDIS_CACHE_HEALTH = _env_flag(ConfigKey.REDIS_CACHE_HEALTH)
     # This is used to encrypt the admin passwords
     PI_PEPPER = ""
     # This is only for testing encrypted files
     PI_ENCFILE_ENC = "tests/testdata/enckey.enc"
     PI_LOGLEVEL = logging.INFO
     PI_GNUPG_HOME = "tests/testdata/gpg"
-    PI_AUDIT_SQL_TRUNCATE = True
-    CACHE_TYPE = "None"
+    # Loading an RSA private key validates it, which costs roughly 100 ms. The audit key is loaded
+    # again for every signed response and for every audit module instance, so the suite spends
+    # minutes re-validating the same key it ships itself. Signing behaviour is unchanged; only the
+    # repeated validation of a known-good test key is skipped.
+    PI_AUDIT_NO_PRIVATE_KEY_CHECK = True
+    PI_RESPONSE_NO_PRIVATE_KEY_CHECK = True
+    # argon2 is meant to be expensive. The production parameters cost about 200 ms per hash and
+    # spawn four threads each, so under pytest-xdist the workers spend more time in the key
+    # derivation function than in the code under test. Tests that are about the production
+    # parameters override this, see DefaultHashAlgoListTestCase in tests/test_lib_crypto.py.
+    PI_HASH_ALGO_PARAMS = {"argon2__rounds": 1, "argon2__memory_cost": 8, "argon2__parallelism": 1}
+    # Disable the /healthz/resolversz probe cache so tests see fresh results
+    PI_HEALTHZ_RESOLVER_CACHE_SECONDS = 0
     PI_SCRIPT_HANDLER_DIRECTORY = "tests/testdata/scripts/"
     PI_NOTIFICATION_HANDLER_SPOOLDIRECTORY = "tests/testdata/"
+    PI_NODE_UUID = "8e4272a9-9037-40df-8aa3-976e4a04b5a9"
     PI_NODE = "Node1"
-    PI_NODES = ["Node1", "Node2"]
     PI_ENGINE_REGISTRY_CLASS = "null"
+    PI_EMAIL_VALIDATOR_MODULES = ["tests.testdata.gmailvalidator"]
     PI_TRUSTED_JWT = [{"public_key": pubtest_key,
                        "algorithm": "HS256",
                        "role": "user",
                        "realm": "realm1",
                        "username": "userA",
                        "resolver": "resolverX"},
-                      {"public_key": non_matchin_pubkey,
+                      {"public_key": non_matching_pubkey,
                        "algorithm": "RS256",
                        "role": "user",
                        "realm": "realm1",
@@ -122,12 +259,17 @@ class AltUIConfig(TestingConfig):
     PI_TEMPLATE_FOLDER = "../tests/testdata/altstatic/templates"
 
 
+class LegacyUIConfig(TestingConfig):
+    """The two settings an administrator adds to pi.cfg to keep the legacy WebUI."""
+    PI_STATIC_FOLDER = DefaultConfigValues.LEGACY_STATIC_FOLDER
+    PI_TEMPLATE_FOLDER = f"{DefaultConfigValues.LEGACY_STATIC_FOLDER}templates/"
+
+
 class ProductionConfig(Config):
     SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or \
-        'sqlite:///' + os.path.join(basedir, 'data.sqlite')
-    #SQLALCHEMY_DATABASE_URI = "mysql://pi2:pi2@localhost/pi2"
+                              'sqlite:///' + os.path.join(basedir, 'data.sqlite')
     # This is used to encrypt the auth_token
-    SECRET_KEY = os.environ.get('SECRET_KEY') or _random_password(24)
+    SECRET_KEY = os.environ.get(ConfigKey.SECRET_KEY) or _random_password(24)
     # This is used to encrypt the admin passwords
     PI_PEPPER = "Never know..."
     # This is used to encrypt the token data and token passwords
@@ -137,32 +279,90 @@ class ProductionConfig(Config):
     PI_AUDIT_KEY_PUBLIC = os.path.join(basedir, "public.pem")
     PI_LOGLEVEL = logging.INFO
     SUPERUSER_REALM = ['superuser']
+    # Optional Redis cache. Production also accepts the URL via env so secret
+    # rotation doesn't require editing pi.cfg.
+    PI_REDIS_URL = os.environ.get(ConfigKey.REDIS_URL)
 
 
-class HerokuConfig(Config):
-    SQLALCHEMY_DATABASE_URI = "postgres://mvfkmtkwzuwojj:" \
-                              "wqy_btZE3CPPNWsmkfdmeorxy6@" \
-                              "ec2-54-83-0-61.compute-1." \
-                              "amazonaws.com:5432/d6fjidokoeilp6"
-    #SQLALCHEMY_DATABASE_URI = "mysql://pi2:pi2@localhost/pi2"
-    # This is used to encrypt the auth_token
-    SECRET_KEY = os.environ.get('SECRET_KEY') or 't0p s3cr3t'
-    # This is used to encrypt the admin passwords
-    PI_PEPPER = "Never know..."
-    # This is used to encrypt the token data and token passwords
-    PI_ENCFILE = os.path.join(basedir, "deploy/heroku/enckey")
-    # This is used to sign the audit log
-    PI_AUDIT_KEY_PRIVATE = os.path.join(basedir,
-                                        "deploy/heroku/private.pem")
-    PI_AUDIT_KEY_PUBLIC = os.path.join(basedir, "deploy/heroku/public.pem")
-    SUPERUSER_REALM = ['superuser']
+docker_secrets_dir = Path("/run/secrets/")
+
+
+def _get_secrets_from_environment(name: str) -> str | None:
+    if f"{name}_FILE" in os.environ:
+        file_name = os.environ[f"{name}_FILE"]
+        try:
+            with open(file_name) as f:
+                return f.read().strip()
+        except OSError as _e:
+            sys.stderr.write(f"Could not read secret from file defined in variable '{name}_FILE'\n")
+    return os.getenv(name)
+
+
+def _get_secrets_paths_from_environment(path: str, name: str) -> str | None:
+    if (docker_secrets_dir / path).is_file():
+        return str(docker_secrets_dir / path)
+    elif name in os.environ:
+        if Path(os.environ[name]).is_file():
+            return os.environ[name]
+        else:
+            sys.stderr.write(f"Could not read secret file path defined in variable '{name}'\n")
+            return None
+    else:
+        return None
+
+
+class DockerConfig:
+    # Try to set the database url from the environment variables
+    # First we try if the URL component was set individually
+    if db_password := _get_secrets_from_environment(ConfigKey.DB_PASSWORD):
+        PI_DB_PASSWORD = db_password
+
+        if all(x in os.environ for x in [ConfigKey.DB_USER, ConfigKey.DB_HOST]) and PI_DB_PASSWORD:
+            SQLALCHEMY_DATABASE_URI = "{}://{}:{}@{}{}/{}{}".format(
+                os.getenv(ConfigKey.DB_DRIVER, 'mysql+pymysql'),
+                os.getenv(ConfigKey.DB_USER),
+                PI_DB_PASSWORD,
+                os.getenv(ConfigKey.DB_HOST),
+                f":{os.getenv(ConfigKey.DB_PORT)}" if ConfigKey.DB_PORT in os.environ else "",
+                os.getenv(ConfigKey.DB_NAME, ""),
+                f"?{os.getenv(ConfigKey.DB_EXTRA_PARAMS)}" if ConfigKey.DB_EXTRA_PARAMS in os.environ else ""
+            )
+    # If the complete SQLALCHEMY_DATABASE_URI is given in the environment (secret)
+    # it overwrites the one combined from components
+    if sqlalchemy_db_url := _get_secrets_from_environment(ConfigKey.SQLALCHEMY_DATABASE_URI):
+        SQLALCHEMY_DATABASE_URI = sqlalchemy_db_url
+    if pi_pepper := _get_secrets_from_environment(ConfigKey.PEPPER):
+        PI_PEPPER = pi_pepper
+    # SECRET_KEY / SECRET_KEY_FILE keep Flask's key name (no PI_ prefix). Also
+    # accept PI_SECRET_KEY / PI_SECRET_KEY_FILE as an alias, for consistency with
+    # the other PI_* secret variables; the unprefixed name takes precedence.
+    if secret_key := (_get_secrets_from_environment(ConfigKey.SECRET_KEY)
+                      or _get_secrets_from_environment("PI_SECRET_KEY")):
+        SECRET_KEY = secret_key
+
+    if enc_key := _get_secrets_paths_from_environment("enckey", ConfigKey.ENCFILE):
+        PI_ENCFILE = enc_key
+    if audit_key_public := _get_secrets_paths_from_environment("audit_key_public",
+                                                               ConfigKey.AUDIT_KEY_PUBLIC):
+        PI_AUDIT_KEY_PUBLIC = audit_key_public
+    if audit_key_private := _get_secrets_paths_from_environment("audit_key_private",
+                                                                ConfigKey.AUDIT_KEY_PRIVATE):
+        PI_AUDIT_KEY_PRIVATE = audit_key_private
+
+    # Optional Redis cache - supports direct URL or file-based secret
+    # Set PI_REDIS_URL=redis://host:6379/0  or  PI_REDIS_URL_FILE=/run/secrets/redis_url
+    if redis_url := _get_secrets_from_environment(ConfigKey.REDIS_URL):
+        PI_REDIS_URL = redis_url
+
+    PI_AUDIT_MODULE = "privacyidea.lib.auditmodules.sqlaudit"
 
 
 config = {
     'development': DevelopmentConfig,
+    'docker': DockerConfig,
     'testing': TestingConfig,
     'production': ProductionConfig,
     'default': DevelopmentConfig,
-    'heroku': HerokuConfig,
-    'altUI': AltUIConfig
+    'altUI': AltUIConfig,
+    'legacyUI': LegacyUIConfig
 }

@@ -1,0 +1,475 @@
+#  2023-01-27 Cornelius Kölbel <cornelius@privacyidea.org>
+#             Create this module for enabling decorators for API calls
+#
+#  License:  AGPLv3
+#  contact:  http://www.privacyidea.org
+#
+# This code is free software; you can redistribute it and/or
+# modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+# License as published by the Free Software Foundation; either
+# version 3 of the License, or any later version.
+#
+# This code is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+#
+# You should have received a copy of the GNU Affero General Public
+# License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+"""
+These are logical policy functions that are usually used in policy API decorators, but
+in some cases also used beside the API.
+Like policies, that are supposed to read and pass parameters during enrollment of a token.
+"""
+import logging
+from dataclasses import dataclass
+from datetime import timedelta, datetime, UTC
+
+from privacyidea.api.lib.utils import report_owner_lookup_error, resolve_token_owner
+from privacyidea.lib.container import find_container_for_token, find_container_by_serial
+from privacyidea.lib.error import PolicyError, ResourceNotFoundError
+from privacyidea.lib.log import log_with
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.policies.conditions import ConditionSection
+from privacyidea.lib.policy import Match, SCOPE
+from privacyidea.lib.realm import realm_is_defined
+from privacyidea.lib.tokens.push_types import PushAction
+from privacyidea.lib.token import get_tokens_from_serial_or_user
+from privacyidea.lib.tokenclass import TokenClass
+from privacyidea.lib.user import User
+from privacyidea.lib.utils import parse_timedelta
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class UserAttributes:
+    role: str | None = None
+    username: str | None = None
+    realm: str | None = None
+    resolver: str | None = None
+    adminuser: str | None = None
+    adminrealm: str | None = None
+    additional_realms: list | None = None
+    user: User | None = None
+
+
+@log_with(log)
+def get_init_tokenlabel_parameters(g, params=None, token_type="hotp", user_object=None):
+    """
+    This helper function modifies the request parameters in regard
+    to enrollment policies tokenlabel, tokenissuer, appimage, force_app_pin
+
+    :param params: The request parameter
+    :param user_object: User object in the request
+    :return: modified request parameters
+    """
+    params = params or {}
+    label_pols = Match.user(g, scope=SCOPE.ENROLL, action=PolicyAction.TOKENLABEL,
+                            user_object=user_object).action_values(unique=True, allow_white_space_in_action=True)
+    if len(label_pols) == 1:
+        # The policy was set, so we need to set the tokenlabel in the request.
+        params[PolicyAction.TOKENLABEL] = list(label_pols)[0]
+
+    issuer_pols = Match.user(g, scope=SCOPE.ENROLL, action=PolicyAction.TOKENISSUER,
+                             user_object=user_object).action_values(unique=True, allow_white_space_in_action=True)
+    if len(issuer_pols) == 1:
+        params[PolicyAction.TOKENISSUER] = list(issuer_pols)[0]
+
+    imageurl_pols = Match.user(g, scope=SCOPE.ENROLL, action=PolicyAction.APPIMAGEURL,
+                               user_object=user_object).action_values(unique=True, allow_white_space_in_action=True)
+    if len(imageurl_pols) == 1:
+        params[PolicyAction.APPIMAGEURL] = list(imageurl_pols)[0]
+
+    # check the force_app_pin policy
+    app_pin_pols = Match.user(g, scope=SCOPE.ENROLL,
+                              action=f'{token_type!s}_{PolicyAction.FORCE_APP_PIN!s}',
+                              user_object=user_object).any()
+
+    if app_pin_pols:
+        params[PolicyAction.FORCE_APP_PIN] = True
+        params[PolicyAction.APP_FORCE_UNLOCK] = "pin"
+
+    app_force_unlock = Match.user(g, scope=SCOPE.ENROLL,
+                                  action=f'{token_type!s}_{PolicyAction.APP_FORCE_UNLOCK!s}',
+                                  user_object=user_object).action_values(unique=True)
+    if app_force_unlock:
+        params[PolicyAction.APP_FORCE_UNLOCK] = list(app_force_unlock)[0]
+
+    return params
+
+
+def get_pushtoken_add_config(g, params=None, user_obj=None):
+    """
+    This helper function modifies the request parameters in regards
+    to enrollment policies for push tokens.
+
+    :param params: The request parameter
+    :param user_object: User object in the request
+    :return: modified request parameters
+    """
+    params = params or {}
+
+    user = user_obj or None
+
+    # Get the firebase configuration from the policies
+    firebase_config = Match.user(g, scope=SCOPE.ENROLL, action=PushAction.FIREBASE_CONFIG,
+                                 user_object=user).action_values(unique=True, allow_white_space_in_action=True)
+    if len(firebase_config) == 1:
+        params[PushAction.FIREBASE_CONFIG] = list(firebase_config)[0]
+    else:
+        raise PolicyError(f"Missing enrollment policy for push token: {PushAction.FIREBASE_CONFIG}")
+
+    # Get the sslverify definition from the policies
+    ssl_verify = Match.user(g, scope=SCOPE.ENROLL, action=PushAction.SSL_VERIFY,
+                            user_object=user).action_values(unique=True)
+    if len(ssl_verify) == 1:
+        params[PushAction.SSL_VERIFY] = list(ssl_verify)[0]
+    else:
+        params[PushAction.SSL_VERIFY] = "1"
+
+    # Get the TTL and the registration URL from the policies
+    registration_url = Match.user(g, scope=SCOPE.ENROLL, action=PushAction.REGISTRATION_URL,
+                                  user_object=user).action_values(unique=True, allow_white_space_in_action=True)
+    if len(registration_url) == 1:
+        params[PushAction.REGISTRATION_URL] = list(registration_url)[0]
+    else:
+        raise PolicyError(f"Missing enrollment policy for push token: {PushAction.REGISTRATION_URL}")
+    ttl = Match.user(g, scope=SCOPE.ENROLL, action=PushAction.TTL,
+                     user_object=user).action_values(unique=True, allow_white_space_in_action=True)
+    if len(ttl) == 1:
+        params[PushAction.TTL] = list(ttl)[0]
+    else:
+        params[PushAction.TTL] = "10"
+
+    # check which scheme to use
+    use_pia_scheme = Match.user(g, scope=SCOPE.ENROLL, action=PushAction.USE_PIA_SCHEME,
+                                user_object=user).allowed()
+    params[PushAction.USE_PIA_SCHEME] = use_pia_scheme
+    return params
+
+
+def get_token_user_attributes(serial: str):
+    """
+    Get the user attributes from the token owner and the token realms.
+
+    :param serial: The serial of the token
+    :return: UserAttributes dataclass
+    """
+    user_attributes = UserAttributes()
+    # get user attributes from the token
+    token = get_tokens_from_serial_or_user(serial, user=None)[0]
+    # If the owner can not be looked up, because the resolver of the owner was deleted or is unreachable, the
+    # policies are matched against the realm and the resolver of the owner, as there is no login name.
+    token_owner = resolve_token_owner(serial)
+    report_owner_lookup_error(serial)
+    if token_owner:
+        user_attributes.username = token_owner.login
+        user_attributes.realm = token_owner.realm
+        user_attributes.resolver = token_owner.resolver
+        user_attributes.user = token_owner
+    if token:
+        user_attributes.additional_realms = token.get_realms()
+    return user_attributes
+
+
+def get_container_user_attributes(container_serial: str) -> UserAttributes:
+    """
+    Get the user and container realms from the request.
+    If a user attribute (username, realm, resolver) is not available, it is set to None.
+    If no container realms are available an empty list is set.
+
+    :param container_serial: Serial of the container
+    :return: container_owner_attributes
+    """
+    container_owner_attributes = UserAttributes()
+
+    try:
+        container = find_container_by_serial(container_serial)
+    except ResourceNotFoundError:
+        container = None
+        log.error(f"Could not find container with serial {container_serial}.")
+    if container:
+        container_owners = container.get_users()
+        container_owner = container_owners[0] if container_owners else None
+        if container_owner:
+            container_owner_attributes.username = container_owner.login
+            container_owner_attributes.realm = container_owner.realm
+            container_owner_attributes.resolver = container_owner.resolver
+            container_owner_attributes.user = container_owner
+        container_owner_attributes.additional_realms = [realm.name for realm in container.realms]
+
+    return container_owner_attributes
+
+
+def check_token_action_allowed(g, action: str, serial: str, user_attributes: UserAttributes) -> bool:
+    """
+    Retrieves user attributes from the token and checks if the logged-in user is allowed to perform the action on the
+    token.
+
+    For admins, the policies either need to match the token owner or at least one of the token realms.
+    If no user attributes (username, realm, resolver) are available, the policies are filtered for generic policies
+    without conditions on the user. Only for the action ASSIGN, all policies are considered, ignoring the username,
+    realm, and resolver conditions. The token realms are still taken into account. This shall allow helpdesk admins
+    to assign their users to tokens without owner.
+    If the owner exists but can not be looked up, only the policies without a user and those for every user (``*``)
+    are considered, as it can not be checked whether a policy names the owner.
+
+    :param g: The global flask object g
+    :param action: The action to be performed on the token
+    :param serial: The serial of the token
+    :param user_attributes: User attributes of the logged-in user
+    :return: True if the action is allowed, False otherwise
+    """
+    if serial:
+        token_owner_attributes = get_token_user_attributes(serial)
+    else:
+        token_owner_attributes = UserAttributes()
+
+    if user_attributes.role == "admin":
+        if action in [PolicyAction.ASSIGN, PolicyAction.COPYTOKENUSER, PolicyAction.COPYTOKENPIN]:
+            # Assigning a user to a token is only possible if the token has no owner yet.
+            # To avoid helpdesk admins (for a specific resolver) lose access on their tokens while changing the owner
+            # of a token, they are allowed to assign their users to tokens without owner. Copying an owner or a PIN
+            # onto a token of the unassigned pool is the same kind of operation and is treated the same way.
+            # Note: the policies are still filtered by the token realms.
+            user_attributes.username = token_owner_attributes.username or None
+            user_attributes.realm = token_owner_attributes.realm or None
+            user_attributes.resolver = token_owner_attributes.resolver or None
+        else:
+            # If no user is available, explicitly filter for generic policies without conditions on the user
+            user_attributes.username = token_owner_attributes.username or ""
+            user_attributes.realm = token_owner_attributes.realm or ""
+            user_attributes.resolver = token_owner_attributes.resolver or ""
+        user_attributes.user = token_owner_attributes.user
+        user_attributes.additional_realms = token_owner_attributes.additional_realms or None
+    elif user_attributes.role == "user" and serial:
+        # for adding / removing tokens from a container, the user has to be the owner of the token
+        if action in [PolicyAction.CONTAINER_ADD_TOKEN, PolicyAction.CONTAINER_REMOVE_TOKEN]:
+            if not user_is_owner(user_attributes.user, token_owner_attributes.user, allow_no_owner=False):
+                return False
+
+    # Do not check extended conditions for containers
+    condition_check = ConditionSection.get_all_sections()
+    condition_check.remove(ConditionSection.CONTAINER)
+    condition_check.remove(ConditionSection.CONTAINER_INFO)
+
+    if user_attributes.user:
+        # If we have a resolved user object, there is no need to pass the user attributes individually
+        user_attributes.username = None
+        user_attributes.realm = None
+        user_attributes.resolver = None
+
+    # Check action for the token
+    action_allowed = Match.generic(g,
+                                   scope=user_attributes.role,
+                                   action=action,
+                                   user_object=user_attributes.user,
+                                   user=user_attributes.username,
+                                   resolver=user_attributes.resolver,
+                                   realm=user_attributes.realm,
+                                   adminrealm=user_attributes.adminrealm,
+                                   adminuser=user_attributes.adminuser,
+                                   additional_realms=user_attributes.additional_realms,
+                                   serial=serial,
+                                   extended_condition_check=condition_check).allowed()
+
+    if action_allowed and action == PolicyAction.CONTAINER_ADD_TOKEN:
+        # Adding a token to a container will remove it from the old container: Check if the remove action is allowed
+        try:
+            old_container = find_container_for_token(serial)
+        except ResourceNotFoundError:
+            old_container = None
+
+        if old_container:
+            action_allowed = check_container_action_allowed(g, PolicyAction.CONTAINER_REMOVE_TOKEN,
+                                                            old_container.serial,
+                                                            user_attributes)
+            if not action_allowed:
+                log.info(f"Token {serial} is in container {old_container.serial}. The user is not allowed to remove the"
+                         " token from this container.")
+
+    return action_allowed
+
+
+def check_container_action_allowed(g, action: str, container_serial: str, user_attributes: UserAttributes) -> bool:
+    """
+    Retrieves user attributes from the container and checks if the logged-in user is allowed to perform the action
+    on the container.
+
+    For admins, the policies either need to match the container owner or at least one of the container realms.
+    If no user attributes (username, realm, resolver) are available, the policies are filtered for generic policies
+    without conditions on the user. Only for the action CONTAINER_ASSIGN_USER, all policies are considered, ignoring
+    the username, realm, and resolver conditions. The container realms are still taken into account. This shall allow
+    helpdesk admins to assign their users to containers without owner.
+    If the owner exists but can not be looked up, only the policies without a user and those for every user (``*``)
+    are considered, as it can not be checked whether a policy names the owner.
+
+    For the action CONTAINER_CREATE, the user attributes from the parameters are considered, as the container has no
+    owner yet.
+
+    :param g: The global flask object g
+    :param action: The action to be performed on the container
+    :param container_serial: The serial of the container
+    :param user_attributes: User attributes of the logged-in user
+    :return: True if the action is allowed, False otherwise
+    """
+    user_attributes.additional_realms = None
+    container_owner_attributes = UserAttributes()
+    if container_serial:
+        # get user attributes from the container
+        container_owner_attributes = get_container_user_attributes(container_serial)
+
+    # Do not check extended conditions for tokens
+    condition_check = ConditionSection.get_all_sections()
+    condition_check.remove(ConditionSection.TOKEN)
+    condition_check.remove(ConditionSection.TOKENINFO)
+
+    if user_attributes.role == "admin":
+        if action == PolicyAction.CONTAINER_ASSIGN_USER:
+            # Assigning a user to a container is only possible if the container has no owner yet.
+            # To avoid helpdesk admins (for a specific resolver) lose access on their containers while changing the
+            # owner of a container, they are allowed to assign their users to containers without user.
+            # Note: the policies are still filtered by the container realms.
+            user_attributes.username = container_owner_attributes.username or None
+            user_attributes.realm = container_owner_attributes.realm or None
+            user_attributes.resolver = container_owner_attributes.resolver or None
+            user_attributes.user = container_owner_attributes.user
+            # user conditions are already evaluated in the check_user_params decorator
+            condition_check.remove(ConditionSection.USERINFO)
+        elif action == PolicyAction.CONTAINER_CREATE:
+            # If the container is created, it has no owner yet, instead check the user attributes from the parameters
+            user_attributes.username = user_attributes.username or ""
+            user_attributes.realm = user_attributes.realm or ""
+            user_attributes.resolver = user_attributes.resolver or ""
+        else:
+            # If no user is available, explicitly filter for generic policies without conditions on the user
+            user_attributes.username = container_owner_attributes.username or ""
+            user_attributes.realm = container_owner_attributes.realm or ""
+            user_attributes.resolver = container_owner_attributes.resolver or ""
+            user_attributes.user = container_owner_attributes.user
+        user_attributes.additional_realms = container_owner_attributes.additional_realms or None
+    elif user_attributes.role == "user" and container_serial:
+        # check if the user is the owner of the container
+        if action == PolicyAction.CONTAINER_CREATE:
+            # container has no owner yet, skip this check
+            is_owner = True
+        elif action == PolicyAction.CONTAINER_ASSIGN_USER:
+            # users are allowed to assign containers without owner
+            is_owner = user_is_owner(user_attributes.user, container_owner_attributes.user, allow_no_owner=True)
+        else:
+            is_owner = user_is_owner(user_attributes.user, container_owner_attributes.user, allow_no_owner=False)
+        if not is_owner:
+            return False
+
+    if user_attributes.user:
+        # If we have a resolved user object, there is no need to pass the user attributes individually
+        user_attributes.username = None
+        user_attributes.realm = None
+        user_attributes.resolver = None
+
+    # Check action for container
+    action_allowed = Match.generic(g,
+                                   scope=user_attributes.role,
+                                   action=action,
+                                   user_object=user_attributes.user,
+                                   user=user_attributes.username,
+                                   resolver=user_attributes.resolver,
+                                   realm=user_attributes.realm,
+                                   adminrealm=user_attributes.adminrealm,
+                                   adminuser=user_attributes.adminuser,
+                                   additional_realms=user_attributes.additional_realms,
+                                   container_serial=container_serial,
+                                   extended_condition_check=condition_check).allowed()
+    return action_allowed
+
+
+def user_is_owner(logged_in_user: User, owner: User, allow_no_owner: bool = False) -> bool:
+    """
+    Checks if the logged-in user is the owner of the token or container.
+
+    :param logged_in_user: Logged-in user
+    :param owner: User who is the owner of the token or container
+    :param allow_no_owner: If True, the user is considered the owner if the owner is None
+    :return: True if the user is the owner, False otherwise
+    """
+    is_owner = logged_in_user == owner
+    if not is_owner and allow_no_owner and not owner:
+        is_owner = True
+    return is_owner
+
+
+def check_last_auth_policy(g, token: TokenClass) -> tuple[bool, list[str]]:
+    """
+    Check if the last_auth policy is enabled and if the token's last_auth is within the allowed time frame.
+
+    :return: a ``(result, policies)`` tuple; *policies* names the deciding LASTAUTH policies, and is only
+        non-empty when *result* is ``False`` - the caller logs it as the reason detail alongside
+        :class:`~privacyidea.lib.conditional_access.authentication_event_types.AuthEventReason.LAST_AUTH_TOO_OLD`,
+        matching how :func:`~privacyidea.lib.policydecorators.auth_lastauth` attributes the same policy check.
+    """
+    if not token:  # pragma: no cover
+        log.error("No token provided to check last_auth policy.")
+        return False, []
+    last_auth_policy = (Match.user(g, scope=SCOPE.AUTHZ, action=PolicyAction.LASTAUTH, user_object=None)
+                        .action_values(unique=True, write_to_audit_log=False))
+    if len(last_auth_policy) == 1:
+        timeframe = list(last_auth_policy)[0]
+        time_delta: timedelta = parse_timedelta(timeframe)
+        last_auth_info = token.get_tokeninfo(PolicyAction.LASTAUTH)
+        if not last_auth_info:
+            log.debug("Token has not been used for authentication yet, unable to apply last_auth policy.")
+            return True, []
+        last_auth_token = datetime.fromisoformat(last_auth_info)
+        if last_auth_token <= datetime.now(UTC) <= last_auth_token + time_delta:
+            return True, []
+        return False, last_auth_policy[timeframe]
+    return True, []
+
+
+def get_login_mode_values(g, user: User) -> dict[str, list[str]]:
+    """
+    The WebUI login modes of *user*, set by the matching ``login_mode`` policies of the highest priority. Policies of
+    that priority may set different modes. Whether that is a conflict depends on the login: a password login needs
+    exactly one mode, while a passkey login only has to know whether one of them is ``disable``.
+
+    The names of the returned policies are added to the audit entry.
+
+    :return: a dictionary mapping each login mode to the names of the policies that set it, empty if no policy matches
+    """
+    policies = Match.user(g, scope=SCOPE.WEBUI, action=PolicyAction.LOGINMODE,
+                          user_object=user).policies(write_to_audit_log=False)
+    prioritized_policies = [policy for policy in policies if policy["priority"] == policies[0]["priority"]]
+    login_mode_values = g.policy_object.extract_action_values(prioritized_policies, PolicyAction.LOGINMODE)
+    g.audit_object.add_policy({name for names in login_mode_values.values() for name in names})
+    return login_mode_values
+
+
+def get_realm_for_authentication(g, username: str, realm: str) -> str:
+    """
+    Checks if the set_realm policy action from the authentication scope defines a realm that should be used for the
+    authentication.
+    Returns the defined realm if the policy is set or the given realm otherwise.
+    In case the realm defined in the policy does not exist the given realm is returned.
+
+    :param g: The global flask object g
+    :param username: The username of the user
+    :param realm: The realm from the request parameters
+    :return: The realm to be used for authentication
+    """
+    auth_realm_policy = Match.generic(g, scope=SCOPE.AUTH, action=PolicyAction.SET_REALM,
+                                      user=username, realm=realm or None).action_values(unique=True)
+    if auth_realm_policy:
+        new_realm = list(auth_realm_policy)[0]
+        if not realm_is_defined(new_realm):
+            log.warning("Realm '%s' defined in the policy '%s' does not exist. Using realm '%s' instead.", new_realm,
+                        PolicyAction.SET_REALM, realm)
+            return realm
+        log.debug("Setting realm for authentication to '%s' due to policy action %s", new_realm, PolicyAction.SET_REALM)
+        if "policies" in g:
+            g.policies[PolicyAction.SET_REALM] = new_realm
+        else:
+            g.policies = {PolicyAction.SET_REALM: new_realm}
+        return new_realm
+    return realm

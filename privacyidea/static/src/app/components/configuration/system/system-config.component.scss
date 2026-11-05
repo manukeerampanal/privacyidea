@@ -1,0 +1,70 @@
+@use "styles";
+@use "table";
+
+.system-config-container {
+  @include styles.main-component-style;
+  display: grid;
+  min-width: calc(616px + 2 * 16px);
+}
+
+.system-config-scroll-container {
+  @include table.base-table-structure(
+    ".system-config-form",
+    ".system-config-filter",
+    ".system-config-scroll-container"
+  );
+}
+
+.well {
+  @include styles.card-recessed(3);
+  padding: 1rem;
+  display: grid;
+  gap: 16px;
+
+  h4 {
+    margin-top: 0;
+  }
+}
+
+.form-group {
+  @extend .flex-center-vertical;
+  margin-bottom: 8px;
+}
+
+.flex-row-space-between {
+  @extend .flex-row;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+
+  button {
+    flex-shrink: 0;
+    align-self: flex-end;
+  }
+}
+
+.full-width-grid-column {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 768px) {
+  form {
+    grid-template-columns: 1fr;
+  }
+  .flex-row-space-between {
+    flex-direction: column;
+    align-items: stretch;
+
+    button {
+      align-self: stretch;
+      margin-top: 0.5rem;
+    }
+  }
+}
+
+.save-buttons {
+  display: flex;
+  width: 100%;
+  margin: 12px 0 16px 0;
+  gap: 16px;
+}

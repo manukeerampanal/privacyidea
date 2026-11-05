@@ -1,0 +1,22 @@
+@use "styles";
+@use "table";
+
+.application-table-container {
+  // Sits inside the raised token-applications page container, so the shallow recess.
+  @include styles.card-recessed(3);
+  @include table.base-table-structure(".token-table", ".token-table-filter", ".table-scroll-container");
+
+  .application-table-filter {
+    width: 32.7rem;
+  }
+}
+
+.token-applications-ssh {
+  h4 {
+    margin: 0 0 16px 8px;
+  }
+
+  p {
+    margin-top: 0;
+  }
+}

@@ -1,0 +1,106 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+
+export interface FilterInputHintOptions {
+  supportsKeywords?: boolean;
+  mayBeCaseSensitive?: boolean;
+  includeCaseNote?: boolean;
+  separator?: string;
+}
+
+export function filterInputHint(options: FilterInputHintOptions = {}): string {
+  const lines: string[] = [];
+  lines.push(
+    $localize`:@@common.wildcardOrExactMatch:Use * as a wildcard, or start a value with = to match it exactly.`
+  );
+  if (options.supportsKeywords ?? true) {
+    lines.push(
+      $localize`:@@common.quoteValuesContain:Quote values that contain spaces or a colon, e.g. description: "my note".`
+    );
+  }
+  if (options.includeCaseNote ?? true) {
+    lines.push(
+      options.mayBeCaseSensitive
+        ? $localize`:@@common.mostlyCaseInsensitive:Mostly case-insensitive`
+        : $localize`:@@common.caseInsensitive:Case-insensitive`
+    );
+  }
+  return lines.join(options.separator ?? "\n");
+}
+
+/**
+ * The text of the info icon on a filter input: the offered keywords, grouped by whether the table matches a value
+ * anywhere in the field or only in full, the first group led by the table's name. A group without keywords is left
+ * out.
+ */
+export function filterMatchTooltip(table: string, keys: readonly string[], isExact: (key: string) => boolean): string {
+  const partial = keys.filter((key) => !isExact(key)).join(", ");
+  const exact = keys.filter((key) => isExact(key)).join(", ");
+  if (!partial) {
+    return $localize`:@@common.tableExactMatchKeys:${table}:table: exact match: ${exact}:keys:`;
+  }
+  const lines = [$localize`:@@common.tablePartialMatchKeys:${table}:table: partial match: ${partial}:keys:`];
+  if (exact) {
+    lines.push($localize`:@@common.exactMatchKeys:Exact match: ${exact}:keys:`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * The standard single-line filter hint shown beneath keyword filter inputs
+ * (wildcard + quoting guidance, no case note). Shared by all filterable tables
+ * so the wording stays consistent across the app.
+ */
+export function inlineFilterHint(): string {
+  return filterInputHint({ includeCaseNote: false, separator: " " });
+}
+
+export type FilterCaseNote = "usually-insensitive" | "usually-sensitive" | "sensitive";
+
+export interface FilterKeywordSemantics {
+  exactMatch: boolean;
+  isBoolean: boolean;
+  caseNote?: FilterCaseNote;
+}
+
+export function filterColumnHint(label: string, semantics: FilterKeywordSemantics): string {
+  const title = $localize`:@@common.filterBy:Filter by ${label}:INTERPOLATION:`;
+  if (semantics.isBoolean) {
+    return `${title}\n${$localize`:@@common.trueFalse:true or false`}`;
+  }
+  const parts: string[] = [];
+  parts.push(
+    semantics.exactMatch ? $localize`:@@common.exactMatch:exact match` : $localize`:@@common.partialMatch:partial match`
+  );
+  if (semantics.caseNote) {
+    parts.push(caseNoteText(semantics.caseNote));
+  }
+  return `${title}\n${parts.join(", ")}`;
+}
+
+function caseNoteText(note: FilterCaseNote): string {
+  switch (note) {
+    case "sensitive":
+      return $localize`:@@common.caseSensitive:case-sensitive`;
+    case "usually-sensitive":
+      return $localize`:@@common.usuallyCaseSensitive:usually case-sensitive`;
+    default:
+      return $localize`:@@common.usuallyCaseInsensitive:usually case-insensitive`;
+  }
+}

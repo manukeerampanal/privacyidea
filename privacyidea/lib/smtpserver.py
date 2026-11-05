@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2015-12-27 Cornelius Kölbel <cornelius@privacyidea.org>
 #             SMTP Server implementation
 #
@@ -17,21 +15,27 @@
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 #
-import six
-from six.moves.urllib.parse import urlparse
-from privacyidea.lib.framework import get_app_config_value
-from privacyidea.lib.queue import job, wrap_job, has_job_queue
-from privacyidea.models import SMTPServer as SMTPServerDB
-from privacyidea.lib.crypto import (decryptPassword, encryptPassword,
-                                    FAILED_TO_DECRYPT_PASSWORD)
-from privacyidea.lib.utils import fetch_one_resource, to_bytes, to_unicode
-from privacyidea.lib.utils.export import (register_import, register_export)
 import logging
-from privacyidea.lib.log import log_with
-from time import gmtime, strftime
 import smtplib
+import time
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
+from time import gmtime, strftime
+from urllib.parse import urlparse
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.serialization import pkcs7
+from flask import current_app
+from sqlalchemy import select
+
+from privacyidea.lib.crypto import (decryptPassword, encryptPassword,
+                                    FAILED_TO_DECRYPT_PASSWORD, is_censored, censor_dict)
+from privacyidea.lib.log import log_with
+from privacyidea.lib.metrics import inc, observe
+from privacyidea.lib.utils import fetch_one_resource, to_unicode
+from privacyidea.lib.utils.export import (register_import, register_export)
+from privacyidea.models import SMTPServer as SMTPServerDB, db
 
 __doc__ = """
 This is the library for creating, listing and deleting SMTPServer objects in
@@ -45,10 +49,15 @@ This module is tested in tests/test_lib_smtpserver.py
 log = logging.getLogger(__name__)
 TIMEOUT = 10
 
-SEND_EMAIL_JOB_NAME = "smtpserver.send_email"
+
+def _get_mail_debug_level():
+    try:
+        return int(current_app.config.get("PI_MAIL_DEBUG_LEVEL", 0))
+    except (RuntimeError, ValueError, TypeError):
+        return 0
 
 
-class SMTPServer(object):
+class SMTPServer:
     """
     SMTP Object that holds a SMTP Database Object but can also send emails.
     """
@@ -64,13 +73,11 @@ class SMTPServer(object):
 
     def send_email(self, recipient, subject, body, sender=None,
                    reply_to=None, mimetype="plain"):
-        return send_or_enqueue_email(self.config.get(), recipient, subject, body, sender,
-                                     reply_to, mimetype)
+        return self.send_email_with_config(self.config.get(), recipient, subject, body, sender, reply_to, mimetype)
 
     @staticmethod
-    @job(SEND_EMAIL_JOB_NAME)
-    def test_email(config, recipient, subject, body, sender=None,
-                   reply_to=None, mimetype="plain"):
+    def send_email_with_config(config, recipient, subject, body, sender=None,
+                               reply_to=None, mimetype="plain"):
         """
         Sends an email via the configuration.
 
@@ -91,7 +98,7 @@ class SMTPServer(object):
         :param mimetype: The type of the email to send. Can by plain or html
         :return: True or False
         """
-        if type(recipient) != list:
+        if not isinstance(recipient, list):
             recipient = [recipient]
         mail_from = sender or config['sender']
         reply_to = reply_to or mail_from
@@ -118,28 +125,56 @@ class SMTPServer(object):
             mail = smtplib.SMTP(smtp_url.hostname,
                                 port=smtp_url.port or int(config['port']),
                                 timeout=config.get('timeout', TIMEOUT))
-        log.debug(u"submitting message to {0!s}".format(msg["To"]))
-        log.debug("Saying EHLO to mailserver {0!s}".format(config['server']))
+        debug_level = _get_mail_debug_level()
+        if debug_level:
+            mail.set_debuglevel(debug_level)
+        log.debug(f"submitting message to {msg['To']!s}")
+        log.debug(f"Saying EHLO to mailserver {config['server']!s}")
         r = mail.ehlo()
-        log.debug("mailserver responded with {0!s}".format(r))
+        log.debug(f"mailserver responded with {r!s}")
         # Start TLS if required
         if not smtp_url.scheme == 'smtps' and config.get('tls', False):
-            log.debug("Trying to STARTTLS: {0!s}".format(config['tls']))
+            log.debug("Trying to STARTTLS: {!s}".format(config['tls']))
             mail.starttls()
         # Authenticate, if a username is given.
         if config.get('username', ''):
-            log.debug("Doing authentication with {0!s}".format(config['username']))
+            log.debug("Doing authentication with {!s}".format(config['username']))
             password = decryptPassword(config['password'])
             if password == FAILED_TO_DECRYPT_PASSWORD:
                 password = config['password']
-            # Under Python 2, we pass passwords as bytestrings to get CRAM-MD5 to work.
-            # We add a safeguard config option to disable the conversion.
-            # Under Python 3, we pass passwords as unicode.
-            if six.PY2 and get_app_config_value("PI_SMTP_PASSWORD_AS_BYTES", True):
-                password = to_bytes(password)
             mail.login(config['username'], password)
-        r = mail.sendmail(mail_from, recipient, msg.as_string())
-        log.info("Mail sent: {0!s}".format(r))
+        msg = msg.as_string()
+        if config.get('smime', False):
+            try:
+                msg = msg.encode("utf-8")
+                with open(config['private_key'], "rb") as key_file:
+                    private_key = key_file.read()
+                with open(config['certificate'], "rb") as cert_file:
+                    certificate = cert_file.read()
+                key_password = config.get('private_key_password')
+                if key_password:
+                    key_password_decrypted = decryptPassword(key_password)
+                    if key_password_decrypted == FAILED_TO_DECRYPT_PASSWORD:
+                        key_password_decrypted = key_password
+                    if isinstance(key_password_decrypted, str):
+                        key_password_bytes = key_password_decrypted.encode("utf-8")
+                    else:
+                        key_password_bytes = key_password_decrypted
+                else:
+                    key_password_bytes = None
+                key = serialization.load_pem_private_key(private_key, key_password_bytes)
+                cert = x509.load_pem_x509_certificate(certificate)
+                options = [pkcs7.PKCS7Options.DetachedSignature, pkcs7.PKCS7Options.NoAttributes]
+                msg = pkcs7.PKCS7SignatureBuilder().set_data(msg).add_signer(cert, key, hashes.SHA256()).sign(
+                    serialization.Encoding.SMIME, options)
+            except Exception as ex:
+                abort = config.get('dont_send_on_error')
+                action = "not be sent" if abort else "be sent anyway"
+                log.error(f"Can't create S/MIME signature: {ex}. Email will {action}")
+                if abort:
+                    return False
+        r = mail.sendmail(mail_from, recipient, msg)
+        log.info(f"Mail sent: {r!s}")
         # r is a dictionary like {"recp@destination.com": (200, 'OK')}
         # we change this to True or False
         success = True
@@ -147,26 +182,20 @@ class SMTPServer(object):
             res_id, res_text = r.get(one_recipient, (200, "OK"))
             if res_id != 200 and res_text != "OK":
                 success = False
-                log.error("Failed to send email to {0!r}: {1!r}, {2!r}".format(one_recipient,
-                                                                               res_id,
-                                                                               res_text))
+                log.error(f"Failed to send email to {one_recipient!r}: {res_id!r}, {res_text!r}")
         mail.quit()
         log.debug("I am done sending your email.")
         return success
 
 
-def send_or_enqueue_email(config, recipient, subject, body, sender=None, reply_to=None, mimetype="plain"):
-    """
-    According to the value of ``config["enqueue_job"]``, send the email directly or send a job
-    to the queue (if a queue is configured).
-    See ``SMTPServer.test_email`` for parameters.
-    :return: True if the job is sent to the queue, return value of ``SMTPServer.test_email`` otherwise
-    """
-    if has_job_queue() and config.get("enqueue_job", False):
-        send = wrap_job(SEND_EMAIL_JOB_NAME, True)
+def _record_email_send(identifier, start, success, error=False):
+    labels = {"identifier": identifier}
+    observe("email_send_duration_seconds", time.monotonic() - start, labels)
+    if error:
+        result = "error"
     else:
-        send = SMTPServer.test_email
-    return send(config, recipient, subject, body, sender, reply_to, mimetype)
+        result = "ok" if success else "failed"
+    inc("email_send_total", {**labels, "result": result})
 
 
 @log_with(log)
@@ -186,8 +215,15 @@ def send_email_identifier(identifier, recipient, subject, body, sender=None,
     :return: True or False
     """
     smtp_server = get_smtpserver(identifier)
-    return smtp_server.send_email(recipient, subject, body, sender, reply_to,
-                                  mimetype)
+    start = time.monotonic()
+    try:
+        success = smtp_server.send_email(recipient, subject, body, sender, reply_to,
+                                         mimetype)
+    except Exception:
+        _record_email_send(identifier, start, False, error=True)
+        raise
+    _record_email_send(identifier, start, success)
+    return success
 
 
 @log_with(log)
@@ -211,10 +247,16 @@ def send_email_data(mailserver, subject, message, mail_from,
     """
     dbserver = SMTPServerDB(identifier="emailtoken", server=mailserver,
                             sender=mail_from, username=username,
-                            password=password, port=port, tls=email_tls, timeout=timeout,
-                            enqueue_job=False)
+                            password=password, port=port, tls=email_tls, timeout=timeout)
     smtpserver = SMTPServer(dbserver)
-    return smtpserver.send_email(recipient, subject, message)
+    start = time.monotonic()
+    try:
+        success = smtpserver.send_email(recipient, subject, message)
+    except Exception:
+        _record_email_send("emailtoken", start, False, error=True)
+        raise
+    _record_email_send("emailtoken", start, success)
+    return success
 
 
 @log_with(log)
@@ -246,19 +288,19 @@ def get_smtpservers(identifier=None, server=None):
     :return: list of SMTPServer Objects.
     """
     res = []
-    sql_query = SMTPServerDB.query
+    stmt = select(SMTPServerDB)
     if identifier:
-        sql_query = sql_query.filter(SMTPServerDB.identifier == identifier)
+        stmt = stmt.filter(SMTPServerDB.identifier == identifier)
     if server:
-        sql_query = sql_query.filter(SMTPServerDB.server == server)
+        stmt = stmt.filter(SMTPServerDB.server == server)
 
-    for row in sql_query.all():
+    for row in db.session.scalars(stmt).all():
         res.append(SMTPServer(row))
 
     return res
 
 
-@log_with(log)
+@log_with(log, log_exit=False)
 def list_smtpservers(identifier=None, server=None):
     """
     This returns a list of all smtpservers matching the criterion.
@@ -281,7 +323,7 @@ def list_smtpservers(identifier=None, server=None):
         decrypted_password = decryptPassword(server_obj.config.password)
         # If the database contains garbage, use the empty password as fallback
         if decrypted_password == FAILED_TO_DECRYPT_PASSWORD:
-            decrypted_password = ""
+            decrypted_password = ""  # nosec B105 # reset password in case of error
         res[server_obj.config.identifier] = server_obj.config.get()
         res[server_obj.config.identifier].pop('id')
         res[server_obj.config.identifier].pop('identifier')
@@ -291,9 +333,10 @@ def list_smtpservers(identifier=None, server=None):
 
 
 @log_with(log)
-def add_smtpserver(identifier, server=None, port=25, username="", password="",
-                   sender="", description="", tls=False, timeout=TIMEOUT,
-                   enqueue_job=False):
+def add_smtpserver(identifier, server: str = None, port: int = 25, username: str = "", password: str = "",
+                   sender: str = "", description: str = "", tls: bool = False, timeout: int = TIMEOUT,
+                   smime: bool = False, dont_send_on_error: bool = False,
+                   private_key: str = "", private_key_password: str | None = None, certificate: str = ""):
     """
     This adds an smtp server to the smtp server database table.
 
@@ -307,12 +350,65 @@ def add_smtpserver(identifier, server=None, port=25, username="", password="",
     :type server: basestring
     :return: The Id of the database object
     """
-    cryptedPassword = encryptPassword(password)
-    r = SMTPServerDB(identifier=identifier, server=server, port=port,
-                     username=username, password=cryptedPassword, sender=sender,
-                     description=description, tls=tls, timeout=timeout,
-                     enqueue_job=enqueue_job).save()
-    return r
+
+    # The CENSORED placeholder (what the API returned for the password) means
+    # "keep the stored password unchanged" -> leave encrypted_password = None so
+    # the update below skips the column. An empty string clears the password, any
+    # other value sets it.
+    if is_censored(password):
+        encrypted_password = None
+    else:
+        encrypted_password = encryptPassword(password)
+    if is_censored(private_key_password):
+        private_key_password = None
+
+    # private_key_password could be empty string or None, which have a different effect later.
+    # here we only care if it has an actual value that we should encrypt, otherwise leave it at empty string or None
+    encrypted_private_key_password = private_key_password
+    if private_key_password:
+        encrypted_private_key_password = encryptPassword(private_key_password)
+
+    stmt = select(SMTPServerDB).filter(SMTPServerDB.identifier == identifier)
+    smtp_server = db.session.execute(stmt).scalar_one_or_none()
+
+    if smtp_server:
+        # Update existing entry
+        if server is not None:
+            smtp_server.server = server
+        if port is not None:
+            smtp_server.port = port
+        if username is not None:
+            smtp_server.username = username
+        if encrypted_password is not None:
+            smtp_server.password = encrypted_password
+        if sender is not None:
+            smtp_server.sender = sender
+        if tls is not None:
+            smtp_server.tls = tls
+        if description is not None:
+            smtp_server.description = description
+        if timeout is not None:
+            smtp_server.timeout = timeout
+        if smime is not None:
+            smtp_server.smime = smime
+        if dont_send_on_error is not None:
+            smtp_server.dont_send_on_error = dont_send_on_error
+        if private_key is not None:
+            smtp_server.private_key = private_key
+        if encrypted_private_key_password is not None:
+            smtp_server.private_key_password = encrypted_private_key_password
+        if certificate is not None:
+            smtp_server.certificate = certificate
+    else:
+        # Create new entry
+        smtp_server = SMTPServerDB(identifier=identifier, server=server, port=port, username=username,
+                                   password=encrypted_password, sender=sender, description=description, tls=tls,
+                                   timeout=timeout, smime=smime,
+                                   dont_send_on_error=dont_send_on_error, private_key=private_key,
+                                   private_key_password=encrypted_private_key_password, certificate=certificate)
+        db.session.add(smtp_server)
+    db.session.commit()
+    return smtp_server.id
 
 
 @log_with(log)
@@ -327,19 +423,39 @@ def delete_smtpserver(identifier):
 
 
 @register_export('smtpserver')
-def export_smtpserver(name=None):
-    """ Export given or all smtpserver configuration """
-    return list_smtpservers(identifier=name)
+def export_smtpserver(name=None, censor=False):
+    """ Export given or all SMTP server configuration
+
+    :param censor: If True, the password and private key password are replaced
+        with the ``__CENSORED__`` placeholder instead of being returned in
+        clear text.
+    """
+    res = list_smtpservers(identifier=name)
+    for identifier, server in res.items():
+        if censor:
+            # The secret values are about to be replaced by the placeholder, so
+            # there is no point decrypting private_key_password first.
+            secret_keys = [key for key in ("password", "private_key_password") if server.get(key)]
+            res[identifier] = censor_dict(server, secret_keys)
+            continue
+        # list_smtpservers() decrypts 'password' but returns 'private_key_password'
+        # still encrypted. Decrypt it here so that a (non-censored) export can be
+        # re-imported without add_smtpserver() encrypting it a second time.
+        if server.get("private_key_password"):
+            decrypted = decryptPassword(server["private_key_password"])
+            server["private_key_password"] = "" if decrypted == FAILED_TO_DECRYPT_PASSWORD else decrypted
+    return res
 
 
 @register_import('smtpserver')
 def import_smtpserver(data, name=None):
-    """Import policy configuration"""
-    log.debug('Import smtpserver config: {0!s}'.format(data))
+    """Import SMTP server configuration"""
+    log.debug(f'Import SMTP server config: {data!s}')
     for res_name, res_data in data.items():
         if name and name != res_name:
             continue
-        # condition is apparently not used anymore
+        # Exports of privacyIDEA 3.14 and older contain "enqueue_job", a setting that no longer exists.
+        res_data = {key: value for key, value in res_data.items() if key != "enqueue_job"}
         rid = add_smtpserver(res_name, **res_data)
-        log.info('Import of smtpserver "{0!s}" finished,'
-                 ' id: {1!s}'.format(res_name, rid))
+        log.info(f'Import of SMTP server "{res_name!s}" finished,'
+                 f' id: {rid!s}')

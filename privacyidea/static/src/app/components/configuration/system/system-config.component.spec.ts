@@ -1,0 +1,299 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { provideHttpClient } from "@angular/common/http";
+import { provideHttpClientTesting } from "@angular/common/http/testing";
+import { provideLocationMocks } from "@angular/common/testing";
+import { ComponentFixture, TestBed } from "@angular/core/testing";
+import { MatDialog } from "@angular/material/dialog";
+import { MatSnackBar } from "@angular/material/snack-bar";
+import { provideRouter } from "@angular/router";
+import { ROUTE_PATHS } from "@app/route_paths";
+import { AuthService } from "@services/auth/auth.service";
+import { ContentService } from "@services/content/content.service";
+import { NotificationService } from "@services/notification/notification.service";
+import { PendingChangesService } from "@services/pending-changes/pending-changes.service";
+import { SmtpServer, SmtpService } from "@services/smtp/smtp.service";
+import { SystemService } from "@services/system/system.service";
+import { MockContentService, MockNotificationService, MockPiResponse, MockSmtpService } from "@testing/mock-services";
+import { MockAuthService } from "@testing/mock-services/mock-auth-service";
+import { MockPendingChangesService } from "@testing/mock-services/mock-pending-changes-service";
+import { MockSystemService } from "@testing/mock-services/mock-system-service";
+import { of, throwError } from "rxjs";
+import { SystemConfigComponent } from "./system-config.component";
+import { SystemDocumentationDialogComponent } from "./system-documentation-dialog/system-documentation-dialog.component";
+
+describe("SystemConfigComponent", () => {
+  let component: SystemConfigComponent;
+  let fixture: ComponentFixture<SystemConfigComponent>;
+  let systemService: MockSystemService;
+  let authService: MockAuthService;
+  let notificationService: MockNotificationService;
+  let pendingChangesService: MockPendingChangesService;
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [SystemConfigComponent],
+      providers: [
+        provideRouter([]),
+        provideLocationMocks(),
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        { provide: SystemService, useClass: MockSystemService },
+        { provide: AuthService, useClass: MockAuthService },
+        { provide: NotificationService, useClass: MockNotificationService },
+        { provide: ContentService, useClass: MockContentService },
+        { provide: MatSnackBar, useValue: { open: jest.fn() } },
+        { provide: PendingChangesService, useClass: MockPendingChangesService },
+        { provide: SmtpService, useClass: MockSmtpService }
+      ]
+    }).compileComponents();
+
+    fixture = TestBed.createComponent(SystemConfigComponent);
+    component = fixture.componentInstance;
+    systemService = TestBed.inject(SystemService) as unknown as MockSystemService;
+    authService = TestBed.inject(AuthService) as unknown as MockAuthService;
+    notificationService = TestBed.inject(NotificationService) as unknown as MockNotificationService;
+    pendingChangesService = TestBed.inject(PendingChangesService) as unknown as MockPendingChangesService;
+
+    const contentService = TestBed.inject(ContentService) as unknown as MockContentService;
+    contentService.routeUrl.set(ROUTE_PATHS.CONFIGURATION_SYSTEM);
+
+    fixture.detectChanges();
+  });
+
+  it("should create", () => {
+    expect(component).toBeTruthy();
+  });
+
+  it("should load system config on init", () => {
+    expect(component.params).toBeDefined();
+    expect(component.params().splitAtSign).toBe(true);
+    expect(component.params().IncFailCountOnFalsePin).toBe(false);
+    expect(component.params().no_auth_counter).toBe(true);
+    expect(component.params().PrependPin).toBe(false);
+    expect(component.params().AutoResync).toBe(true);
+    expect(component.params()["someOtherConfig"]).toBe("test_value");
+  });
+
+  it("should convert boolean config values correctly", () => {
+    // Test that boolean values are properly converted
+    expect(component.params().splitAtSign).toBe(true);
+    expect(component.params().IncFailCountOnFalsePin).toBe(false);
+    expect(component.params().no_auth_counter).toBe(true);
+    expect(component.params().PrependPin).toBe(false);
+    expect(component.params().AutoResync).toBe(true);
+  });
+
+  it("should derive SMTP identifiers from the configured servers", () => {
+    expect(component.smtpIdentifiers()).toStrictEqual([]);
+
+    const smtpService = TestBed.inject(SmtpService) as unknown as MockSmtpService;
+    smtpService.smtpServers.set([{ identifier: "myServer" }, { identifier: "otherServer" }] as SmtpServer[]);
+
+    expect(component.smtpIdentifiers()).toStrictEqual(["myServer", "otherServer"]);
+  });
+
+  it("should offer to clear the SMTP identifier only while one is selected", () => {
+    const smtpField = Array.from<HTMLElement>(fixture.nativeElement.querySelectorAll("mat-form-field")).find((field) =>
+      field.querySelector("mat-select")
+    )!;
+    expect(smtpField.querySelector("app-clear-button")).toBeNull();
+
+    component.updateParam("recovery.identifier", "myServer");
+    fixture.detectChanges();
+    expect(smtpField.querySelector("app-clear-button")).not.toBeNull();
+
+    smtpField.querySelector<HTMLButtonElement>("app-clear-button button")!.click();
+    fixture.detectChanges();
+    expect(component.params()["recovery.identifier"]).toBe("");
+    expect(smtpField.querySelector("app-clear-button")).toBeNull();
+  });
+
+  it("should save system config successfully", () => {
+    const saveSpy = jest.spyOn(systemService, "saveSystemConfig");
+    const notificationSpy = jest.spyOn(notificationService, "success");
+
+    component.saveSystemConfig();
+
+    expect(saveSpy).toHaveBeenCalled();
+    expect(notificationSpy).toHaveBeenCalledWith("System configuration saved successfully.");
+  });
+
+  it("should handle save system config error", () => {
+    jest
+      .spyOn(systemService, "saveSystemConfig")
+      .mockReturnValueOnce(of(new MockPiResponse<Record<string, "insert" | "update">>({ result: { status: false } })));
+    const notificationSpy = jest.spyOn(notificationService, "error");
+
+    component.saveSystemConfig();
+
+    expect(notificationSpy).toHaveBeenCalledWith("Failed to save system configuration.");
+  });
+
+  it("should handle save system config HTTP error", () => {
+    jest.spyOn(systemService, "saveSystemConfig").mockReturnValueOnce(throwError(() => new Error("Network error")));
+    const notificationSpy = jest.spyOn(notificationService, "error");
+
+    component.saveSystemConfig();
+
+    expect(notificationSpy).toHaveBeenCalledWith("Error saving system configuration.");
+  });
+
+  it("should delete user cache successfully", () => {
+    const deleteSpy = jest.spyOn(systemService, "deleteUserCache");
+    const notificationSpy = jest.spyOn(notificationService, "success");
+
+    component.deleteUserCache();
+
+    expect(deleteSpy).toHaveBeenCalled();
+    expect(notificationSpy).toHaveBeenCalledWith("User cache deleted successfully.");
+  });
+
+  it("should handle delete user cache error", () => {
+    jest
+      .spyOn(systemService, "deleteUserCache")
+      .mockReturnValueOnce(of(new MockPiResponse<{ status: boolean; deleted: number }>({ result: { status: false } })));
+    const notificationSpy = jest.spyOn(notificationService, "error");
+
+    component.deleteUserCache();
+
+    expect(notificationSpy).toHaveBeenCalledWith("Failed to delete user cache.");
+  });
+
+  it("should handle delete user cache HTTP error", () => {
+    jest.spyOn(systemService, "deleteUserCache").mockReturnValueOnce(throwError(() => new Error("Network error")));
+    const notificationSpy = jest.spyOn(notificationService, "error");
+
+    component.deleteUserCache();
+
+    expect(notificationSpy).toHaveBeenCalledWith("Error deleting user cache.");
+  });
+
+  it("should handle openDocumentationDialog HTTP error", () => {
+    jest.spyOn(systemService, "getDocumentation").mockReturnValueOnce(throwError(() => new Error("Network error")));
+    const notificationSpy = jest.spyOn(notificationService, "error");
+
+    (component as unknown as { openDocumentationDialog: () => void }).openDocumentationDialog();
+
+    expect(notificationSpy).toHaveBeenCalledWith("Error loading system documentation.");
+  });
+
+  it("should open the documentation dialog once the documentation loads", () => {
+    jest.spyOn(systemService, "getDocumentation").mockReturnValueOnce(of("<p>Docs</p>"));
+    const dialog = TestBed.inject(MatDialog);
+    const openSpy = jest.spyOn(dialog, "open");
+
+    (component as unknown as { openDocumentationDialog: () => void }).openDocumentationDialog();
+
+    expect(openSpy).toHaveBeenCalledWith(
+      SystemDocumentationDialogComponent,
+      expect.objectContaining({ data: { documentation: "<p>Docs</p>" } })
+    );
+  });
+
+  it("should mark the form dirty when a parameter is updated", () => {
+    component.updateParam("SomeKey", "SomeValue");
+
+    expect(component.isDirty()).toBe(true);
+    expect(component.params()["SomeKey"]).toBe("SomeValue");
+  });
+
+  it("should check config write permission", () => {
+    jest.spyOn(authService, "actionAllowed").mockReturnValue(true);
+    expect(component.hasConfigWritePermission()).toBe(true);
+
+    jest.spyOn(authService, "actionAllowed").mockReturnValue(false);
+    expect(component.hasConfigWritePermission()).toBe(false);
+  });
+
+  it("should reload system config when loadSystemConfig is called", () => {
+    const reloadSpy = jest.spyOn(systemService.systemConfigResource, "reload");
+    component.loadSystemConfig();
+    expect(reloadSpy).toHaveBeenCalled();
+  });
+
+  it("should register hasChanges, validChanges, and save in ngOnInit", () => {
+    expect(pendingChangesService.registerHasChanges).toHaveBeenCalled();
+    expect(pendingChangesService.registerValidChanges).toHaveBeenCalled();
+    expect(pendingChangesService.registerSave).toHaveBeenCalled();
+  });
+
+  it("should report hasChanges based on isDirty signal", () => {
+    const fn = (pendingChangesService.registerHasChanges as jest.Mock).mock.calls[0][0] as () => boolean;
+    expect(fn()).toBe(false);
+    component.isDirty.set(true);
+    expect(fn()).toBe(true);
+  });
+
+  it("_saveAndReturn should call saveSystemConfig and resolve true on success", async () => {
+    const saveSpy = jest.spyOn(systemService, "saveSystemConfig");
+    const saveFn = (pendingChangesService.registerSave as jest.Mock).mock.calls[0][0] as () => Promise<boolean>;
+    const result = await saveFn();
+    expect(saveSpy).toHaveBeenCalled();
+    expect(notificationService.success).toHaveBeenCalledWith("System configuration saved successfully.");
+    expect(result).toBe(true);
+  });
+
+  it("_saveAndReturn should resolve false when save returns status false", async () => {
+    jest
+      .spyOn(systemService, "saveSystemConfig")
+      .mockReturnValueOnce(of(new MockPiResponse<Record<string, "insert" | "update">>({ result: { status: false } })));
+    const saveFn = (pendingChangesService.registerSave as jest.Mock).mock.calls[0][0] as () => Promise<boolean>;
+    const result = await saveFn();
+    expect(notificationService.error).toHaveBeenCalledWith("Failed to save system configuration.");
+    expect(result).toBe(false);
+  });
+
+  it("_saveAndReturn should resolve false on HTTP error", async () => {
+    jest.spyOn(systemService, "saveSystemConfig").mockReturnValueOnce(throwError(() => new Error("Network error")));
+    const saveFn = (pendingChangesService.registerSave as jest.Mock).mock.calls[0][0] as () => Promise<boolean>;
+    const result = await saveFn();
+    expect(notificationService.error).toHaveBeenCalledWith("Error saving system configuration.");
+    expect(result).toBe(false);
+  });
+
+  it("validChanges combines permission and form validity", () => {
+    const fn = (pendingChangesService.registerValidChanges as jest.Mock).mock.calls[0][0] as () => boolean;
+    jest.spyOn(authService, "actionAllowed").mockReturnValue(true);
+    expect(fn()).toBe(true);
+    jest.spyOn(authService, "actionAllowed").mockReturnValue(false);
+    expect(fn()).toBe(false);
+  });
+
+  it("ngOnDestroy clears all pending-changes registrations", () => {
+    component.ngOnDestroy();
+    expect(pendingChangesService.clearAllRegistrations).toHaveBeenCalled();
+  });
+
+  it("shows no input as 'undefined' for config keys the backend does not return", () => {
+    const offenders = Array.from(fixture.nativeElement.querySelectorAll("input") as NodeListOf<HTMLInputElement>)
+      .filter((input) => input.value === "undefined")
+      .map((input) => input.getAttribute("placeholder") ?? input.getAttribute("name") ?? input.outerHTML);
+
+    expect(offenders).toEqual([]);
+  });
+
+  it("shows the value the backend returns for a default token setting", () => {
+    systemService.systemConfig.set({ DefaultOtpLen: "8" });
+    fixture.detectChanges();
+
+    const otpLenInput: HTMLInputElement = fixture.nativeElement.querySelector('input[placeholder="6"]');
+    expect(otpLenInput.value).toBe("8");
+  });
+});

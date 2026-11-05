@@ -1,0 +1,501 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div class="sms-gateway-page-layout">
+  <div
+    #scrollContainer
+    class="sms-gateway-page-container">
+    @if (isEditMode()) {
+      <h3
+        class="margin-8"
+        i18n="@@smsGateway.editSmsGateway"
+        >Edit SMS Gateway</h3
+      >
+    } @else {
+      <h3
+        class="margin-8"
+        i18n="@@common.createSmsGateway"
+        >Create SMS Gateway</h3
+      >
+    }
+
+    <div
+      class="sticky-header"
+      [appStickyHeader]="scrollContainer">
+      <div class="sticky-controls ali-center">
+        @if (isEditMode() && authService.actionAllowed("smsgateway_write")) {
+          <button
+            (click)="deleteGateway()"
+            class="action-button-delete-secondary button-width-s"
+            mat-stroked-button>
+            <mat-icon>delete</mat-icon>
+            <span i18n="@@common.delete">Delete</span>
+          </button>
+        }
+        <button
+          (click)="onCancel()"
+          class="action-button-secondary button-width-s"
+          mat-stroked-button>
+          <span i18n="@@common.cancel">Cancel</span>
+        </button>
+        <button
+          (click)="save()"
+          [disabled]="!smsForm().valid() || !parametersValid()"
+          class="action-button-primary button-width-s"
+          mat-stroked-button>
+          <mat-icon>save</mat-icon>
+          <span i18n="@@common.save">Save</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="sms-gateway-content">
+      <div class="sms-gateway-form">
+        <div class="flex-row gap-16 margin-bottom-16">
+          <mat-form-field
+            appearance="fill"
+            class="input-width-l">
+            <mat-label i18n="@@common.name">Name</mat-label>
+            <app-clearable-input
+              (clearButtonClick)="smsModel.update(m => ({...m, name: ''}))"
+              [showClearButton]="!isEditMode() && !!smsModel().name">
+              <input
+                [formField]="smsForm.name"
+                matInput
+                placeholder="mySmsGateway" />
+            </app-clearable-input>
+            @if (smsForm.name().errors().some(e => e.kind === 'required')) {
+              <mat-error i18n="@@smsGateway.nameRequired">Name is <strong>required</strong></mat-error>
+            }
+            @if (smsForm.name().errors().some(e => e.kind === 'pattern')) {
+              <mat-error i18n="@@common.nameContainsInvalid"
+                >Name contains <strong>invalid characters</strong>. Only alphanumeric characters, dots, underscores and
+                hyphens are allowed.</mat-error
+              >
+            }
+          </mat-form-field>
+
+          <mat-form-field
+            appearance="fill"
+            class="input-width-l">
+            <mat-label i18n="@@smsGateway.providerModule">Provider Module</mat-label>
+            <mat-select
+              [value]="smsModel().providermodule"
+              (selectionChange)="smsModel.update(m => ({...m, providermodule: $event.value}))"
+              required>
+              @for (provider of providerEntries(); track provider.key) {
+                <mat-option [value]="provider.key">
+                  {{ provider.key.split(".").pop() }}
+                </mat-option>
+              }
+            </mat-select>
+            @if (smsForm.providermodule().errors().some(e => e.kind === 'required')) {
+              <mat-error i18n="@@smsGateway.providerModuleRequired"
+                >Provider Module is <strong>required</strong></mat-error
+              >
+            }
+          </mat-form-field>
+        </div>
+
+        <mat-form-field
+          appearance="fill"
+          class="input-width-xl">
+          <mat-label i18n="@@common.description">Description</mat-label>
+          <app-clearable-input
+            (clearButtonClick)="smsModel.update(m => ({...m, description: ''}))"
+            [showClearButton]="!!smsModel().description">
+            <textarea
+              [formField]="smsForm.description"
+              matInput
+              placeholder="some wise words"
+              rows="3"></textarea>
+          </app-clearable-input>
+        </mat-form-field>
+      </div>
+
+      @if (selectedProvider()) {
+        <h3 i18n="@@smsGateway.parameters">Parameters</h3>
+        <div class="parameters-form">
+          @for (param of parameterEntries(); track param.key) {
+            <mat-form-field
+              [class.input-width-l]="param.key !== 'REGEXP' && param.value.type !== 'text'"
+              [class.input-width-xl]="param.key === 'REGEXP' || param.value.type === 'text'"
+              [class.margin-bottom-64]="
+                param.key === 'PROXY' &&
+                smsModel().providermodule === 'privacyidea.lib.smsprovider.HttpSMSProvider.HttpSMSProvider'
+              "
+              appearance="fill"
+              class="margin-bottom-16">
+              <mat-label>{{ param.key }}</mat-label>
+
+              @if (param.value.values) {
+                <mat-select
+                  [value]="parametersModel()[param.key]"
+                  (selectionChange)="updateParameter(param.key, $event.value)"
+                  [required]="param.value.required">
+                  @for (val of param.value.values; track val) {
+                    <mat-option [value]="val">
+                      {{ val }}
+                    </mat-option>
+                  }
+                </mat-select>
+              }
+
+              @if (!param.value.values && param.value.type === "text") {
+                <textarea
+                  [value]="parametersModel()[param.key]"
+                  (input)="updateParameter(param.key, $any($event.target).value)"
+                  [required]="param.value.required"
+                  matInput
+                  rows="2"></textarea>
+              }
+
+              @if (!param.value.values && param.value.type !== "text") {
+                <app-clearable-input
+                  (clearButtonClick)="clearParameter(param.key)"
+                  [showClearButton]="!!parametersModel()[param.key]">
+                  <input
+                    [value]="parametersModel()[param.key]"
+                    (input)="updateParameter(param.key, $any($event.target).value)"
+                    [required]="param.value.required"
+                    matInput />
+                </app-clearable-input>
+              }
+
+              <mat-hint>{{ param.value.description }}</mat-hint>
+
+              @if (param.value.required && !parametersModel()[param.key]) {
+                <mat-error i18n="@@smsGateway.isRequired">{{ param.key }} is <strong>required</strong></mat-error>
+              }
+            </mat-form-field>
+          }
+        </div>
+      }
+
+      @if (selectedProvider()?.options_allowed) {
+        <h3 i18n="@@common.options">Options</h3>
+
+        <div class="table-wrapper">
+          <table
+            [dataSource]="optionRows"
+            class="width-100 mat-elevation-z0"
+            mat-table>
+            <ng-container matColumnDef="key">
+              <th
+                *matHeaderCellDef
+                i18n="@@common.key"
+                mat-header-cell
+                >Key</th
+              >
+              <td
+                *matCellDef="let row"
+                mat-cell>
+                {{ row.key }}
+              </td>
+            </ng-container>
+
+            <ng-container matColumnDef="value">
+              <th
+                *matHeaderCellDef
+                i18n="@@common.value"
+                mat-header-cell
+                >Value</th
+              >
+              <td
+                *matCellDef="let row"
+                mat-cell>
+                {{ row.value }}
+              </td>
+            </ng-container>
+
+            <ng-container matColumnDef="actions">
+              <th
+                *matHeaderCellDef
+                i18n="@@common.actions"
+                mat-header-cell
+                >Actions</th
+              >
+              <td
+                *matCellDef="let row"
+                class="actions-cell"
+                mat-cell>
+                <button
+                  (click)="deleteOption(row.key)"
+                  color="warn"
+                  mat-icon-button>
+                  <mat-icon>delete</mat-icon>
+                </button>
+              </td>
+            </ng-container>
+
+            <ng-container matColumnDef="secret">
+              <th
+                *matHeaderCellDef
+                i18n="@@common.secret"
+                mat-header-cell
+                >Secret</th
+              >
+              <td
+                *matCellDef="let row"
+                mat-cell>
+                <mat-checkbox
+                  (change)="toggleOptionSecret(row.key)"
+                  [checked]="row.secret"></mat-checkbox>
+              </td>
+            </ng-container>
+
+            <tr
+              *matHeaderRowDef="optionDisplayedColumns"
+              mat-header-row></tr>
+            <tr
+              *matRowDef="let row; columns: optionDisplayedColumns"
+              mat-row></tr>
+
+            <ng-container matColumnDef="footerKey">
+              <td
+                *matFooterCellDef
+                mat-footer-cell>
+                <mat-form-field
+                  appearance="fill"
+                  class="input-width-m">
+                  <mat-label i18n="@@smsGateway.optionName">Option Name</mat-label>
+                  <app-clearable-input
+                    (clearButtonClick)="newOptionKey.set('')"
+                    [showClearButton]="!!newOptionKey()">
+                    <input
+                      [value]="newOptionKey()"
+                      (input)="newOptionKey.set($any($event.target).value)"
+                      matInput />
+                  </app-clearable-input>
+                </mat-form-field>
+              </td>
+            </ng-container>
+
+            <ng-container matColumnDef="footerValue">
+              <td
+                *matFooterCellDef
+                mat-footer-cell>
+                <mat-form-field
+                  appearance="fill"
+                  class="input-width-m">
+                  <mat-label i18n="@@common.value">Value</mat-label>
+                  <app-clearable-input
+                    (clearButtonClick)="newOptionValue.set('')"
+                    [showClearButton]="!!newOptionValue()">
+                    <input
+                      [value]="newOptionValue()"
+                      (input)="newOptionValue.set($any($event.target).value)"
+                      matInput />
+                  </app-clearable-input>
+                </mat-form-field>
+              </td>
+            </ng-container>
+
+            <ng-container matColumnDef="footerSecret">
+              <td
+                *matFooterCellDef
+                mat-footer-cell>
+                <mat-checkbox
+                  (change)="newOptionSecret.set(!newOptionSecret())"
+                  [checked]="newOptionSecret()"
+                  aria-label="Secret"
+                  i18n-aria-label="@@common.secret"></mat-checkbox>
+              </td>
+            </ng-container>
+
+            <ng-container matColumnDef="footerActions">
+              <td
+                *matFooterCellDef
+                mat-footer-cell>
+                <div class="add-button">
+                  <button
+                    (click)="addOption()"
+                    [disabled]="!newOptionKey()"
+                    color="primary"
+                    mat-icon-button>
+                    <mat-icon>add</mat-icon>
+                  </button>
+                </div>
+              </td>
+            </ng-container>
+
+            <tr
+              *matFooterRowDef="optionFooterColumns"
+              class="add-footer-row"
+              mat-footer-row></tr>
+          </table>
+        </div>
+      }
+
+      @if (selectedProvider()?.headers_allowed) {
+        <h3 i18n="@@smsGateway.headers">Headers</h3>
+
+        <div class="table-wrapper margin-bottom-16">
+          <table
+            [dataSource]="headerRows"
+            class="width-100 mat-elevation-z0 sms-kv-table"
+            mat-table>
+            <ng-container matColumnDef="key">
+              <th
+                *matHeaderCellDef
+                i18n="@@common.key"
+                mat-header-cell
+                >Key</th
+              >
+              <td
+                *matCellDef="let row"
+                mat-cell>
+                {{ row.key }}
+              </td>
+            </ng-container>
+
+            <ng-container matColumnDef="value">
+              <th
+                *matHeaderCellDef
+                i18n="@@common.value"
+                mat-header-cell
+                >Value</th
+              >
+              <td
+                *matCellDef="let row"
+                mat-cell>
+                {{ row.value }}
+              </td>
+            </ng-container>
+
+            <ng-container matColumnDef="actions">
+              <th
+                *matHeaderCellDef
+                i18n="@@common.actions"
+                mat-header-cell
+                >Actions</th
+              >
+              <td
+                *matCellDef="let row"
+                class="actions-cell"
+                mat-cell>
+                <button
+                  (click)="deleteHeader(row.key)"
+                  color="warn"
+                  mat-icon-button>
+                  <mat-icon>delete</mat-icon>
+                </button>
+              </td>
+            </ng-container>
+
+            <ng-container matColumnDef="secret">
+              <th
+                *matHeaderCellDef
+                i18n="@@common.secret"
+                mat-header-cell
+                >Secret</th
+              >
+              <td
+                *matCellDef="let row"
+                mat-cell>
+                <mat-checkbox
+                  (change)="toggleHeaderSecret(row.key)"
+                  [checked]="row.secret"></mat-checkbox>
+              </td>
+            </ng-container>
+
+            <tr
+              *matHeaderRowDef="headerDisplayedColumns"
+              mat-header-row></tr>
+            <tr
+              *matRowDef="let row; columns: headerDisplayedColumns"
+              mat-row></tr>
+
+            <ng-container matColumnDef="footerKey">
+              <td
+                *matFooterCellDef
+                mat-footer-cell>
+                <mat-form-field
+                  appearance="fill"
+                  class="input-width-m">
+                  <mat-label i18n="@@smsGateway.headerName">Header Name</mat-label>
+                  <app-clearable-input
+                    (clearButtonClick)="newHeaderKey.set('')"
+                    [showClearButton]="!!newHeaderKey()">
+                    <input
+                      [value]="newHeaderKey()"
+                      (input)="newHeaderKey.set($any($event.target).value)"
+                      matInput />
+                  </app-clearable-input>
+                </mat-form-field>
+              </td>
+            </ng-container>
+
+            <ng-container matColumnDef="footerValue">
+              <td
+                *matFooterCellDef
+                mat-footer-cell>
+                <mat-form-field
+                  appearance="fill"
+                  class="input-width-m">
+                  <mat-label i18n="@@common.value">Value</mat-label>
+                  <app-clearable-input
+                    (clearButtonClick)="newHeaderValue.set('')"
+                    [showClearButton]="!!newHeaderValue()">
+                    <input
+                      [value]="newHeaderValue()"
+                      (input)="newHeaderValue.set($any($event.target).value)"
+                      matInput />
+                  </app-clearable-input>
+                </mat-form-field>
+              </td>
+            </ng-container>
+
+            <ng-container matColumnDef="footerSecret">
+              <td
+                *matFooterCellDef
+                mat-footer-cell>
+                <mat-checkbox
+                  (change)="newHeaderSecret.set(!newHeaderSecret())"
+                  [checked]="newHeaderSecret()"
+                  aria-label="Secret"
+                  i18n-aria-label="@@common.secret"></mat-checkbox>
+              </td>
+            </ng-container>
+
+            <ng-container matColumnDef="footerActions">
+              <td
+                *matFooterCellDef
+                mat-footer-cell>
+                <div class="flex ali-center just-center">
+                  <button
+                    (click)="addHeader()"
+                    [disabled]="!newHeaderKey()"
+                    color="primary"
+                    mat-icon-button>
+                    <mat-icon>add</mat-icon>
+                  </button>
+                </div>
+              </td>
+            </ng-container>
+
+            <tr
+              *matFooterRowDef="headerFooterColumns"
+              class="add-footer-row"
+              mat-footer-row></tr>
+          </table>
+        </div>
+      }
+    </div>
+  </div>
+</div>

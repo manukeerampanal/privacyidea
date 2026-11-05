@@ -1,0 +1,85 @@
+@use "styles";
+@use "@angular/material" as mat;
+
+.sms-gateway-page-layout {
+  display: flex;
+  justify-content: center;
+}
+
+.sms-gateway-page-container {
+  @include styles.main-component-style;
+  min-width: calc(var(--config-form-width) + 32px);
+  display: grid;
+  position: relative;
+}
+
+.sms-gateway-content {
+  width: var(--config-form-width);
+}
+
+.parameters-form {
+  margin-top: 16px;
+  margin-bottom: 32px;
+  display: flex;
+  flex-flow: row wrap;
+  gap: 16px;
+  max-width: 616px;
+}
+
+.custom-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.custom-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px;
+  background-color: var(--mat-sys-surface-container);
+  border-radius: var(--border-radius);
+
+  .key {
+    flex: 1;
+  }
+
+  .value {
+    flex: 2;
+  }
+}
+
+.add-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 8px;
+
+  mat-form-field {
+    flex: 1;
+  }
+}
+
+.table-wrapper {
+  @include styles.card-recessed(3);
+  margin-top: 8px;
+  overflow: auto;
+}
+
+.actions-cell {
+  width: 1%;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.add-footer-row td {
+  padding-top: 8px;
+}
+
+.add-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: -8px;
+}

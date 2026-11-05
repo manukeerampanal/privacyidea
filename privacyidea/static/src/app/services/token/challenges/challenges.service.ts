@@ -1,0 +1,129 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { HttpClient, httpResource, HttpResourceRef } from "@angular/common/http";
+import { computed, inject, Injectable, linkedSignal, signal } from "@angular/core";
+import { AuthService, AuthServiceInterface } from "@services/auth/auth.service";
+import { ContentService, ContentServiceInterface } from "@services/content/content.service";
+import { TokenService, TokenServiceInterface } from "@services/token/token.service";
+import { Observable } from "rxjs";
+
+import { Sort } from "@angular/material/sort";
+import { PiResponse } from "@app/app.component";
+import { FilterValue } from "@core/models/filter_value/filter_value";
+import { FilterableTableService, FilterableTableServiceInterface } from "@services/table-utils/filterable-table-service";
+import { filterParamsEqual } from "@utils/filter.utils";
+
+const apiFilterKeys = ["serial", "transaction_id"];
+
+export interface Challenges {
+  challenges: Challenge[];
+  count: number;
+  current: number;
+  next?: number;
+  prev?: number;
+}
+
+export interface Challenge {
+  challenge: string;
+  data: string;
+  expiration: string;
+  id: number;
+  otp_received: boolean;
+  otp_valid: boolean;
+  received_count: number;
+  serial: string;
+  timestamp: string;
+  transaction_id: string;
+}
+
+export interface ChallengesServiceInterface extends FilterableTableServiceInterface {
+  challengesResource: HttpResourceRef<PiResponse<Challenges> | undefined>;
+
+  deleteExpiredChallenges(): Observable<PiResponse<{ status: boolean; deleted: number }>>;
+}
+
+@Injectable()
+export class ChallengesService extends FilterableTableService implements ChallengesServiceInterface {
+  private readonly tokenService: TokenServiceInterface = inject(TokenService);
+  private readonly authService: AuthServiceInterface = inject(AuthService);
+  private readonly contentService: ContentServiceInterface = inject(ContentService);
+  private readonly http = inject(HttpClient);
+  readonly apiFilterKeys = apiFilterKeys;
+  readonly activeFilter = linkedSignal({
+    source: this.contentService.routeUrl,
+    computation: () => new FilterValue()
+  });
+  pageSize = linkedSignal({
+    source: this.contentService.routeUrl,
+    computation: () => 10
+  });
+  pageIndex = linkedSignal({
+    source: () => ({
+      filterValue: this.activeFilter(),
+      pageSize: this.pageSize(),
+      routeUrl: this.contentService.routeUrl()
+    }),
+    computation: () => 0
+  });
+  sort = signal({ active: "timestamp", direction: "asc" } as Sort);
+  tokenBaseUrl = this.tokenService.tokenBaseUrl;
+  // The serial goes into the endpoint path rather than the query string.
+  readonly requestParams = computed(
+    () => {
+      const { serial = "", ...params } = this.filterParams();
+      return { params, serial };
+    },
+    { equal: (a, b) => a.serial === b.serial && filterParamsEqual(a.params, b.params) }
+  );
+
+  challengesResource = httpResource<PiResponse<Challenges>>(() => {
+    if (!this.contentService.onTokensChallenges() || !this.authService.actionAllowed("getchallenges")) {
+      return undefined;
+    }
+
+    const { params: filterParams, serial } = this.requestParams();
+    const url = serial
+      ? `${this.tokenBaseUrl}challenges/${encodeURIComponent(serial)}`
+      : `${this.tokenBaseUrl}challenges/`;
+
+    return {
+      url,
+      method: "GET",
+      headers: this.authService.getHeaders(),
+      params: {
+        pagesize: this.pageSize(),
+        page: this.pageIndex() + 1,
+        ...(this.sort().active && {
+          sortby: this.sort().active,
+          sortdir: this.sort().direction || "asc"
+        }),
+        ...filterParams
+      }
+    };
+  });
+
+  deleteExpiredChallenges(): Observable<PiResponse<{ status: boolean; deleted: number }>> {
+    return this.http.delete<PiResponse<{
+      status: boolean;
+      deleted: number
+    }>>(`${this.tokenBaseUrl}challenges/expired`, {
+      headers: this.authService.getHeaders()
+    });
+  }
+}

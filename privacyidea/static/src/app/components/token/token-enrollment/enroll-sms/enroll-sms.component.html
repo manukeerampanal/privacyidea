@@ -1,0 +1,70 @@
+<!--
+ (c) NetKnights GmbH 2025,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div class="flex-column">
+  @if (!defaultSMSGatewayIsSet() && authService.role() === "admin") {
+    <span
+      i18n="@@token.easeEnrollment"
+      class="inline-hint"
+      >To ease the enrollment you can set default values in the
+      <a
+        role="button"
+        tabindex="0"
+        aria-label="Go to SMS token configuration"
+        i18n-aria-label="@@token.goSmsTokenConfiguration"
+        (click)="goToSmsConfig()"
+        (keydown)="onSmsConfigKeydown($event)">
+        SMS Token Configuration </a
+      >!</span
+    >
+  }
+  <mat-checkbox
+    [checked]="readNumberDynamically()"
+    (change)="readNumberDynamically.set($event.checked)"
+    i18n="@@token.readNumberDynamically"
+    >Read number dynamically from user source on each request.</mat-checkbox
+  >
+  <div class="flex-row gap-16 margin-bottom-16">
+    @if (!wizard() || !defaultSMSGatewayIsSet()) {
+      <mat-form-field class="input-width-xl">
+        <mat-label i18n="@@token.tokenSpecific">A token specific SMS gateway</mat-label>
+        <mat-hint i18n="@@token.ifTokenShould"
+          >If this token should not use the system wide SMS gateway but an individual SMS gateway, you can select the
+          gateway here.</mat-hint
+        >
+        <mat-select
+          [value]="smsGateway()"
+          (selectionChange)="smsGateway.set($event.value)"
+          required>
+          @for (option of smsGatewayOptions(); track option) {
+            <mat-option [value]="option">{{ option }}</mat-option>
+          }
+        </mat-select>
+        <mat-error i18n="@@token.smsGatewayRequired">SMS Gateway is <strong>required</strong></mat-error>
+      </mat-form-field>
+    }
+
+    <mat-form-field class="input-width-l">
+      <mat-label i18n="@@token.phoneNumber">Phone number</mat-label>
+      <input
+        [formField]="phoneNumberForm"
+        matInput />
+      <mat-error i18n="@@token.phoneNumberRequired">Phone number is <strong>required</strong></mat-error>
+    </mat-form-field>
+  </div>
+</div>

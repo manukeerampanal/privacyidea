@@ -1,0 +1,33 @@
+.dot {
+  margin-left: -4px;
+}
+
+.server-checkbox {
+  margin-bottom: 16px;
+}
+
+.inline-hint {
+  margin-bottom: 16px;
+  background: var(--inline-hint-bg);
+  padding: 8px;
+  border-radius: var(--border-radius);
+}
+
+.inline-warning {
+  margin-bottom: 16px;
+  background: var(--inline-warning-bg);
+  padding: 8px;
+  border-radius: var(--border-radius);
+}
+
+.inline-success {
+  margin-bottom: 16px;
+  background: var(--mint-bg);
+  padding: 8px;
+  border-radius: var(--border-radius);
+}
+
+.width-948 {
+  max-width: 948px;
+  width: 100%;
+}

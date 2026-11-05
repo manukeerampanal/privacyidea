@@ -1,0 +1,424 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { HttpClient, HttpHeaders, HttpParams, provideHttpClient } from "@angular/common/http";
+import {
+  MockContentService,
+  MockLocalService,
+  MockPiResponse,
+  MockTableUtilsService,
+  MockTokenService
+} from "@testing/mock-services";
+import { lastValueFrom, of } from "rxjs";
+
+import { HttpTestingController, provideHttpClientTesting } from "@angular/common/http/testing";
+import { signal } from "@angular/core";
+import { TestBed } from "@angular/core/testing";
+import { FilterValue } from "@core/models/filter_value/filter_value";
+import { environment } from "@env/environment";
+import { AuthService } from "@services/auth/auth.service";
+import { ContentService } from "@services/content/content.service";
+import { LocalService } from "@services/local/local.service";
+import { TableUtilsService } from "@services/table-utils/table-utils.service";
+import { MockAuthService } from "@testing/mock-services/mock-auth-service";
+import { MachineService } from "./machine.service";
+import { PageEvent } from "@angular/material/paginator";
+import { Sort } from "@angular/material/sort";
+import { TokenService } from "@services/token/token.service";
+
+environment.proxyUrl = "/api";
+
+const httpStub = {
+  get: jest.fn(),
+  post: jest.fn(),
+  delete: jest.fn()
+};
+
+describe("MachineService (with mock classes)", () => {
+  let machineService: MachineService;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        { provide: HttpClient, useValue: httpStub },
+        { provide: LocalService, useClass: MockLocalService },
+        { provide: TableUtilsService, useClass: MockTableUtilsService },
+        { provide: ContentService, useClass: MockContentService },
+        { provide: TokenService, useClass: MockTokenService },
+        MachineService
+      ]
+    });
+
+    httpStub.get.mockReturnValue(of({}));
+
+    machineService = TestBed.inject(MachineService);
+  });
+
+  it("postAssignMachineToToken posts args with auth header", async () => {
+    httpStub.post.mockReturnValue(of({ ok: true }));
+    await lastValueFrom(
+      machineService.postAssignMachineToToken({
+        service_id: "svc",
+        user: "alice",
+        serial: "serial",
+        application: "ssh",
+        machineid: 0,
+        resolver: "RES"
+      })
+    );
+    const [url, body, opts] = (httpStub.post as jest.Mock).mock.calls[0];
+    expect(url).toBe("/api/machine/token");
+    expect(body).toEqual({
+      service_id: "svc",
+      user: "alice",
+      serial: "serial",
+      application: "ssh",
+      machineid: 0,
+      resolver: "RES"
+    });
+    expect(opts.headers instanceof HttpHeaders).toBe(true);
+  });
+
+  it("postTokenOption builds correct request body with merged options", async () => {
+    httpStub.post.mockReturnValue(of({}));
+    await lastValueFrom(
+      machineService.postTokenOption("host", "mid", "res", "serial", "ssh", "mtid", { user: "u", service_id: "svc" })
+    );
+    const [url, body, opts] = (httpStub.post as jest.Mock).mock.calls[0];
+    expect(url).toBe("/api/machine/tokenoption");
+    expect(body).toEqual({
+      hostname: "host",
+      machineid: "mid",
+      resolver: "res",
+      serial: "serial",
+      application: "ssh",
+      mtid: "mtid",
+      user: "u",
+      service_id: "svc"
+    });
+    expect(opts.headers instanceof HttpHeaders).toBe(true);
+  });
+
+  it("postToken hits /token endpoint", async () => {
+    httpStub.post.mockReturnValue(of({}));
+    await lastValueFrom(machineService.postToken("host", "mid", "res", "serial", "offline"));
+    const [url, body, opts] = (httpStub.post as jest.Mock).mock.calls[0];
+    expect(url).toBe("/api/machine/token");
+    expect(body).toEqual({
+      hostname: "host",
+      machineid: "mid",
+      resolver: "res",
+      serial: "serial",
+      application: "offline"
+    });
+    expect(opts.headers instanceof HttpHeaders).toBe(true);
+  });
+
+  it("getAuthItem chooses URL with and without application", () => {
+    httpStub.get.mockReturnValue(of({}));
+
+    machineService.getAuthItem("ch", "h", "ssh/1").subscribe();
+    const [, optsA] = httpStub.get.mock.calls.at(-1);
+    expect(httpStub.get).toHaveBeenLastCalledWith(
+      `/api/machine/authitem/${encodeURIComponent("ssh/1")}`,
+      expect.any(Object)
+    );
+    expect(optsA.params.get("challenge")).toBe("ch");
+    expect(optsA.params.get("hostname")).toBe("h");
+
+    machineService.getAuthItem("c2", "h2").subscribe();
+    const [urlB, optsB] = httpStub.get.mock.calls.at(-1);
+    expect(urlB).toBe("/api/machine/authitem");
+    expect(optsB.params.get("challenge")).toBe("c2");
+    expect(optsB.params.get("hostname")).toBe("h2");
+  });
+
+  it("getMachine forwards only defined params", () => {
+    httpStub.get.mockReturnValue(of({}));
+    machineService
+      .getMachine({
+        hostname: "h",
+        ip: "1.2.3.4",
+        id: "ID",
+        resolver: "R",
+        any: "X"
+      })
+      .subscribe();
+
+    const [, opts] = httpStub.get.mock.calls.at(-1);
+    const p = opts.params as HttpParams;
+    expect(p.get("hostname")).toBe("h");
+    expect(p.get("ip")).toBe("1.2.3.4");
+    expect(p.get("id")).toBe("ID");
+    expect(p.get("resolver")).toBe("R");
+    expect(p.get("any")).toBe("X");
+  });
+
+  it("deleteToken & deleteTokenMtid craft correct URLs", async () => {
+    httpStub.delete.mockReturnValue(of({}));
+    await lastValueFrom(machineService.deleteToken("S/1", "M/1", "R/1", "ssh/1"));
+    const [url] = (httpStub.delete as jest.Mock).mock.calls[0];
+    expect(url).toBe(
+      `/api/machine/token/${encodeURIComponent("S/1")}/${encodeURIComponent("M/1")}/${encodeURIComponent("R/1")}/${encodeURIComponent("ssh/1")}`
+    );
+    await lastValueFrom(machineService.deleteTokenById("S2/1", "offline/1", "MT/1"));
+    const [url2] = (httpStub.delete as jest.Mock).mock.calls[1];
+    expect(url2).toBe(
+      `/api/machine/token/${encodeURIComponent("S2/1")}/${encodeURIComponent("offline/1")}/${encodeURIComponent("MT/1")}`
+    );
+  });
+
+  it("getMachineTokens calls /machine/token with machineid and resolver", async () => {
+    httpStub.get.mockReturnValue(of({ result: { value: [] } }));
+    await lastValueFrom(machineService.getMachineTokens({ machineid: 1, resolver: "RES" }));
+    const [url, opts] = (httpStub.get as jest.Mock).mock.calls.at(-1);
+    expect(url).toBe("/api/machine/token");
+    expect(opts.params.get("machineid")).toBe("1");
+    expect(opts.params.get("resolver")).toBe("RES");
+  });
+
+  it("filterParams produces expected object for ssh", () => {
+    machineService.activeFilter.set(new FilterValue({ value: "serial:abc hostname:host" }));
+    expect(machineService.filterParams()).toEqual({
+      serial: "*abc*",
+      hostname: "host"
+    });
+  });
+
+  it("filterParams handles offline application type", () => {
+    machineService.selectedApplicationType.set("offline");
+    machineService.activeFilter.set(
+      new FilterValue({ value: "serial:xyz hostname:h count:5 rounds:10 service_id:svc" })
+    );
+
+    expect(machineService.filterParams()).toEqual({
+      serial: "*xyz*",
+      hostname: "h",
+      count: "5",
+      rounds: "10"
+    });
+  });
+
+  it("isExactMatchKey follows the keys sent plain for the application", () => {
+    machineService.selectedApplicationType.set("ssh");
+    expect(machineService.isExactMatchKey("hostname")).toBe(true);
+    expect(machineService.isExactMatchKey("machineid & resolver")).toBe(true);
+    expect(machineService.isExactMatchKey("serial")).toBe(false);
+    expect(machineService.isExactMatchKey("count")).toBe(false);
+
+    machineService.selectedApplicationType.set("offline");
+    expect(machineService.isExactMatchKey("count")).toBe(true);
+  });
+
+  it("onPageEvent & onSortEvent update linked signals", () => {
+    machineService.onPageEvent({ pageSize: 25, pageIndex: 3 } as PageEvent);
+    expect(machineService.pageSize()).toBe(25);
+    expect(machineService.pageIndex()).toBe(3);
+
+    machineService.onSortEvent({
+      active: "hostname",
+      direction: "desc"
+    } as Sort);
+    expect(machineService.sort()).toEqual({
+      active: "hostname",
+      direction: "desc"
+    });
+  });
+
+  it("should not include empty filter values in filterParams", () => {
+    machineService.selectedApplicationType.set("ssh");
+    machineService.activeFilter.set({
+      filterMap: new Map([
+        ["serial", ""],
+        ["service_id", "123"],
+        ["hostname", "   "],
+        ["machineid", "*"]
+      ])
+    } as unknown as FilterValue);
+
+    const params = machineService.filterParams();
+    expect(params).not.toHaveProperty("serial");
+    expect(params).toHaveProperty("service_id", "*123*");
+    expect(params).not.toHaveProperty("hostname");
+    expect(params).not.toHaveProperty("machineid");
+  });
+});
+
+describe("MachineService resources and signals", () => {
+  let machineService: MachineService;
+  let authService: MockAuthService;
+  let contentService: MockContentService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        { provide: LocalService, useClass: MockLocalService },
+        { provide: TableUtilsService, useClass: MockTableUtilsService },
+        { provide: ContentService, useClass: MockContentService },
+        { provide: AuthService, useClass: MockAuthService },
+        { provide: TokenService, useClass: MockTokenService },
+        MachineService
+      ]
+    });
+
+    httpStub.get.mockReturnValue(of({}));
+
+    machineService = TestBed.inject(MachineService);
+    authService = TestBed.inject(AuthService) as unknown as MockAuthService;
+    contentService = TestBed.inject(ContentService) as unknown as MockContentService;
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  describe("machines signal", () => {
+    it("Fallback should be undefined", () => {
+      expect(machineService.machines()).toBeUndefined();
+    });
+
+    it("should read machines correctly from machineResource", async () => {
+      authService.actionAllowed = jest.fn().mockReturnValue(true);
+      contentService.onConfigurationMachines = signal(true);
+      TestBed.tick();
+
+      const req = httpMock.expectOne((r) => r.url.includes("/machine/"));
+      expect(req.request.method).toBe("GET");
+      const machines = [{ hostname: "test", id: 1, ip: "127.0.0.1", resolver_name: "test" }];
+      req.flush(MockPiResponse.fromValue(machines));
+      await Promise.resolve();
+
+      expect(machineService.machines()).toEqual(machines);
+    });
+
+    it("should fall back to undefined for http error", async () => {
+      authService.actionAllowed = jest.fn().mockReturnValue(true);
+      contentService.onConfigurationMachines = signal(true);
+      TestBed.tick();
+
+      const req = httpMock.expectOne((r) => r.url.includes("/machine/"));
+      expect(req.request.method).toBe("GET");
+      req.flush(MockPiResponse.fromError({ message: "Permission denied" }), {
+        status: 403,
+        statusText: "Permission denied"
+      });
+      await Promise.resolve();
+
+      expect(machineService.machines()).toBeUndefined();
+    });
+
+    it("should reset to undefined when machinesResource errors after successful load", async () => {
+      authService.actionAllowed = jest.fn().mockReturnValue(true);
+      contentService.onConfigurationMachines = signal(true);
+      TestBed.tick();
+
+      let req = httpMock.expectOne((r) => r.url.includes("/machine/"));
+      const machines = [{ hostname: "test", id: 1, ip: "127.0.0.1", resolver_name: "test" }];
+      req.flush(MockPiResponse.fromValue(machines));
+      await Promise.resolve();
+      expect(machineService.machines()).toEqual(machines);
+
+      machineService.machinesResource.reload();
+      TestBed.tick();
+      req = httpMock.expectOne((r) => r.url.includes("/machine/"));
+      req.flush("Error", { status: 500, statusText: "Server Error" });
+      await Promise.resolve();
+
+      expect(machineService.machines()).toBeUndefined();
+    });
+  });
+
+  describe("tokenApplications signal", () => {
+    it("Fallback should be undefined", () => {
+      expect(machineService.tokenApplications()).toBeUndefined();
+    });
+
+    it("should read token applications correctly from tokenApplicationResource", async () => {
+      authService.actionAllowed = jest.fn().mockReturnValue(true);
+      contentService.onTokensApplications = signal(true);
+      TestBed.tick();
+
+      const req = httpMock.expectOne((r) => r.url.includes("/machine/token"));
+      expect(req.request.method).toBe("GET");
+      const applications = [
+        { application: "test", hostname: "localhost", id: 0, options: {}, serial: "1234", type: "ssh" }
+      ];
+      req.flush(MockPiResponse.fromValue(applications));
+      await Promise.resolve();
+
+      expect(machineService.tokenApplications()).toEqual(applications);
+    });
+
+    it("should fall back to undefined for http error", async () => {
+      authService.actionAllowed = jest.fn().mockReturnValue(true);
+      contentService.onTokensApplications = signal(true);
+      TestBed.tick();
+
+      const req = httpMock.expectOne((r) => r.url.includes("/machine/token"));
+      expect(req.request.method).toBe("GET");
+      req.flush(MockPiResponse.fromError({ message: "Permission denied" }), {
+        status: 403,
+        statusText: "Permission denied"
+      });
+      await Promise.resolve();
+
+      expect(machineService.tokenApplications()).toBeUndefined();
+    });
+
+    // /machine/token requires manage_machine_tokens, not tokenlist.
+    it("should request token applications with manage_machine_tokens alone", () => {
+      authService.authData.set({ ...MockAuthService.MOCK_AUTH_DATA, rights: ["manage_machine_tokens"] });
+      contentService.onTokensApplications = signal(true);
+      TestBed.tick();
+
+      httpMock.expectOne((r) => r.url.includes("/machine/token"));
+    });
+
+    it("should not request token applications with tokenlist but without manage_machine_tokens", () => {
+      authService.authData.set({ ...MockAuthService.MOCK_AUTH_DATA, rights: ["tokenlist"] });
+      contentService.onTokensApplications = signal(true);
+      TestBed.tick();
+
+      httpMock.expectNone((r) => r.url.includes("/machine/token"));
+    });
+
+    it("should reset to undefined when tokenApplicationResource errors after successful load", async () => {
+      authService.actionAllowed = jest.fn().mockReturnValue(true);
+      contentService.onTokensApplications = signal(true);
+      TestBed.tick();
+
+      let req = httpMock.expectOne((r) => r.url.includes("/machine/token"));
+      const applications = [
+        { application: "test", hostname: "localhost", id: 0, options: {}, serial: "1234", type: "ssh" }
+      ];
+      req.flush(MockPiResponse.fromValue(applications));
+      await Promise.resolve();
+      expect(machineService.tokenApplications()).toEqual(applications);
+
+      machineService.tokenApplicationResource.reload();
+      TestBed.tick();
+      req = httpMock.expectOne((r) => r.url.includes("/machine/token"));
+      req.flush("Error", { status: 500, statusText: "Server Error" });
+      await Promise.resolve();
+
+      expect(machineService.tokenApplications()).toBeUndefined();
+    });
+  });
+});

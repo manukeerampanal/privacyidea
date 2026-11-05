@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  privacyIDEA
 #  Jul 18, 2014 Cornelius Kölbel
 #  License:  AGPLv3
@@ -24,6 +22,9 @@ This file is tested in tests/test_lib_machinetokens.py
 from privacyidea.lib.applications import MachineApplicationBase
 import logging
 from privacyidea.lib.token import get_tokens
+from privacyidea.lib.policy import TYPE
+from privacyidea.lib.serviceid import get_serviceids
+from privacyidea.lib import _
 log = logging.getLogger(__name__)
 
 
@@ -47,11 +48,13 @@ class MachineApplication(MachineApplicationBase):
     @staticmethod
     def get_authentication_item(token_type,
                                 serial,
-                                challenge=None, options=None,
-                                filter_param=None):
+                                challenge=None,
+                                options=None,
+                                filter_param=None,
+                                user_agent=None):
         """
         :param token_type: the type of the token. At the moment
-                           we support the tokenype "sshkey"
+                           we support the tokentype "sshkey"
         :param serial:     the serial number of the token.
         :return auth_item: Return the SSH pub keys.
         """
@@ -70,7 +73,7 @@ class MachineApplication(MachineApplicationBase):
                     tokclass = toks[0]
                     # We just return the ssh public key, so that
                     # it can be included into authorized keys.
-                    log.info(u"Using SSH key {0!s} for SSH user {1!s}".format(tokclass.token.serial,
+                    log.info("Using SSH key {!s} for SSH user {!s}".format(tokclass.token.serial,
                                                                               options.get("user")))
                     ret["sshkey"] = tokclass.get_sshkey()
                     # We return the username if the token is assigned to a
@@ -78,23 +81,31 @@ class MachineApplication(MachineApplicationBase):
                     # the ssh key accordingly
                     user_object = toks[0].user
                     if user_object:
-                        uInfo = user_object.info
+                        uInfo = user_object.get_specific_info(["username"])
                         if "username" in uInfo:
                             ret["username"] = uInfo.get("username")
                 else:
-                    log.debug(u"The requested user {0!s} does not match the user "
-                              "option ({0!s}) of the SSH application.".format(
+                    log.debug("The requested user {!s} does not match the user "
+                              "option ({!s}) of the SSH application.".format(
                         user_filter, options.get("user")))
         else:
-            log.info(u"Token {0!r}, type {0!r} is not supported by "
-                     "SSH application module".format(serial, token_type))
+            log.info(f"Token {serial!r}, type {token_type!r} is not supported by "
+                     "SSH application module")
 
         return ret
 
     @staticmethod
     def get_options():
         """
-        returns a dictionary with a list of required and optional options
+        returns a dictionary with a list of options
         """
-        return {'required': [],
-                'optional': ['user']}
+        sids = [s.name for s in get_serviceids()]
+        options = {"sshkey":
+                       {'user': {'type': TYPE.STRING,
+                                 'description': _('The username on the SSH server.')},
+                        'service_id': {'type': TYPE.STRING,
+                                       'description': _('The service ID of the SSH server. '
+                                                        'Several servers can have the same service ID.'),
+                                       'value': sids}}
+                   }
+        return options

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 # http://www.privacyidea.org
 # (c) Cornelius Kölbel, privacyidea.org
 #
@@ -22,25 +20,44 @@
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-__doc__ = """This module contains the REST API for registering as a new user.
-This endpoint can be used without any authentication, since a new user can
-register.
+__doc__ = """
+The register REST API lets an unauthenticated user create a new user
+account in an editable user resolver. Successful registration creates
+the user, issues a registration token, and emails the registration key
+to the user. The user can then complete enrollment by authenticating
+with their chosen password and that registration key.
 
-The methods are tested in the file tests/test_api_register.py
+Both endpoints are anonymous (no auth header). Registration is gated
+by a set of policies in scope ``register`` — a destination
+``resolver`` is required, plus ``smtpconfig`` for sending the email,
+optionally ``realm``, ``registration_body`` and ``requiredemail``. See
+:ref:`register_policy` for the full list.
+
+.. deprecated:: 3.14
+    Self-registration is deprecated and will be removed in a future
+    release, together with the ``register`` policy scope. Its only user
+    interface is the registration page of the old WebUI, which is being
+    removed, and the new WebUI does not call these endpoints. Both
+    endpoints log a warning when they are used on an installation that has
+    the feature configured, so that one relying on it can be recognised
+    before it goes. Probing them where registration was never enabled
+    leaves no warning.
 """
-from flask import (Blueprint, request, g, current_app)
-from .lib.utils import send_result, getParam
-from .lib.utils import required
+from flask_babel import _
+from flask import (Blueprint, request, g)
+from .lib.utils import map_error_to_code, send_error, send_result
+from ..lib.params import get_optional, get_required
 import logging
-from privacyidea.lib.policy import ACTION, SCOPE
+from privacyidea.lib.policy import SCOPE
+from ..lib.policies.actions import PolicyAction
 from privacyidea.lib.user import create_user
 from privacyidea.lib.user import User
 from privacyidea.lib.token import init_token
 from privacyidea.lib.policy import Match
 from privacyidea.lib.realm import get_default_realm
-from privacyidea.lib.error import RegistrationError
+from privacyidea.lib.error import RegistrationError, Error
 from privacyidea.api.lib.prepolicy import required_email, prepolicy
-from privacyidea.lib.smtpserver import get_smtpserver, send_email_identifier
+from privacyidea.lib.smtpserver import send_email_identifier
 
 DEFAULT_BODY="""
 Your registration token is {regkey}.
@@ -50,20 +67,53 @@ log = logging.getLogger(__name__)
 
 register_blueprint = Blueprint('register_blueprint', __name__)
 
+# Endpoints whose deprecation has already been logged in this process.
+_deprecation_warned = set()
+
+
+def _warn_register_deprecated(endpoint: str) -> None:
+    """
+    Log the deprecation of a self-registration endpoint once per process.
+
+    Once per process rather than once per request: an anonymous endpoint must not let a caller
+    fill the log, and one line is enough to tell an administrator reading it that this
+    installation still uses a feature that is going away.
+    """
+    if endpoint not in _deprecation_warned:
+        _deprecation_warned.add(endpoint)
+        log.warning(f"The endpoint '{endpoint}' is deprecated and will be removed in a future "
+                    f"release, together with the 'register' policy scope. If this installation "
+                    f"relies on self-registration, please say so before it goes.")
+
 
 # The before and after methods are the same as in the validate endpoint
 
 @register_blueprint.route('', methods=['GET'])
 def register_status():
     """
-    This endpoint returns the information if registration is allowed or not.
-    This is used by the UI to either display the registration button or not.
+    Return whether self-registration is enabled on this server. The result
+    is ``True`` when at least one policy in scope ``register`` configures a
+    ``resolver`` action; otherwise ``False``. The WebUI uses this to decide
+    whether to show the registration button.
 
-    :return: JSON with value=True or value=False
+    This endpoint is anonymous — no authentication header is required.
+
+    .. deprecated:: 3.14
+        See the note on the module. Self-registration is going away; this
+        endpoint only tells the old WebUI whether to show its registration
+        button.
+
+    :status 200: ``result.value`` is ``True`` if registration is configured,
+        ``False`` otherwise.
     """
-    resolvername = Match.action_only(g, scope=SCOPE.REGISTER, action=ACTION.RESOLVER)\
+    resolvername = Match.action_only(g, scope=SCOPE.REGISTER, action=PolicyAction.RESOLVER)\
         .action_values(unique=True)
     result = bool(resolvername)
+    if result:
+        # Only when the feature is configured. Warning on every call would make a probe of this
+        # endpoint look like an installation that uses self-registration, and the point of the
+        # line is to be evidence of the opposite.
+        _warn_register_deprecated("GET /register")
     g.audit_object.log({"info": result,
                         "success": True})
     return send_result(result)
@@ -73,42 +123,56 @@ def register_status():
 @prepolicy(required_email, request=request)
 def register_post():
     """
-    Register a new user in the realm/userresolver. To do so, the user
-    resolver must be writeable like an SQLResolver.
+    Register a new user in a configured user resolver. The destination
+    resolver must be editable (e.g. an SQL resolver). On success the call
+    creates the user account, issues a registration token, and emails the
+    registration key to ``email``.
 
-    Registering a user in fact creates a new user and also creates the first
-    token for the user. The following values are needed to register the user:
+    If the email cannot be sent, the just-created user and token are
+    removed before the request fails — failed registrations leave no
+    state behind.
 
-    * username (mandatory)
-    * givenname (mandatory)
-    * surname (mandatory)
-    * email address (mandatory)
-    * password (mandatory)
-    * mobile phone (optional)
-    * telephone (optional)
+    This endpoint is anonymous. Registration depends on policies in scope
+    ``register``:
 
-    The user receives a registration token via email to be able to login with
-    his self chosen password and the registration token.
+    * ``resolver`` (required) — the editable resolver to create the user in.
+    * ``smtpconfig`` (required) — identifier of the SMTP server used to
+      send the registration email.
+    * ``realm`` (optional) — the realm to register in. Defaults to the
+      default realm.
+    * ``registration_body`` (optional) — text template for the email body;
+      ``{regkey}`` is substituted with the registration key.
+    * ``requiredemail`` (optional) — restricts which email addresses may
+      register (enforced by the ``required_email`` prepolicy).
+    * ``hide_specific_error_message`` (optional) — masks specific error
+      messages with a generic registration error.
 
-    :jsonparam username: The login name of the new user. Check if it already
-        exists
-    :jsonparam givenname: The givenname of the new user
-    :jsonparam surname: The surname of the new user
-    :jsonparam email: The email address of the new user
-    :jsonparam password: The password of the new user. This is the resolver
-        password of the new user.
-    :jsonparam mobile: The mobile phone number
-    :jsonparam phone: The phone number (land line) of the new user
+    :jsonparam username: login name of the new user (required).
+    :jsonparam givenname: given name (required).
+    :jsonparam surname: surname (required).
+    :jsonparam email: email address (required); registration key is sent
+        here.
+    :jsonparam password: password the user will authenticate with
+        (required).
+    :jsonparam mobile: mobile phone number.
+    :jsonparam phone: land line phone number.
+    :status 200: ``result.value`` is ``True`` if the user was created and
+        the registration email was sent.
+    :status 400: registration prerequisites not met (no resolver
+        configured, SMTP not configured, username already registered,
+        email rejected by ``requiredemail``, send failure).
 
-    :return: a json result with a boolean "result": true
+    .. deprecated:: 3.14
+        See the note on the module. Self-registration is going away, so this
+        endpoint is not being extended.
     """
-    username = getParam(request.all_data, "username", required)
-    surname = getParam(request.all_data, "surname", required)
-    givenname = getParam(request.all_data, "givenname", required)
-    email = getParam(request.all_data, "email", required)
-    password = getParam(request.all_data, "password", required)
-    mobile = getParam(request.all_data, "mobile")
-    phone = getParam(request.all_data, "phone")
+    username = get_required(request.all_data, "username")
+    surname = get_required(request.all_data, "surname")
+    givenname = get_required(request.all_data, "givenname")
+    email = get_required(request.all_data, "email")
+    password = get_required(request.all_data, "password")
+    mobile = get_optional(request.all_data, "mobile")
+    phone = get_optional(request.all_data, "phone")
     options = {"g": g,
                "clientip": g.client_ip}
     g.audit_object.log({"info": username})
@@ -118,62 +182,77 @@ def register_post():
                 options[key] = value
 
     # 0. check, if we can do the registration at all!
-    smtpconfig = Match.action_only(g, scope=SCOPE.REGISTER, action=ACTION.EMAILCONFIG)\
+    smtpconfig = Match.action_only(g, scope=SCOPE.REGISTER, action=PolicyAction.EMAILCONFIG)\
         .action_values(unique=True)
     if not smtpconfig:
-        raise RegistrationError("No SMTP server configuration specified!")
+        raise RegistrationError(_("No SMTP server configuration specified!"))
 
     # 1. determine, in which resolver/realm the user should be created
-    realm = Match.action_only(g, scope=SCOPE.REGISTER, action=ACTION.REALM)\
+    realm = Match.action_only(g, scope=SCOPE.REGISTER, action=PolicyAction.REALM)\
         .action_values(unique=True)
     if not realm:
         # No policy for realm, so we use the default realm
-        realm = get_default_realm
+        realm = get_default_realm()
     else:
         # we use the first realm in the list
         realm = list(realm)[0]
-    resolvername = Match.action_only(g, scope=SCOPE.REGISTER, action=ACTION.RESOLVER)\
+    resolvername = Match.action_only(g, scope=SCOPE.REGISTER, action=PolicyAction.RESOLVER)\
         .action_values(unique=True)
     if not resolvername:
-        raise RegistrationError("No resolver specified to register in!")
+        raise RegistrationError(_("No resolver specified to register in!"))
     resolvername = list(resolvername)[0]
-    # Check if the user exists
-    user = User(username, realm=realm, resolver=resolvername)
-    if user.exist():
-        raise RegistrationError("The username is already registered!")
-    # Create user
-    uid = create_user(resolvername, {"username": username,
-                                     "email": email,
-                                     "phone": phone,
-                                     "mobile": mobile,
-                                     "surname": surname,
-                                     "givenname": givenname,
-                                     "password": password})
+    # Past the configuration checks, so this installation really does offer self-registration.
+    # A request that only probes the endpoint of an installation that never enabled it fails
+    # above and leaves no warning behind.
+    _warn_register_deprecated("POST /register")
 
-    # 3. create a registration token for this user
-    user = User(username, realm=realm, resolver=resolvername)
-    token = init_token({"type": "registration"}, user=user)
-    # 4. send the registration token to the users email
-    registration_key = token.init_details.get("otpkey")
+    try:
+        # Check if the user exists
+        user = User(username, realm=realm, resolver=resolvername)
+        if user.exist():
+            raise RegistrationError(_("The username is already registered!"))
+        # Create user
+        uid = create_user(resolvername, {"username": username,
+                                         "email": email,
+                                         "phone": phone,
+                                         "mobile": mobile,
+                                         "surname": surname,
+                                         "givenname": givenname,
+                                         "password": password})
 
-    smtpconfig = list(smtpconfig)[0]
-    # Send the registration key via email
-    body = Match.action_only(g, scope=SCOPE.REGISTER, action=ACTION.REGISTERBODY)\
-        .action_values(unique=True)
-    body = body or DEFAULT_BODY
-    email_sent = send_email_identifier(
-        smtpconfig, email,
-        "Your privacyIDEA registration",
-        body.format(regkey=registration_key))
-    if not email_sent:
-        log.warning("Failed to send registration email to {0!r}".format(email))
-        # delete registration token
-        token.delete_token()
-        # delete user
-        user.delete()
-        raise RegistrationError("Failed to send email!")
+        # 3. create a registration token for this user
+        user = User(realm=realm, resolver=resolvername, uid=uid)
+        token = init_token({"type": "registration"}, user=user)
+        # 4. send the registration token to the users email
+        registration_key = token.init_details.get("otpkey")
 
-    log.debug("Registration email sent to {0!r}".format(email))
+        smtpconfig = list(smtpconfig)[0]
+        # Send the registration key via email
+        body = Match.action_only(g, scope=SCOPE.REGISTER, action=PolicyAction.REGISTERBODY)\
+            .action_values(unique=True)
+        body = body or DEFAULT_BODY
+        email_sent = send_email_identifier(
+            smtpconfig, email,
+            "Your privacyIDEA registration",
+            body.format(regkey=registration_key))
+        if not email_sent:
+            log.warning(f"Failed to send registration email to {email!r}")
+            # delete registration token
+            token.delete_token()
+            # delete user
+            user.delete()
+            raise RegistrationError(_("Failed to send email!"))
 
-    g.audit_object.log({"success": email_sent})
-    return send_result(email_sent)
+        log.debug(f"Registration email sent to {email!r}")
+
+        g.audit_object.log({"success": email_sent})
+        return send_result(email_sent)
+
+    except Exception as e:
+        if Match.realm(
+            g,
+            scope=SCOPE.REGISTER,
+            action=PolicyAction.HIDE_SPECIFIC_ERROR_MESSAGE,
+            realm=realm).any():
+            return send_error("Failed registering new user", error_code=Error.REGISTRATION), map_error_to_code(e)
+        raise

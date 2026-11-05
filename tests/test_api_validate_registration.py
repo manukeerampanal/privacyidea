@@ -1,0 +1,481 @@
+# SPDX-FileCopyrightText: 2024 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+import datetime
+from urllib.parse import quote
+
+
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.policy import SCOPE, set_policy, delete_policy
+from privacyidea.lib.serviceid import set_serviceid
+from privacyidea.lib.token import (get_tokens, init_token, remove_token,
+                                   get_one_token)
+from privacyidea.lib.tokenclass import (DATE_FORMAT)
+from privacyidea.lib.tokens.passwordtoken import DEFAULT_LENGTH as DEFAULT_LENGTH_PW
+from privacyidea.lib.tokens.registrationtoken import DEFAULT_LENGTH as DEFAULT_LENGTH_REG
+from privacyidea.lib.user import (User)
+from privacyidea.models import (db)
+from .base import MyApiTestCase
+
+
+
+class RegistrationValidity(MyApiTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.setUp_user_realms()
+
+    def test_00_registrationtoken_with_validity_period(self):
+        r = init_token({"type": "registration"},
+                       user=User("cornelius", self.realm1))
+        password = r.init_details.get("otpkey")
+
+        # The enddate is 17 minutes in the past
+        end_date = datetime.datetime.now() - datetime.timedelta(minutes=17)
+        end_date_str = end_date.strftime(DATE_FORMAT)
+        r.set_validity_period_end(end_date_str)
+        # now check if authentication fails
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "cornelius",
+                                                 "pass": quote(password)}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            data = res.json
+            self.assertTrue(data.get("result").get("status"))
+            self.assertFalse(data.get("result").get("value"))
+            detail = data.get("detail")
+            self.assertEqual("Outside validity period", detail.get("message"), (detail, password))
+
+
+class RegistrationAndPasswordToken(MyApiTestCase):
+
+    def setUp(self):
+        self.setUp_user_realms()
+        # an application specific password token only enrolls with a defined service ID
+        for service_id in ("thunderbird", "evolution"):
+            set_serviceid(service_id, f"the {service_id} service")
+
+    def test_00_registration_tokens(self):
+        # Registration tokens always do a genkey, even if we do not set it
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={'user': 'cornelius',
+                                                 'type': 'registration'},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            data = res.json
+            detail = data.get("detail")
+            regcode = detail.get("registrationcode")
+            self.assertEqual(DEFAULT_LENGTH_REG, len(regcode))
+            # Check if a number is contained
+            self.assertRegex(regcode, "[0-9]+")
+            # Check if a character is contained
+            self.assertRegex(regcode, "[a-zA-Z]+")
+
+        # now check if authentication
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "cornelius",
+                                                 "pass": quote(regcode)}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            data = res.json
+            self.assertEqual("ACCEPT", data.get("result").get("authentication"), (data, regcode))
+
+        # Create a reg token with explicitly setting genkey
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={'user': 'cornelius',
+                                                 'type': 'registration',
+                                                 'genkey': 1},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            data = res.json
+            detail = data.get("detail")
+            regcode = detail.get("registrationcode")
+
+        # now check the authentication
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "cornelius",
+                                                 "pass": quote(regcode)}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            data = res.json
+            self.assertEqual("ACCEPT", data.get("result").get("authentication"), (data, regcode))
+
+        # create a reg token, where the otpkey is ignored
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={'user': 'cornelius',
+                                                 'type': 'registration',
+                                                 'otpkey': "hallo"},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            data = res.json
+            detail = data.get("detail")
+            regcode = detail.get("registrationcode")
+            self.assertEqual(DEFAULT_LENGTH_REG, len(regcode))
+            self.assertNotEqual("hallo", regcode)
+
+        # now check the authentication
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "cornelius",
+                                                 "pass": quote(regcode)}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            data = res.json
+            self.assertEqual("ACCEPT", data.get("result").get("authentication"), (data, regcode))
+
+        # The registration code was generated. The passed otpkey was NOT used.
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "cornelius",
+                                                 "pass": "hallo"}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            data = res.json
+            self.assertEqual("REJECT", data.get("result").get("authentication"), data)
+
+    def test_01_password_tokens(self):
+        set_policy("enroll", scope=SCOPE.ADMIN, action=["enrollPW", PolicyAction.ENROLLPIN])
+        # always generate a key if non is given
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={'user': 'cornelius',
+                                                 'type': 'pw'},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code)
+            serial = res.json.get("detail").get("serial")
+            remove_token(serial)
+            db.session.expunge_all()
+
+        # Try setting an explicit password
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={'user': 'cornelius',
+                                                 'type': 'pw',
+                                                 'otpkey': 'topsecret',
+                                                 'pin': 'test'},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code)
+            data = res.json
+            detail = data.get("detail")
+            serial = detail.get("serial")
+
+        # now check the authentication
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "cornelius",
+                                                 "pass": "testtopsecret"}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            data = res.json
+            self.assertEqual("ACCEPT", data.get("result").get("authentication"), data)
+        # delete token
+        remove_token(serial)
+        db.session.expunge_all()
+
+        # Try getting a generated password
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={'user': 'cornelius',
+                                                 'type': 'pw',
+                                                 'genkey': 1,
+                                                 'pin': 'test'},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code)
+            data = res.json
+            detail = data.get("detail")
+            serial = detail.get("serial")
+            password = detail.get("password")
+            self.assertEqual(DEFAULT_LENGTH_PW, len(password))
+            # Check if a number is contained
+            self.assertRegex(password, "[0-9]+")
+            # Check if a character is contained
+            self.assertRegex(password, "[a-zA-Z]+")
+
+        # now check the authentication
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "cornelius",
+                                                 "pass": quote(f"test{password!s}")}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            data = res.json
+            self.assertEqual("ACCEPT", data.get("result").get("authentication"), (data, password))
+        # delete token
+        remove_token(serial)
+        delete_policy("enroll")
+
+    def test_02_application_specific_password_token(self):
+        set_policy("enroll", scope=SCOPE.ADMIN, action=["enrollAPPLSPEC", PolicyAction.ENROLLPIN])
+        # always generate a key if non is give
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={'user': 'cornelius',
+                                                 'type': 'applspec',
+                                                 'service_id': 'thunderbird'},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res.json.get("result"))
+            serial = res.json.get("detail").get("serial")
+            remove_token(serial)
+
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={'user': 'cornelius',
+                                                 'genkey': '1',
+                                                 'type': 'applspec'},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(400, res.status_code)
+            data = res.json
+            error = data.get("result").get("error")
+            self.assertEqual(905, error.get("code"))
+            self.assertEqual("ERR905: Missing parameter: service_id", error.get("message"), data)
+
+        # Now pass all necessary parameters
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={'user': 'cornelius',
+                                                 'type': 'applspec',
+                                                 'genkey': '1',
+                                                 'service_id': 'thunderbird',
+                                                 'pin': 'test'},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code)
+            data = res.json
+            detail = data.get("detail")
+            serial = detail.get("serial")
+            password = detail.get("password")
+
+        # Check, if the token has the service_id
+        tok = get_tokens(serial=serial)[0]
+        self.assertEqual("thunderbird", tok.service_id)
+
+        # now check the authentication. No service_id
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "cornelius",
+                                                 "pass": quote(f"test{password!s}")}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            data = res.json
+            self.assertEqual("REJECT", data.get("result").get("authentication"), data)
+            self.assertEqual("No suitable token found for authentication.",
+                             data.get("detail").get("message"), data)
+
+        # now check the authentication. wrong service_id
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "cornelius",
+                                                 "service_id": "wrong",
+                                                 "pass": quote(f"test{password!s}")}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            data = res.json
+            self.assertEqual("REJECT", data.get("result").get("authentication"), data)
+            self.assertEqual("No suitable token found for authentication.",
+                             data.get("detail").get("message"), data)
+
+        # now check the authentication. correct service_id
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "cornelius",
+                                                 "service_id": "thunderbird",
+                                                 "pass": quote(f"test{password!s}")}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            data = res.json
+            self.assertEqual("ACCEPT", data.get("result").get("authentication"), (data, password))
+            self.assertEqual("matching 1 tokens", data.get("detail").get("message"), data)
+
+        # delete token
+        remove_token(serial)
+
+    def test_03_applspec_service_id_case_insensitive(self):
+        # ApplicationSpecificPasswordTokenClass.use_for_authentication compares
+        # service_id case-insensitively (.lower() on both sides). The spec/test
+        # only exercises an exact-case match, so pin down upper/mixed case here.
+        set_policy("enroll", scope=SCOPE.ADMIN, action=["enrollAPPLSPEC", PolicyAction.ENROLLPIN])
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={'user': 'cornelius',
+                                                 'type': 'applspec',
+                                                 'genkey': '1',
+                                                 'service_id': 'thunderbird',
+                                                 'pin': 'test'},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code)
+            detail = res.json.get("detail")
+            serial = detail.get("serial")
+            password = detail.get("password")
+
+        for sent_service_id in ("THUNDERBIRD", "Thunderbird", "thuNDerbird"):
+            with self.app.test_request_context('/validate/check',
+                                               method='POST',
+                                               data={"user": "cornelius",
+                                                     "service_id": sent_service_id,
+                                                     "pass": quote(f"test{password}")}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(200, res.status_code, res)
+                data = res.json
+                self.assertEqual("ACCEPT", data.get("result").get("authentication"),
+                                 (sent_service_id, data))
+                self.assertEqual("matching 1 tokens", data.get("detail").get("message"), data)
+
+        remove_token(serial)
+        delete_policy("enroll")
+
+    def test_04_applspec_multiple_tokens_select_by_service_id(self):
+        # Same user owns two applspec tokens for different service_ids.
+        # The use_for_authentication filter must select the right token per
+        # request — wrong-password / right-service_id stays REJECT.
+        set_policy("enroll", scope=SCOPE.ADMIN, action=["enrollAPPLSPEC", PolicyAction.ENROLLPIN])
+
+        passwords = {}
+        serials = {}
+        for service in ("thunderbird", "evolution"):
+            with self.app.test_request_context('/token/init',
+                                               method='POST',
+                                               data={'user': 'cornelius',
+                                                     'type': 'applspec',
+                                                     'genkey': '1',
+                                                     'service_id': service,
+                                                     'pin': 'test'},
+                                               headers={'Authorization': self.at}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(200, res.status_code)
+                detail = res.json.get("detail")
+                serials[service] = detail.get("serial")
+                passwords[service] = detail.get("password")
+
+        self.assertNotEqual(passwords["thunderbird"], passwords["evolution"])
+
+        for service in ("thunderbird", "evolution"):
+            with self.app.test_request_context('/validate/check',
+                                               method='POST',
+                                               data={"user": "cornelius",
+                                                     "service_id": service,
+                                                     "pass": quote(f"test{passwords[service]}")}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(200, res.status_code, res)
+                data = res.json
+                self.assertEqual("ACCEPT", data.get("result").get("authentication"),
+                                 (service, data))
+                self.assertEqual(serials[service], data.get("detail").get("serial"), data)
+
+        # Right service_id, wrong (other token's) password -> REJECT.
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "cornelius",
+                                                 "service_id": "thunderbird",
+                                                 "pass": quote(f"test{passwords['evolution']}")}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            data = res.json
+            self.assertEqual("REJECT", data.get("result").get("authentication"), data)
+
+        for serial in serials.values():
+            remove_token(serial)
+        delete_policy("enroll")
+
+    def test_05_applspec_service_id_must_be_defined(self):
+        """An applspec token can only be enrolled with one of the defined service IDs, and it stores the service ID
+        the way it is defined."""
+        set_policy("enroll", scope=SCOPE.ADMIN, action=["enrollAPPLSPEC", PolicyAction.ENROLLPIN])
+
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={'user': 'cornelius',
+                                                 'type': 'applspec',
+                                                 'genkey': '1',
+                                                 'service_id': 'lightning'},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(400, res.status_code)
+            error = res.json.get("result").get("error")
+            self.assertEqual(905, error.get("code"))
+            self.assertEqual("ERR905: The service ID 'lightning' is not defined.", error.get("message"))
+
+        # the service ID is matched the same way the authentication matches it, which is case-insensitively
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={'user': 'cornelius',
+                                                 'type': 'applspec',
+                                                 'genkey': '1',
+                                                 'service_id': 'ThUnderBird'},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code)
+            serial = res.json.get("detail").get("serial")
+
+        self.assertEqual("thunderbird", get_one_token(serial=serial).get_tokeninfo("service_id"))
+        remove_token(serial)
+
+        # a JSON request body keeps the type the service ID was sent with
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           json={'user': 'cornelius',
+                                                 'type': 'applspec',
+                                                 'genkey': True,
+                                                 'service_id': 7},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(400, res.status_code)
+            self.assertEqual("ERR905: The service ID '7' is not defined.",
+                             res.json.get("result").get("error").get("message"))
+
+        delete_policy("enroll")
+
+    def test_06_applspec_rollover_with_undefined_service_id_keeps_the_password(self):
+        """A rollover that names an undefined service ID is refused without giving the token a new password."""
+        set_policy("enroll", scope=SCOPE.ADMIN,
+                   action=["enrollAPPLSPEC", PolicyAction.ENROLLPIN, PolicyAction.TOKENROLLOVER])
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={'user': 'cornelius',
+                                                 'type': 'applspec',
+                                                 'genkey': '1',
+                                                 'service_id': 'thunderbird',
+                                                 'pin': 'test'},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code)
+            detail = res.json.get("detail")
+            serial = detail.get("serial")
+            password = detail.get("password")
+
+        with self.app.test_request_context('/token/init',
+                                           method='POST',
+                                           data={'serial': serial,
+                                                 'type': 'applspec',
+                                                 'genkey': '1',
+                                                 'service_id': 'lightning'},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(400, res.status_code)
+            self.assertEqual(905, res.json.get("result").get("error").get("code"))
+
+        # the password of the token is the one the enrollment handed out
+        with self.app.test_request_context('/validate/check',
+                                           method='POST',
+                                           data={"user": "cornelius",
+                                                 "service_id": "thunderbird",
+                                                 "pass": quote(f"test{password}")}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            self.assertEqual("ACCEPT", res.json.get("result").get("authentication"), res.json)
+
+        remove_token(serial)
+        delete_policy("enroll")

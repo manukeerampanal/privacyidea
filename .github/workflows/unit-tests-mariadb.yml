@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: (C) 2014 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: CC0-1.0
+#
+# Runs the full unit test suite against MariaDB.
+# On pull requests: only the oldest and newest supported Python versions are
+# tested to keep feedback fast. The middle versions run nightly as a dependency
+# health check — they are unlikely to catch Python-version bugs that min+max
+# would miss, but they will surface broken installs or subtle stdlib regressions.
+# Migration tests are excluded — they have their own dedicated workflow.
+#
+# The actual test steps live in the reusable unit-tests.yml workflow, shared
+# with the PostgreSQL run.
+
+name: Unit Tests MariaDB
+
+on:
+  pull_request:
+    paths:
+      - 'privacyidea/**.py'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - 'requirements.txt'
+      - 'tools/**'
+      - '.github/workflows/unit-tests-mariadb.yml'
+      - '.github/workflows/unit-tests.yml'
+      - '.github/python-versions.env'
+  schedule:
+    # Nightly at 02:00 UTC — runs all Python versions as a dependency health check
+    - cron: '0 2 * * *'
+
+permissions:
+  contents: read
+
+# Cancel any in-progress run for the same PR when a new commit is pushed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: MariaDB
+    permissions:
+      contents: read
+      checks: write # allow the python tests to mark an action run as failed
+    uses: ./.github/workflows/unit-tests.yml
+    with:
+      db-kind: mariadb
+      driver-pip: PyMySQL
+      test-database-url: "mysql+pymysql://privacyidea:privacyidea@127.0.0.1:3306/privacyidea_test"
+      full-matrix-on-schedule: true
+      coverage: true
+    secrets:
+      codecov_token: ${{ secrets.CODECOV_TOKEN }}
+
+  notify-failure:
+    needs: unit-tests
+    # Surface nightly breakage as a GitHub issue. Scheduled runs only — PR
+    # failures already show up as PR checks. Runs when any matrix job failed.
+    if: ${{ failure() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # for actions/checkout to reach the local composite action
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/notify-nightly-failure
+        with:
+          title: Nightly backend unit tests failed on master
+          body: |
+            The nightly MariaDB backend unit-test run failed on master.
+
+            Commit: ${{ github.sha }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  License:  AGPLv3
 #  contact:  http://www.privacyidea.org
 #
@@ -25,7 +23,7 @@ import binascii
 __doc__ = """This is the implementation of the VASCO token"""
 
 import logging
-from privacyidea.api.lib.utils import getParam
+from privacyidea.lib.params import get_optional
 from privacyidea.lib.utils import is_true
 from privacyidea.lib.decorators import check_token_locked
 from privacyidea.lib.error import ParameterError
@@ -33,10 +31,9 @@ from privacyidea.lib.log import log_with
 from privacyidea.lib.tokenclass import TokenClass
 from privacyidea.lib.tokens.vasco import vasco_otp_check
 from privacyidea.lib import _
-from privacyidea.lib.policy import SCOPE, ACTION, GROUP
+from privacyidea.lib.policy import SCOPE, GROUP
+from privacyidea.lib.policies.actions import PolicyAction
 
-optional = True
-required = False
 
 log = logging.getLogger(__name__)
 
@@ -67,7 +64,7 @@ class VascoTokenClass(TokenClass):
         :param aToken: the db bound token
         """
         TokenClass.__init__(self, db_token)
-        self.set_type(u"vasco")
+        self.set_type("vasco")
         self.hKeyRequired = True
 
     @staticmethod
@@ -100,17 +97,17 @@ class VascoTokenClass(TokenClass):
                'title': 'VASCO Token',
                'description': _('VASCO Token: Authentication using VASCO tokens'),
                # If this was set, the user could enroll a Vasco token via the API
-               #'user': ["enroll"],
+               # 'user': ["enroll"],
                # only administrators can enroll the token in the UI
                'ui_enroll': ["admin"],
                'policy': {
                    SCOPE.ENROLL: {
-                       ACTION.MAXTOKENUSER: {
+                       PolicyAction.MAXTOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of Vasco tokens assigned."),
                            'group': GROUP.TOKEN
                        },
-                       ACTION.MAXACTIVETOKENUSER: {
+                       PolicyAction.MAXACTIVETOKENUSER: {
                            'type': 'int',
                            'desc': _(
                                "The user may only have this maximum number of active Vasco tokens assigned."),
@@ -137,7 +134,7 @@ class VascoTokenClass(TokenClass):
 
         :return: nothing
         """
-        if is_true(getParam(param, 'genkey', optional)):
+        if is_true(get_optional(param, 'genkey')):
             raise ParameterError("Generating OTP keys is not supported")
 
         upd_param = param.copy()
@@ -176,13 +173,29 @@ class VascoTokenClass(TokenClass):
                 # wrong OTP value, no log message
                 pass
             elif result == 201:
-                log.warning("VASCO token failed to authenticate, code replay attempt, previous OTP value was used again!")
+                log.warning(
+                    "VASCO token failed to authenticate, code replay attempt, previous OTP value was used again!")
             elif result == 202:
                 log.warning("Token-internal fail counter reached its maximum!")
             elif result == -202:
-                log.warning("VASCO token failed to authenticate, response too small, user did not type his complete OTP!")
+                log.warning(
+                    "VASCO token failed to authenticate, response too small, user did not type his complete OTP!")
             elif result == -205:
                 log.warning("VASCO token failed to authenticate, response not decimal!")
             else:
-                log.warning("VASCO token failed to authenticate, result: {!r}".format(result))
+                log.warning(f"VASCO token failed to authenticate, result: {result!r}")
             return -1
+
+    def export_token(self, export_user: bool = False) -> dict:
+        """
+        Export for this token is not supported.
+        """
+        raise NotImplementedError("Export for VASCO token is not supported.")
+
+    def import_token(self, token_information: dict):
+        """
+        Import for this token is not supported.
+
+        Concern that the database token must be deleted manually.
+        """
+        raise NotImplementedError("Import for VASCO token is not supported.")

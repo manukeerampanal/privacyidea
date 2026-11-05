@@ -1,21 +1,25 @@
-# -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: 2015 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
-import mock
-from contextlib import contextmanager
-from datetime import datetime, timedelta
+from contextlib import contextmanager, suppress
+from datetime import datetime, timedelta, UTC
 
-from .base import MyApiTestCase
-from privacyidea.lib.policy import set_policy, SCOPE, ACTION, delete_policy
-from privacyidea.models import Audit
-from privacyidea.lib.resolver import save_resolver
-from privacyidea.lib.realm import set_realm
+from unittest import mock
+
 from privacyidea.lib.auditmodules.base import Audit as BaseAudit
+from privacyidea.lib.error import ResourceNotFoundError
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.policy import set_policy, SCOPE, delete_policy
+from privacyidea.lib.realm import set_realm
+from privacyidea.lib.resolver import save_resolver
+from privacyidea.lib.utils import AUTH_RESPONSE
+from privacyidea.models import Audit, db
+from .base import MyApiTestCase
 
 PWFILE = "tests/testdata/passwords"
 
 
 class APIAuditTestCase(MyApiTestCase):
-
     realm1a = "realm1a"
     realm2b = "realm2b"
 
@@ -27,12 +31,12 @@ class APIAuditTestCase(MyApiTestCase):
         self.assertTrue(rid > 0, rid)
 
         (added, failed) = set_realm(self.realm1a,
-                                    [self.resolvername1])
+                                    [{'name': self.resolvername1}])
         self.assertTrue(len(failed) == 0)
         self.assertTrue(len(added) == 1)
 
         (added, failed) = set_realm(self.realm2b,
-                                    [self.resolvername1])
+                                    [{'name': self.resolvername1}])
         self.assertTrue(len(failed) == 0)
         self.assertTrue(len(added) == 1)
 
@@ -49,14 +53,12 @@ class APIAuditTestCase(MyApiTestCase):
             # check that we have all available entries in the audit data
             # create a fake base Audit object to get the available_columns prop
             a = BaseAudit()
-            self.assertEqual(set(json_response['result']['value']['auditcolumns']),
-                             set(a.available_audit_columns),
+            audit_response = set(json_response['result']['value']['auditcolumns'])
+            self.assertEqual(audit_response, set(a.available_audit_columns),
                              json_response['result']['value']['auditcolumns'])
-            self.assertEqual(set(json_response['result']['value']['auditdata'][0].keys()),
-                             set(a.available_audit_columns),
+            audit_response = set(json_response['result']['value']['auditdata'][0].keys())
+            self.assertEqual(audit_response, set(a.available_audit_columns),
                              json_response['result']['value']['auditcolumns'])
-
-        # TODO: test audit columns if HIDE_AUDIT_COLUMNS policy is set.
 
         # check for entry in audit log
         aentry = self.find_most_recent_audit_entry(action='GET /audit/')
@@ -74,14 +76,14 @@ class APIAuditTestCase(MyApiTestCase):
             cols = json_response.get("result").get("value").get("auditcolumns")
             self.assertIn("number", cols)
             self.assertIn("serial", cols)
-            self.assertEqual(22, len(cols))
+            self.assertEqual(27, len(cols))
 
     def test_01_get_audit_csv(self):
         @contextmanager
         def _fake_time(t):
             """ context manager that fakes the current time that is written
             to the database """
-            with mock.patch("privacyidea.models.datetime") as mock_dt:
+            with mock.patch("privacyidea.models.audit.datetime") as mock_dt:
                 mock_dt.now.return_value = t
                 yield
 
@@ -113,8 +115,11 @@ class APIAuditTestCase(MyApiTestCase):
             self.assertNotIn(b"'enroll','1','','','','foo'", res.data, res)
 
     def test_02_get_allowed_audit_realm(self):
+        self.setUp_user_realms()
+        Audit.query.delete()
+
         # Check that an administrator is only allowed to see log entries of
-        # the defined realms.
+        # the defined realms and its own log entries
         # fill some audit entries
         Audit(action="enroll", success=1, realm=self.realm1a).save()
         Audit(action="enroll", success=1, realm=self.realm1a).save()
@@ -125,7 +130,7 @@ class APIAuditTestCase(MyApiTestCase):
         # check, that we see all audit entries
         with self.app.test_request_context('/audit/',
                                            method='GET',
-                                           data={"realm": self.realm1a},
+                                           query_string={"realm": self.realm1a},
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
@@ -133,6 +138,7 @@ class APIAuditTestCase(MyApiTestCase):
             self.assertTrue(json_response.get("result").get("status"), res)
             self.assertEqual(json_response.get("result").get("value").get(
                 "count"), 2)
+            self.assertEqual(2, len(json_response.get("result").get("value").get("auditdata")))
 
         with self.app.test_request_context('/audit/',
                                            method='GET',
@@ -141,26 +147,26 @@ class APIAuditTestCase(MyApiTestCase):
             self.assertTrue(res.status_code == 200, res)
             json_response = res.json
             self.assertTrue(json_response.get("result").get("status"), res)
-            self.assertGreaterEqual(json_response.get("result").get("value").get(
-                "count"), 7)
+            self.assertEqual(6, json_response.get("result").get("value").get(
+                "count"))
             audit_list = json_response.get("result").get("value").get("auditdata")
             audit_actions = [a for a in audit_list if a.get("action") == "GET /audit/"]
             self.assertGreaterEqual(len(audit_actions), 1)
 
         with self.app.test_request_context('/audit/',
                                            method='GET',
-                                           data={"realm": self.realm2b},
+                                           query_string={"realm": self.realm2b},
                                            headers={
                                                'Authorization': self.at}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             json_response = res.json
             self.assertTrue(json_response.get("result").get("status"), res)
-            self.assertEqual(json_response.get("result").get("value").get(
-                "count"), 3)
+            self.assertEqual(3, json_response.get("result").get("value").get(
+                "count"))
 
         # set policy for audit realms
-        set_policy("audit01", scope=SCOPE.ADMIN, action=ACTION.AUDIT,
+        set_policy("audit01", scope=SCOPE.ADMIN, action=PolicyAction.AUDIT,
                    realm=self.realm1a)
 
         # check, that we only see allowed audit realms
@@ -174,15 +180,41 @@ class APIAuditTestCase(MyApiTestCase):
             # We now have 3 entries, as we added one by the search in line #43
             audit_list = json_response.get("result").get("value").get("auditdata")
             audit_realms = [a for a in audit_list if a.get("realm") == self.realm1a]
-            self.assertEqual(len(audit_realms), 3)
-            self.assertEqual(json_response.get("result").get("value").get("count"), 3)
+            self.assertEqual(3, len(audit_realms))
+            admin_audit = [a for a in audit_list if a.get("administrator") == "testadmin"]
+            self.assertEqual(3, len(admin_audit))
+            self.assertEqual(5, json_response.get("result").get("value").get("count"))
+            # Check that all audit columns are available
+            self.assertEqual(set(BaseAudit().available_audit_columns),
+                             set(json_response.get("result").get("value").get("auditcolumns")))
 
+        # Set policy to restrict audit columns
+        set_policy("audit02", scope=SCOPE.ADMIN,
+                   action=f"{PolicyAction.HIDE_AUDIT_COLUMNS}=serial action")
+
+        # Check, that the normal user can only see the restricted audit columns
+        with self.app.test_request_context('/audit/',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            json_response = res.json
+            self.assertTrue(json_response.get("result").get("status"), res)
+            # Check that only restricted audit columns are available
+            self.assertTrue({"serial", "action"}.isdisjoint(
+                set(json_response.get("result").get("value").get("auditcolumns"))),
+                json_response.get("result").get("value").get("auditcolumns"))
+            self.assertEqual(len(json_response.get("result").get("value").get("auditdata")[0]),
+                             len(json_response.get("result").get("value").get("auditcolumns")))
         # delete policy
         delete_policy("audit01")
+        delete_policy("audit02")
 
     def test_03_get_allowed_audit_realm(self):
-        # Check than an internal admin is allowed to see all realms
-        # A helpdesk user in "adminrealm" is only allowerd to see realm1A
+        self.setUp_user_realms()
+        Audit.query.delete()
+        # Check that an internal admin is allowed to see all realms
+        # A helpdesk user in "adminrealm" is only allowed to see realm1A
         Audit(action="enroll", success=1, realm=self.realm1a).save()
         Audit(action="enroll", success=1, realm=self.realm1a).save()
         Audit(action="enroll", success=1, realm=self.realm2b).save()
@@ -192,34 +224,30 @@ class APIAuditTestCase(MyApiTestCase):
         # check, that we see all audit entries
         with self.app.test_request_context('/audit/',
                                            method='GET',
-                                           data={"realm": self.realm1a},
+                                           query_string={"realm": self.realm1a},
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             json_response = res.json
             self.assertTrue(json_response.get("result").get("status"), res)
-            self.assertGreaterEqual(json_response.get("result").get("value").get(
-                "count"), 2)
+            self.assertEqual(2, json_response.get("result").get("value").get("count"))
 
         with self.app.test_request_context('/audit/',
                                            method='GET',
-                                           data={"realm": self.realm2b},
-                                           headers={
-                                               'Authorization': self.at}):
+                                           query_string={"realm": self.realm2b},
+                                           headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             json_response = res.json
             self.assertTrue(json_response.get("result").get("status"), res)
-            self.assertGreaterEqual(json_response.get("result").get("value").get(
-                "count"), 3)
+            self.assertEqual(3, json_response.get("result").get("value").get("count"))
 
         # set policy: helpdesk users in adminrealm are only allowed to
         # view "realm1A".
-        set_policy("audit01", scope=SCOPE.ADMIN, action=ACTION.AUDIT,
-                   adminrealm="adminrealm", realm=self.realm1a)
+        set_policy("audit01", scope=SCOPE.ADMIN, action=PolicyAction.AUDIT, adminrealm="adminrealm",
+                   realm=self.realm1a)
         # Test admin is allowed to view unrestricted logs!
-        set_policy("audit02", scope=SCOPE.ADMIN, action=ACTION.AUDIT,
-                   user="testadmin")
+        set_policy("audit02", scope=SCOPE.ADMIN, action=PolicyAction.AUDIT, adminuser="testadmin")
 
         rid = save_resolver({"resolver": self.resolvername1,
                              "type": "passwdresolver",
@@ -227,14 +255,14 @@ class APIAuditTestCase(MyApiTestCase):
         self.assertTrue(rid > 0, rid)
 
         (added, failed) = set_realm("adminrealm",
-                                    [self.resolvername1])
+                                    [{'name': self.resolvername1}])
         self.assertTrue(len(failed) == 0)
         self.assertTrue(len(added) == 1)
 
-        helpdesk_authorization = None
         with self.app.test_request_context('/auth',
-                                           method='POST', data={'username': 'selfservice@adminrealm',
-                                                                'password': 'test'}):
+                                           method='POST',
+                                           data={'username': 'selfservice@adminrealm',
+                                                 'password': 'test'}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             json_response = res.json
@@ -246,34 +274,42 @@ class APIAuditTestCase(MyApiTestCase):
         # check, that we only see allowed audit realms
         with self.app.test_request_context('/audit/',
                                            method='GET',
-                                           data={"action": "**",
-                                                 "action_detail": "**",
-                                                 "administrator": "**",
-                                                 "client": "**",
-                                                 "date": "**",
-                                                 "info": "**",
-                                                 "page": "1",
-                                                 "page_size": "10",
-                                                 "policies": "**",
-                                                 "privacyidea_server": "**",
-                                                 "realm": "**",
-                                                 "resolver": "**",
-                                                 "serial": "**",
-                                                 "sortorder": "desc",
-                                                 "success": "**",
-                                                 "tokentype": "**",
-                                                 "user": "**"},
+                                           query_string={"action": "**",
+                                                         "action_detail": "**",
+                                                         "administrator": "**",
+                                                         "client": "**",
+                                                         "date": "**",
+                                                         "info": "**",
+                                                         "page": "1",
+                                                         "page_size": "10",
+                                                         "policies": "**",
+                                                         "privacyidea_server": "**",
+                                                         "realm": "**",
+                                                         "resolver": "**",
+                                                         "serial": "**",
+                                                         "sortorder": "desc",
+                                                         "success": "**",
+                                                         "tokentype": "**",
+                                                         "user": "**",
+                                                         "container_serial": "**",
+                                                         "container_type": "**"},
                                            headers={'Authorization': helpdesk_authorization}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             json_response = res.json
             self.assertTrue(json_response.get("result").get("status"), res)
-            # We now have 3 entries, as we added one by the search in line #43
+            # We have 3 entries for realm1a and 1 auth entry for the admin
             count = json_response.get("result").get("value").get("count")
-            auditdata = json_response.get("result").get("value").get("auditdata")
-            self.assertGreaterEqual(count, 3)
-            # All entries are in realm1A!
-            for ad in auditdata:
+            self.assertEqual(4, count)
+            audit_list = json_response.get("result").get("value").get("auditdata")
+            # Own audit entries
+            admin_auth = [a for a in audit_list if a.get("action") == "POST /auth"]
+            self.assertEqual("selfservice", admin_auth[0].get("administrator"))
+            self.assertEqual(1, len(admin_auth))
+            # audit entries for realm1a
+            audit_realm1a = [a for a in audit_list if a.get("action") != "POST /auth"]
+            self.assertEqual(3, len(audit_realm1a))
+            for ad in audit_realm1a:
                 self.assertEqual(ad.get("realm"), self.realm1a)
 
         # Now check, that the testadmin (self.at) sees all entries!
@@ -284,10 +320,17 @@ class APIAuditTestCase(MyApiTestCase):
             self.assertTrue(res.status_code == 200, res)
             json_response = res.json
             self.assertTrue(json_response.get("result").get("status"), res)
-            # We now have 3 entries, as we added one by the search in line #43
             count = json_response.get("result").get("value").get("count")
-            auditdata = json_response.get("result").get("value").get("auditdata")
-            self.assertGreaterEqual(count, 10)
+            self.assertEqual(9, count)
+            audit_data = json_response.get("result").get("value").get("auditdata")
+            audit_realm1a = [a for a in audit_data if a.get("realm") == self.realm1a]
+            self.assertEqual(3, len(audit_realm1a))
+            audit_realm2b = [a for a in audit_data if a.get("realm") == self.realm2b]
+            self.assertEqual(4, len(audit_realm2b))
+            audit_testadmin = [a for a in audit_data if a.get("administrator") == "testadmin"]
+            self.assertEqual(2, len(audit_testadmin))
+            audit_admin = [a for a in audit_data if a.get("administrator") == "selfservice"]
+            self.assertEqual(2, len(audit_admin))
 
         # delete policy
         delete_policy("audit01")
@@ -309,12 +352,12 @@ class APIAuditTestCase(MyApiTestCase):
               resolver="resolver1", realm=self.realm2b).save()
 
         # set policy: normal users in realm1a are allowed to view audit log
-        set_policy("audit01", scope=SCOPE.USER, action=ACTION.AUDIT, realm=self.realm1a)
+        set_policy("audit01", scope=SCOPE.USER, action=PolicyAction.AUDIT, realm=self.realm1a)
 
-        user_authorization = None
         with self.app.test_request_context('/auth',
-                                           method='POST', data={'username': 'selfservice@{0!s}'.format(self.realm1a),
-                                                                'password': 'test'}):
+                                           method='POST',
+                                           data={'username': f'selfservice@{self.realm1a!s}',
+                                                 'password': 'test'}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             json_response = res.json
@@ -325,23 +368,25 @@ class APIAuditTestCase(MyApiTestCase):
         # check, that the normal user only sees his own entries
         with self.app.test_request_context('/audit/',
                                            method='GET',
-                                           data={"action": "**",
-                                                 "action_detail": "**",
-                                                 "administrator": "**",
-                                                 "client": "**",
-                                                 "date": "**",
-                                                 "info": "**",
-                                                 "page": "1",
-                                                 "page_size": "10",
-                                                 "policies": "**",
-                                                 "privacyidea_server": "**",
-                                                 "realm": "**",
-                                                 "resolver": "**",
-                                                 "serial": "**",
-                                                 "sortorder": "desc",
-                                                 "success": "**",
-                                                 "tokentype": "**",
-                                                 "user": "**"},
+                                           query_string={"action": "enroll",
+                                                         "action_detail": "**",
+                                                         "administrator": "**",
+                                                         "client": "**",
+                                                         "date": "**",
+                                                         "info": "**",
+                                                         "page": "1",
+                                                         "page_size": "10",
+                                                         "policies": "**",
+                                                         "privacyidea_server": "**",
+                                                         "realm": "**",
+                                                         "resolver": "**",
+                                                         "serial": "**",
+                                                         "sortorder": "desc",
+                                                         "success": "**",
+                                                         "tokentype": "**",
+                                                         "user": "**",
+                                                         "container_serial": "**",
+                                                         "container_type": "**"},
                                            headers={'Authorization': user_authorization}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
@@ -350,31 +395,55 @@ class APIAuditTestCase(MyApiTestCase):
             # We now have 3 entries, as we added one by the search in line #43
             count = json_response.get("result").get("value").get("count")
             auditdata = json_response.get("result").get("value").get("auditdata")
-            self.assertGreaterEqual(count, 3)
+            self.assertEqual(2, count, json_response)
+            # Check that all audit columns are available
+            self.assertEqual(set(BaseAudit().available_audit_columns),
+                             set(json_response.get("result").get("value").get("auditcolumns")))
             # All entries are in realm1A!
             for ad in auditdata:
                 self.assertEqual(ad.get("realm"), self.realm1a)
 
+        # Set policy to restrict audit columns
+        set_policy("audit02", scope=SCOPE.USER,
+                   action=f"{PolicyAction.HIDE_AUDIT_COLUMNS}=serial action")
+
+        # Check, that the normal user can only see the restricted audit columns
+        with self.app.test_request_context('/audit/',
+                                           method='GET',
+                                           headers={'Authorization': user_authorization}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            json_response = res.json
+            self.assertTrue(json_response.get("result").get("status"), res)
+            # Check that only restricted audit columns are available
+            self.assertTrue({"serial", "action"}.isdisjoint(
+                set(json_response.get("result").get("value").get("auditcolumns"))),
+                json_response.get("result").get("value").get("auditcolumns"))
+            self.assertEqual(len(json_response.get("result").get("value").get("auditdata")[0]),
+                             len(json_response.get("result").get("value").get("auditcolumns")))
+
         # try to explicitly query another realm
         with self.app.test_request_context('/audit/',
                                            method='GET',
-                                           data={"action": "**",
-                                                 "action_detail": "**",
-                                                 "administrator": "**",
-                                                 "client": "**",
-                                                 "date": "**",
-                                                 "info": "**",
-                                                 "page": "1",
-                                                 "page_size": "10",
-                                                 "policies": "**",
-                                                 "privacyidea_server": "**",
-                                                 "realm": self.realm2b,
-                                                 "resolver": "**",
-                                                 "serial": "**",
-                                                 "sortorder": "desc",
-                                                 "success": "**",
-                                                 "tokentype": "**",
-                                                 "user": "**"},
+                                           query_string={"action": "**",
+                                                         "action_detail": "**",
+                                                         "administrator": "**",
+                                                         "client": "**",
+                                                         "date": "**",
+                                                         "info": "**",
+                                                         "page": "1",
+                                                         "page_size": "10",
+                                                         "policies": "**",
+                                                         "privacyidea_server": "**",
+                                                         "realm": self.realm2b,
+                                                         "resolver": "**",
+                                                         "serial": "**",
+                                                         "sortorder": "desc",
+                                                         "success": "**",
+                                                         "tokentype": "**",
+                                                         "user": "**",
+                                                         "container_serial": "**",
+                                                         "container_type": "**"},
                                            headers={'Authorization': user_authorization}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
@@ -386,3 +455,234 @@ class APIAuditTestCase(MyApiTestCase):
 
         # delete policy
         delete_policy("audit01")
+        delete_policy("audit02")
+
+    def test_05_audit_age(self):
+        # Check that audit age policy is applied correctly
+        Audit.query.delete()
+        self.setUp_user_realms()
+        date = datetime.now(UTC)
+        three_days = timedelta(days=3)
+        # enroll policies are within last day and enable policies not
+        audit = Audit(action="enroll", success=1, realm=self.realm1a)
+        audit.date = date - timedelta(minutes=5)
+        audit.save()
+        audit = Audit(action="enable", success=1, realm=self.realm1a)
+        audit.date = date - three_days
+        audit.save()
+        audit = Audit(action="enroll", success=1, realm=self.realm2b)
+        audit.date = date - timedelta(minutes=2)
+        audit.save()
+        audit = Audit(action="enable", success=1, realm=self.realm2b)
+        audit.date = date - three_days
+        audit.save()
+        audit = Audit(action="enroll", success=1, realm=self.realm2b)
+        audit.date = date
+        audit.save()
+
+        # check that we see all audit entries
+        with self.app.test_request_context('/audit/',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            json_response = res.json
+            self.assertTrue(json_response.get("result").get("status"), res)
+            self.assertEqual(5, json_response.get("result").get("value").get("count"))
+
+        # Set audit age policy
+        set_policy("audit_age", scope=SCOPE.ADMIN, action=f"{PolicyAction.AUDIT},{PolicyAction.AUDIT_AGE}=1d")
+        # Now we should only get audit entries within the last day
+        with self.app.test_request_context('/audit/',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            json_response = res.json
+            self.assertTrue(json_response.get("result").get("status"), res)
+            audit_result = json_response.get("result").get("value")
+            self.assertEqual(4, audit_result.get("count"))
+            for audit in audit_result.get("auditdata"):
+                self.assertNotEqual("enable", audit.get("action"), audit)
+
+        # Set audit policy for helpdesk
+        set_policy("audit_age", scope=SCOPE.ADMIN, action=f"{PolicyAction.AUDIT},{PolicyAction.AUDIT_AGE}=1d",
+                   realm=self.realm2b)
+        with self.app.test_request_context('/audit/',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            json_response = res.json
+            self.assertTrue(json_response.get("result").get("status"), res)
+            audit_result = json_response.get("result").get("value")
+            self.assertEqual(4, audit_result.get("count"))
+            for audit in audit_result.get("auditdata"):
+                self.assertNotEqual("enable", audit.get("action"), audit)
+                self.assertNotEqual(self.realm1a, audit.get("realm"), audit)
+
+        delete_policy("audit_age")
+
+    def test_06_audit_pagination(self):
+        self.setUp_user_realms()
+        # prepare some log entries
+        Audit(action="enroll", success=1, user="selfservice", administrator=None,
+              resolver="resolver1", realm=self.realm1a).save()
+        Audit(action="enroll", success=1, user="selfservice", administrator=None,
+              resolver="resolver1", realm=self.realm1a).save()
+        Audit(action="enroll", success=1, user="selfservice", administrator=None,
+              resolver="resolver1", realm=self.realm2b).save()
+        Audit(action="enroll", success=1, user="selfservice", administrator=None,
+              resolver="resolver1", realm=self.realm2b).save()
+        Audit(action="enroll", success=1, user="selfservice", administrator=None,
+              resolver="resolver1", realm=self.realm2b).save()
+
+        # Query API with page size parameter
+        with self.app.test_request_context('/audit/',
+                                           method='GET',
+                                           query_string={'page_size': 3},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            json_response = res.json
+            self.assertTrue(json_response.get("result").get("status"), json_response)
+            self.assertGreaterEqual(json_response.get("result").get("value").get(
+                "count"), 6,  json_response)
+            self.assertEqual(3, len(json_response.get("result").get("value").get(
+                "auditdata")), json_response)
+            self.assertEqual(1, json_response.get("result").get("value").get(
+                "current"), json_response)
+            self.assertEqual(2, json_response.get("result").get("value").get(
+                "next"), json_response)
+
+        # Query API with negative page size parameter
+        with self.app.test_request_context('/audit/',
+                                           method='GET',
+                                           query_string={'page_size': -5},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            json_response = res.json
+            self.assertTrue(json_response.get("result").get("status"), json_response)
+            self.assertGreaterEqual(json_response.get("result").get("value").get(
+                "count"), 6,  json_response)
+            self.assertGreaterEqual(len(json_response.get("result").get("value").get(
+                "auditdata")), 5, json_response)
+            self.assertEqual(1, json_response.get("result").get("value").get(
+                "current"), json_response)
+
+        # Query API with negative page parameter
+        with self.app.test_request_context('/audit/',
+                                           method='GET',
+                                           query_string={'page': -1},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            json_response = res.json
+            self.assertTrue(json_response.get("result").get("status"), json_response)
+            self.assertGreaterEqual(json_response.get("result").get("value").get(
+                "count"), 6,  json_response)
+            self.assertGreaterEqual(len(json_response.get("result").get("value").get(
+                "auditdata")), 5, json_response)
+            self.assertEqual(1, json_response.get("result").get("value").get(
+                "current"), json_response)
+
+    def test_07_search_negation_matches_unset_columns(self):
+        Audit.query.delete()
+        Audit(action="enroll", success=1, authentication=AUTH_RESPONSE.CHALLENGE).save()
+        Audit(action="enroll", success=1, authentication=AUTH_RESPONSE.REJECT).save()
+        Audit(action="enroll", success=1).save()
+        # entries written before the column was added contain NULL, not ""
+        Audit.query.filter(Audit.authentication == "").update({Audit.authentication: None})
+        db.session.commit()
+
+        # the entry with the unset column is not dropped by the negation
+        with self.app.test_request_context('/audit/',
+                                           method='GET',
+                                           query_string={"action": "enroll",
+                                                         "authentication": f"!{AUTH_RESPONSE.CHALLENGE}"},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            value = res.json.get("result").get("value")
+            self.assertEqual(2, value.get("count"), value)
+            self.assertIn(None, [entry.get("authentication") for entry in value.get("auditdata")], value)
+
+        # a positive filter still does not match it
+        with self.app.test_request_context('/audit/',
+                                           method='GET',
+                                           query_string={"action": "enroll",
+                                                         "authentication": AUTH_RESPONSE.CHALLENGE},
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res)
+            value = res.json.get("result").get("value")
+            self.assertEqual(1, value.get("count"), value)
+
+    def test_08_an_audit_policy_is_read_with_its_wildcard_and_exclusions(self):
+        self.setUp_user_realms()
+        Audit.query.delete()
+        for realm in (self.realm1a, self.realm1a, self.realm2b):
+            Audit(action="enroll", success=1, realm=realm).save()
+
+        def enroll_realms() -> list[str]:
+            with self.app.test_request_context('/audit/', method='GET', query_string={"action": "enroll"},
+                                               headers={'Authorization': self.at}):
+                res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res.json)
+            return sorted(entry["realm"] for entry in res.json["result"]["value"]["auditdata"])
+
+        every_entry = [self.realm1a, self.realm1a, self.realm2b]
+        try:
+            set_policy("audit_realms", scope=SCOPE.ADMIN, action=PolicyAction.AUDIT, realm="*")
+            self.assertEqual(every_entry, enroll_realms())
+
+            set_policy("audit_realms", scope=SCOPE.ADMIN, action=PolicyAction.AUDIT, realm=f"*,!{self.realm2b}")
+            self.assertEqual([self.realm1a, self.realm1a], enroll_realms())
+
+            # A policy with no target scope at all grants every realm, whatever another policy names.
+            set_policy("audit_every_realm", scope=SCOPE.ADMIN, action=PolicyAction.AUDIT)
+            self.assertEqual(every_entry, enroll_realms())
+            delete_policy("audit_every_realm")
+
+            # A policy scoped by user grants no realm, since the audit log can not show just that user: next to
+            # another policy it adds nothing, and on its own it leaves the admin's own entries only.
+            set_policy("audit_one_user", scope=SCOPE.ADMIN, action=PolicyAction.AUDIT, user="cornelius")
+            self.assertEqual([self.realm1a, self.realm1a], enroll_realms())
+            for realm in ("*", self.realm2b):
+                set_policy("audit_one_user", scope=SCOPE.ADMIN, action=PolicyAction.AUDIT, user="cornelius",
+                           realm=realm)
+                self.assertEqual([self.realm1a, self.realm1a], enroll_realms(), realm)
+            delete_policy("audit_realms")
+            for realm in (None, "*", self.realm2b):
+                set_policy("audit_one_user", scope=SCOPE.ADMIN, action=PolicyAction.AUDIT, user="cornelius",
+                           realm=realm)
+                self.assertEqual([], enroll_realms(), realm)
+            delete_policy("audit_one_user")
+
+            # A realm field that matches no realm grants no realm.
+            set_policy("audit_realms", scope=SCOPE.ADMIN, action=PolicyAction.AUDIT, realm=f"!{self.realm2b}")
+            self.assertEqual([], enroll_realms())
+        finally:
+            for name in ("audit_realms", "audit_every_realm", "audit_one_user"):
+                with suppress(ResourceNotFoundError):
+                    delete_policy(name)
+
+    def test_09_search_by_day_matches_that_day_only(self):
+        Audit.query.delete()
+        for day, hour in ((24, 23), (25, 0), (25, 23), (26, 0)):
+            Audit(action="enroll", success=1, date=datetime(2026, 9, day, hour, 30)).save()
+        # 2024-12-30 lies in ISO week 1 of 2025, so the day is only found under its calendar year.
+        Audit(action="enroll", success=1, date=datetime(2024, 12, 30, 12, 0)).save()
+
+        for day, expected in (("2026-09-25", ["2026-09-25", "2026-09-25"]),
+                              ("2024-12-30", ["2024-12-30"]),
+                              ("2025-12-30", [])):
+            with self.app.test_request_context('/audit/',
+                                               method='GET',
+                                               query_string={"action": "enroll", "date": f"*{day}*"},
+                                               headers={'Authorization': self.at}):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(200, res.status_code, res)
+                value = res.json.get("result").get("value")
+                self.assertEqual(expected, sorted(entry.get("date")[:10] for entry in value.get("auditdata")), day)

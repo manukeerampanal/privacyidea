@@ -9,21 +9,25 @@ REST API
 
 Start to read about authentication to the API at :ref:`rest_auth`.
 
-Now you can take a look at the several REST endpoints.
-
 .. toctree::
 
    api/audit
    api/auth
    api/validate
+   api/authentication_log
+   api/conditional_access
    api/system
+   api/tokengroup
+   api/serviceid
    api/resolver
    api/realm
    api/defaultrealm
    api/token
+   api/container
    api/user
    api/policy
    api/event
+   api/healthcheck
    api/machineresolver
    api/machines
    api/privacyideaserver
@@ -39,3 +43,5 @@ Now you can take a look at the several REST endpoints.
    api/radiusserver
    api/subscriptions
    api/client
+   api/clients
+   api/info

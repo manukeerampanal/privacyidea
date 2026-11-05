@@ -1,0 +1,191 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div
+  #scrollContainer
+  appScrollToTop
+  class="privacyidea-server-page-layout">
+  <div class="privacyidea-server-page-container">
+    @if (isEditMode()) {
+      <h3
+        class="margin-8"
+        i18n="@@piServer.editPrivacyidea"
+        >Edit privacyIDEA Server</h3
+      >
+    } @else {
+      <h3
+        class="margin-8"
+        i18n="@@piServer.createPrivacyidea"
+        >Create privacyIDEA Server</h3
+      >
+    }
+
+    <div
+      class="header-row sticky-header"
+      [appStickyHeader]="scrollContainer">
+      <div class="action-buttons">
+        @if (isEditMode() && authService.actionAllowed("privacyideaserver_write")) {
+          <button
+            (click)="deleteServer()"
+            class="action-button-delete-secondary button-width-s"
+            mat-stroked-button>
+            <mat-icon>delete</mat-icon>
+            <span i18n="@@common.delete">Delete</span>
+          </button>
+        }
+        <button
+          (click)="onCancel()"
+          class="action-button-secondary button-width-s"
+          mat-stroked-button>
+          <span i18n="@@common.cancel">Cancel</span>
+        </button>
+        <button
+          (click)="save()"
+          [disabled]="!privacyideaForm().valid() || !privacyideaForm().dirty()"
+          class="action-button-primary button-width-s"
+          mat-stroked-button>
+          <mat-icon>save</mat-icon>
+          <span i18n="@@common.save">Save</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="privacyidea-server-form">
+      <div class="flex-row gap-16 margin-bottom-16">
+        <mat-form-field
+          appearance="fill"
+          class="input-width-l">
+          <mat-label i18n="@@common.identifier">Identifier</mat-label>
+          <app-clearable-input
+            (clearButtonClick)="privacyideaModel.update(m => ({...m, identifier: ''}))"
+            [showClearButton]="!isEditMode() && !!privacyideaModel().identifier">
+            <input
+              [formField]="privacyideaForm.identifier"
+              matInput
+              placeholder="myRemotePrivacyIDEAServer" />
+          </app-clearable-input>
+          @if (privacyideaForm.identifier().errors().some(e => e.kind === 'required')) {
+            <mat-error i18n="@@common.identifierRequired">Identifier is <strong>required</strong></mat-error>
+          }
+          @if (privacyideaForm.identifier().errors().some(e => e.kind === 'pattern')) {
+            <mat-error i18n="@@common.identifierContains"
+              >Identifier contains <strong>invalid characters</strong>. Only alphanumeric characters, dots, underscores
+              and hyphens are allowed.</mat-error
+            >
+          }
+          @if (privacyideaForm.identifier().errors().some(e => e.kind === 'reservedName')) {
+            <mat-error i18n="@@common.cannotBeNamed">Cannot be named "{{ privacyideaForm.identifier().value() }}".</mat-error>
+          }
+          <mat-hint i18n="@@piServer.uniqueIdentifying"
+            >This is the unique identifying name of the privacyIDEA server definition.</mat-hint
+          >
+        </mat-form-field>
+
+        <mat-form-field
+          appearance="fill"
+          class="input-width-l">
+          <mat-label i18n="@@piServer.urlPrivacyidea">URL of the privacyIDEA Server</mat-label>
+          <app-clearable-input
+            (clearButtonClick)="privacyideaModel.update(m => ({...m, url: ''}))"
+            [showClearButton]="!!privacyideaModel().url">
+            <input
+              [formField]="privacyideaForm.url"
+              matInput
+              placeholder="https://pi17.example.com/" />
+          </app-clearable-input>
+          @if (privacyideaForm.url().errors().some(e => e.kind === 'required')) {
+            <mat-error i18n="@@piServer.urlPrivacyideaServer"
+              >URL of the privacyIDEA Server is <strong>required</strong></mat-error
+            >
+          }
+          <mat-hint i18n="@@piServer.pleaseProvide">Please provide the base URL of the privacyIDEA server.</mat-hint>
+        </mat-form-field>
+      </div>
+
+      <div class="margin-top-16">
+        <mat-checkbox
+          [checked]="privacyideaModel().tls"
+          (change)="privacyideaModel.update(m => ({...m, tls: $event.checked}))">
+          <span i18n="@@piServer.verifyCertificate">Verify the Certificate</span>
+        </mat-checkbox>
+        <p
+          class="mat-hint"
+          i18n="@@piServer.certificateChecked"
+          >The certificate will be checked for a valid hostname and for a trusted certificate. <br />
+          Do not uncheck this in productive use!</p
+        >
+      </div>
+
+      <mat-form-field
+        appearance="fill"
+        class="input-width-xl margin-top-16">
+        <mat-label i18n="@@common.description">Description</mat-label>
+        <app-clearable-input
+          (clearButtonClick)="privacyideaModel.update(m => ({...m, description: ''}))"
+          [showClearButton]="!!privacyideaModel().description">
+          <textarea
+            [formField]="privacyideaForm.description"
+            matInput
+            rows="3"></textarea>
+        </app-clearable-input>
+      </mat-form-field>
+
+      <div class="flex-row ali-center gap-16 margin-bottom-16">
+        <div class="flex-column">
+          <mat-form-field
+            appearance="fill"
+            class="input-width-l">
+            <mat-label i18n="@@common.user">User</mat-label>
+            <app-clearable-input
+              (clearButtonClick)="privacyideaModel.update(m => ({...m, username: ''}))"
+              [showClearButton]="!!privacyideaModel().username">
+              <input
+                [formField]="privacyideaForm.username"
+                matInput />
+            </app-clearable-input>
+          </mat-form-field>
+
+          <mat-form-field
+            appearance="fill"
+            class="input-width-l">
+            <mat-label i18n="@@common.password">Password</mat-label>
+            <app-clearable-input
+              (clearButtonClick)="privacyideaModel.update(m => ({...m, password: ''}))"
+              [showClearButton]="!!privacyideaModel().password">
+              <input
+                autocomplete="new-password"
+                [formField]="privacyideaForm.password"
+                matInput
+                type="password" />
+            </app-clearable-input>
+          </mat-form-field>
+        </div>
+
+        <button
+          (click)="test()"
+          [disabled]="!privacyideaForm().valid() || isTesting()"
+          class="action-button-secondary button-width-m margin-bottom-16"
+          mat-stroked-button
+          type="button">
+          <mat-icon>send</mat-icon>
+          <span i18n="@@piServer.sendTestRequest">Send Test Request</span>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,57 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<mat-expansion-panel>
+  <mat-expansion-panel-header>
+    <mat-panel-title i18n="@@tokenTypeConfig.remote">Remote</mat-panel-title>
+  </mat-expansion-panel-header>
+  <div class="panel-content expansion-well">
+    <p i18n="@@tokenTypeConfig.remoteTokenForwards"
+      >The Remote token forwards the authentication request to another privacyIDEA server.</p
+    >
+
+    <div class="flex-row gap-16 ali-center">
+      <mat-checkbox
+        [checked]="verifySSL()"
+        (change)="updateFormData(REMOTE_VERIFY_SSL, $event.checked)"
+        i18n="@@tokenTypeConfig.verifySslCertificate"
+        >Verify SSL certificate</mat-checkbox
+      >
+    </div>
+
+    <div class="flex-row gap-16 ali-center">
+      <mat-form-field
+        appearance="fill"
+        class="input-width-l">
+        <mat-label i18n="@@tokenTypeConfig.defaultRemote">Default Remote Server</mat-label>
+        <input
+          #remoteServerInput
+          [value]="formData()[REMOTE_SERVER] ?? ''"
+          (input)="updateFormData(REMOTE_SERVER, $any($event.target).value)"
+          matInput
+          placeholder="https://your.other.privacyidea.server"
+          required />
+        @if (remoteServerInput.validity.valueMissing) {
+          <mat-error i18n="@@tokenTypeConfig.defaultRemoteServer"
+            >Default Remote Server is <strong>required</strong></mat-error
+          >
+        }
+      </mat-form-field>
+    </div>
+  </div>
+</mat-expansion-panel>

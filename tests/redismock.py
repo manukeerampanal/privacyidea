@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 2015-06-04 Create REDIS mock
            Cornelius Kölbel <cornelius@privacyidea.org>
@@ -19,16 +18,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from __future__ import (
-    absolute_import, print_function, division, unicode_literals
-)
-
 from collections import namedtuple
 
-try:
-    from collections import Sequence, Sized
-except ImportError:
-    from collections.abc import Sequence, Sized
+from collections.abc import Sequence, Sized
 
 from .smtpmock import get_wrapped
 
@@ -61,7 +53,7 @@ class CallList(Sequence, Sized):
         self._calls = []
 
 
-class Redis(object):
+class Redis:
 
     def __init__(self):
         self.dictionary = {}
@@ -77,7 +69,7 @@ class Redis(object):
         self.dictionary = data
 
 
-class RedisMock(object):
+class RedisMock:
 
     def __init__(self):
         self._calls = CallList()
@@ -106,7 +98,7 @@ class RedisMock(object):
         self.data = data
 
     def start(self):
-        import mock
+        from unittest import mock
 
         def unbound_on_Redis(hostname):
             self.redis_obj = Redis()

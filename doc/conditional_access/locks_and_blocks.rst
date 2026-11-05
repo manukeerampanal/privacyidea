@@ -1,0 +1,237 @@
+.. index:: PI_CONDITIONAL_ACCESS_NEVER_BLOCK, never-block
+.. _conditional_access_locks_and_blocks:
+
+Locks and blocks
+================
+
+A lock or a block created by a policy stays in force until it expires or an
+administrator lifts it. Both are listed in the WebUI, where they can also be
+lifted. Individual addresses or whole networks can be exempted from ever being
+blocked, see :ref:`conditional_access_never_block`.
+
+A **Cause** column says whether a conditional access policy or an administrator imposed the
+restriction now in force - *Policy* or *Manual* - and can be filtered on. It
+describes the restriction on record rather than its history: an administrator who
+replaces a policy lock by hand turns it into a manual one, and a policy that
+strengthens a manual lock turns it back, because the cause is written together
+with the expiry it belongs to. A manual restriction is also the one that no
+threshold created, so it lifts only when someone lifts it or its own duration
+runs out.
+
+Each entry also shows the error message the restriction carries - what the
+affected user is being told on the requests it refuses, or nothing where the stage
+said nothing. It is a copy taken when a policy wrote the restriction, see
+:ref:`conditional_access_error_messages_snapshot`. A restriction set by hand
+carries none, also where it replaces one a policy wrote: the policy's copy is
+cleared together with its expiry and cause. Such a restriction is silent unless
+``show_default_ca_error_message`` is set.
+
+
+.. _conditional_access_policies_lifting:
+
+Lifting locks and blocks
+------------------------
+
+*Audit → Locked Users* and *Audit → IP Blocklist* show the restrictions in force,
+with the permanent ones marked. An entry can be lifted individually or in bulk.
+Expired records restrict nobody. They are listed until they are purged - from
+the same pages, or daily by the Ubuntu packages and the Docker image, see
+:ref:`cleanup_jobs` - or until the next authentication request of that user, or
+from that address, removes them. A block on an address that has since been
+added to ``PI_CONDITIONAL_ACCESS_NEVER_BLOCK`` is removed the same way. The
+authentication log keeps the history.
+
+The same can be done on the command line with :ref:`pi-manage <pimanage>`::
+
+   pi-manage conditionalaccess list-locked-users
+   pi-manage conditionalaccess unlock-user <login> --realm <realm>
+   pi-manage conditionalaccess unlock-user <login> --admin
+   pi-manage conditionalaccess unlock-by-id --uid <uid> --realm <realm>
+   pi-manage conditionalaccess clear-locks [--realm <realm>]
+   pi-manage conditionalaccess purge-expired-locks
+
+   pi-manage conditionalaccess list-blocked-ips
+   pi-manage conditionalaccess unblock-ip <ip>
+   pi-manage conditionalaccess clear-blocks
+   pi-manage conditionalaccess purge-expired-blocks
+
+``unlock-user`` takes the login name as an argument and requires ``--realm``.
+It lifts every lock standing under that login name in the realm - if the login
+exists in more than one resolver, the locks of all of them; add ``--resolver``
+to lift only the lock of the user in that resolver. For a
+**local administrator** pass ``--admin`` instead of ``--realm``: such an account
+lives in the ``admin`` table rather than in a realm, so its login name is the
+whole identity, see :ref:`conditional_access_local_admins`.
+``unlock-by-id`` does the same for a user that no longer resolves to a login,
+taking the stored ``--uid`` and ``--realm`` instead; it too lifts every lock
+with that uid in the realm unless ``--resolver`` narrows it to one resolver. The
+two ``clear-`` commands remove everything and ask for confirmation first, so pass
+``--yes`` when calling them from a script.
+
+.. note:: If you lock yourself out of the WebUI with a source IP policy, use
+   ``pi-manage conditionalaccess clear-blocks`` on the server, or add your
+   address to ``PI_CONDITIONAL_ACCESS_NEVER_BLOCK``, see
+   :ref:`conditional_access_never_block`. If a *user* policy locked your local
+   administrator account, ``pi-manage conditionalaccess unlock-user <login>
+   --admin`` lifts it.
+
+Lifting a lock or a block only undoes what a policy has already done; the policy
+keeps counting. Whether it restricts again depends on the action: one with
+*Re-trigger while above the threshold* does so on the next request the policy
+tracks while the count is still in its stage's range, and a fire-once action
+only once the count has dropped below its threshold and reached it again, see
+:ref:`conditional_access_policies_stages`. Switching the policy itself off,
+which is what a ``DENY`` needs (it stores nothing that could be lifted), is
+described in :ref:`conditional_access_policies_cli`.
+
+.. _conditional_access_manual_restrictions:
+
+Locking or blocking by hand
+---------------------------
+
+.. index:: manual lock, manual block
+
+A restriction does not have to come from a policy. The *User Lock State* card on
+a user's details page offers a **Lock** action and the *IP Blocklist* page a
+**Block IP** action; both ask whether the restriction lasts until an administrator lifts
+it (the default) or for a chosen duration. On the command line::
+
+   pi-manage conditionalaccess lock-user <login> --realm <realm> [--duration <seconds>]
+   pi-manage conditionalaccess lock-user <login> --admin [--duration <seconds>]
+   pi-manage conditionalaccess block-ip <ip> [--duration <seconds>]
+
+A manual restriction is written to the same place a policy writes to and is
+enforced by the same pre-check, so at authentication time it behaves exactly like
+a policy lock, is described by the same *Cause* column, and is lifted by the same
+actions.
+
+Unlike a policy action, a manual write is **authoritative**: an administrator may
+replace a permanent lock with a timed one, which the engine refuses to do to
+itself, since a policy never weakens a restriction - that rule exists so the
+order two policies happen to fire in cannot decide the outcome. An address on the
+never-block list is refused with an explanation rather than silently skipped,
+which is the other way round from the engine, see
+:ref:`conditional_access_never_block`.
+
+A block is stored under the client IP that privacyIDEA uses for the address. If you
+block an IPv4-mapped address such as ``::ffff:192.0.2.1``, the block is stored under
+``192.0.2.1``. It applies whether the client is reported as ``192.0.2.1`` or as
+``::ffff:192.0.2.1``, see :ref:`override_client`.
+
+Imposing a restriction has rights of its own, :ref:`policy_user_lock_set` and
+:ref:`policy_blocklist_set`, kept apart from the ``*_reset`` rights.
+
+The lock rights are scoped like any other administrator right: a policy naming
+realms, resolvers or users reaches only the locks of the users it names. The
+blocklist rights cannot be, an entry being a source IP with none of those three
+dimensions to it - so a policy that scopes its target and grants a blocklist
+right names nothing in the blocklist, and such a request is refused rather than
+read as unrestricted. Grant the blocklist rights without a target scope.
+
+A local administrator is locked by hand from the command line only, with
+``--admin`` in place of ``--realm``. There is no WebUI action for it: the
+**Lock** button lives on a user's details page, and a local administrator has
+none.
+
+
+.. _conditional_access_local_admins:
+
+Local administrators
+--------------------
+
+.. index:: local administrator, internal admin
+
+Local (internal) administrators - the accounts created with ``pi-manage admin
+add``, which authenticate at ``/auth`` and live in the ``admin`` table rather
+than in a realm - are locked by ``user`` policies like anybody else. They are
+identified differently, though, and it shows in a few places:
+
+* They have no realm or resolver. Their login name **is** the identity, and it is
+  what both the failure count and the lock are keyed on, together with the role
+  the authentication log records them under (*admin-internal*).
+* On MySQL and MariaDB the ``admin`` table matches a login without regard to
+  case, so ``Admin`` and ``admin`` authenticate the same account. Counting and
+  locking follow that: whichever spelling is typed, the failures are counted
+  against the one account and the lock is written under the name the table
+  holds. Unlocking by name lifts every lock standing under a spelling of it,
+  since each of them would bar the account from logging in.
+* On *Audit → Locked Users* such an entry carries an **internal admin** badge and
+  has no realm, resolver or link to a user page. It is lifted like any other,
+  individually or in bulk.
+* On the command line they are addressed with ``--admin`` instead of
+  ``--realm``, both to lock and to unlock.
+* A **target-scoped** administrator does not see or lift their locks. An admin
+  policy is scoped by realm, resolver and user - userstore terms, none of which
+  describes an account that has only a login name - so such a delegation stops
+  at ordinary users, and a policy scoped to a login name does not reach a local
+  administrator who happens to share it. Lifting one needs a ``user_lock_reset``
+  policy with no target scope, or the command line.
+* If a user of the same login name exists, the two share a lockout. ``/auth``
+  takes a bare login name and only learns which of them was meant from the
+  credential that matches, so a request is refused while *either* is locked - and
+  a lock standing on such a user in **any** realm counts, the realm the name
+  would have resolved to not being settled that early. Anything else would let
+  the name be locked over and over without a single request being refused. The
+  failure count is shared for the same reason (see :ref:`policy_auth_max_fail`).
+
+  The one thing the user's lock does not do is lock the administrator out of an
+  account no policy may lock in the first place. Where every enforcing locking
+  policy excludes them - by the ``USER_ROLE`` condition below, or any other
+  condition that does not match them - the administrator's own password still
+  gets in, while the same-named user stays refused on the request that turns out
+  to be theirs.
+
+  .. warning:: That is the only part the exemption settles. The **count** is
+     still shared: failed logins under the bare name are counted against the
+     user, the request being a user's as soon as the administrator password does
+     not match, so the user can end up locked by logins meant for the
+     administrator. Which account a bare name means is unknown until a credential
+     matches, and nothing in the request decides it. **Give the local
+     administrator a login name no realm will ever hold** - that is what makes
+     this section mean what it says.
+
+Since a lock applies to them like anyone else, a policy can lock out the account
+you would use to undo it. Two things guard against that: a timed lock lifts
+itself, and ``pi-manage conditionalaccess unlock-user <login> --admin`` lifts one
+from the server without needing to log in. To keep such an account out of a
+policy altogether, give the policy a ``USER_ROLE NOT IN [admin-internal]``
+condition, and read what that exemption costs in
+:ref:`conditional_access_policies_exceptions`. The shipped templates do not
+carry this condition, so a ``user`` policy created from a template reaches the
+local administrator like anybody else until you add it.
+
+
+.. _conditional_access_never_block:
+
+Never blocking an address
+-------------------------
+
+Blocking the wrong address can lock out everybody. ``127.0.0.0/8`` and
+``::1/128`` are therefore never blocked. Further addresses and networks are
+added in ``PI_CONDITIONAL_ACCESS_NEVER_BLOCK``, a server-configuration setting
+with no WebUI or API - deliberately, since it is the safety net that keeps an
+administrator from locking themselves out. See
+:ref:`ini_conditional_access_never_block` for the setting itself.
+
+An IPv4 entry also covers the IPv4-mapped form of the same address
+(``::ffff:10.0.0.1`` for ``10.0.0.1``), which is what a dual-stack listener
+reports for an IPv4 client. Tunnel encodings that merely carry an IPv4 address
+(6to4, Teredo) are not covered: unlike the mapped form, those are chosen by the
+client rather than by the operating system.
+
+The exemption is checked both when a block is created and when an existing one
+is enforced, so adding an address immediately stops a block already in force
+from taking effect. It withholds the block itself, not the whole policy: an
+exempt address is never blocked and is never refused by the ``DENY`` of a
+``source_ip`` policy, but a policy it trips still counts, still records what it
+did in the authentication log, and still runs the other actions of the stage -
+an ``EMAIL_ADMIN`` alongside the block is sent as usual. ``user`` policies do
+not look at the address at all: their ``DENY`` and the locks they write apply to
+requests from an exempt address like to any other.
+
+.. warning:: A source IP is only meaningful if privacyIDEA sees the real client
+   address. Behind a reverse proxy or a load balancer you have to configure
+   ``OverrideAuthorizationClient`` in the :ref:`system_config`. Otherwise every
+   request appears to come from the proxy, and a single ``BLOCK_IP`` action
+   blocks all of them. List your proxies, load balancers and management
+   networks in ``PI_CONDITIONAL_ACCESS_NEVER_BLOCK``.

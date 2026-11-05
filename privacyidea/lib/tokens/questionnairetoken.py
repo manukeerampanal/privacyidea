@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2020-09-21 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Add possibility of multiple questions and answers
 #  http://www.privacyidea.org
@@ -26,34 +24,32 @@ user is asked one of these questions and can respond with the corresponding
 answer.
 """
 
-from privacyidea.api.lib.utils import getParam
+from privacyidea.lib.params import get_required
 from privacyidea.lib.config import get_from_config
 from privacyidea.lib.tokenclass import TokenClass
 from privacyidea.lib.log import log_with
 from privacyidea.lib.error import TokenAdminError
 import logging
-from privacyidea.models import Challenge
 from privacyidea.lib.challenge import get_challenges
+from privacyidea.lib.token import create_challenge
 from privacyidea.lib import _
 from privacyidea.lib.decorators import check_token_locked
-from privacyidea.lib.policy import SCOPE, ACTION, GROUP, get_action_values_from_options
+from privacyidea.lib.policy import SCOPE, GROUP, get_action_values_from_options
+from privacyidea.lib.policies.actions import PolicyAction
 from privacyidea.lib.crypto import safe_compare
-import random
+import secrets
 import json
 import datetime
 
 log = logging.getLogger(__name__)
-optional = True
-required = False
 DEFAULT_NUM_ANSWERS = 5
 
 
-class QUESTACTION(object):
+class QUESTACTION:
     NUM_QUESTIONS = "number"
 
 
 class QuestionnaireTokenClass(TokenClass):
-
     """
     This is a Questionnaire Token. The token stores a list of questions and
     answers in the tokeninfo database table. The answers are encrypted.
@@ -62,11 +58,25 @@ class QuestionnaireTokenClass(TokenClass):
     The user has to remember and pass the right answer.
     """
 
+    @classmethod
+    def is_owned_tokeninfo_key(cls, key: str) -> bool:
+        """
+        Every token info key of a questionnaire token is owned by the token class. The questions are the keys and
+        the answers are the values, both are chosen during enrollment, so the keys are not known up front and
+        cannot be declared. A key that is not a question would be indistinguishable from one that is, and the
+        answers are the shared secret of this token type, so the whole token info is written during the
+        enrollment only. Free-form notes belong in the description of the token.
+
+        :param key: The token info key to check
+        :return: Always True
+        """
+        return True
+
     @staticmethod
     def get_class_type():
         """
         Returns the internal token type identifier
-        :return: qust
+        :return: question
         :rtype: basestring
         """
         return "question"
@@ -99,7 +109,7 @@ class QuestionnaireTokenClass(TokenClass):
                                 'user.'),
                'init': {},
                'config': {},
-               'user':  ['enroll'],
+               'user': ['enroll'],
                # This tokentype is enrollable in the UI for...
                'ui_enroll': ["admin", "user"],
                'policy': {
@@ -112,14 +122,15 @@ class QuestionnaireTokenClass(TokenClass):
                        }
                    },
                    SCOPE.ENROLL: {
-                       ACTION.MAXTOKENUSER: {
+                       PolicyAction.MAXTOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of questionaire tokens assigned."),
                            'group': GROUP.TOKEN
                        },
-                       ACTION.MAXACTIVETOKENUSER: {
+                       PolicyAction.MAXACTIVETOKENUSER: {
                            'type': 'int',
-                           'desc': _("The user may only have this maximum number of active questionaire tokens assigned."),
+                           'desc': _("The user may only have this maximum number of active questionaire "
+                                     "tokens assigned."),
                            'group': GROUP.TOKEN
                        }
                    }
@@ -153,7 +164,7 @@ class QuestionnaireTokenClass(TokenClass):
         :type param: dict
         :return: None
         """
-        j_questions = getParam(param, "questions", required)
+        j_questions = get_required(param, "questions")
         try:
             # If we have a string, we load the json format
             questions = json.loads(j_questions)
@@ -165,9 +176,16 @@ class QuestionnaireTokenClass(TokenClass):
         if len(questions) < int(num_answers):
             raise TokenAdminError(_("You need to provide at least %s "
                                     "answers.") % num_answers)
+        # Replace the questions of the token instead of adding to them. create_challenge() asks any question
+        # that is stored, so a question of a previous set would stay answerable and its answer would keep
+        # authenticating, even though it is not part of the questions the token was enrolled with.
+        previous_questions = [tokeninfo.Key for tokeninfo in self.token.info_list if tokeninfo.Type == "password"]
+        for question in previous_questions:
+            if question not in questions:
+                self.remove_tokeninfo(question)
         # Save all questions and answers and encrypt them
         for question, answer in questions.items():
-            self.add_tokeninfo(question, answer, value_type="password")
+            self.write_tokeninfo(question, answer, value_type="password")
         TokenClass.update(self, param)
 
     def is_challenge_request(self, passw, user=None, options=None):
@@ -185,7 +203,6 @@ class QuestionnaireTokenClass(TokenClass):
         :return: true or false
         :rtype: bool
         """
-        request_is_challenge = False
         options = options or {}
         pin_match = self.check_pin(passw, user=user, options=options)
         return pin_match
@@ -217,7 +234,7 @@ class QuestionnaireTokenClass(TokenClass):
         questions = {}
 
         # Get an integer list of the already used questions
-        used_questions = [int(x) for x in options.get("data", "").split(",") if options.get("data")]
+        used_questions = options.get("data", {}).get("used_questions", [])
         # Fill the questions of the token
         for tinfo in self.token.info_list:
             if tinfo.Type == "password":
@@ -225,13 +242,13 @@ class QuestionnaireTokenClass(TokenClass):
                 questions[tinfo.id] = tinfo.Key
         # if all questions are used up, make a new round
         if len(questions) == len(used_questions):
-            log.info(u"User has only {0!s} questions in his token. Reusing questions now.".format(len(questions)))
+            log.info(f"User has only {len(questions)!s} questions in his token. Reusing questions now.")
             used_questions = []
         # Reduce the allowed questions
         remaining_questions = {k: v for (k, v) in questions.items() if k not in used_questions}
-        message_id = random.choice(list(remaining_questions))
+        message_id = secrets.choice(list(remaining_questions))
         message = remaining_questions[message_id]
-        used_questions = (options.get("data", "") + ",{0!s}".format(message_id)).strip(",")
+        used_questions = used_questions + [message_id]
 
         validity = int(get_from_config('DefaultChallengeValidityTime', 120))
         tokentype = self.get_tokentype().lower()
@@ -240,16 +257,15 @@ class QuestionnaireTokenClass(TokenClass):
         validity = int(get_from_config(lookup_for, validity))
 
         # Create the challenge in the database
-        db_challenge = Challenge(self.token.serial,
-                                 transaction_id=transactionid,
-                                 data=used_questions,
-                                 session=options.get("session"),
-                                 challenge=message,
-                                 validitytime=validity)
-        db_challenge.save()
+        db_challenge = create_challenge(self.token.serial,
+                                        transaction_id=transactionid,
+                                        data={"used_questions": used_questions},
+                                        session=options.get("session"),
+                                        challenge=message,
+                                        validitytime=validity)
         expiry_date = datetime.datetime.now() + \
                       datetime.timedelta(seconds=validity)
-        reply_dict = {'attributes': {'valid_until': "{0!s}".format(expiry_date)}}
+        reply_dict = {'attributes': {'valid_until': f"{expiry_date!s}"}}
         return True, message, db_challenge.transaction_id, reply_dict
 
     def check_answer(self, given_answer, challenge_object):
@@ -271,8 +287,7 @@ class QuestionnaireTokenClass(TokenClass):
         if safe_compare(answer, given_answer):
             res = 1
         else:
-            log.debug("The answer for token {0!s} does not match.".format(
-                      self.get_serial()))
+            log.debug(f"The answer for token {self.get_serial()!s} does not match.")
         return res
 
     @check_token_locked
@@ -335,14 +350,13 @@ class QuestionnaireTokenClass(TokenClass):
         challengeobject_list = get_challenges(serial=self.token.serial,
                                               transaction_id=transaction_id)
         question_number = int(get_action_values_from_options(SCOPE.AUTH,
-                                                             "{0!s}_{1!s}".format(self.get_class_type(),
-                                                                                  QUESTACTION.NUM_QUESTIONS),
+                                                             f"{self.get_class_type()!s}_{QUESTACTION.NUM_QUESTIONS!s}",
                                                              options) or 1)
         if len(challengeobject_list) == 1:
             session = int(challengeobject_list[0].session or "0") + 1
-            options["session"] = u"{0!s}".format(session)
+            options["session"] = f"{session!s}"
             # write the used questions to the data field
-            options["data"] = challengeobject_list[0].data or ""
+            options["data"] = challengeobject_list[0].get_data()
             if session < question_number:
                 return True
         return False
@@ -356,5 +370,6 @@ class QuestionnaireTokenClass(TokenClass):
         :param key: The key of the setting
         :return: "public" string
         """
-        if key.startswith("question.question."):
+        if key.startswith("question.question.") or key == "question.num_answers":
             return "public"
+        return ""

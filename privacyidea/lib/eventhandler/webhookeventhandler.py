@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 # License:  AGPLv3
 # (c)
 #
@@ -17,35 +15,46 @@
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 #
-__doc__ = """This is th event handler module for posting webhooks.
-You can send an webhook to trigger an event on an other system or use to replace
+__doc__ = """This is the event handler module for posting webhooks.
+You can send a webhook to trigger an event on another system or use it to replace
 api requests and reduce your traffic this way.
 
 """
 
 from privacyidea.lib.eventhandler.base import BaseEventHandler
 from privacyidea.lib import _
+from privacyidea.lib.utils import create_tag_dict, is_true
 import json
 import logging
 import requests
 from requests.exceptions import HTTPError, Timeout, ConnectionError, RequestException
 from privacyidea.lib.user import User
-from privacyidea.lib.utils import replace_function_event_handler
-
+from privacyidea.lib.error import UserError
 
 log = logging.getLogger(__name__)
 TIMEOUT = 10
 
 
-class CONTENT_TYPE(object):
+class ContentType:
     """
-    Allowed type off content
+    Allowed content types sent as the HTTP Content-Type header.
     """
-    JSON = "json"
-    URLENCODED = "urlendcode"
+    JSON = "application/json"
+    URLENCODED = "application/x-www-form-urlencoded"
 
 
-class ACTION_TYPE(object):
+# Maps legacy values stored in the database to the proper HTTP Content-Type header values.
+# Older entries may have stored "json" or "urlencoded" as shortcuts before the correct
+# MIME types were introduced. Both old and new values are accepted.
+DB_CONTENT_TYPE_MAP = {
+    "json": ContentType.JSON,
+    "urlencoded": ContentType.URLENCODED,
+    ContentType.JSON: ContentType.JSON,
+    ContentType.URLENCODED: ContentType.URLENCODED,
+}
+
+
+class ActionType:
     """
     Allowed actions
     """
@@ -57,11 +66,11 @@ class WebHookHandler(BaseEventHandler):
     With the WebHook Handler, a webhook can be sent at a particular event
     """
 
-    identifier = "WebHookHandler"
+    identifier = "WebHook"
     description = "This eventhandler can post webhooks"
 
     @property
-    def allowed_positions(cls):
+    def allowed_positions(self):
         """
         This returns the allowed positions of the event handler definition.
 
@@ -70,7 +79,7 @@ class WebHookHandler(BaseEventHandler):
         return ["post", "pre"]
 
     @property
-    def actions(cls):
+    def actions(self):
         """
         This method returns a dictionary of allowed actions and possible
         options in this handler module.
@@ -78,7 +87,7 @@ class WebHookHandler(BaseEventHandler):
         :return: dict with actions
         """
         # The event handler has just one action. Maybe we can  hide action select for the clarity of the UI
-        actions = {ACTION_TYPE.POST_WEBHOOK: {
+        actions = {ActionType.POST_WEBHOOK: {
             "URL": {
                 "type": "str",
                 "required": True,
@@ -87,15 +96,23 @@ class WebHookHandler(BaseEventHandler):
             "content_type": {
                 "type": "str",
                 "required": True,
-                "description": _("The encoding that is sent to the WebHook, for example json"),
+                "description": _("The MIME type (Content-Type) used for the WebHook payload, for example "
+                                 "application/json or application/x-www-form-urlencoded"),
                 "value": [
-                    CONTENT_TYPE.JSON,
-                    CONTENT_TYPE.URLENCODED]
+                    ContentType.JSON,
+                    ContentType.URLENCODED]
             },
             "replace": {
                 "type": "bool",
                 "required": True,
-                "description": _("You can replace placeholder like {logged_in_user}")
+                "description": _("You can use the following placeholders: "
+                                 "{admin}, {realm}, {action}, {serial}, {url}, {user}, {surname}, "
+                                 "{givenname}, {username}, {userrealm}, {tokentype}, {tokendescription}, "
+                                 "{time}, {date}, {client_ip}, {ua_browser}, {ua_string}, {challenge}. "
+                                 "For backward compatibility the following aliases also work: "
+                                 "{logged_in_user}, {token_serial} (= {serial}), "
+                                 "{token_owner} (= {givenname}), {user_realm} (= {userrealm}). "
+                                 "Tag availability depends on the endpoint."),
             },
             "data": {
                 "type": "str",
@@ -122,55 +139,91 @@ class WebHookHandler(BaseEventHandler):
         handler_options = handler_def.get("options")
         webhook_url = handler_options.get("URL")
         webhook_text = handler_options.get("data")
-        content_type = handler_options.get("content_type")
-        replace = handler_options.get("replace")
-        token_serial = None
-        tokenowner = None
+        # Map the database entries, which might contain the older values, to the actual content type value
+        content_type = DB_CONTENT_TYPE_MAP.get(handler_options.get("content_type"))
+        replace = is_true(handler_options.get("replace"))
 
-        if request is not None:
-            token_serial = request.all_data.get('serial')
-            tokenowner = self._get_tokenowner(request)
-        user = User(login=g.logged_in_user.get('username'),
-                    realm=g.logged_in_user.get('realm'))
+        user = request.User if hasattr(request, 'User') else None
+        if not user:
+            try:
+                user = User(login=g.logged_in_user.get('username'),
+                            realm=g.logged_in_user.get('realm'))
+            except (UserError, AttributeError) as e:  # pragma: no cover
+                log.info(f'Could not determine user: {e}')
 
         if replace:
-            webhook_text = replace_function_event_handler(webhook_text, token_serial=token_serial,
-                                                          tokenowner=tokenowner, logged_in_user=user)
-
-        if action.lower() == ACTION_TYPE.POST_WEBHOOK:
+            # If tags should be replaced, gather information about the user and token
+            token_serial = request.all_data.get('serial', '') if request else ""
+            tokenowner = self._get_tokenowner(request) if request else None
+            logged_in_user = g.logged_in_user if hasattr(g, 'logged_in_user') else {}
             try:
-                if content_type == CONTENT_TYPE.JSON:
-                    """
-                    This is the main function where the webhook is sent.
-                    Documentation of the requests function is found her docs.python-requests.org
-                    """
-                    log.info('A webhook is send to {0!r} with the text: {1!r}'.format(
-                        webhook_url, webhook_text))
-                    resp = requests.post(webhook_url, data=json.dumps(webhook_text),
-                                         headers={'Content-Type': content_type}, timeout=TIMEOUT)
-                    # all answers will be logged in the debug. The HTTP response code will be shown in the audit too
-                    log.info(resp.status_code)
-                    log.debug(resp)
-                elif content_type == CONTENT_TYPE.URLENCODED:
-                    """
-                    This is the main function where the webhook is sent.
-                    Documentation of the requests function is found her docs.python-requests.org
-                    """
-                    log.info('A webhook is send to {0!r} with the text: {1!r}'.format(
-                        webhook_url, webhook_text))
-                    resp = requests.post(webhook_url, webhook_text,
-                                         headers={'Content-Type': content_type}, timeout=TIMEOUT)
-                    # all answers will be logged in the debug. The HTTP response code will be shown in the audit too
-                    log.info(resp.status_code)
-                    log.debug(resp)
+                token_serial, tokentype, tokendescription = self._get_token_data(token_serial, tokenowner)
+
+                tags = create_tag_dict(logged_in_user=logged_in_user,
+                                       request=request,
+                                       client_ip=g.client_ip if hasattr(g, 'client_ip') else None,
+                                       tokenowner=tokenowner,
+                                       serial=token_serial,
+                                       tokentype=tokentype,
+                                       tokendescription=tokendescription)
+                # Backward-compatible aliases so existing webhook configs keep working.
+                # The old {logged_in_user} was sourced from request.User first
+                # (the authenticating end-user), falling back to g.logged_in_user
+                # (the admin).  create_tag_dict always uses g.logged_in_user for
+                # {admin} and {realm}, so we keep {logged_in_user} as a separate
+                # alias that preserves the old request.User-first behavior.
+                tags["realm"] = user.realm if user else ""
+                tags["logged_in_user"] = user.login if user else ""
+                tags["token_serial"] = tags.get("serial", "")
+                tags["token_owner"] = tags.get("givenname", "")
+                tags["user_realm"] = tags.get("userrealm", "")
+
+                # Replace None values with empty strings so .format() doesn't insert 'None'
+                tags = {k: (v if v is not None else "") for k, v in tags.items()}
+
+                if content_type == ContentType.JSON:
+                    def replace_recursive(val):
+                        if isinstance(val, dict):
+                            return {
+                                k.format(**tags): replace_recursive(v)
+                                for k, v in val.items()
+                            }
+                        elif isinstance(val, list):
+                            return [replace_recursive(item) for item in val]
+                        elif isinstance(val, str):
+                            return val.format(**tags)
+                        else:
+                            # numbers, booleans, None – pass through unchanged
+                            return val
+
+                    new_json = replace_recursive(json.loads(webhook_text))
+                    webhook_text = json.dumps(new_json)
                 else:
-                    log.warning('Unknown content type value: {0!s}'.format(content_type))
+                    # Content Type URLENCODED, simple format
+                    webhook_text = webhook_text.format(**tags)
+            except (KeyError, AttributeError, IndexError) as err:
+                log.warning(f"Unable to replace placeholder: ({err})! Please check the webhooks data option.")
+            except (ValueError, TypeError) as err:
+                log.warning(f"Unable to parse JSON string '{webhook_text}': {err}")
+
+        # Send the request
+        if action.lower() == ActionType.POST_WEBHOOK:
+            if content_type in (ContentType.JSON, ContentType.URLENCODED):
+                try:
+                    log.info(f"A webhook is called at '{webhook_url}' with data: '{webhook_text}'")
+                    response = requests.post(webhook_url, data=webhook_text,
+                                             headers={'Content-Type': content_type}, timeout=TIMEOUT)
+                    # Responses will be logged when running debug. The HTTP response code will be shown in the audit too
+                    log.info(response.status_code)
+                    log.debug(response)
+                except (HTTPError, ConnectionError, RequestException, Timeout) as err:
+                    log.warning(err)
                     ret = False
-            # error handling
-            except (HTTPError, ConnectionError, RequestException, Timeout) as err:
-                log.warning(err)
-                return False
+            else:
+                log.warning(f'Unknown content type value: {handler_options.get("content_type")}')
+                ret = False
         else:
-            log.warning('Unknown action value: {0!s}'.format(action))
+            log.warning(f'Unknown action value: {action}')
             ret = False
+
         return ret

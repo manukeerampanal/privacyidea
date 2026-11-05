@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  privacyIDEA is a fork of LinOTP
 #  May 08, 2014 Cornelius Kölbel
 #  License:  AGPLv3
@@ -47,16 +45,15 @@ import requests
 from privacyidea.lib.utils import is_true
 from privacyidea.lib.decorators import check_token_locked
 from privacyidea.lib.config import get_from_config
-from privacyidea.api.lib.utils import getParam
+from privacyidea.lib.params import get_optional, get_required
 from privacyidea.lib.log import log_with
 from privacyidea.lib.policydecorators import challenge_response_allowed
-from privacyidea.lib.tokenclass import TokenClass, TOKENKIND
+from privacyidea.lib.tokenclass import TokenClass, Tokenkind, AuthenticationMode
 from privacyidea.lib.privacyideaserver import get_privacyideaserver
 from privacyidea.lib import _
-from privacyidea.lib.policy import SCOPE, ACTION, GROUP
+from privacyidea.lib.policy import SCOPE, GROUP
+from privacyidea.lib.policies.actions import PolicyAction
 
-optional = True
-required = False
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +70,15 @@ class RemoteTokenClass(TokenClass):
     Using the Remote token you can assign one physical token to many
     different users.
     """
+    mode = [AuthenticationMode.AUTHENTICATE, AuthenticationMode.CHALLENGE]
+
+    owned_tokeninfo_keys = frozenset({"last_matching_remote_serial"})
+    owned_tokeninfo_prefixes = frozenset({"remote."})
+    # Which server the request is forwarded to, and as whom, is set at enrollment and changes afterwards, e.g.
+    # when the remote privacyIDEA moves. "last_matching_remote_serial" is not listed, the server records it.
+    settable_tokeninfo_keys = frozenset({"remote.server", "remote.server_id", "remote.serial", "remote.user",
+                                         "remote.realm", "remote.resolver", "remote.path",
+                                         "remote.local_checkpin"})
 
     def __init__(self, db_token):
         """
@@ -81,8 +87,7 @@ class RemoteTokenClass(TokenClass):
         :param aToken: the db bound token
         """
         TokenClass.__init__(self, db_token)
-        self.set_type(u"remote")
-        self.mode = ['authenticate', 'challenge']
+        self.set_type("remote")
 
     @staticmethod
     def get_class_type():
@@ -118,12 +123,12 @@ class RemoteTokenClass(TokenClass):
                'ui_enroll': ["admin"],
                'policy': {
                    SCOPE.ENROLL: {
-                       ACTION.MAXTOKENUSER: {
+                       PolicyAction.MAXTOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of remote tokens assigned."),
                            'group': GROUP.TOKEN
                        },
-                       ACTION.MAXACTIVETOKENUSER: {
+                       PolicyAction.MAXACTIVETOKENUSER: {
                            'type': 'int',
                            'desc': _(
                                "The user may only have this maximum number of active remote tokens assigned."),
@@ -152,26 +157,32 @@ class RemoteTokenClass(TokenClass):
         self.set_otplen(6)
         TokenClass.update(self, param)
 
-        remote_server_id = getParam(param, "remote.server_id", optional)
+        # The parent class writes the software kind, this token forwards to another privacyIDEA
+        self.write_tokeninfo("tokenkind", Tokenkind.VIRTUAL)
+
+        # What this token forwards to is written from the enrollment parameters, so it is only taken while the
+        # token is being enrolled. Changing it later goes through POST /token/set.
+        if not self.is_being_enrolled():
+            return
+
+        remote_server_id = get_optional(param, "remote.server_id")
 
         if remote_server_id is not None:
             if get_privacyideaserver(id=remote_server_id):
-                self.add_tokeninfo("remote.server_id", remote_server_id)
+                self.write_tokeninfo("remote.server_id", remote_server_id)
         else:
-            remoteServer = getParam(param, "remote.server", required)
-            self.add_tokeninfo("remote.server", remoteServer)
+            remoteServer = get_required(param, "remote.server")
+            self.write_tokeninfo("remote.server", remoteServer)
             log.warning("Using remote.server for remote tokens is deprecated. Use remote.server_id!")
 
-        val = getParam(param, "remote.local_checkpin", optional) or 0
-        self.add_tokeninfo("remote.local_checkpin", val)
+        val = get_optional(param, "remote.local_checkpin") or 0
+        self.write_tokeninfo("remote.local_checkpin", val)
 
         for key in ["remote.serial", "remote.user", "remote.path",
                     "remote.realm", "remote.resolver"]:
-            val = getParam(param, key, optional)
+            val = get_optional(param, key)
             if val is not None:
-                self.add_tokeninfo(key, val)
-
-        self.add_tokeninfo("tokenkind", TOKENKIND.VIRTUAL)
+                self.write_tokeninfo(key, val)
 
     @property
     def check_pin_local(self):
@@ -181,11 +192,11 @@ class RemoteTokenClass(TokenClass):
         :return: bool
         """
         local_check = is_true(self.get_tokeninfo("remote.local_checkpin"))
-        log.debug(" local checking pin? {0!r}".format(local_check))
+        log.debug(f" local checking pin? {local_check!r}")
 
         return local_check
 
-    @log_with(log)
+    @log_with(log, hide_args=[1])
     @check_token_locked
     def authenticate(self, passw, user=None, options=None):
         """
@@ -206,7 +217,7 @@ class RemoteTokenClass(TokenClass):
         reply = None
         otpval = passw
 
-        # should we check the pin localy?
+        # should we check the pin locally?
         if self.check_pin_local:
             (_res, pin, otpval) = self.split_pin_pass(passw, user,
                                                       options=options)
@@ -265,9 +276,8 @@ class RemoteTokenClass(TokenClass):
         remoteResolver = self.get_tokeninfo("remote.resolver") or ""
 
         # here we also need to check for remote.user and so on....
-        log.debug("checking OTP len:%r remotely on server: %r,"
-                  " serial: %r, user: %r" %
-                  (len(otpval), remoteServer, remoteSerial, remoteUser))
+        log.debug(f"checking OTP len:{len(otpval)!r} remotely on server: {remoteServer!r},"
+                  f" serial: {remoteSerial!r}, user: {remoteUser!r}")
         params = {}
 
         if remoteSerial:
@@ -285,8 +295,8 @@ class RemoteTokenClass(TokenClass):
             if remoteServer:
                 # Deprecated
                 params['pass'] = otpval
-                request_url = "{0!s}{1!s}".format(remoteServer, remotePath)
-                r = requests.post(request_url, data=params, verify=ssl_verify)
+                request_url = f"{remoteServer!s}{remotePath!s}"
+                r = requests.post(request_url, data=params, verify=ssl_verify, timeout=60)
             elif pi_server_obj:
                 r = pi_server_obj.validate_check(remoteUser, otpval,
                                                  serial=remoteSerial,
@@ -299,16 +309,16 @@ class RemoteTokenClass(TokenClass):
                 if result.get("value"):
                     otp_count = 1
                     # Add the serial of the used remote token in the tokeninfo parameters
-                    self.add_tokeninfo("last_matching_remote_serial", response.get("detail", {}).get("serial"))
+                    self.write_tokeninfo("last_matching_remote_serial", response.get("detail", {}).get("serial"))
 
         except Exception as exx:  # pragma: no cover
             log.error("Error getting response from "
-                      "remote Server (%r): %r" % (request_url, exx))
-            log.debug("{0!s}".format(traceback.format_exc()))
+                      f"remote Server ({request_url!r}): {exx!r}")
+            log.debug(f"{traceback.format_exc()!s}")
 
         return otp_count
 
-    @log_with(log)
+    @log_with(log, hide_args=[1])
     @challenge_response_allowed
     def is_challenge_request(self, passw, user=None, options=None):
         """
@@ -333,3 +343,15 @@ class RemoteTokenClass(TokenClass):
                 request_is_valid = True
 
         return request_is_valid
+
+    def export_token(self, export_user: bool = False) -> dict:
+        """
+        Export for this token is not supported.
+        """
+        raise NotImplementedError("Export for Remote token is not supported.")
+
+    def import_token(self, token_information: dict):
+        """
+        Import for this token is not supported.
+        """
+        raise NotImplementedError("Import for Remote token is not supported.")

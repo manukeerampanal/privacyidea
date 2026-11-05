@@ -5,15 +5,14 @@ This depends on lib.tokenclass
 import functools
 from binascii import hexlify
 
-import mock
-import six
-from flask import current_app
+from unittest import mock
 
 from privacyidea.lib.error import ParameterError
-from privacyidea.lib.token import check_serial_pass
+from privacyidea.lib.token import check_serial_pass, init_token, get_tokens, import_tokens
 from privacyidea.lib.tokens.vascotoken import VascoTokenClass
 from privacyidea.models import Token
 from tests.base import MyTestCase
+
 
 def mock_verification(replacement):
     def decorator(f):
@@ -30,7 +29,7 @@ def _set_next_blob(data):
     update ``data._obj.Blob``: Increment the contents by 1.
     i.e. "XXX...X" is replaced with "YYY...Y".
     """
-    data._obj.Blob = b"".join(six.int2byte(x + 1) for x in six.iterbytes(data._obj.Blob))
+    data._obj.Blob = b"".join(bytes((x + 1,)) for x in data._obj.Blob)
 
 def mock_success(data, params, password, challenge):
     # fake a new blob
@@ -88,7 +87,7 @@ class VascoTokenTest(MyTestCase):
         token = VascoTokenClass(db_token)
         token.update({"otpkey": hexlify(b"X"*248).decode("utf-8"),
                       "pin": self.otppin})
-        self.assertRaises(RuntimeError, token.authenticate, "{}123456".format(self.otppin))
+        self.assertRaises(RuntimeError, token.authenticate, f"{self.otppin}123456")
         token.delete_token()
 
     @mock_verification(create_mock_failure(1))
@@ -98,20 +97,20 @@ class VascoTokenTest(MyTestCase):
         token = VascoTokenClass(db_token)
         token.update({"otpkey": hexlify(b"X"*248).decode("utf-8"),
                       "pin": self.otppin})
-        r = token.authenticate("{}123456".format(self.otppin))
+        r = token.authenticate(f"{self.otppin}123456")
         self.assertEqual(r[0], True)
         self.assertEqual(r[1], -1)
         # failure, but the token secret has been updated nonetheless
         key = token.token.get_otpkey().getKey()
         self.assertEqual(key, b"X"*24 + b"Y"*224)
         # wrong PIN, the token secret has not been updated
-        r = token.authenticate("WRONG123456".format(self.otppin))
+        r = token.authenticate("WRONG123456")
         self.assertEqual(r[0], False)
         self.assertEqual(r[1], -1)
         key = token.token.get_otpkey().getKey()
         self.assertEqual(key, b"X"*24 + b"Y"*224)
         # another failure, but the token secret has been updated again!
-        r = token.authenticate("{}234567".format(self.otppin))
+        r = token.authenticate(f"{self.otppin}234567")
         self.assertEqual(r[0], True)
         self.assertEqual(r[1], -1)
         key = token.token.get_otpkey().getKey()
@@ -126,19 +125,19 @@ class VascoTokenTest(MyTestCase):
         token.update({"otpkey": hexlify(b"X"*248).decode("utf-8"),
                       "pin": self.otppin})
         # wrong PIN, the token secret has not been updated
-        r = token.authenticate("WRONG123456".format(self.otppin))
+        r = token.authenticate("WRONG123456")
         self.assertEqual(r[0], False)
         self.assertEqual(r[1], -1)
         key = token.token.get_otpkey().getKey()
         self.assertEqual(key, b"X"*24 + b"X"*224)
         # correct PIN + OTP
-        r = token.authenticate("{}123456".format(self.otppin))
+        r = token.authenticate(f"{self.otppin}123456")
         self.assertEqual(r[0], True)
         self.assertEqual(r[1], 0) # TODO: that is success?
         key = token.token.get_otpkey().getKey()
         self.assertEqual(key, b"X"*24 + b"Y"*224)
         # another success
-        r = token.authenticate("{}234567".format(self.otppin))
+        r = token.authenticate(f"{self.otppin}234567")
         self.assertEqual(r[0], True)
         self.assertEqual(r[1], 0)  # TODO: that is success?
         key = token.token.get_otpkey().getKey()
@@ -155,7 +154,7 @@ class VascoTokenTest(MyTestCase):
         @mock_verification(mock_success)
         def _step1():
             # correct PIN + OTP
-            return token.authenticate("{}123456".format(self.otppin))
+            return token.authenticate(f"{self.otppin}123456")
 
         r = _step1()
         self.assertEqual(r[0], True)
@@ -201,7 +200,7 @@ class VascoTokenTest(MyTestCase):
 
         @mock_verification(create_mock_failure(123))
         def _step1():
-            return token.authenticate("{}123456".format(self.otppin))
+            return token.authenticate(f"{self.otppin}123456")
 
         r = _step1()
         self.assertEqual(r[0], True)
@@ -212,7 +211,7 @@ class VascoTokenTest(MyTestCase):
 
         @mock_verification(create_mock_failure(202))
         def _step2():
-            return token.authenticate("{}123456".format(self.otppin))
+            return token.authenticate(f"{self.otppin}123456")
         r = _step2()
         self.assertEqual(r[0], True)
         self.assertEqual(r[1], -1)
@@ -244,32 +243,36 @@ class VascoTokenTest(MyTestCase):
         @mock_verification(create_mock_failure(1))
         def _step1():
             # correct PIN, wrong OTP
-            return check_serial_pass(self.serial2, "{}123456".format(self.otppin))
+            return check_serial_pass(self.serial2, f"{self.otppin}123456")
 
         self.assertTrue(token.check_failcount())
         # fail 10 times
-        for _ in range(10 + 1):
+        for _ in range(10):
             r = _step1()
             self.assertEqual(r[0], False)
-            self.assertEqual(r[1].get('message'), 'wrong otp value')
+            self.assertEqual("wrong otp value", r[1].get('message'))
+            key = token.token.get_otpkey().getKey()
+        r = _step1()
+        self.assertFalse(r[0])
+        self.assertEqual("Failcounter exceeded", r[1].get('message'))
 
         key = token.token.get_otpkey().getKey()
-        self.assertEqual(key, b"A" * 24 + b"L" * 224)
+        self.assertEqual(key, b"A" * 24 + b"K" * 224)
         # fail counter has been exceeded
         self.assertFalse(token.check_failcount())
 
         @mock_verification(mock_success)
         def _step2():
             # correct PIN, wrong OTP
-            return check_serial_pass(self.serial2, "{}123456".format(self.otppin))
+            return check_serial_pass(self.serial2, f"{self.otppin}123456")
 
         # subsequent authentication attempt fails due to fail counter
         r = _step2()
         self.assertEqual(r[0], False)
-        self.assertEqual(r[1].get('message'), 'matching 1 tokens, Failcounter exceeded')
+        self.assertEqual("Failcounter exceeded", r[1].get('message'))
         # this actually does update the OTP key
         key = token.token.get_otpkey().getKey()
-        self.assertEqual(key, b"A" * 24 + b"M" * 224)
+        self.assertEqual(key, b"A" * 24 + b"K" * 224)
 
         # reset the failcounter
         token.reset()
@@ -279,6 +282,28 @@ class VascoTokenTest(MyTestCase):
         self.assertEqual(r[0], True)
         self.assertEqual(r[1].get('message'), 'matching 1 tokens')
         key = token.token.get_otpkey().getKey()
-        self.assertEqual(key, b"A" * 24 + b"N" * 224)
+        self.assertEqual(key, b"A" * 24 + b"L" * 224)
 
         token.delete_token()
+
+    def test_10_vasco_token_export(self):
+        token = init_token(param={'serial': "OATH12345678",
+                                  'type': 'vasco',
+                                  'otpkey': hexlify(b"A" * 248).decode("utf-8")})
+        self.assertRaises(NotImplementedError, token.export_token)
+
+        # Clean up
+        token.delete_token()
+
+    def test_11_vasco_token_import(self):
+        token_data = [{
+            "serial": "123456",
+            "type": "vasco",
+            "description": "this token can't be imported",
+            "otpkey": self.otpkey,
+            "issuer": "privacyIDEA",
+        }]
+        before_import = get_tokens()
+        import_tokens(token_data)
+        after_import = get_tokens()
+        self.assertEqual(len(before_import), len(after_import))

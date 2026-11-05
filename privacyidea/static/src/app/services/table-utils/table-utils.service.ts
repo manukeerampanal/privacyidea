@@ -1,0 +1,428 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { inject, Injectable, signal, WritableSignal } from "@angular/core";
+import { Sort } from "@angular/material/sort";
+import { FilterValue } from "@core/models/filter_value/filter_value";
+import { AuthService, AuthServiceInterface } from "@services/auth/auth.service";
+import { ContainerDetailToken } from "@services/container/container.service";
+import { tokenTypeLabel } from "@utils/token.utils";
+import {
+  AUTHENTICATION_VALUES,
+  booleanDisplayLabel,
+  containerStateLabel,
+  DisplayableValue,
+  ROLLOUT_STATE_VALUES,
+  tokenStateLabel,
+  valueDisplayLabel
+} from "@utils/value-label.utils";
+
+export interface FilterPair {
+  key: string;
+  value: string;
+}
+
+export type TableRow = Record<string, unknown>;
+export type TableCellValue = string | number | boolean | null | undefined;
+
+export type ColumnKey =
+  | "select"
+  | "serial"
+  | "type"
+  | "states"
+  | "description"
+  | "user_name"
+  | "user_realm"
+  | "realms"
+  | "tokentype"
+  | "active"
+  | "username"
+  | "failcount"
+  | "maxfail"
+  | "container_serial"
+  | "count"
+  | "rounds"
+  | "service_id"
+  | "user"
+  | "actions";
+
+export type ColumnDef<K extends ColumnKey = ColumnKey> = Readonly<{
+  key: K;
+  label: string;
+}>;
+
+export const COLUMN_REGISTRY: Readonly<Record<ColumnKey, ColumnDef>> = {
+  select: { key: "select", label: "" },
+  serial: { key: "serial", label: $localize`:@@common.serial:Serial` },
+  type: { key: "type", label: $localize`:@@common.type:Type` },
+  states: { key: "states", label: $localize`:@@common.status:Status` },
+  description: { key: "description", label: $localize`:@@common.description:Description` },
+  user_name: { key: "user_name", label: $localize`:@@common.user:User` },
+  user_realm: { key: "user_realm", label: $localize`:@@common.realm:Realm` },
+  realms: { key: "realms", label: $localize`:@@common.containerRealms:Container Realms` },
+  tokentype: { key: "tokentype", label: $localize`:@@common.type:Type` },
+  active: { key: "active", label: $localize`:@@common.active:Active` },
+  username: { key: "username", label: $localize`:@@common.user:User` },
+  failcount: { key: "failcount", label: $localize`:@@token.failCounter:Fail Counter` },
+  maxfail: { key: "maxfail", label: $localize`:@@token.maxfail:Maxfail` },
+  container_serial: { key: "container_serial", label: $localize`:@@common.container:Container` },
+  count: { key: "count", label: $localize`:@@token.count:Count` },
+  rounds: { key: "rounds", label: $localize`:@@token.rounds:Rounds` },
+  service_id: { key: "service_id", label: $localize`:@@common.serviceId:Service ID` },
+  user: { key: "user", label: $localize`:@@token.sshUser:SSH User` },
+  actions: { key: "actions", label: $localize`:@@common.actions:Actions` }
+} as const;
+
+type ColumnsTuple<K extends readonly ColumnKey[]> = {
+  readonly [I in keyof K]: ColumnDef<Extract<K[I], ColumnKey>>;
+};
+
+type KeysOfColumns<C extends readonly ColumnDef[]> = {
+  readonly [I in keyof C]: C[I] extends ColumnDef<infer KK> ? KK : never;
+};
+
+export interface TableUtilsServiceInterface {
+  pageSizeOptions: WritableSignal<number[]>;
+
+  toggleKeywordInFilter(args: { keyword: string; currentValue: FilterValue }): FilterValue;
+
+  toggleBooleanInFilter(args: { keyword: string; currentValue: FilterValue }): FilterValue;
+
+  isLink(columnKey: string): boolean;
+
+  getClassForColumn(columnKey: string, element: TableRow): string;
+
+  getTooltipForColumn(columnKey: string, element: TableRow): string;
+
+  getDisplayText(columnKey: string, element: TableRow): string;
+
+  getSpanClassForKey(args: { key: string; value?: TableCellValue; maxfail?: number }): string;
+
+  getDivClassForKey(key: string): string;
+
+  getClassForColumnKey(columnKey: string): string;
+
+  getChildClassForColumnKey(columnKey: string): string;
+
+  getTdClassForKey(key: string): string[];
+
+  getSpanClassForState(state: string, clickable: boolean): string;
+
+  getDisplayTextForState(state: string): string;
+
+  pickColumns<const K extends readonly ColumnKey[]>(...keys: K): ColumnsTuple<K>;
+
+  getColumnKeys<const C extends readonly ColumnDef[]>(cols: C): KeysOfColumns<C>;
+
+  getSortIcon(columnKey: string, sort: Sort): string;
+
+  onSortButtonClick(key: string, sort: WritableSignal<Sort>, fallback?: Sort): void;
+
+  clientsideSortTokenData(data: ContainerDetailToken[], s: Sort): ContainerDetailToken[];
+}
+
+function displayableCell(value: unknown): DisplayableValue | undefined {
+  return typeof value === "string" || typeof value === "number" || typeof value === "boolean" ? value : undefined;
+}
+
+/**
+ * Columns whose cell text is more than the raw value. A formatter returning undefined leaves the
+ * cell to the raw rendering, so every column keeps working without an entry here.
+ */
+const CELL_FORMATTERS = new Map<string, (element: TableRow) => string | undefined>([
+  [
+    "active",
+    (element) => {
+      const active = element["active"];
+      if (active === "") return "";
+      if (element["revoked"]) return tokenStateLabel("revoked");
+      if (element["locked"]) return tokenStateLabel("locked");
+      if (active) return tokenStateLabel("active");
+      if (active === false) return tokenStateLabel("deactivated");
+      return undefined;
+    }
+  ],
+  [
+    "rollout_state",
+    (element) => {
+      const state = element["rollout_state"];
+      return typeof state === "string" ? valueDisplayLabel(state, ROLLOUT_STATE_VALUES, { vocabulary: true }) : "";
+    }
+  ],
+  [
+    "tokentype",
+    (element) => {
+      const tokenType = element["tokentype"];
+      return typeof tokenType === "string" ? (tokenTypeLabel(tokenType) ?? tokenType) : undefined;
+    }
+  ],
+  ["success", (element) => booleanDisplayLabel(displayableCell(element["success"]), "predicate")],
+  [
+    "authentication",
+    (element) =>
+      valueDisplayLabel(displayableCell(element["authentication"]), AUTHENTICATION_VALUES, { vocabulary: true })
+  ]
+]);
+
+@Injectable()
+export class TableUtilsService implements TableUtilsServiceInterface {
+  private readonly authService: AuthServiceInterface = inject(AuthService);
+  pageSizeOptions = signal([5, 10, 25, 50]);
+
+  // A keyword such as "machineid & resolver" is a label for two keys that are filtered together.
+  toggleKeywordInFilter(args: { keyword: string; currentValue: FilterValue }): FilterValue {
+    const { keyword, currentValue } = args;
+    return currentValue.toggleKeys(keyword.split("&").map((key) => key.trim()));
+  }
+
+  public toggleBooleanInFilter(args: { keyword: string; currentValue: FilterValue }): FilterValue {
+    const { keyword, currentValue } = args;
+    return currentValue.toggleBooleanKey(keyword);
+  }
+
+  isLink(columnKey: string): boolean {
+    return (
+      columnKey === "container_serial" //||
+      //columnKey === 'username' ||
+      //columnKey === 'user_realm' ||
+      //columnKey === 'users' ||
+      //columnKey === 'realms'
+    );
+  }
+
+  getClassForColumn(columnKey: string, element: TableRow): string {
+    if (element["locked"] || element["revoked"]) return "highlight-disabled";
+
+    switch (columnKey) {
+      case "active":
+        if (element["active"]) {
+          if (this.authService.actionAllowed("disable")) return "highlight-true-clickable";
+          else return "highlight-true";
+        }
+        if (element["active"] === false) {
+          if (this.authService.actionAllowed("enable")) return "highlight-false-clickable";
+          else return "highlight-false";
+        }
+        return "";
+
+      case "failcount": {
+        const raw = element["failcount"];
+        if (raw === "" || raw === null || raw === undefined) return "";
+        const failcount = typeof raw === "number" ? raw : Number(raw);
+        const rawMax = element["maxfail"];
+        const maxfail = typeof rawMax === "number" ? rawMax : Number(rawMax);
+        if (!Number.isFinite(failcount)) return "";
+        if (failcount <= 0) return "highlight-true";
+        if (Number.isFinite(maxfail) && failcount < maxfail) {
+          if (this.authService.actionAllowed("reset")) return "highlight-warning-clickable";
+          else return "highlight-warning";
+        }
+        if (this.authService.actionAllowed("reset")) return "highlight-false-clickable";
+        else return "highlight-false";
+      }
+    }
+    return "";
+  }
+
+  getTooltipForColumn(columnKey: string, element: TableRow): string {
+    if (element["locked"]) return tokenStateLabel("locked");
+    if (element["revoked"]) return tokenStateLabel("revoked");
+
+    switch (columnKey) {
+      case "active":
+        if (element["active"] === "") return "";
+        return element["active"]
+          ? $localize`:@@token.deactivateToken:Deactivate Token`
+          : $localize`:@@token.activateToken:Activate Token`;
+
+      case "failcount":
+        return element["failcount"] ? $localize`:@@token.resetFailCounter:Reset Fail Counter` : "";
+    }
+    return "";
+  }
+
+  getDisplayText(columnKey: string, element: TableRow): string {
+    const formatted = CELL_FORMATTERS.get(columnKey)?.(element);
+    if (formatted !== undefined) return formatted;
+    // Own properties only - a column named "toString" must not render Object.prototype's member.
+    const cell = Object.hasOwn(element, columnKey) ? element[columnKey] : undefined;
+    return cell == null ? "" : String(cell);
+  }
+
+  getSpanClassForKey(args: { key: string; value?: TableCellValue; maxfail?: number }): string {
+    const { key, value, maxfail } = args;
+    if (key === "success") {
+      if (value === "" || value === null || value === undefined) {
+        return "";
+      }
+      if (value) return "highlight-true";
+      return "highlight-false";
+    }
+    if (key === "description") {
+      return "details-table-item details-description";
+    }
+    if (key === "active") {
+      if (value === "") {
+        return "";
+      }
+      return value === true ? "highlight-true" : "highlight-false";
+    }
+    if (key === "authentication" && typeof value === "string") {
+      if (value.toLowerCase() === "accept") {
+        return "highlight-true";
+      } else if (value.toLowerCase() === "challenge") {
+        return "highlight-warning";
+      } else if (value.toLowerCase() === "reject") {
+        return "highlight-false";
+      }
+    }
+    if (key === "failcount") {
+      if (value === "") {
+        return "";
+      } else if (value === 0) {
+        return "highlight-true";
+      } else if (typeof value === "number" && value >= 1 && maxfail !== undefined && value < maxfail) {
+        return "highlight-warning";
+      } else {
+        return "highlight-false";
+      }
+    }
+    return "details-table-item";
+  }
+
+  getDivClassForKey(key: string): string {
+    if (key === "description") {
+      return "details-scrollable-container";
+    } else if (key === "maxfail" || key === "count_window" || key === "sync_window") {
+      return "details-value";
+    }
+
+    return "";
+  }
+
+  getClassForColumnKey(columnKey: string): string {
+    switch (columnKey) {
+      case "failcount":
+      case "active":
+      case "revoke":
+      case "maxfail":
+      case "delete":
+        return "flex-center";
+      case "realms":
+      case "description":
+        return "table-scroll-container";
+      default:
+        return "flex-center-vertical";
+    }
+  }
+
+  getChildClassForColumnKey(columnKey: string): string {
+    if (this.getClassForColumnKey(columnKey).includes("table-scroll-container")) {
+      return "scroll-item";
+    }
+    return "";
+  }
+
+  getTdClassForKey(key: string): string[] {
+    const classes = ["width-241"];
+    if (key === "description") {
+      classes.push("height-127");
+    } else if (["realms", "tokengroup"].includes(key)) {
+      classes.push("height-78");
+    } else {
+      classes.push("height-53");
+    }
+    return classes;
+  }
+
+  getSpanClassForState(state: string, clickable: boolean): string {
+    switch (clickable) {
+      case false:
+        if (state === "active") {
+          return "highlight-true";
+        } else if (state === "disabled" || state === "damaged" || state === "lost") {
+          return "highlight-false";
+        } else {
+          return "";
+        }
+      case true:
+        if (state === "active") {
+          return "highlight-true-clickable";
+        } else if (state === "disabled" || state === "damaged" || state === "lost") {
+          return "highlight-false-clickable";
+        } else {
+          return "";
+        }
+    }
+  }
+
+  getDisplayTextForState(state: string): string {
+    return containerStateLabel(state);
+  }
+
+  pickColumns<const K extends readonly ColumnKey[]>(...keys: K) {
+    return keys.map((k) => COLUMN_REGISTRY[k]) as {
+      readonly [I in keyof K]: ColumnDef<Extract<K[I], ColumnKey>>;
+    };
+  }
+
+  getColumnKeys<const C extends readonly ColumnDef[]>(cols: C) {
+    return cols.map((c) => c.key) as {
+      readonly [I in keyof C]: C[I] extends ColumnDef<infer KK> ? KK : never;
+    };
+  }
+
+  getSortIcon(columnKey: string, sort: Sort): string {
+    if (sort.active !== columnKey || !sort.direction) {
+      return "unfold_more";
+    }
+    return sort.direction === "asc" ? "keyboard_arrow_upward" : "keyboard_arrow_downward";
+  }
+
+  onSortButtonClick(
+    columnKey: string,
+    sort: WritableSignal<Sort>,
+    fallback: Sort = { active: "serial", direction: "asc" }
+  ): void {
+    const current = sort();
+    let direction: Sort["direction"] = "asc";
+
+    if (current.active === columnKey) {
+      if (current.direction === "asc") {
+        direction = "desc";
+      } else if (current.direction === "desc") {
+        direction = "";
+      }
+    }
+
+    sort.set(direction === "" ? fallback : { active: columnKey, direction });
+  }
+
+  clientsideSortTokenData(data: ContainerDetailToken[], s: Sort) {
+    if (!s.direction) return data;
+    const dir = s.direction === "asc" ? 1 : -1;
+    const key = s.active as keyof ContainerDetailToken;
+    return data.sort((a: ContainerDetailToken, b: ContainerDetailToken) => {
+      const va = (a[key] ?? "").toString().toLowerCase();
+      const vb = (b[key] ?? "").toString().toLowerCase();
+      if (va < vb) return -1 * dir;
+      if (va > vb) return 1 * dir;
+      return 0;
+    });
+  }
+}

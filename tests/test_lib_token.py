@@ -1,4 +1,5 @@
-# -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: 2024 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """
 This test file tests the lib.token methods.
 
@@ -13,35 +14,42 @@ getTokens4UserOrSerial
 gettokensoftype
 getToken....
 """
-from .base import MyTestCase, FakeAudit, FakeFlaskG
-from privacyidea.lib.user import (User)
-from privacyidea.lib.tokenclass import TokenClass, TOKENKIND, FAILCOUNTER_EXCEEDED, FAILCOUNTER_CLEAR_TIMEOUT
-from privacyidea.lib.token import weigh_token_type
-from privacyidea.lib.tokens.totptoken import TotpTokenClass
-from privacyidea.models import (Token, Challenge, TokenRealm)
-from privacyidea.lib.config import (set_privacyidea_config, get_token_types, delete_privacyidea_config, SYSCONF)
-from privacyidea.lib.policy import set_policy, SCOPE, ACTION, delete_policy, PolicyClass, delete_policy
-from privacyidea.lib.utils import b32encode_and_unicode, hexlify_and_unicode
-from privacyidea.lib.error import PolicyError
-import datetime
-from dateutil import parser
-import hashlib
 import binascii
-import warnings
+import datetime
+import hashlib
+import json
+import logging
+
+from unittest import mock
+from dateutil import parser
+from dateutil.tz import tzlocal
+from sqlalchemy import select
+from testfixtures import log_capture
+
+from privacyidea.lib.challenge import get_challenges
+from privacyidea.lib.config import (set_privacyidea_config, get_token_types)
+from privacyidea.lib.container import (init_container, add_token_to_container,
+                                       find_container_by_serial)
+from privacyidea.lib.error import (TokenAdminError, ParameterError,
+                                   PrivacyIDEAError, ResourceNotFoundError)
+from privacyidea.lib.error import UserError
+from privacyidea.lib.framework import get_app_config
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.policy import (set_policy, SCOPE, delete_policy)
 from privacyidea.lib.token import (create_tokenclass_object,
-                                   get_tokens, list_tokengroups,
-                                   get_token_type, check_serial,
+                                   get_tokens, get_token_type, check_serial,
                                    get_num_tokens_in_realm,
+                                   get_token_owner_keys,
                                    get_realms_of_token,
-                                   token_exist, get_token_owner, is_token_owner,
+                                   token_exist, get_token_owner, get_token_owner_without_lookup, is_token_owner,
                                    get_tokenclass_info,
                                    get_tokens_in_resolver, get_otp,
                                    get_token_by_otp, get_serial_by_otp,
-                                   gen_serial, init_token, remove_token,
+                                   gen_serial, init_token,
                                    set_realms, set_defaults, assign_token,
                                    unassign_token, resync_token,
                                    reset_token, set_pin, set_pin_user,
-                                   set_pin_so, enable_token,
+                                   set_pin_so, enable_token, revoke_token,
                                    is_token_active, set_hashlib, set_otplen,
                                    set_count_auth, add_tokeninfo,
                                    set_sync_window, set_count_window,
@@ -56,22 +64,31 @@ from privacyidea.lib.token import (create_tokenclass_object,
                                    set_validity_period_end,
                                    set_validity_period_start, remove_token, delete_tokeninfo,
                                    import_token, get_one_token, get_tokens_from_serial_or_user,
-                                   get_tokens_paginated_generator, assign_tokengroup, unassign_tokengroup)
-from privacyidea.lib.tokengroup import set_tokengroup, delete_tokengroup
-from privacyidea.lib.error import (TokenAdminError, ParameterError,
-                                   privacyIDEAError, ResourceNotFoundError)
-from privacyidea.lib.tokenclass import DATE_FORMAT
-from dateutil.tz import tzlocal
+                                   get_tokens_paginated_generator)
+from privacyidea.lib.token import log as token_log
+from privacyidea.lib.token import query as token_query
+from privacyidea.lib.token import weigh_token_type, import_tokens, export_tokens
+from privacyidea.lib.tokenclass import (TokenClass, Tokenkind)
+from privacyidea.lib.tokenrolloutstate import RolloutState
+from privacyidea.lib.tokens.totptoken import TotpTokenClass
+from privacyidea.lib.user import (User)
+from privacyidea.lib.utils import b32encode_and_unicode, hexlify_and_unicode
+from privacyidea.lib.realm import set_realm, delete_realm
+from privacyidea.models import (db, Token, Challenge, TokenRealm, TokenOwner)
+from .base import MyTestCase
 
 PWFILE = "tests/testdata/passwords"
 OTPKEY = "3132333435363738393031323334353637383930"
 OTPKE2 = "31323334353637383930313233343536373839AA"
+CHANGED_KEY = '31323334353637383930313233343536373839AA'
 
 
 class TokenTestCase(MyTestCase):
     """
     Test the lib.token on an interface level
     """
+    yubikey_token_key = '31323334353637383930313233343536'
+    owner_count_realm = "ownercountrealm"
 
     def test_00_create_realms(self):
         self.setUp_user_realms()
@@ -113,80 +130,187 @@ class TokenTestCase(MyTestCase):
         # get All tokens
         tokenobject_list = get_tokens()
         # Check if these are valid tokentypes
-        self.assertTrue(len(tokenobject_list) > 0, tokenobject_list)
+        self.assertGreater(len(tokenobject_list), 0, tokenobject_list)
         for token_object in tokenobject_list:
-            self.assertTrue(token_object.type in get_token_types(),
-                            token_object.type)
+            self.assertIn(token_object.type, get_token_types(),
+                          token_object.type)
 
         # get assigned tokens
         tokenobject_list = get_tokens(assigned=True)
-        self.assertTrue(len(tokenobject_list) == 0, tokenobject_list)
+        self.assertEqual(0, len(tokenobject_list), tokenobject_list)
         # get unassigned tokens
         tokenobject_list = get_tokens(assigned=False)
-        self.assertTrue(len(tokenobject_list) > 0, tokenobject_list)
-        # pass the wrong parameter
-        # This will ignore the filter!
+        self.assertGreater(len(tokenobject_list), 0, tokenobject_list)
+        # This will interpret the value as true as the functions expects a bool
         tokenobject_list = get_tokens(assigned="True")
-        self.assertTrue(len(tokenobject_list) > 0, tokenobject_list)
+        self.assertEqual(0, len(tokenobject_list), tokenobject_list)
 
         # get tokens of type HOTP
         tokenobject_list = get_tokens(tokentype="hotp")
-        self.assertTrue(len(tokenobject_list) == 0, tokenobject_list)
+        self.assertEqual(0, len(tokenobject_list), tokenobject_list)
         # get tokens of type TOTP
         tokenobject_list = get_tokens(tokentype="totp")
-        self.assertTrue(len(tokenobject_list) > 0, tokenobject_list)
+        self.assertGreater(len(tokenobject_list), 0, tokenobject_list)
+        # get tokens of type TOTP and HOTP
+        spass_token = init_token(param={'serial': 'SPAS01', 'type': 'spass'})
+        self.assertIn("creation_date", spass_token.get_tokeninfo(), spass_token)
+        create_now = datetime.datetime.now(tz=datetime.UTC)
+        with mock.patch("privacyidea.lib.resolvers.LDAPIdResolver.datetime.datetime",
+                        wraps=datetime.datetime) as mock_datetime:
+            mock_datetime.now.return_value = create_now
+            hotp_token = init_token(param={'serial': 'HOTP01', 'type': 'hotp', 'otpkey': '123'})
+        self.assertEqual(create_now.isoformat(timespec="seconds"), hotp_token.get_tokeninfo("creation_date"),
+                         hotp_token)
+        tokenobject_list = get_tokens(token_type_list=["hotp", "totp"])
+        self.assertGreater(len(tokenobject_list), 0, tokenobject_list)
+        for token in tokenobject_list:
+            self.assertIn(token.type, ["hotp", "totp"], token)
+        spass_token.delete_token()
+        hotp_token.delete_token()
 
         # Search for tokens in realm
-        db_token = Token("hotptoken",
-                         tokentype="hotp",
-                         userid=1000,
-                         resolver=self.resolvername1,
-                         realm=self.realm1)
-        db_token.update_otpkey(self.otpkey)
-        db_token.save()
+        init_token({"type": "hotp", "serial": "hotptoken", "otpkey": self.otpkey},
+                   user=User(uid=1000, realm=self.realm1, resolver=self.resolvername1))
         tokenobject_list = get_tokens(realm=self.realm1)
-        self.assertTrue(len(tokenobject_list) == 1, tokenobject_list)
-        self.assertTrue(tokenobject_list[0].type == "hotp",
-                        tokenobject_list[0].type)
+        self.assertEqual(1, len(tokenobject_list), tokenobject_list)
+        self.assertEqual("hotp", tokenobject_list[0].type,
+                         tokenobject_list[0].type)
 
         # get tokens for a given serial number
         tokenobject_list = get_tokens(serial="hotptoken")
-        self.assertTrue(len(tokenobject_list) == 1, tokenobject_list)
+        self.assertEqual(1, len(tokenobject_list), tokenobject_list)
 
         # ...but not in an unassigned state!
         tokenobject_list = get_tokens(serial="hotptoken", assigned=False)
-        self.assertTrue(len(tokenobject_list) == 0, tokenobject_list)
+        self.assertEqual(0, len(tokenobject_list), tokenobject_list)
         # get the tokens for the given user
         tokenobject_list = get_tokens(user=User(login="cornelius",
                                                 realm=self.realm1))
-        self.assertTrue(len(tokenobject_list) == 1, tokenobject_list)
+        self.assertEqual(1, len(tokenobject_list), tokenobject_list)
 
         # get tokens for a given tokeninfo of the token!!!
         token = init_token({"type": "yubikey",
                             "serial": "yk1",
                             "yubikey.prefix": "vv123456",
-                            "otpkey": self.otpkey})
-        self.assertEqual(token.token.serial, "yk1")
+                            "otpkey": self.yubikey_token_key})
+        self.assertEqual("yk1", token.token.serial)
         tokenobject_list = get_tokens(tokeninfo={"yubikey.prefix": "vv123456"})
-        self.assertEqual(len(tokenobject_list), 1)
-        self.assertEqual(tokenobject_list[0].get_tokeninfo("yubikey.prefix"),
-                         "vv123456")
+        self.assertEqual(1, len(tokenobject_list))
+        self.assertEqual("vv123456", tokenobject_list[0].get_tokeninfo("yubikey.prefix"))
         remove_token("yk1")
 
         # Tokeninfo with more than one entry is not supported
-        self.assertRaises(privacyIDEAError, get_tokens,
+        self.assertRaises(PrivacyIDEAError, get_tokens,
                           tokeninfo={"key1": "value1",
                                      "key2": "value2"})
 
+        # get tokens for a user with an invalid realm
+        user = User("test", realm="deleted")
+        self.assertRaises(UserError, get_tokens, user=user)
+
         # wildcard matches do not work for the ``serial`` parameter
         tokenobject_list = get_tokens(serial="hotptoke*")
-        self.assertEqual(len(tokenobject_list), 0)
+        self.assertEqual(0, len(tokenobject_list))
         # get tokens with a wildcard serial
         tokenobject_list = get_tokens(serial_wildcard="SE*")
-        self.assertEqual(len(tokenobject_list), 3)
+        self.assertEqual(3, len(tokenobject_list))
         # get all tokens
         tokenobject_list = get_tokens(serial_wildcard="*")
-        self.assertEqual(len(tokenobject_list), 4)
+        self.assertEqual(4, len(tokenobject_list))
+
+    def test_02c_get_tokens_resolver_and_userid_filter(self):
+        # The resolver and the userid are filters of their own, independent of a user object
+        init_token({"type": "spass", "serial": "RESO01"},
+                   user=User(login="cornelius", realm=self.realm1, resolver=self.resolvername1))
+        init_token({"type": "spass", "serial": "RESO02"})
+
+        serials = [token.token.serial for token in get_tokens(resolver=self.resolvername1)]
+        self.assertIn("RESO01", serials)
+        self.assertNotIn("RESO02", serials)
+
+        # The resolver name is matched case-insensitively and honors '*' as wildcard
+        serials = [token.token.serial for token in get_tokens(resolver=self.resolvername1.upper())]
+        self.assertIn("RESO01", serials)
+        serials = [token.token.serial for token in get_tokens(resolver="resol*")]
+        self.assertIn("RESO01", serials)
+        self.assertNotIn("RESO02", serials)
+
+        # A resolver that does not exist matches nothing
+        self.assertListEqual([], get_tokens(resolver="no_such_resolver"))
+
+        # The same for the user id of the token owner, in both entry points
+        serials = [token.token.serial for token in get_tokens(userid="1000")]
+        self.assertIn("RESO01", serials)
+        self.assertNotIn("RESO02", serials)
+        self.assertListEqual([], get_tokens(userid="999999"))
+
+        serials = [token["serial"] for token in get_tokens_paginate(userid="1000")["tokens"]]
+        self.assertIn("RESO01", serials)
+        self.assertNotIn("RESO02", serials)
+        self.assertListEqual([], get_tokens_paginate(userid="999999")["tokens"])
+
+        # The user id honors '*' as wildcard
+        serials = [token.token.serial for token in get_tokens(userid="100*")]
+        self.assertIn("RESO01", serials)
+        self.assertNotIn("RESO02", serials)
+
+        # A user object carrying only a realm returns the tokens of all users of that realm
+        serials = [token.token.serial for token in get_tokens(user=User(realm=self.realm1))]
+        self.assertIn("RESO01", serials)
+        self.assertNotIn("RESO02", serials)
+
+        # A realm that does not exist matches nothing, while an unresolvable login is an error
+        self.assertListEqual([], get_tokens(user=User(realm="no_such_realm")))
+        self.assertRaises(UserError, get_tokens,
+                          user=User(login="no_such_user", realm=self.realm1))
+
+        remove_token("RESO01")
+        remove_token("RESO02")
+
+    def test_02a_get_tokens_like_wildcard_escaping(self):
+        # SQL LIKE metacharacters (_ and %) in filter values must be matched
+        # literally; only the '*' wildcard should expand.
+        init_token({"type": "spass", "serial": "ESC_01"})
+        init_token({"type": "spass", "serial": "ESCX01"})
+        init_token({"type": "spass", "serial": "ESCY01", "description": "cost is 50% off"})
+        init_token({"type": "spass", "serial": "ESCZ01", "description": "cost is 50XXoff"})
+
+        # '_' in a serial_wildcard is literal, so only "ESC_01" matches, not "ESCX01"
+        matches = get_tokens(serial_wildcard="ESC_01")
+        self.assertListEqual(["ESC_01"], [token_obj.token.serial for token_obj in matches], matches)
+
+        # '*' still works as a wildcard and matches both "ESC_01" and "ESCX01"
+        matches = get_tokens(serial_wildcard="ESC*01")
+        self.assertSetEqual({"ESC_01", "ESCX01", "ESCY01", "ESCZ01"},
+                            {token_obj.token.serial for token_obj in matches}, matches)
+
+        # '%' is literal even on the LIKE path: "50%*" must not let the literal
+        # '%' act as a wildcard, so "cost is 50XXoff" is not matched.
+        result = get_tokens_paginate(description="cost is 50%*")
+        self.assertListEqual(["ESCY01"], [token_dict["serial"] for token_dict in result["tokens"]], result)
+
+        for serial in ["ESC_01", "ESCX01", "ESCY01", "ESCZ01"]:
+            remove_token(serial)
+
+    def test_02b_get_tokens_rollout_state_like_escaping(self):
+        # rollout_state filter: '*' is a wildcard, literal '_' is matched literally.
+        literal = init_token({"type": "spass", "serial": "ROLLA"})
+        literal.token.rollout_state = "phase_1"
+        literal.token.save()
+        other = init_token({"type": "spass", "serial": "ROLLB"})
+        other.token.rollout_state = "phaseX1"
+        other.token.save()
+
+        # '*' expands and matches both rollout states
+        matches = get_tokens(rollout_state="phase*")
+        self.assertSetEqual({"ROLLA", "ROLLB"}, {token_obj.token.serial for token_obj in matches}, matches)
+
+        # '_' is literal, so "phase_1*" matches only the "phase_1" token
+        matches = get_tokens(rollout_state="phase_1*")
+        self.assertListEqual(["ROLLA"], [token_obj.token.serial for token_obj in matches], matches)
+
+        remove_token("ROLLA")
+        remove_token("ROLLB")
 
     def test_03_get_token_type(self):
         ttype = get_token_type("hotptoken")
@@ -207,19 +331,145 @@ class TokenTestCase(MyTestCase):
 
     def test_05_get_num_tokens_in_realm(self):
         # one active token
-        self.assertTrue(get_num_tokens_in_realm(self.realm1) == 1,
-                        "{0!r}".format(get_num_tokens_in_realm(self.realm1)))
+        self.assertEqual(1, get_num_tokens_in_realm(self.realm1),
+                         f"{get_num_tokens_in_realm(self.realm1)!r}")
         # No active tokens
-        self.assertTrue(get_num_tokens_in_realm(self.realm1, active=False) == 0)
+        self.assertEqual(0, get_num_tokens_in_realm(self.realm1, active=False))
+
+    def test_05b_get_token_owner_keys(self):
+        self.setUp_user_realms()
+        set_realm(self.owner_count_realm, [{"name": self.resolvername1}])
+        cornelius_uid = User("cornelius", self.realm1, self.resolvername1).uid
+        cornelius_key = (self.owner_count_realm.lower(), self.resolvername1, cornelius_uid)
+
+        keys_before = get_token_owner_keys()
+        serial = None
+        try:
+            tok = init_token({"otpkey": self.otpkey}, user=User("cornelius", self.owner_count_realm))
+            serial = tok.get_serial()
+
+            keys_after = get_token_owner_keys()
+            self.assertIn(cornelius_key, keys_after)
+            self.assertTrue(keys_before <= keys_after, (keys_before, keys_after))
+            # the token is assigned in one realm only, although the resolver serves realm1 as well
+            self.assertNotIn((self.realm1.lower(), self.resolvername1, cornelius_uid), keys_after - keys_before)
+            # scoped to the resolver that owns it, the triple is still there
+            self.assertIn(cornelius_key, get_token_owner_keys(resolvers=[self.resolvername1]))
+            # a resolver that owns nothing, and no resolver at all, yield nothing
+            self.assertEqual(set(), get_token_owner_keys(resolvers=["does-not-exist"]))
+            self.assertEqual(set(), get_token_owner_keys(resolvers=[]))
+        finally:
+            if serial:
+                remove_token(serial)
+            delete_realm(self.owner_count_realm)
+
+        self.assertEqual(keys_before, get_token_owner_keys())
+
+    def test_05c_an_owner_without_a_realm_belongs_to_none(self):
+        # A token can be assigned to a user that has no realm, which leaves TokenOwner.realm_id
+        # empty. Such an owner matches the user of no realm.
+        self.setUp_user_realms()
+        set_realm(self.owner_count_realm, [{"name": self.resolvername1}])
+        cornelius_uid = User("cornelius", self.realm1, self.resolvername1).uid
+
+        serial = None
+        try:
+            tok = init_token({"otpkey": self.otpkey}, user=User("cornelius", self.owner_count_realm))
+            serial = tok.get_serial()
+            owner_row = db.session.execute(
+                select(TokenOwner).where(TokenOwner.token_id == tok.token.id)).unique().scalar_one()
+            owner_row.realm_id = None
+            db.session.commit()
+
+            keys = get_token_owner_keys()
+            self.assertIn(("", self.resolvername1, cornelius_uid), keys)
+            self.assertNotIn((self.owner_count_realm, self.resolvername1, cornelius_uid), keys)
+        finally:
+            if serial:
+                remove_token(serial)
+            delete_realm(self.owner_count_realm)
+
+    def test_05f_get_token_owner_keys_of_some_user_ids(self):
+        self.setUp_user_realms()
+        set_realm(self.owner_count_realm, [{"name": self.resolvername1}])
+        cornelius_uid = User("cornelius", self.realm1, self.resolvername1).uid
+        shadow_uid = User("shadow", self.realm1, self.resolvername1).uid
+        realm = self.owner_count_realm.lower()
+
+        serials = []
+        try:
+            for username in ("cornelius", "shadow"):
+                tok = init_token({"otpkey": self.otpkey}, user=User(username, self.owner_count_realm))
+                serials.append(tok.get_serial())
+
+            self.assertEqual({(realm, self.resolvername1, cornelius_uid)},
+                             {key for key in get_token_owner_keys(user_ids=[cornelius_uid]) if key[0] == realm})
+            self.assertEqual(set(), get_token_owner_keys(user_ids=[]))
+            self.assertEqual(set(), get_token_owner_keys(user_ids=["does-not-exist"]))
+
+            # Looked up one id per query, the result is the same as in one query.
+            user_ids = [cornelius_uid, "does-not-exist", shadow_uid]
+            in_one_query = get_token_owner_keys(user_ids=user_ids)
+            chunked = token_query._chunked
+            with (mock.patch.object(token_query, "_chunked", lambda items: chunked(items, size=1)),
+                  mock.patch.object(db.session, "execute", wraps=db.session.execute) as execute):
+                self.assertEqual(in_one_query, get_token_owner_keys(user_ids=user_ids))
+            self.assertEqual(3, execute.call_count)
+            self.assertTrue({(realm, self.resolvername1, cornelius_uid),
+                             (realm, self.resolvername1, shadow_uid)} <= in_one_query, in_one_query)
+        finally:
+            for serial in serials:
+                remove_token(serial)
+            delete_realm(self.owner_count_realm)
+
+    def test_05g_a_revoked_token_does_not_count_as_owned(self):
+        # A revoked token can never be used again, a disabled one can be enabled again.
+        self.setUp_user_realms()
+        set_realm(self.owner_count_realm, [{"name": self.resolvername1}])
+        cornelius_uid = User("cornelius", self.realm1, self.resolvername1).uid
+        cornelius_key = (self.owner_count_realm.lower(), self.resolvername1, cornelius_uid)
+        serial = None
+        try:
+            token = init_token({"otpkey": self.otpkey}, user=User("cornelius", self.owner_count_realm))
+            serial = token.get_serial()
+            self.assertIn(cornelius_key, get_token_owner_keys(user_ids=[cornelius_uid]))
+
+            # A token that was never revoked may hold NULL instead of False.
+            token.token.revoked = None
+            db.session.commit()
+            self.assertIn(cornelius_key, get_token_owner_keys(user_ids=[cornelius_uid]))
+
+            enable_token(serial, enable=False)
+            self.assertIn(cornelius_key, get_token_owner_keys(user_ids=[cornelius_uid]))
+
+            revoke_token(serial)
+            self.assertNotIn(cornelius_key, get_token_owner_keys(user_ids=[cornelius_uid]))
+            self.assertNotIn(cornelius_key, get_token_owner_keys())
+        finally:
+            if serial:
+                remove_token(serial)
+            delete_realm(self.owner_count_realm)
 
     def test_05_get_token_in_resolver(self):
-        tokenobject_list = get_tokens_in_resolver(self.resolvername1)
-        self.assertTrue(len(tokenobject_list) > 0)
+        # Only the tokens whose owner is in the given resolver are returned
+        init_token({"type": "spass", "serial": "INRES01"},
+                   user=User(login="cornelius", realm=self.realm1, resolver=self.resolvername1))
+        init_token({"type": "spass", "serial": "INRES02"})
+
+        serials = [token_obj.token.serial for token_obj in get_tokens_in_resolver(self.resolvername1)]
+        self.assertIn("INRES01", serials)
+        self.assertNotIn("INRES02", serials)
+
+        # A resolver that owns no token matches nothing
+        self.assertListEqual([], get_tokens_in_resolver("no_such_resolver"))
+
+        remove_token("INRES01")
+        remove_token("INRES02")
 
     def test_06_get_realms_of_token(self):
         # Return a list of realmnames for a token
-        self.assertTrue(get_realms_of_token("hotptoken") == [self.realm1],
-                        "{0!s}".format(get_realms_of_token("hotptoken")))
+        self.assertSetEqual({self.realm1}, set(get_realms_of_token("hotptoken")),
+                            f"{get_realms_of_token('hotptoken')!s}")
 
     def test_07_token_exist(self):
         self.assertTrue(token_exist("hotptoken"))
@@ -234,7 +484,7 @@ class TokenTestCase(MyTestCase):
         self.assertFalse(user)
         # for non existing token
         with self.assertRaises(ResourceNotFoundError):
-            user = get_token_owner("does not exist")
+            get_token_owner("does not exist")
 
         # check if the token owner is cornelius
         user = User("cornelius", realm=self.realm1, resolver=self.resolvername1)
@@ -244,6 +494,62 @@ class TokenTestCase(MyTestCase):
                          get_token_owner("hotptoken"))
         self.assertFalse(is_token_owner(self.serials[1], user),
                          get_token_owner(self.serials[1]))
+
+    def test_08b_token_owner_without_lookup(self):
+        # The owner as the database knows it: realm and resolver of the owner row, no login from the user store.
+        # A token without an owner gives an empty user.
+        owner = get_token_owner_without_lookup("hotptoken")
+        self.assertEqual(self.realm1, owner.realm)
+        self.assertEqual(self.resolvername1, owner.resolver)
+        self.assertEqual("", owner.login)
+        self.assertIsNone(owner.uid)
+        self.assertTrue(get_token_owner_without_lookup(self.serials[0]).is_empty())
+        with self.assertRaises(ResourceNotFoundError):
+            get_token_owner_without_lookup("does not exist")
+
+    def test_08a_get_owner_by_token_id_retries_once_after_a_transient_failure(self):
+        # A page-wide owner query that fails once (e.g. a lock-wait timeout) is retried
+        # after a rollback, and the retry recovers the owner in one go.
+        token_id = get_tokens(serial="hotptoken")[0].token.id
+        expected_owner = token_query._get_owner_by_token_id([token_id])[token_id]
+        real_select_owners = token_query._select_owners
+        calls = []
+
+        def flaky_select_owners(token_ids: list[int]) -> list[TokenOwner]:
+            calls.append(list(token_ids))
+            if len(calls) == 1:
+                raise Exception("simulated transient DB error")
+            return real_select_owners(token_ids)
+
+        with mock.patch("privacyidea.lib.token.query._select_owners", side_effect=flaky_select_owners):
+            owner_by_token_id = token_query._get_owner_by_token_id([token_id])
+
+        self.assertEqual(2, len(calls))
+        self.assertEqual(expected_owner.resolver, owner_by_token_id[token_id].resolver)
+        self.assertEqual(expected_owner.user_id, owner_by_token_id[token_id].user_id)
+
+    def test_08b_get_owner_by_token_id_falls_back_per_token_after_two_failures(self):
+        # A page-wide owner query that keeps failing even after the retry falls back to
+        # resolving each token's owner individually, so only the tokens that keep
+        # failing (whether they have no owner or the per-token query itself keeps
+        # failing) are left without an owner.
+        token_id = get_tokens(serial="hotptoken")[0].token.id
+        expected_owner = token_query._get_owner_by_token_id([token_id])[token_id]
+        real_select_owners = token_query._select_owners
+        poison_id = -1
+
+        def flaky_select_owners(token_ids: list[int]) -> list[TokenOwner]:
+            if len(token_ids) > 1 or token_ids == [poison_id]:
+                raise Exception("simulated persistent DB error")
+            return real_select_owners(token_ids)
+
+        with mock.patch("privacyidea.lib.token.query._select_owners", side_effect=flaky_select_owners):
+            owner_by_token_id = token_query._get_owner_by_token_id([token_id, 999999999, poison_id])
+
+        self.assertEqual(expected_owner.resolver, owner_by_token_id[token_id].resolver)
+        self.assertEqual(expected_owner.user_id, owner_by_token_id[token_id].user_id)
+        self.assertNotIn(999999999, owner_by_token_id)
+        self.assertNotIn(poison_id, owner_by_token_id)
 
     def test_09_get_tokenclass_info(self):
         info = get_tokenclass_info("hotp")
@@ -278,23 +584,43 @@ class TokenTestCase(MyTestCase):
         db_token.delete()
 
     def test_14_gen_serial(self):
+        hotp_token_count = get_tokens(tokentype="hotp", count=True)
         serial = gen_serial(tokentype="hotp")
         # check the beginning of the serial
-        self.assertTrue("OATH0001" in serial, serial)
+        self.assertTrue(serial.startswith(f"OATH000{hotp_token_count}"), serial)
+        self.assertEqual(12, len(serial), serial)
 
         serial = gen_serial(tokentype="hotp", prefix="blah")
         # check the beginning of the serial
-        self.assertTrue("blah0001" in serial, serial)
+        self.assertTrue(serial.startswith(f"blah000{hotp_token_count}"), serial)
 
-        serial = gen_serial()
-        # check the beginning of the serial
-        self.assertTrue("PIUN0000" in serial, serial)
+        # Try a non-existing token type
+        serial = gen_serial(tokentype="non-existing")
+        self.assertTrue(serial.startswith("NON-EXISTING0000"), serial)
 
         set_privacyidea_config("SerialLength", 12)
         serial = gen_serial(tokentype="hotp")
-        self.assertTrue("OATH0001" in serial, serial)
+        self.assertTrue(serial.startswith(f"OATH000{hotp_token_count}"), serial)
         self.assertEqual(len(serial), len("OATH") + 12)
         set_privacyidea_config("SerialLength", 8)
+
+        # Test the random serial configuration
+        get_app_config()["PI_TOKEN_SERIAL_RANDOM"] = True
+        serial = gen_serial(tokentype="hotp")
+        # check the beginning of the serial
+        self.assertTrue(serial.startswith("OATH"), serial)
+        self.assertEqual(12, len(serial), serial)
+
+        serial = gen_serial(tokentype="hotp", prefix="blah")
+        # check the beginning of the serial
+        self.assertTrue(serial.startswith("blah"), serial)
+
+        set_privacyidea_config("SerialLength", 12)
+        serial = gen_serial(tokentype="yubikey")
+        self.assertTrue(serial.startswith("UBAM"), serial)
+        self.assertEqual(16, len(serial), serial)
+        set_privacyidea_config("SerialLength", 8)
+        del get_app_config()["PI_TOKEN_SERIAL_RANDOM"]
 
     def test_15_init_token(self):
         count = get_tokens(count=True)
@@ -358,8 +684,7 @@ class TokenTestCase(MyTestCase):
         self.assertTrue(count2 == count1 + 1, count2)
         # check for the token association
         token_id = tokenobject.token.id
-        realm_assoc = TokenRealm.query.filter(TokenRealm.token_id == \
-            token_id).count()
+        realm_assoc = TokenRealm.query.filter(TokenRealm.token_id == token_id).count()
         self.assertTrue(realm_assoc == 1, realm_assoc)
         # Add a challenge for this token
         challenge = Challenge(tokenobject.get_serial(), transaction_id="918273")
@@ -373,8 +698,7 @@ class TokenTestCase(MyTestCase):
         self.assertTrue(count_remove == 1, count_remove)
         self.assertTrue(get_tokens(count=True) == count1)
         # check for the realm association
-        realm_assoc = TokenRealm.query.filter(TokenRealm.token_id == \
-            token_id).count()
+        realm_assoc = TokenRealm.query.filter(TokenRealm.token_id == token_id).count()
         self.assertTrue(realm_assoc == 0, realm_assoc)
         # check if the challenge is removed
         chall_count = Challenge.query.filter(Challenge.serial ==
@@ -383,17 +707,54 @@ class TokenTestCase(MyTestCase):
 
     def test_16_set_realms(self):
         serial = "NEWREALM01"
-        tokenobject = init_token({"serial": serial,
-                                  "otpkey": "1234567890123456"})
+        init_token({"serial": serial, "otpkey": "1234567890123456"})
         realms = get_realms_of_token(serial)
-        self.assertTrue(realms == [], "{0!s}".format(realms))
+        self.assertEqual(realms, [], f"{realms!s}")
         set_realms(serial, [self.realm1])
         realms = get_realms_of_token(serial)
-        self.assertTrue(realms == [self.realm1], "{0!s}".format(realms))
+        self.assertEqual(realms, [self.realm1], f"{realms!s}")
         remove_token(serial=serial)
         realms = get_realms_of_token(serial)
-        self.assertTrue(realms == [], "{0!s}".format(realms))
+        self.assertTrue(realms == [], f"{realms!s}")
 
+        # Testing that set_realm always sets the realm of the token owner
+        with mock.patch("logging.Logger.info") as mock_log:
+            db_token = Token(serial, tokentype="totp")
+            db_token.update_otpkey(self.otpkey)
+            db_token.save()
+            token = TotpTokenClass(db_token)
+            token.set_realms(['realm1'])
+            self.assertEqual(token.get_realms(), ['realm1'], token.get_realms())
+            token.set_realms([''])
+            self.assertEqual(token.get_realms(), [], token.get_realms())
+
+            token.add_user(User(login="cornelius",
+                                realm=self.realm1))
+            token.set_realms(realms=[''])
+            self.assertEqual(token.get_realms(), ['realm1'], token.get_realms())
+            mock_log.assert_called_with(f'The realms ({self.realm1}) of assigned users cannot be removed from the '
+                                        f'token {serial}.')
+
+        # Deleting the token also deletes the token realm relationship
+        token_id = token.token.id
+        token.delete_token()
+        stmt = select(TokenRealm).filter_by(token_id=token_id)
+        token_realm_db = db.session.execute(stmt).one_or_none()
+        self.assertIsNone(token_realm_db)
+
+    def test_16a_set_realms_with_no_allowed_realm(self):
+        # An empty list of allowed realms is an admin allowed no realm at all, which is not the
+        # same as None ("every realm"): no realm is set and the existing ones are kept.
+        self.setUp_user_realm2()
+        serial = "NOALLOWEDREALM01"
+        init_token({"serial": serial, "otpkey": self.otpkey})
+        set_realms(serial, [self.realm1])
+        self.assertEqual([self.realm1], get_realms_of_token(serial))
+
+        set_realms(serial, [self.realm2], allowed_realms=[])
+
+        self.assertEqual([self.realm1], get_realms_of_token(serial))
+        remove_token(serial=serial)
 
     def test_17_set_defaults(self):
         serial = "SETTOKEN"
@@ -406,15 +767,16 @@ class TokenTestCase(MyTestCase):
         remove_token(serial)
 
     def test_18_assign_token(self):
+        self.setUp_user_realm2()
         serial = "ASSTOKEN"
-        user = User("cornelius", resolver=self.resolvername1,
-                    realm=self.realm1)
-        tokenobject = init_token({"serial": serial,
-                                  "otpkey": "1234567890123456"})
+        user = User("cornelius", resolver=self.resolvername1, realm=self.realm1)
+        token = init_token({"serial": serial, "otpkey": "1234567890123456"}, tokenrealms=[self.realm2])
+        self.assertSetEqual({self.realm2}, set(token.get_realms()))
 
         r = assign_token(serial, user, pin="1234")
         self.assertTrue(r)
-        self.assertEqual(tokenobject.token.first_owner.user_id, "1000")
+        self.assertEqual(token.token.first_owner.user_id, "1000")
+        self.assertSetEqual({self.realm2, self.realm1}, set(token.get_realms()))
 
         # token already assigned...
         self.assertRaises(TokenAdminError, assign_token, serial,
@@ -423,7 +785,12 @@ class TokenTestCase(MyTestCase):
         # unassign token
         r = unassign_token(serial)
         self.assertTrue(r)
-        self.assertEqual(tokenobject.token.first_owner, None)
+        self.assertEqual(token.token.first_owner, None)
+
+        # assign invalid user
+        self.assertRaises(UserError, assign_token, serial, User("invalid", realm=self.realm2))
+        self.assertRaises(ResourceNotFoundError, assign_token, serial,
+                          User("hans", realm="invalid", resolver=self.resolvername1))
 
         remove_token(serial)
         # assign or unassign a token, that does not exist
@@ -469,7 +836,6 @@ class TokenTestCase(MyTestCase):
         self.assertTrue(tokenobject.token.so_pin != "")
         remove_token(serial)
 
-
     def test_21_enable_disable(self):
         serial = "enable"
         tokenobject = init_token({"serial": serial,
@@ -479,8 +845,7 @@ class TokenTestCase(MyTestCase):
         self.assertTrue(r == 0, r)
         r = enable_token(serial, enable=False)
         self.assertTrue(r == 1, r)
-        self.assertTrue(tokenobject.token.active == False,
-                        tokenobject.token.active)
+        self.assertFalse(tokenobject.token.active, tokenobject)
         self.assertFalse(is_token_active(serial))
 
         r = enable_token(serial)
@@ -500,10 +865,9 @@ class TokenTestCase(MyTestCase):
 
         r = set_hashlib(serial=serial, hashlib="sha256")
         self.assertTrue(r == 1)
-        hashlib = tokenobject.token.get_info()
-        self.assertTrue(hashlib.get("hashlib") == "sha256", hashlib)
+        token_info = tokenobject.token.get_info()
+        self.assertTrue(token_info.get("hashlib") == "sha256", token_info)
         remove_token(serial)
-
 
     def test_23_set_otplen(self):
         serial = "otplen"
@@ -547,7 +911,7 @@ class TokenTestCase(MyTestCase):
         self.assertNotIn("something", tinfo2)
         # delete non-existing tokeninfo entry
         r = delete_tokeninfo(serial, "somethingelse")
-        self.assertEqual(r, 1) # this still returns 1, because 1 token was matched!
+        self.assertEqual(r, 1)  # this still returns 1, because 1 token was matched!
         # tokeninfo has not changed
         self.assertEqual(tokenobject.token.get_info(), tinfo2)
         # try to delete non-existing tokeninfo
@@ -582,6 +946,17 @@ class TokenTestCase(MyTestCase):
                         tokenobject.token.description)
         remove_token(serial)
 
+        # Check that description will be cut
+        serial = "t1"
+        tokenobject = init_token({"serial": serial, "genkey": 1})
+        r = set_description(serial, "The new and very long token description is more"
+                                    " than eighty characters long and is therefore cut")
+        self.assertTrue(r == 1, r)
+        self.assertTrue(tokenobject.token.description == "The new and very long token description is more"
+                                                         " than eighty characters long and ",
+                        tokenobject.token.description)
+        remove_token(serial)
+
     def test_29_get_multi_otp(self):
         r = get_multi_otp("hotptoken")
         self.assertTrue(r.get("error") == "No count specified", r)
@@ -600,7 +975,7 @@ class TokenTestCase(MyTestCase):
         r = set_max_failcount(serial, 112)
         self.assertTrue(r == 1, r)
         self.assertTrue(tokenobject.token.maxfail == 112,
-                        "{0!s}".format(tokenobject.token.maxfail))
+                        f"{tokenobject.token.maxfail!s}")
         remove_token(serial)
 
     def test_31_copy_token_pin(self):
@@ -615,21 +990,20 @@ class TokenTestCase(MyTestCase):
 
         # Now compare the pinhash
         self.assertTrue(tobject1.token.pin_hash == tobject2.token.pin_hash,
-                        "{0!s} <> {1!s}".format(tobject1.token.pin_hash,
-                                      tobject2.token.pin_hash))
+                        f"{tobject1.token.pin_hash!s} <> {tobject2.token.pin_hash!s}")
 
         remove_token(serial1)
         remove_token(serial2)
 
     def test_32_copy_token_user(self):
         serial1 = "tcopy1"
-        tobject1 = init_token({"serial": serial1, "genkey": 1})
+        init_token({"serial": serial1, "genkey": 1})
         r = assign_token(serial1, User(login="cornelius", realm=self.realm1))
         self.assertTrue(r, r)
         serial2 = "tcopy2"
         tobject2 = init_token({"serial": serial2, "genkey": 1})
 
-        r = copy_token_user(serial1, serial2)
+        copy_token_user(serial1, serial2)
         assert isinstance(tobject2, TokenClass)
         self.assertEqual(tobject2.token.first_owner.user_id, "1000")
         self.assertEqual(tobject2.token.first_owner.resolver, self.resolvername1)
@@ -647,7 +1021,7 @@ class TokenTestCase(MyTestCase):
     def test_33_lost_token(self):
         # create a token with a user
         serial1 = "losttoken"
-        tobject1 = init_token({"serial": serial1, "genkey": 1})
+        init_token({"serial": serial1, "genkey": 1})
         r = assign_token(serial1, User(login="cornelius", realm=self.realm1))
         self.assertTrue(r, r)
 
@@ -657,21 +1031,16 @@ class TokenTestCase(MyTestCase):
         validity = 10
         r = lost_token(serial1)
         end_date = datetime.datetime.now(tzlocal()) + datetime.timedelta(days=validity)
-        """
-        r = {'end_date': '16/12/14 23:59',
-             'pin': True, 'valid_to': 'xxxx', 'init': True, 'disable': 1,
-             'user': True, 'serial': 'lostlosttoken', 'password':
-             'EC7YRgr)ss9LcE*('}
-        """
         self.assertTrue(r.get("pin"), r)
         self.assertTrue(r.get("init"), r)
         self.assertTrue(r.get("user"), r)
-        self.assertTrue(r.get("serial") == "lost{0!s}".format(serial1), r)
+        self.assertTrue(r.get("serial") == f"lost{serial1!s}", r)
         self.assertTrue(parser.parse(r.get("end_date")) <= end_date, r)
         remove_token("losttoken")
         remove_token("lostlosttoken")
 
-    def test_34_check_token_list(self):
+    @log_capture(level=logging.DEBUG)
+    def test_34_check_token_list(self, capture):
         # We can not authenticate with an unknown type
         # Such a token will not be returned by get_tokens...
         db_token = Token("serial72", tokentype="unknown")
@@ -687,11 +1056,16 @@ class TokenTestCase(MyTestCase):
         hotp_tokenobject.set_pin("hotppin")
         hotp_tokenobject.save()
         old_failcount = hotp_tokenobject.token.failcount
+        token_log.setLevel(logging.DEBUG)
         res, reply = check_token_list(tokenobject_list, "hotppin40123456")
         self.assertFalse(res)
         failcount = hotp_tokenobject.token.failcount
         self.assertEqual(failcount, old_failcount + 1, (old_failcount,
                                                         failcount))
+        log_msg = str(capture)
+        self.assertIn('HIDDEN', log_msg, log_msg)
+        self.assertNotIn("hotppin40123456", log_msg, log_msg)
+        token_log.setLevel(logging.INFO)
 
         # if there is no token with at least a correct pin, we increase all
         # failcounters
@@ -748,22 +1122,20 @@ class TokenTestCase(MyTestCase):
 
         # Now we disable the hotp_tokenobject. If the token is disabled,
         # we must not be able to authenticate anymore with this very token.
-        # But if the OTP value is valid, the counter is increased, anyway!
         old_counter = hotp_tokenobject.token.count
         hotp_tokenobject.enable(False)
         res, reply = check_token_list(tokenobject_list, "hotppin403154")
         self.assertFalse(res)
         self.assertTrue("Token is disabled" in reply.get("message"))
-        self.assertEqual(old_counter + 1, hotp_tokenobject.token.count)
+        self.assertEqual(old_counter, hotp_tokenobject.token.count)
         # enable the token again
         hotp_tokenobject.enable(True)
 
         # Set HOTP as challenge response
-        set_policy("check_token_list_CR", scope=SCOPE.AUTH, action="{0!s}=HOTP".format(
-            ACTION.CHALLENGERESPONSE))
+        set_policy("check_token_list_CR", scope=SCOPE.AUTH, action=f"{PolicyAction.CHALLENGERESPONSE!s}=HOTP")
 
-        hotp_tokenobject.add_tokeninfo("next_pin_change", u"{0!s}".format(datetime.datetime(2019, 1, 7, 0, 0)))
-        hotp_tokenobject.add_tokeninfo("next_password_change", u"{0!s}".format(datetime.datetime(2019, 1, 7, 0, 0)))
+        hotp_tokenobject.write_tokeninfo("next_pin_change", f"{datetime.datetime(2019, 1, 7, 0, 0)!s}")
+        hotp_tokenobject.write_tokeninfo("next_password_change", f"{datetime.datetime(2019, 1, 7, 0, 0)!s}")
 
         # Now the HOTP is a valid C/R token
         res, reply = check_token_list(tokenobject_list, "hotppin")
@@ -792,13 +1164,148 @@ class TokenTestCase(MyTestCase):
         res, reply = check_token_list(tokenobject_list, "hotppin")
         self.assertFalse(res)
         self.assertFalse("multi_challenge" in reply)
-        self.assertEqual(reply.get("message"), "No active challenge response token found")
+        self.assertEqual("Token is disabled", reply.get("message"))
 
         hotp_tokenobject.enable()
         hotp_tokenobject.save()
         delete_policy("check_token_list_CR")
 
-    def test_35_check_serial_pass(self):
+    def test_34a_check_token_list_invalid_tokens(self):
+        # User has different invalid tokens
+        pin = "1234"
+        disabled_token = init_token({"type": "hotp", "pin": pin})
+        failcounter_token = init_token({"type": "hotp", "pin": pin})
+        invalid_token = init_token({"type": "hotp", "pin": pin})
+        clientwait_token = init_token({"type": "hotp", "pin": pin})
+        auth_max_token = init_token({"type": "hotp", "pin": pin})
+        valid_token = init_token({"type": "hotp", "pin": pin})
+
+        messages = {"Token is disabled", "Failcounter exceeded", "Outside validity period", "Token is not yet enrolled",
+                    "Authentication counter exceeded"}
+
+        tokens = [disabled_token, failcounter_token, invalid_token, clientwait_token, auth_max_token]
+        tokens_with_valid = [disabled_token, failcounter_token, invalid_token, clientwait_token, auth_max_token,
+                             valid_token]
+
+        # Tokens are all valid
+        # wrong pin
+        success, reply = check_token_list(tokens, "invalid123456")
+        self.assertFalse(success)
+        self.assertEqual("wrong otp pin", reply.get("message"))
+        # correct pin but invalid otp
+        success, reply = check_token_list(tokens, "1234123456")
+        self.assertFalse(success)
+        self.assertEqual("wrong otp value", reply.get("message"))
+        # correct authentication
+        for token in tokens:
+            success, reply = check_token_list(tokens, "1234" + token.get_otp()[2])
+            self.assertTrue(success)
+
+        # Create challenge for all tokens
+        set_policy("challenge_response", scope=SCOPE.AUTH, action=f"{PolicyAction.CHALLENGERESPONSE}=hotp")
+        success, reply = check_token_list(tokens_with_valid, "1234")
+        self.assertFalse(success)
+        self.assertEqual("please enter otp: ", reply.get("message"))
+        transaction_id = reply.get("transaction_id")
+
+        # Invalidate tokens
+        disabled_token.enable(False)
+        for i in range(10):
+            failcounter_token.inc_failcount()
+        start = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=10)
+        end = start + datetime.timedelta(days=5)
+        invalid_token.set_validity_period_start(start.isoformat())
+        invalid_token.set_validity_period_end(end.isoformat())
+        clientwait_token.token.rollout_state = RolloutState.CLIENTWAIT
+        auth_max_token.set_count_auth(100)
+        auth_max_token.set_count_auth_max(100)
+
+        # Challenge response fails even with correct challenge
+        for token in tokens:
+            success, reply = check_token_list(tokens, token.get_otp()[2], options={"transaction_id": transaction_id})
+            self.assertFalse(success)
+            reply_messages = reply.get("message").split(", ")
+            self.assertSetEqual(messages, set(reply_messages))
+        # Same response for wrong challenge
+        success, reply = check_token_list(tokens, "000999", options={"transaction_id": transaction_id})
+        self.assertFalse(success)
+        reply_messages = reply.get("message").split(", ")
+        self.assertSetEqual(messages, set(reply_messages))
+
+        # Using valid token only contains response for this token
+        success, reply = check_token_list(tokens_with_valid, "000999", options={"transaction_id": transaction_id})
+        self.assertFalse(success)
+        self.assertEqual("Response did not match the challenge.", reply.get("message"))
+        success, reply = check_token_list(tokens_with_valid, valid_token.get_otp()[2],
+                                          options={"transaction_id": transaction_id})
+        self.assertTrue(success)
+        self.assertEqual("Found matching challenge", reply.get("message"))
+
+        # Request challenge
+        # wrong pin
+        success, reply = check_token_list(tokens, "invalid")
+        self.assertFalse(success)
+        reply_messages = reply.get("message").split(", ")
+        self.assertSetEqual(messages, set(reply_messages))
+        # right pin
+        success, reply = check_token_list(tokens, "1234")
+        self.assertFalse(success)
+        reply_messages = reply.get("message").split(", ")
+        self.assertSetEqual(messages, set(reply_messages))
+        self.assertIsNone(reply.get("transaction_id"))
+        # Request challenge with valid token only contains response and only triggers challenge for this token
+        # wrong pin
+        success, reply = check_token_list(tokens_with_valid, "invalid")
+        self.assertFalse(success)
+        self.assertEqual("wrong otp pin", reply.get("message"))
+        # correct pin
+        success, reply = check_token_list(tokens_with_valid, "1234")
+        self.assertFalse(success)
+        self.assertEqual("please enter otp: ", reply.get("message"))
+        transaction_id = reply.get("transaction_id")
+        challenges = get_challenges(transaction_id=transaction_id)
+        self.assertEqual(1, len(challenges))
+        self.assertEqual(valid_token.get_serial(), challenges[0].serial)
+
+        delete_policy("challenge_response")
+
+        # Authentication pw+pin
+        # wrong pin
+        success, reply = check_token_list(tokens, "invalid123456")
+        self.assertFalse(success)
+        reply_messages = reply.get("message").split(", ")
+        self.assertSetEqual(messages, set(reply_messages))
+        # right pin
+        success, reply = check_token_list(tokens, "1234123456")
+        self.assertFalse(success)
+        reply_messages = reply.get("message").split(", ")
+        self.assertSetEqual(messages, set(reply_messages))
+        # correct authentication
+        for token in tokens:
+            success, reply = check_token_list(tokens, "1234" + token.get_otp()[2])
+            self.assertFalse(success)
+            reply_messages = reply.get("message").split(", ")
+            self.assertSetEqual(messages, set(reply_messages))
+        # passing also valid token
+        # wrong pin
+        success, reply = check_token_list(tokens_with_valid, "invalid123456")
+        self.assertFalse(success)
+        self.assertEqual("wrong otp pin", reply.get("message"))
+        # right pin
+        success, reply = check_token_list(tokens_with_valid, "1234123456")
+        self.assertFalse(success)
+        self.assertEqual("wrong otp value", reply.get("message"))
+        # correct authentication
+        success, reply = check_token_list(tokens_with_valid, "1234" + valid_token.get_otp()[2])
+        self.assertTrue(success)
+        self.assertEqual("matching 1 tokens", reply.get("message"))
+
+        # Clean up
+        for token in tokens_with_valid:
+            token.delete_token()
+
+    @log_capture(level=logging.DEBUG)
+    def test_35_check_serial_pass(self, capture):
         hotp_tokenobject = get_tokens(serial="hotptoken")[0]
         hotp_tokenobject.set_pin("hotppin")
         hotp_tokenobject.token.count = 10
@@ -807,51 +1314,43 @@ class TokenTestCase(MyTestCase):
         with self.assertRaises(ResourceNotFoundError):
             check_serial_pass("XXXXXXXXX", "password")
 
-        #r = get_multi_otp("hotptoken", count=20)
-        #self.assertTrue(r == 0, r)
-        # 0: '520489', 1: '403154', 2: '481090', 3: '868912',
-        # 4: '736127', 5: '229903', 6: '436521', 7: '186581',
-        # 8: '447589', 9: '903435', 10: '578337', 11: '328281',
-        # 12: '191635', 13: '184416', 14: '574561', 15: '797908'
+        token_log.setLevel(logging.DEBUG)
         r, reply = check_serial_pass("hotptoken", "hotppin481090")
         self.assertTrue(r)
         # the same OTP value  must not match!
-        # cko
-        r, reply = check_serial_pass("hotptoken", "hotppin481090")
+        r, reply = check_serial_pass("hotptoken", passw="hotppin481090")
         self.assertFalse(r)
+        log_msg = str(capture)
+        self.assertIn('HIDDEN', log_msg, log_msg)
+        self.assertNotIn('hotppin481090', log_msg, log_msg)
+        token_log.setLevel(logging.INFO)
 
     def test_36_check_user_pass(self):
-        hotp_tokenobject = get_tokens(serial="hotptoken")[0]
         user = User("shadow", realm=self.realm1)
         r, reply = check_user_pass(user, "passwordasdf")
         self.assertFalse(r)
         self.assertTrue(reply.get("message") == 'The user has no tokens '
-                                                'assigned', "{0!s}".format(reply))
+                                                'assigned', f"{reply!s}")
 
         user = User("cornelius", realm=self.realm1)
-        r, reply = check_user_pass(user, "hotppin868912")
+        r, _reply = check_user_pass(user, "hotppin868912")
         self.assertTrue(r)
-        r, reply = check_user_pass(user, "hotppin736127")
-        #r = get_multi_otp("hotptoken", count=20)
-        #self.assertTrue(r == 0, r)
-        # 0: '520489', 1: '403154', 2: '481090', 3: '868912',
-        # 4: '736127', 5: '229903', 6: '436521', 7: '186581',
-        # 8: '447589', 9: '903435', 10: '578337', 11: '328281',
-        # 12: '191635', 13: '184416', 14: '574561', 15: '797908'
+        r, _reply = check_user_pass(user, "hotppin736127")
+        self.assertTrue(r)
 
     def test_36b_check_nonascii_pin(self):
         user = User("cornelius", self.realm1)
         serial = "nonasciipin"
-        token = init_token({"type": "hotp",
-                            "otpkey": self.otpkey,
-                            "pin": u"ünicøde",
-                            "serial": serial}, user)
-        r = check_user_pass(user, u"µröng287082")
+        init_token({"type": "hotp",
+                    "otpkey": self.otpkey,
+                    "pin": "ünicøde",
+                    "serial": serial}, user)
+        r = check_user_pass(user, "µröng287082")
         self.assertEqual(r[0], False)
         self.assertEqual(r[1]['message'], 'wrong otp pin')
-        r = check_user_pass(user, u"ünicøde287082")
+        r = check_user_pass(user, "ünicøde287082")
         self.assertEqual(r[0], True)
-        r = check_user_pass(user, u"ünicøde666666")
+        r = check_user_pass(user, "ünicøde666666")
         self.assertEqual(r[0], False)
         self.assertEqual(r[1]['message'], 'wrong otp value')
         remove_token(serial)
@@ -860,15 +1359,15 @@ class TokenTestCase(MyTestCase):
         # We create a challenge by first sending the PIN of the HOTP token
         # then we answer the challenge by sending the OTP.
 
-        num1 = Challenge.query.filter(Challenge.serial == "hotptoken").count()
+        num1 = len(get_challenges(serial="hotptoken"))
         # The correct PIN will create a challenge
         r, reply = check_serial_pass("hotptoken", "hotppin")
         self.assertTrue(r is False, r)
-        num2 = Challenge.query.filter(Challenge.serial == "hotptoken").count()
+        num2 = len(get_challenges(serial="hotptoken"))
         # check that the challenge is created
         self.assertTrue(num1 + 1 == num2, (num1, num2))
-        self.assertTrue(type(reply) == dict, reply)
-        transaction_id = reply.get("transaction_id","")
+        self.assertIsInstance(reply, dict, reply)
+        transaction_id = reply.get("transaction_id", "")
         self.assertTrue(len(transaction_id) > 10, reply)
 
         # Challenge Response, with the transaction id
@@ -892,6 +1391,10 @@ class TokenTestCase(MyTestCase):
         self.assertTrue("spass_otp_pin_contents" in p, p)
         self.assertTrue("spass_otp_pin_maxlength" in p, p)
         self.assertTrue("spass_otp_pin_minlength" in p, p)
+
+        # invalid scope returns empty dict
+        p = get_dynamic_policy_definitions(scope="invalid")
+        self.assertDictEqual({}, p)
 
     def test_41_get_tokens_paginate(self):
         # create some tokens
@@ -930,7 +1433,7 @@ class TokenTestCase(MyTestCase):
 
         tokens = get_tokens_paginate(sortby=Token.serial, page=1,
                                      sortdir="desc")
-        self.assertTrue(len(tokens.get("tokens")), token_count-1)
+        self.assertTrue(len(tokens.get("tokens")), token_count - 1)
         self.assertEqual(tokens.get("count"), token_count)
         self.assertTrue(tokens.get("next") is None, tokens.get("next"))
         self.assertTrue(tokens.get("prev") is None, tokens.get("prev"))
@@ -944,6 +1447,259 @@ class TokenTestCase(MyTestCase):
         tokens = get_tokens_paginate(serial="hotp*")
         self.assertTrue(len(tokens.get("tokens")) == 1,
                         len(tokens.get("tokens")))
+
+        # filter by exact serial
+        hotp_token = init_token({"type": "hotp", "genkey": 1})
+        init_token({"type": "totp", "genkey": 1})
+        init_token({"type": "spass"})
+        tokens_pag = get_tokens_paginate(serial=hotp_token.get_serial())
+        tokens = tokens_pag["tokens"]
+        self.assertEqual(1, len(tokens))
+        self.assertEqual(hotp_token.get_serial(), tokens[0]["serial"])
+
+        # filter by type list
+        tokens_pag = get_tokens_paginate(token_type_list="spass,totp")
+        tokens = tokens_pag["tokens"]
+        for token in tokens:
+            self.assertIn(token["tokentype"], ["spass", "totp"])
+
+        # type wildcard
+        tokens_pag = get_tokens_paginate(tokentype="*otp*")
+        tokens = tokens_pag["tokens"]
+        for token in tokens:
+            self.assertIn(token["tokentype"], ["hotp", "totp"])
+
+        # filter by type list and wildcard
+        tokens_pag = get_tokens_paginate(token_type_list="spass,totp", tokentype="*otp*")
+        tokens = tokens_pag["tokens"]
+        for token in tokens:
+            self.assertIn(token["tokentype"], ["totp"])
+
+        # filter by type list and type
+        tokens_pag = get_tokens_paginate(token_type_list="spass,totp", tokentype="totp")
+        tokens = tokens_pag["tokens"]
+        for token in tokens:
+            self.assertIn(token["tokentype"], ["totp"])
+
+        # Filter by container_serial
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        token = init_token({"type": "hotp", "genkey": 1})
+        add_token_to_container(container_serial, token.get_serial())
+        tokens_pag = get_tokens_paginate(container_serial=container_serial)
+        self.assertEqual(1, len(tokens_pag["tokens"]))
+
+        # Filter tokens that are not in a container
+        tokens_pag = get_tokens_paginate(container_serial="")
+        self.assertGreater(tokens_pag["count"], 0)
+        token_serials = [t["serial"] for t in tokens_pag["tokens"]]
+        self.assertNotIn(token.get_serial(), token_serials)
+        for token in tokens_pag["tokens"]:
+            self.assertEqual("", token["container_serial"])
+
+        # filter for container serial in lower cases
+        container_serial = init_container({"type": "generic", "container_serial": "CONT0001"})["container_serial"]
+        token_in_container = init_token({"genkey": True, "type": "hotp"})
+        container = find_container_by_serial(container_serial)
+        container.add_token(token_in_container)
+        tokens = get_tokens_paginate(container_serial="cont0001")["tokens"]
+        self.assertEqual(1, len(tokens))
+        self.assertEqual(token_in_container.get_serial(), tokens[0]["serial"])
+        container.delete()
+        token_in_container.delete_token()
+
+        # filter for realm combined with allowed_realms (realm-scoped admin)
+        self.setUp_user_realm2()
+        # token_both is a member of realm1 AND realm2
+        token_both = init_token({"type": "hotp", "genkey": True}, user=User("hans", self.realm2))
+        token_both.set_realms([self.realm1, self.realm2])
+        # An admin restricted to realm1 filtering by realm2 still sees the token:
+        # the realm filter and the allowed_realms restriction are independent
+        # membership tests, and the token satisfies both (in realm2, and in the
+        # allowed realm1).
+        tokens = get_tokens_paginate(realm=self.realm2, allowed_realms=[self.realm1])["tokens"]
+        self.assertEqual(1, len(tokens))
+        self.assertEqual(token_both.get_serial(), tokens[0]["serial"])
+        # The token is counted once, not once per matching realm membership
+        result = get_tokens_paginate(realm=self.realm2, allowed_realms=[self.realm1, self.realm2])
+        self.assertEqual(1, len(result["tokens"]))
+        self.assertEqual(token_both.get_serial(), result["tokens"][0]["serial"])
+        self.assertEqual(len(result["tokens"]), result["count"])
+        # A token that is not in any allowed realm is not returned
+        token_r2 = init_token({"type": "hotp", "genkey": True})
+        token_r2.set_realms([self.realm2])
+        serials = [t["serial"] for t in get_tokens_paginate(realm=self.realm2,
+                                                             allowed_realms=[self.realm1])["tokens"]]
+        self.assertNotIn(token_r2.get_serial(), serials)
+        # filter for a user which is not contained in the allowed realms, but the token itself is
+        tokens = get_tokens_paginate(user=User(login="hans", realm=self.realm2), allowed_realms=[self.realm1])["tokens"]
+        self.assertEqual(1, len(tokens))
+        # Wildcard realm combined with allowed_realms: the token matches both
+        # realm memberships, but is still counted and returned exactly once
+        result = get_tokens_paginate(realm="*realm*", allowed_realms=[self.realm1, self.realm2])
+        serials = [t["serial"] for t in result["tokens"]]
+        self.assertEqual(1, serials.count(token_both.get_serial()))
+        self.assertEqual(len(result["tokens"]), result["count"])
+        # allowed_realms alone (no realm filter) restricts to the allowed realms
+        serials = [t["serial"] for t in get_tokens_paginate(allowed_realms=[self.realm1])["tokens"]]
+        self.assertIn(token_both.get_serial(), serials)
+        self.assertNotIn(token_r2.get_serial(), serials)
+        # realm and allowed_realms matching is case-insensitive
+        tokens = get_tokens_paginate(realm=self.realm2.upper(),
+                                     allowed_realms=[self.realm1.upper()])["tokens"]
+        self.assertEqual(1, len(tokens))
+        self.assertEqual(token_both.get_serial(), tokens[0]["serial"])
+        token_both.delete_token()
+        token_r2.delete_token()
+
+        # Realm-only filter (no login in the user object)
+        # A User with empty login but a realm set should filter by realm without raising.
+        self.setUp_user_realm2()
+        tok1 = init_token({"type": "hotp", "genkey": True}, user=User("hans", self.realm2))
+        tok2 = init_token({"type": "hotp", "genkey": True}, user=User("cornelius", self.realm1))
+        realm2_only = User(login="", realm=self.realm2)
+        tokens = get_tokens_paginate(user=realm2_only)["tokens"]
+        serials = [t["serial"] for t in tokens]
+        self.assertIn(tok1.get_serial(), serials)
+        self.assertNotIn(tok2.get_serial(), serials)
+        tok1.delete_token()
+        tok2.delete_token()
+
+        # Unresolvable user raises ERR904 "user can not be found in any resolver..."
+        unresolvable = User(login="no_such_user_xyz", realm=self.realm1)
+        # Confirm the user is not resolvable (resolver will be None/empty)
+        self.assertFalse(unresolvable.resolver)
+        with self.assertRaises(UserError):
+            tokens = get_tokens_paginate(user=unresolvable)["tokens"]
+
+    def test_41a_get_tokens_paginate_comma_separated_realms(self):
+        """Test that the realm parameter accepts a comma-separated list of
+        realm names and returns tokens from all listed realms."""
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+        self.setUp_user_realm3()
+
+        tok_r1 = init_token({"type": "hotp", "genkey": True},
+                            tokenrealms=[self.realm1])
+        tok_r2 = init_token({"type": "hotp", "genkey": True},
+                            tokenrealms=[self.realm2])
+        tok_r3 = init_token({"type": "hotp", "genkey": True},
+                            tokenrealms=[self.realm3])
+
+        # Comma-separated: realm1,realm2 returns tokens from both
+        tokens = get_tokens_paginate(realm=f"{self.realm1},{self.realm2}")["tokens"]
+        serials = [t["serial"] for t in tokens]
+        self.assertIn(tok_r1.get_serial(), serials)
+        self.assertIn(tok_r2.get_serial(), serials)
+        self.assertNotIn(tok_r3.get_serial(), serials)
+
+        # Comma-separated: all three realms
+        tokens = get_tokens_paginate(realm=f"{self.realm1},{self.realm2},{self.realm3}")["tokens"]
+        serials = [t["serial"] for t in tokens]
+        self.assertIn(tok_r1.get_serial(), serials)
+        self.assertIn(tok_r2.get_serial(), serials)
+        self.assertIn(tok_r3.get_serial(), serials)
+
+        # Comma-separated with spaces should also work
+        tokens = get_tokens_paginate(realm=f"{self.realm1}, {self.realm2}")["tokens"]
+        serials = [t["serial"] for t in tokens]
+        self.assertIn(tok_r1.get_serial(), serials)
+        self.assertIn(tok_r2.get_serial(), serials)
+
+        # Wildcard still works (not treated as comma-separated)
+        tokens = get_tokens_paginate(realm="realm*")["tokens"]
+        serials = [t["serial"] for t in tokens]
+        self.assertIn(tok_r1.get_serial(), serials)
+        self.assertIn(tok_r2.get_serial(), serials)
+        self.assertIn(tok_r3.get_serial(), serials)
+
+        # Comma-separated with wildcards in individual entries
+        tokens = get_tokens_paginate(realm="realm1,realm3*")["tokens"]
+        serials = [t["serial"] for t in tokens]
+        self.assertIn(tok_r1.get_serial(), serials)
+        self.assertNotIn(tok_r2.get_serial(), serials)
+        self.assertIn(tok_r3.get_serial(), serials)
+
+        # All wildcards in comma-separated list
+        tokens = get_tokens_paginate(realm="realm1*,realm2*")["tokens"]
+        serials = [t["serial"] for t in tokens]
+        self.assertIn(tok_r1.get_serial(), serials)
+        self.assertIn(tok_r2.get_serial(), serials)
+        self.assertNotIn(tok_r3.get_serial(), serials)
+
+        tok_r1.delete_token()
+        tok_r2.delete_token()
+        tok_r3.delete_token()
+
+    def test_41b_paginate_count_with_duplicate_owner_rows(self):
+        """Verify that token count is not inflated by outer-join fan-out.
+
+        The TokenOwner outerjoin can fan out when a token has more than one
+        owner row.  The count must use COUNT(DISTINCT token.id) so that it
+        agrees with the .unique() de-duplication applied to the token list.
+
+        Without the fix, get_tokens(count=True) would return 2 (one per
+        joined row), while the de-duplicated token list has length 1.
+        """
+        self.setUp_user_realms()
+
+        # Create a fresh token assigned to a user
+        tok = init_token({"type": "hotp", "genkey": True},
+                         user=User("cornelius", self.realm1))
+        serial = tok.get_serial()
+
+        # Directly insert a second TokenOwner row for the same token,
+        # bypassing the application-level single-owner restriction.
+        # This simulates the fan-out that any future one-to-many
+        # owner relationship would cause.
+        # Use select(Token.id) (not select(Token)) to avoid triggering
+        # SQLAlchemy's joined-eager-loading uniqueness requirement.
+        token_id = db.session.execute(
+            select(Token.id).where(Token.serial == serial)
+        ).scalar_one()
+        second_owner = TokenOwner(
+            token_id=token_id,
+            user_id="9999",
+            resolver=self.resolvername1,
+            realmname=self.realm1,
+        )
+        second_owner.save()
+        db.session.commit()
+
+        # get_tokens(count=True) must return 1, not 2
+        count = get_tokens(serial=serial, count=True)
+        self.assertEqual(1, count,
+                         "count must reflect distinct tokens, not raw joined rows")
+
+        # The de-duplicated token list must also have length 1
+        token_list = get_tokens(serial=serial)
+        self.assertEqual(1, len(token_list))
+
+        # count and list length must agree
+        self.assertEqual(count, len(token_list))
+
+        # Clean up the extra owner row and the token
+        db.session.delete(second_owner)
+        db.session.commit()
+        tok.delete_token()
+
+    def test_41c_owners_relationship_orders_by_id(self):
+        """first_owner (owners.first()) of a multi-owner token must be deterministic.
+
+        The owners relationship is lazy='dynamic', so first_owner's plain
+        "SELECT ... FROM tokenowner WHERE token_id = ?" needs its own explicit order_by to agree
+        with any other query on the same table that orders explicitly (e.g. the token list
+        page's batched owner lookup). Checked on the compiled statement rather than actual row
+        order, since some backends (e.g. SQLite here) happen to return rows in insertion order
+        even without an ORDER BY, which would hide a missing one.
+        """
+        self.setUp_user_realms()
+        tok = init_token({"type": "hotp", "genkey": True},
+                         user=User("cornelius", self.realm1))
+        try:
+            compiled = str(tok.token.owners.statement.compile(compile_kwargs={"literal_binds": True}))
+            self.assertIn("ORDER BY tokenowner.id", compiled, compiled)
+        finally:
+            tok.delete_token()
 
     def test_42_sort_tokens(self):
         # return pagination
@@ -999,11 +1755,18 @@ class TokenTestCase(MyTestCase):
             self.assertEqual('X', tokens[0].get("serial"), tokens[0])
         self.assertTrue(tokens[-1].get("serial") == "A8")
 
-        # try a different sort key
+        # Try a different sort key: sorting by id returns ascending order. Do not assume the lowest id is 1 -
+        # earlier test classes sharing the DB may have already consumed lower ids, so assert the ordering, not
+        # an absolute starting value.
         tokendata = get_tokens_paginate(sortby="id", page=1, psize=100)
         tokens = tokendata.get("tokens")
 
-        self.assertEqual(1, tokens[0].get("id"), tokens[0])
+        # Assert ascending id order without assuming absolute id values: token
+        # ids are a non-resetting sequence, so under parallel test execution
+        # other tests on this worker's DB may have consumed the lower ids and
+        # the lowest surviving id need not be 1.
+        ids = [token.get("id") for token in tokens]
+        self.assertEqual(sorted(ids), ids, ids)
         self.assertGreaterEqual(tokens[-1].get("id"), len(tokens), tokens[-1])
 
         # unknown sort key results in sorting by serial
@@ -1164,12 +1927,12 @@ class TokenTestCase(MyTestCase):
     def test_47_use_yubikey_and_hotp(self):
         # fix problem https://github.com/privacyidea/privacyidea/issues/279
         user = User("cornelius", self.realm1)
-        token = init_token({"type": "hotp",
-                            "otpkey": self.otpkey,
-                            "pin": "pin47"}, user)
-        token = init_token({"type": "yubikey",
-                            "otpkey": self.otpkey,
-                            "pin": "pin47"}, user)
+        init_token({"type": "hotp",
+                    "otpkey": self.otpkey,
+                    "pin": "pin47"}, user)
+        init_token({"type": "yubikey",
+                    "otpkey": self.yubikey_token_key,
+                    "pin": "pin47"}, user)
         r = check_user_pass(user, "pin47888888")
         self.assertEqual(r[0], False)
         self.assertEqual(r[1].get('message'), "wrong otp value")
@@ -1190,15 +1953,14 @@ class TokenTestCase(MyTestCase):
         # disable token_b
         enable_token("CR2B", False)
         # Allow HOTP for chalresp
-        set_policy("test48", scope=SCOPE.AUTH, action="{0!s}=HOTP".format(
-            ACTION.CHALLENGERESPONSE))
+        set_policy("test48", scope=SCOPE.AUTH, action=f"{PolicyAction.CHALLENGERESPONSE}=HOTP")
         r, r_dict = check_token_list([token_a, token_b], pin, user)
         self.assertFalse(r)
         self.assertTrue("message" in r_dict)
         self.assertTrue("transaction_id" in r_dict)
         transaction_id = r_dict.get("transaction_id")
 
-        # Now we try authenticate:
+        # Now we try to authenticate:
         r, r_dict = check_token_list([token_a, token_b], self.valid_otp_values[1], user,
                                      options={"transaction_id": transaction_id})
         self.assertTrue(r)
@@ -1210,14 +1972,20 @@ class TokenTestCase(MyTestCase):
 
         # Now we run a bunch of failing responses to the challenge
         for i in range(0, 10):
-            r, r_dict = check_token_list([token_a, token_b], self.valid_otp_values[1], user,
+            r, r_dict = check_token_list([token_a, token_b], "123456789", user,
                                          options={"transaction_id": transaction_id})
             self.assertFalse(r)
-        # Now we try the next value, which fails
+            self.assertEqual("Response did not match the challenge.", r_dict.get("message"))
+        # Fail counter exceeded: Failing authentication
+        r, r_dict = check_token_list([token_a, token_b], "123456789", user,
+                                     options={"transaction_id": transaction_id})
+        self.assertFalse(r)
+        self.assertEqual(", ".join({"Failcounter exceeded", "Token is disabled"}), r_dict.get("message"))
+        # Now we try the next valid value, which fails
         r, r_dict = check_token_list([token_a, token_b], self.valid_otp_values[2], user,
                                      options={"transaction_id": transaction_id})
         self.assertFalse(r)
-        self.assertEqual(r_dict.get("message"), "Challenge matches, but token is not fit for challenge. Failcounter exceeded")
+        self.assertEqual(", ".join({"Failcounter exceeded", "Token is disabled"}), r_dict.get("message"))
 
         remove_token("CR2A")
         remove_token("CR2B")
@@ -1235,8 +2003,10 @@ class TokenTestCase(MyTestCase):
                               "type": "hotp",
                               "otpkey": self.otpkey,
                               "pin": pin}, user)
-        set_policy("test49", scope=SCOPE.AUTH, action="{0!s}=HOTP".format(
-            ACTION.CHALLENGERESPONSE))
+        token_c = init_token({"type": "hotp", "otpkey": self.otpkey, "pin": pin}, user)
+        for i in range(0, 10):
+            token_c.inc_failcount()
+        set_policy("test49", scope=SCOPE.AUTH, action=f"{PolicyAction.CHALLENGERESPONSE!s}=HOTP")
         # both tokens will be a valid challenge response token!
         r, r_dict = check_token_list([token_a, token_b], pin, user)
         multi_challenge = r_dict.get("multi_challenge")
@@ -1251,13 +2021,12 @@ class TokenTestCase(MyTestCase):
         self.assertEqual("interactive", multi_challenge[1].get("client_mode"))
 
         # There are two challenges in the database
-        r = Challenge.query.filter(Challenge.transaction_id ==
-                                   transaction_id).all()
+        r = get_challenges(transaction_id=transaction_id)
         self.assertEqual(len(r), 2)
 
         # Check the second response to the challenge, the second step in
         # challenge response:
-        r, r_dict = check_token_list([token_a, token_b], "287082", user,
+        r, r_dict = check_token_list([token_a, token_b, token_c], "287082", user,
                                      options={"transaction_id": transaction_id})
         # The response is successfull
         self.assertTrue(r)
@@ -1265,12 +2034,12 @@ class TokenTestCase(MyTestCase):
         self.assertEqual(r_dict.get("serial"), "CR2B")
         # All challenges of the transaction_id have been deleted on
         # successful authentication
-        r = Challenge.query.filter(Challenge.transaction_id ==
-                                transaction_id).all()
+        r = get_challenges(transaction_id=transaction_id)
         self.assertEqual(len(r), 0)
 
         remove_token("CR2A")
         remove_token("CR2B")
+        token_c.delete_token()
         delete_policy("test49")
 
     def test_50_otpkeyformat(self):
@@ -1289,16 +2058,16 @@ class TokenTestCase(MyTestCase):
                          binascii.hexlify(otpkey))
         remove_token("NEW001")
         # unknown encoding
-        self.assertRaisesRegexp(ParameterError,
-                                "Unknown OTP key format",
-                                init_token,
-                                {"serial": "NEW001",
-                                 "type": "hotp",
-                                 "otpkey": binascii.hexlify(otpkey),
-                                 "otpkeyformat": "foobar"},
-                                user=User(login="cornelius",
-                                          realm=self.realm1))
-        remove_token("NEW001")
+        self.assertRaisesRegex(ParameterError,
+                               "Unknown OTP key format",
+                               init_token,
+                               {"serial": "NEW001",
+                                "type": "hotp",
+                                "otpkey": binascii.hexlify(otpkey),
+                                "otpkeyformat": "foobar"},
+                               user=User(login="cornelius",
+                                         realm=self.realm1))
+
         # successful base32check encoding
         base32check_encoding = b32encode_and_unicode(checksum + otpkey).strip("=")
         tokenobject = init_token({"serial": "NEW002", "type": "hotp",
@@ -1341,108 +2110,107 @@ class TokenTestCase(MyTestCase):
         # invalid base32check encoding (incorrect checksum due to typo)
         base32check_encoding = b32encode_and_unicode(checksum + otpkey)
         base32check_encoding = "A" + base32check_encoding[1:]
-        self.assertRaisesRegexp(ParameterError,
-                                "Incorrect checksum",
-                                init_token,
-                                {"serial": "NEW004", "type": "hotp",
-                                 "otpkey": base32check_encoding,
-                                 "otpkeyformat": "base32check"},
-                                user=User(login="cornelius", realm=self.realm1))
-        remove_token("NEW004") # TODO: Token is created anyway?
+        self.assertRaisesRegex(ParameterError,
+                               "Incorrect checksum",
+                               init_token,
+                               {"serial": "NEW004", "type": "hotp",
+                                "otpkey": base32check_encoding,
+                                "otpkeyformat": "base32check"},
+                               user=User(login="cornelius", realm=self.realm1))
+
         # invalid base32check encoding (missing four characters => incorrect checksum)
         base32check_encoding = b32encode_and_unicode(checksum + otpkey)
         base32check_encoding = base32check_encoding[:-4]
-        self.assertRaisesRegexp(ParameterError,
-                                "Incorrect checksum",
-                                init_token,
-                                {"serial": "NEW005", "type": "hotp",
-                                 "otpkey": base32check_encoding,
-                                 "otpkeyformat": "base32check"},
-                                user=User(login="cornelius", realm=self.realm1))
-        remove_token("NEW005") # TODO: Token is created anyway?
+        self.assertRaisesRegex(ParameterError,
+                               "Incorrect checksum",
+                               init_token,
+                               {"serial": "NEW005", "type": "hotp",
+                                "otpkey": base32check_encoding,
+                                "otpkeyformat": "base32check"},
+                               user=User(login="cornelius", realm=self.realm1))
+
         # invalid base32check encoding (too many =)
         base32check_encoding = b32encode_and_unicode(checksum + otpkey)
-        base32check_encoding = base32check_encoding + "==="
-        self.assertRaisesRegexp(ParameterError,
-                                "Invalid base32",
-                                init_token,
-                                {"serial": "NEW006", "type": "hotp",
-                                 "otpkey": base32check_encoding,
-                                 "otpkeyformat": "base32check"},
-                                user=User(login="cornelius", realm=self.realm1))
-        remove_token("NEW006") # TODO: Token is created anyway?
+        base32check_encoding += "==="
+        self.assertRaisesRegex(ParameterError,
+                               "Invalid base32",
+                               init_token,
+                               {"serial": "NEW006", "type": "hotp",
+                                "otpkey": base32check_encoding,
+                                "otpkeyformat": "base32check"},
+                               user=User(login="cornelius", realm=self.realm1))
+
         # invalid base32check encoding (wrong characters)
         base32check_encoding = b32encode_and_unicode(checksum + otpkey)
         base32check_encoding = "1" + base32check_encoding[1:]
-        self.assertRaisesRegexp(ParameterError,
-                                "Invalid base32",
-                                init_token,
-                                {"serial": "NEW006", "type": "hotp",
-                                 "otpkey": base32check_encoding,
-                                 "otpkeyformat": "base32check"},
-                                user=User(login="cornelius", realm=self.realm1))
-        remove_token("NEW006") # TODO: Token is created anyway?
+        self.assertRaisesRegex(ParameterError,
+                               "Invalid base32",
+                               init_token,
+                               {"serial": "NEW006", "type": "hotp",
+                                "otpkey": base32check_encoding,
+                                "otpkeyformat": "base32check"},
+                               user=User(login="cornelius", realm=self.realm1))
+
         # invalid key (too short)
         base32check_encoding = b32encode_and_unicode(b'Yo')
-        self.assertRaisesRegexp(ParameterError,
-                                "Too short",
-                                init_token,
-                                {"serial": "NEW006", "type": "hotp",
-                                 "otpkey": base32check_encoding,
-                                 "otpkeyformat": "base32check"},
-                                user=User(login="cornelius", realm=self.realm1))
-        remove_token("NEW006")
+        self.assertRaisesRegex(ParameterError,
+                               "Too short",
+                               init_token,
+                               {"serial": "NEW006", "type": "hotp",
+                                "otpkey": base32check_encoding,
+                                "otpkeyformat": "base32check"},
+                               user=User(login="cornelius", realm=self.realm1))
 
     def test_51_tokenkind(self):
         # A normal token will be of kind "software"
         tok = init_token({"type": "totp", "otpkey": self.otpkey})
         kind = tok.get_tokeninfo("tokenkind")
-        self.assertEqual(kind, TOKENKIND.SOFTWARE)
+        self.assertEqual(kind, Tokenkind.SOFTWARE)
         tok.delete_token()
 
         # A token, that is imported, will be of kind "hardware"
         tok = init_token({"type": "totp", "otpkey": self.otpkey},
-                         tokenkind=TOKENKIND.HARDWARE)
+                         tokenkind=Tokenkind.HARDWARE)
         kind = tok.get_tokeninfo("tokenkind")
-        self.assertEqual(kind, TOKENKIND.HARDWARE)
+        self.assertEqual(kind, Tokenkind.HARDWARE)
         tok.delete_token()
 
         # A yubikey initialized as HOTP is hardware
         tok = init_token({"type": "hotp", "otpkey": self.otpkey,
                           "serial": "UBOM111111"})
         kind = tok.get_tokeninfo("tokenkind")
-        self.assertEqual(kind, TOKENKIND.HARDWARE)
+        self.assertEqual(kind, Tokenkind.HARDWARE)
         tok.delete_token()
 
         # A yubikey and yubicloud tokentype is hardware
-        tok = init_token({"type": "yubikey", "otpkey": self.otpkey})
+        tok = init_token({"type": "yubikey", "otpkey": self.yubikey_token_key})
         kind = tok.get_tokeninfo("tokenkind")
-        self.assertEqual(kind, TOKENKIND.HARDWARE)
+        self.assertEqual(kind, Tokenkind.HARDWARE)
         tok.delete_token()
 
         tok = init_token({"type": "yubico",
                           "yubico.tokenid": "123456789012"})
         kind = tok.get_tokeninfo("tokenkind")
-        self.assertEqual(kind, TOKENKIND.HARDWARE)
+        self.assertEqual(kind, Tokenkind.HARDWARE)
         tok.delete_token()
 
         # 4eyes, radius and remote are virtual tokens
         tok = init_token({"type": "radius", "radius.identifier": "1",
                           "radius.user": "hans"})
         kind = tok.get_tokeninfo("tokenkind")
-        self.assertEqual(kind, TOKENKIND.VIRTUAL)
+        self.assertEqual(kind, Tokenkind.VIRTUAL)
         tok.delete_token()
 
         tok = init_token({"type": "remote", "remote.server": "1",
                           "radius.user": "hans"})
         kind = tok.get_tokeninfo("tokenkind")
-        self.assertEqual(kind, TOKENKIND.VIRTUAL)
+        self.assertEqual(kind, Tokenkind.VIRTUAL)
         tok.delete_token()
 
         tok = init_token({"type": "4eyes", "4eyes": "realm1",
                           "separator": ","})
         kind = tok.get_tokeninfo("tokenkind")
-        self.assertEqual(kind, TOKENKIND.VIRTUAL)
+        self.assertEqual(kind, Tokenkind.VIRTUAL)
         tok.delete_token()
 
     def test_52_import_token(self):
@@ -1466,7 +2234,7 @@ class TokenTestCase(MyTestCase):
                                      "resolver": self.resolvername1,
                                      "realm": self.realm1}})
         self.assertEqual(tok.get_user_id(), "1000")
-        self.assertEqual(tok.get_user_displayname(), (u'cornelius_realm1', u'Cornelius '))
+        self.assertEqual(tok.get_user_displayname(), ('cornelius_realm1', 'Cornelius '))
         remove_token("IMP002")
 
     def test_54_helper_functions(self):
@@ -1508,12 +2276,14 @@ class TokenTestCase(MyTestCase):
         unassign_token(serial=None, user=user)
 
     def test_55_get_tokens_paginated_generator(self):
-        def flatten_tokens(l):
-            return [token.token.id for l2 in l for token in l2]
+        def flatten_tokens(token_list):
+            return [token.token.id for l2 in token_list for token in l2]
 
         # serial72 token has invalid type. Check behavior and remove it.
         self.assertEqual(list(get_tokens_paginated_generator(serial_wildcard="serial*")), [[]])
-        Token.query.filter_by(serial="serial72").delete()
+        # We need to remove the token directly in the DB since `remove_token()` would check the type
+        db.session.query(Token).filter_by(serial="serial72").delete()
+        db.session.commit()
 
         all_matching_tokens = get_tokens(serial_wildcard="S*")
         lists1 = list(get_tokens_paginated_generator(serial_wildcard="S*"))
@@ -1554,7 +2324,7 @@ class TokenTestCase(MyTestCase):
         # Check that we did not miss any tokens
         self.assertEqual(set(t.token.serial for t in list1 + list2), all_serials)
 
-    def test_0057_check_invalid_serial(self):
+    def test_57a_check_invalid_serial(self):
         # This is an invalid serial, which will trigger an exception
         self.assertRaises(Exception, reset_token, "hans wurst")
 
@@ -1562,7 +2332,7 @@ class TokenTestCase(MyTestCase):
                           {"serial": "invalid/chars",
                            "genkey": 1})
 
-    def test_57_registration_token_no_auth_counter(self):
+    def test_57b_registration_token_no_auth_counter(self):
         # Test, that a registration token is deleted even if no_auth_counter is used.
         from privacyidea.lib.config import set_privacyidea_config, delete_privacyidea_config
         set_privacyidea_config("no_auth_counter", 1)
@@ -1593,518 +2363,329 @@ class TokenTestCase(MyTestCase):
 
     def test_59_weigh_token_types(self):
 
-        class dummy_token(object):
+        class dummy_token:
             def __init__(self, type):
                 self.type = type
+
         self.assertEqual(1000, weigh_token_type(dummy_token("push")))
         self.assertTrue(weigh_token_type(dummy_token("push")) > weigh_token_type(dummy_token("hotp")))
         self.assertTrue(weigh_token_type(dummy_token("push")) > weigh_token_type(dummy_token("HOTP")))
         self.assertTrue(weigh_token_type(dummy_token("PUSH")) > weigh_token_type(dummy_token("hotp")))
 
+    def test_60_get_enroll_url(self):
+        hotp_params = {'container_serial': None, 'genkey': True, 'hashlib': 'sha1', 'otplen': 6,
+                       'radius.system_settings': True,
+                       'rollover': False, 'timeStep': 30, 'type': 'hotp', 'validity_period_end': '',
+                       'validity_period_start': ''}
+        hotp = init_token(hotp_params)
+        totp_params = {'container_serial': None, 'genkey': True, 'hashlib': 'sha1', 'otplen': 6,
+                       'radius.system_settings': True, 'rollover': False, 'timeStep': 30, 'type': 'totp',
+                       'validity_period_end': '', 'validity_period_start': ''}
+        totp = init_token(totp_params)
 
-class TokenOutOfBandTestCase(MyTestCase):
+        hotp_init = hotp.get_init_detail(hotp_params, User())
+        hotp_enroll_url = hotp.get_enroll_url(User(), {})
+        self.assertEqual(hotp_init["googleurl"]["value"], hotp_enroll_url)
 
-    def test_00_create_realms(self):
-        self.setUp_user_realms()
+        totp_init = totp.get_init_detail(totp_params, User())
+        totp_enroll_url = totp.get_enroll_url(User(), {})
+        self.assertEqual(totp_init["googleurl"]["value"], totp_enroll_url)
 
-    def test_01_failcounter_no_increase(self):
-        # The fail counter for tiqr tokens will not increase, since this
-        # is a tokenmode outofband.
-        user = User(login="cornelius", realm=self.realm1)
-        pin1 = "pin1"
-        token1 = init_token({"serial": pin1, "pin": pin1,
-                             "type": "tiqr", "genkey": 1}, user=user)
+    def test_61_import_list_of_tokens(self):
+        # Import a list of tokens
+        tokens = [
+            {"serial": "12345678901234567890", "type": "hotp", "otplen": "6"},
+            {"serial": "12345678901234567890123456789012", "type": "totp", "otplen": "8"},
+            {"serial": "987654321", "type": "hotp", "otplen": "6", "otpkey": "12345"}
+        ]
+        result = import_tokens(tokens)
+        self.assertEqual(set(["12345678901234567890", "12345678901234567890123456789012", "987654321"]),
+                         set(result.successful_tokens), result)
+        imported_tokens = get_tokens()
+        for token in tokens:
+            serial = token["serial"]
+            self.assertEqual(get_tokens(serial=serial)[0].token.serial, serial)
 
-        r = token1.get_failcount()
-        self.assertEqual(r, 0)
+        # Clean up the imported tokens
+        remove_token(imported_tokens[0].token.serial)
+        remove_token(imported_tokens[1].token.serial)
+        remove_token(imported_tokens[2].token.serial)
 
-        r, r_dict = check_token_list([token1], pin1, user=user, options={})
-        self.assertFalse(r, r_dict)
-        transaction_id = r_dict.get("transaction_id")
+    def test_62_token_import_and_export(self):
+        hotptoken = init_token(param={'serial': "OATH12345678",
+                                      'type': 'hotp',
+                                      'otpkey': self.otpkey,
+                                      "otplen": '8',
+                                      "description": "Hotp Token"})
+        totptoken = init_token(param={'serial': "TOTP12345678",
+                                      'type': 'totp',
+                                      'otpkey': self.otpkey,
+                                      "otplen": '8',
+                                      "description": "Totp Token"})
 
-        # Now we check the status of the challenge several times and verify that the
-        # failcounter is not increased:
-        for i in range(1, 10):
-            r, r_dict = check_token_list([token1], "", user=user, options={"transaction_id": transaction_id})
-            self.assertFalse(r, r_dict)
-            self.assertEqual(r_dict.get("type"), "tiqr", r_dict)
+        # Export the tokens
+        exported_tokens = export_tokens([hotptoken, totptoken]).successful_tokens
+        exported_tokens_str = json.dumps(exported_tokens)
+        self.assertIn('"type": "hotp"', exported_tokens_str)
+        self.assertIn('"serial": "OATH12345678"', exported_tokens_str)
+        self.assertIn('"type": "totp"', exported_tokens_str)
+        self.assertIn('"serial": "TOTP12345678"', exported_tokens_str)
 
-        r = token1.get_failcount()
-        self.assertEqual(r, 0)
+        # Remove the tokens
+        hotptoken.delete_token()
+        totptoken.delete_token()
 
-        # Now set the challenge to be answered and recheck:
-        Challenge.query.filter(Challenge.transaction_id == transaction_id).update({"otp_valid": True})
-        r, r_dict = check_token_list([token1], "", user=user, options={"transaction_id": transaction_id})
-        self.assertTrue(r, r_dict)
-        self.assertEqual(r_dict.get("message"), "Found matching challenge", r_dict)
+        # Import tokens
+        imported_tokens = import_tokens(exported_tokens)
+        hotptoken = get_tokens(serial="OATH12345678")[0]
+        totptoken = get_tokens(serial="TOTP12345678")[0]
+        self.assertEqual(len(imported_tokens.successful_tokens), 2)
+        self.assertEqual(len(imported_tokens.failed_tokens), 0)
+        self.assertEqual(len(imported_tokens.updated_tokens), 0)
+        self.assertIn('OATH12345678', imported_tokens.successful_tokens)
+        self.assertIn('TOTP12345678', imported_tokens.successful_tokens)
+        self.assertEqual(hotptoken.token.serial, "OATH12345678")
+        self.assertEqual(hotptoken.token.tokentype, "hotp")
+        self.assertEqual(totptoken.token.serial, "TOTP12345678")
+        self.assertEqual(totptoken.token.tokentype, "totp")
 
-        remove_token(pin1)
+        # Test updating existing tokens
+        hotptoken.set_description("this will be replaced by the import")
+        totptoken.set_description("this will be replaced by the import")
+        self.assertEqual(hotptoken.token.description, "this will be replaced by the import")
+        self.assertEqual(totptoken.token.description, "this will be replaced by the import")
+        db.session.commit()
 
+        updated_tokens = import_tokens(exported_tokens, update_existing_tokens=True)
+        self.assertEqual(hotptoken.token.description, "Hotp Token")
+        self.assertEqual(totptoken.token.description, "Totp Token")
+        self.assertEqual(len(updated_tokens.updated_tokens), 2)
 
-class TokenFailCounterTestCase(MyTestCase):
-    """
-    Test the lib.token on an interface level
-    """
+        # Test not updating existing tokens
+        hotptoken.set_description("this will not be replaced by the import")
+        totptoken.set_description("this will not be replaced by the import")
+        self.assertEqual(hotptoken.token.description, "this will not be replaced by the import")
+        self.assertEqual(totptoken.token.description, "this will not be replaced by the import")
+        db.session.commit()
 
-    def test_00_create_realms(self):
-        self.setUp_user_realms()
+        updated_tokens = import_tokens(exported_tokens, update_existing_tokens=False)
+        self.assertEqual(hotptoken.token.description, "this will not be replaced by the import")
+        self.assertEqual(totptoken.token.description, "this will not be replaced by the import")
+        self.assertEqual(len(updated_tokens.failed_tokens), 2)
 
-    def test_01_failcounter_max_hotp(self):
-        # Check if we can not authenticate with a token that has the maximum
-        # failcounter
-        user = User(login="cornelius", realm=self.realm1)
-        token = init_token({"serial": "test47", "pin": "test47",
-                            "type": "hotp", "otpkey": OTPKEY},
-                           user=user)
+        # Remove the tokens
+        hotptoken.delete_token()
+        totptoken.delete_token()
 
-        """                        Truncated
-           Count    Hexadecimal    Decimal        HOTP
-           0        4c93cf18       1284755224     755224
-           1        41397eea       1094287082     287082
-           2         82fef30        137359152     359152
-           3        66ef7655       1726969429     969429
-           4        61c5938a       1640338314     338314
-           5        33c083d4        868254676     254676
-           6        7256c032       1918287922     287922
-           7         4e5b397         82162583     162583
-           8        2823443f        673399871     399871
-           9        2679dc69        645520489     520489
-           10                                     403154
-           11                                     481090
-           12                                     868912
-           13                                     736127
-        """
-        res, reply = check_user_pass(user, "test47287082")
-        self.assertTrue(res)
-        # Set the failcounter to maximum failcount
-        token.set_failcount(10)
-        # Authentication must fail, since the failcounter is reached
-        res, reply = check_user_pass(user, "test47359152")
-        self.assertFalse(res)
-        self.assertEqual(reply.get("message"), "matching 1 tokens, "
-                                               "Failcounter exceeded")
+    def test_63_token_export_with_user(self):
+        # Set up a user and a token
+        self.setUp_user_realm2()
+        user = User("cornelius", self.realm2)
+        hotptoken = init_token(param={'serial': "OATH12345678",
+                                      'type': 'hotp',
+                                      'otpkey': self.otpkey,
+                                      "otplen": '8',
+                                      "description": "Hotp Token"})
+        totptoken = init_token(param={'serial': "TOTP12345678",
+                                      'type': 'totp',
+                                      'otpkey': self.otpkey,
+                                      "otplen": '8',
+                                      "description": "Totp Token"})
+        assign_token(user=user, serial="OATH12345678")
+        assign_token(user=user, serial="TOTP12345678")
 
-        remove_token("test47")
+        exported_tokens = export_tokens([hotptoken, totptoken], export_user=True).successful_tokens
+        self.assertIn('"login": "cornelius"', json.dumps(exported_tokens))
 
-    def test_02_failcounter_max_totp(self):
-        # Check if we can not authenticate with a token that has the maximum
-        # failcounter
-        user = User(login="cornelius", realm=self.realm1)
-        pin = "testTOTP"
-        token = init_token({"serial": pin, "pin": pin,
-                            "type": "totp", "otpkey": OTPKEY},
-                           user=user)
-        """
-        47251644    942826
-        47251645    063321
-        47251646    306773
-        47251647    722053
-        47251648    032819
-        47251649    705493
-        47251650    589836
-        """
-        res, reply = check_user_pass(user, pin + "942826",
-                                     options={"initTime": 47251644 * 30})
-        self.assertTrue(res)
-        # Set the failcounter to maximum failcount
-        token.set_failcount(10)
-        # Authentication must fail, since the failcounter is reached
-        res, reply = check_user_pass(user, pin + "032819",
-                                     options={"initTime": 47251648 * 30})
-        self.assertFalse(res)
-        self.assertEqual(reply.get("message"), "matching 1 tokens, "
-                                               "Failcounter exceeded")
+        # Remove the tokens
+        unassign_token(user=user, serial="OATH12345678")
+        unassign_token(user=user, serial="TOTP12345678")
+        hotptoken.delete_token()
+        totptoken.delete_token()
 
-        remove_token(pin)
+        # import the tokens with user assignment
+        import_tokens(exported_tokens, update_existing_tokens=True, assign_to_user=True)
+        hotptoken = get_tokens(serial="OATH12345678")[0]
+        totptoken = get_tokens(serial="TOTP12345678")[0]
 
-    def test_03_inc_failcounter_of_all_tokens(self):
-        # If a user has more than one token and authenticates with wrong OTP
-        # PIN, the failcounter on all tokens should be increased
-        user = User(login="cornelius", realm=self.realm1)
-        pin1 = "pin1"
-        pin2 = "pin2"
-        token1 = init_token({"serial": pin1, "pin": pin1,
-                             "type": "hotp", "genkey": 1}, user=user)
-        token2 = init_token({"serial": pin2, "pin": pin2,
-                             "type": "hotp", "genkey": 1}, user=user)
+        self.assertEqual(hotptoken.owners[0].login, "cornelius")
+        self.assertEqual(totptoken.owners[0].login, "cornelius")
 
-        # Authenticate with pin1 will increase first failcounter
-        res, reply = check_user_pass(user, pin1 + "000000")
-        self.assertEqual(res, False)
-        self.assertEqual(reply.get("message"), "wrong otp value")
+        # unassign the tokens
+        unassign_token(user=user, serial="OATH12345678")
+        unassign_token(user=user, serial="TOTP12345678")
 
-        self.assertEqual(token1.token.failcount, 1)
-        self.assertEqual(token2.token.failcount, 0)
+        self.assertEqual(hotptoken.token.first_owner, None)
+        self.assertEqual(totptoken.token.first_owner, None)
 
-        # Authenticate with a wrong PIN will increase all failcounters
-        res, reply = check_user_pass(user, "XXX" + "000000")
-        self.assertEqual(res, False)
-        self.assertEqual(reply.get("message"), "wrong otp pin")
+        # check token will be assigned to the user on update
+        import_tokens(exported_tokens, update_existing_tokens=True, assign_to_user=True)
+        self.assertEqual(hotptoken.owners[0].login, "cornelius")
+        self.assertEqual(totptoken.owners[0].login, "cornelius")
 
-        self.assertEqual(token1.token.failcount, 2)
-        self.assertEqual(token2.token.failcount, 1)
-        remove_token(pin1)
-        remove_token(pin2)
+        # unassign the tokens
+        unassign_token(user=user, serial="OATH12345678")
+        unassign_token(user=user, serial="TOTP12345678")
 
-    def test_04_reset_all_failcounters(self):
-        from privacyidea.lib.policy import (set_policy, PolicyClass, SCOPE,
-            ACTION)
-        from flask import g
+        self.assertEqual(hotptoken.token.first_owner, None)
+        self.assertEqual(totptoken.token.first_owner, None)
 
-        set_policy("reset_all", scope=SCOPE.AUTH,
-                   action=ACTION.RESETALLTOKENS)
+        # check token will not be assigned to the user on no update
+        import_tokens(exported_tokens, update_existing_tokens=False, assign_to_user=True)
+        self.assertEqual(hotptoken.token.first_owner, None)
+        self.assertEqual(totptoken.token.first_owner, None)
 
-        user = User(login="cornelius", realm=self.realm1)
-        pin1 = "pin1"
-        pin2 = "pin2"
-        token1 = init_token({"serial": pin1, "pin": pin1,
-                             "type": "spass"}, user=user)
-        token2 = init_token({"serial": pin2, "pin": pin2,
-                             "type": "spass"}, user=user)
+    def test_64_import_tokens_missing_serial(self):
+        """Test that a token entry without a serial is recorded as failed and does not crash."""
+        tokens_data = [
+            {"type": "hotp", "otpkey": self.otpkey, "otplen": 6, "description": "No serial"}
+        ]
+        result = import_tokens(tokens_data, update_existing_tokens=True)
+        self.assertEqual(len(result.failed_tokens), 1)
+        self.assertIsNone(result.failed_tokens[0])
+        self.assertEqual(len(result.successful_tokens), 0)
+        self.assertEqual(len(result.updated_tokens), 0)
 
-        token1.inc_failcount()
-        token2.inc_failcount()
-        token2.inc_failcount()
-        self.assertEqual(token1.token.failcount, 1)
-        self.assertEqual(token2.token.failcount, 2)
+        # Several serial-less entries each yield their own None entry, so the
+        # failure count stays accurate and the placeholders never masquerade as serials
+        tokens_data = [
+            {"type": "hotp", "otpkey": self.otpkey, "description": "No serial 1"},
+            {"type": "hotp", "otpkey": self.otpkey, "description": "No serial 2"},
+            {"type": "hotp", "otpkey": self.otpkey, "description": "No serial 3"},
+        ]
+        result = import_tokens(tokens_data, update_existing_tokens=True)
+        self.assertEqual(result.failed_tokens, [None, None, None])
 
-        g.policy_object = PolicyClass()
-        g.audit_object = FakeAudit()
-        g.client_ip = None
-        g.serial = None
-        options = {"g": g}
+    def test_65_import_tokens_missing_type(self):
+        """Test that a token entry without a type is recorded as failed and does not crash."""
+        tokens_data = [
+            {"serial": "NOTYPE001", "otpkey": self.otpkey, "otplen": 6, "description": "No type"}
+        ]
+        result = import_tokens(tokens_data, update_existing_tokens=True)
+        self.assertEqual(len(result.failed_tokens), 1)
+        self.assertEqual(result.failed_tokens[0], "NOTYPE001")
+        self.assertEqual(len(result.successful_tokens), 0)
+        self.assertEqual(len(result.updated_tokens), 0)
+        # Ensure no token was created
+        self.assertEqual(get_tokens(serial="NOTYPE001"), [])
 
-        check_token_list([token1, token2], pin1, user=user,
-                         options=options, allow_reset_all_tokens=True)
+    def test_66_import_existing_token_not_deleted_on_import_failure(self):
+        """Test that a pre-existing token is NOT deleted when import_token fails during update."""
+        # Create a token that already exists
+        existing = init_token(param={'serial': "EXISTING001",
+                                     'type': 'hotp',
+                                     'otpkey': self.otpkey,
+                                     "otplen": '6',
+                                     "description": "Pre-existing token"})
+        db.session.commit()
 
-        self.assertEqual(token1.token.failcount, 0)
-        self.assertEqual(token2.token.failcount, 0)
+        # Craft import data that will fail during import_token (invalid data)
+        bad_token_data = [
+            {"serial": "EXISTING001", "type": "hotp", "otpkey": None}
+        ]
 
-        # check with tokens without users
-        unassign_token(pin1)
-        unassign_token(pin1)
-        # After unassigning we need to set the PIN again
-        token1.set_pin(pin1)
-        token2.set_pin(pin2)
-        token1.inc_failcount()
-        token2.inc_failcount()
-        token2.inc_failcount()
-        self.assertEqual(token1.token.failcount, 1)
-        self.assertEqual(token2.token.failcount, 2)
+        # Mock the import_token method on the token to raise an exception
+        with mock.patch.object(type(existing), "import_token", side_effect=Exception("Import failed")):
+            result = import_tokens(bad_token_data, update_existing_tokens=True)
 
-        check_token_list([token1, token2], pin1, options=options,
-                         allow_reset_all_tokens=True)
-
-        self.assertEqual(token1.token.failcount, 0)
-        self.assertEqual(token2.token.failcount, 0)
+        # The token should be in failed list
+        self.assertIn("EXISTING001", result.failed_tokens)
+        # The pre-existing token must NOT have been deleted
+        tokens = get_tokens(serial="EXISTING001")
+        self.assertEqual(len(tokens), 1)
+        self.assertEqual(tokens[0].token.description, "Pre-existing token")
 
         # Clean up
-        remove_token(pin1)
-        remove_token(pin2)
+        existing.delete_token()
 
-    def test_05_reset_failcounter(self):
-        tok = init_token({"type": "hotp",
-                          "serial": "test05",
-                          "otpkey": self.otpkey})
-        # Set failcounter clear timeout to 1 minute
-        set_privacyidea_config(FAILCOUNTER_CLEAR_TIMEOUT, 1)
-        tok.token.count = 10
-        tok.set_pin("hotppin")
-        tok.set_failcount(10)
-        exceeded_timestamp = datetime.datetime.now(tzlocal()) - datetime.timedelta(minutes=1)
-        tok.add_tokeninfo(FAILCOUNTER_EXCEEDED, exceeded_timestamp.strftime(DATE_FORMAT))
-
-        # OTP value #11
-        res, reply = check_token_list([tok], "hotppin481090")
-        self.assertTrue(res)
-        set_privacyidea_config(FAILCOUNTER_CLEAR_TIMEOUT, 0)
-        remove_token("test05")
-
-    def test_06_reset_failcounter_out_of_sync(self):
-        # Reset fail counter of a token that is out of sync
-        # The fail counter will reset, even if the token is out of sync, since the
-        # autoresync is handled in the tokenclass.authenticate.
-        tok = init_token({"type": "hotp",
-                          "serial": "test06",
-                          "otpkey": self.otpkey})
-
-        set_privacyidea_config("AutoResyncTimeout", "300")
-        set_privacyidea_config("AutoResync", 1)
-
-        tok.set_pin("hotppin")
-        tok.set_count_window(2)
-
-        res, reply = check_token_list([tok], "hotppin{0!s}".format(self.valid_otp_values[0]))
-        self.assertTrue(res)
-
-        # Now we set the failoucnter and the exceeded time.
-        tok.set_failcount(10)
-        exceeded_timestamp = datetime.datetime.now(tzlocal()) - datetime.timedelta(minutes=1)
-        tok.add_tokeninfo(FAILCOUNTER_EXCEEDED, exceeded_timestamp.strftime(DATE_FORMAT))
-        set_privacyidea_config(FAILCOUNTER_CLEAR_TIMEOUT, 1)
-
-        # authentication with otp value #3 will fail
-        res, reply = check_token_list([tok], "hotppin{0!s}".format(self.valid_otp_values[3]))
-        self.assertFalse(res)
-
-        # authentication with otp value #4 will resync and succeed
-        res, reply = check_token_list([tok], "hotppin{0!s}".format(self.valid_otp_values[4]))
-        self.assertTrue(res)
-        self.assertEqual(tok.get_failcount(), 0)
-
-        set_privacyidea_config(FAILCOUNTER_CLEAR_TIMEOUT, 0)
-        delete_privacyidea_config("AutoResyncTimeout")
-        delete_privacyidea_config("AutoResync")
-        remove_token("test06")
-
-    def test_07_reset_failcounter_on_pin_only(self):
-        tok = init_token({"type": "hotp",
-                          "serial": "test07",
-                          "otpkey": self.otpkey})
-        # Set failcounter clear timeout to 1 minute
-        set_privacyidea_config(FAILCOUNTER_CLEAR_TIMEOUT, 1)
-        tok.token.count = 10
-        tok.set_pin("hotppin")
-        tok.set_failcount(10)
-        exceeded_timestamp = datetime.datetime.now(tzlocal()) - datetime.timedelta(minutes=1)
-        tok.add_tokeninfo(FAILCOUNTER_EXCEEDED, exceeded_timestamp.strftime(DATE_FORMAT))
-
-        # by default, correct PIN + wrong OTP value does not reset the failcounter
-        res, reply = check_token_list([tok], "hotppin123456")
-        self.assertEqual(tok.get_failcount(), 10)
-        self.assertFalse(res)
-        # with the corresponding config option ...
-        set_privacyidea_config(SYSCONF.RESET_FAILCOUNTER_ON_PIN_ONLY, "True")
-        # ... correct PIN + wrong OTP resets the failcounter ...
-        res, reply = check_token_list([tok], "hotppin123456")
-        self.assertEqual(tok.get_failcount(), 0)
-        # ... but authentication still fails
-        self.assertFalse(res)
-
-        set_privacyidea_config(FAILCOUNTER_CLEAR_TIMEOUT, 0)
-        delete_privacyidea_config(SYSCONF.RESET_FAILCOUNTER_ON_PIN_ONLY)
-        remove_token("test07")
-
-
-class PINChangeTestCase(MyTestCase):
-    """
-    Test the check_token_list from lib.token on an interface level
-    """
-
-    def test_00_create_realms(self):
+    def test_67_import_existing_token_not_deleted_on_user_assign_failure(self):
+        """Test that a pre-existing token is NOT deleted when add_user fails during update."""
         self.setUp_user_realms()
-        # Set a policy to change the pin every 10d
-        set_policy("every10d", scope=SCOPE.ENROLL, action="{0!s}=10d".format(ACTION.CHANGE_PIN_EVERY))
-        # set policy for chalresp
-        set_policy("chalresp", scope=SCOPE.AUTH, action="{0!s}=hotp".format(ACTION.CHALLENGERESPONSE))
-        # Change PIN via validate
-        set_policy("viaValidate", scope=SCOPE.AUTH, action=ACTION.CHANGE_PIN_VIA_VALIDATE)
+        # Create a token that already exists
+        existing = init_token(param={'serial': "EXISTING002",
+                                     'type': 'hotp',
+                                     'otpkey': self.otpkey,
+                                     "otplen": '6',
+                                     "description": "Pre-existing token 2"})
+        db.session.commit()
 
-    def test_01_successfully_change_pin(self):
-        """
-        Authentication per challenge response with an HOTP token and then
-        do a successful PIN reset
-        """
-        g = FakeFlaskG()
-        g.client_ip = "10.0.0.1"
-        g.policy_object = PolicyClass()
-        g.audit_object = FakeAudit()
-        user_obj = User("cornelius", realm=self.realm1)
-        # remove all tokens of cornelius
-        remove_token(user=user_obj)
-        tok = init_token({"type": "hotp",
-                          "otpkey": self.otpkey, "pin": "test",
-                          "serial": "PINCHANGE"}, tokenrealms=["r1"], user=user_obj)
-        tok2 = init_token({"type": "hotp",
-                          "otpkey": self.otpkey, "pin": "fail",
-                          "serial": "NOTNEEDED"}, tokenrealms=["r1"], user=user_obj)
-        # Set, that the token needs to change the pin
-        tok.set_next_pin_change("-1d")
-        # Check it
-        self.assertTrue(tok.is_pin_change())
+        # Craft import data with a user that will fail assignment
+        bad_token_data = [
+            {"serial": "EXISTING002", "type": "hotp", "otpkey": self.otpkey,
+             "user": {"login": "nonexistent_user", "resolver": "bad_resolver",
+                      "realm": "bad_realm", "uid": "999"}}
+        ]
 
-        # Trigger the first auth challenge by sending the PIN
-        r, reply_dict = check_token_list([tok, tok2], "test", user=user_obj, options={"g": g})
-        self.assertFalse(r)
-        self.assertEqual('please enter otp: ', reply_dict.get("message"))
-        transaction_id = reply_dict.get("transaction_id")
+        with mock.patch.object(type(existing), "add_user", side_effect=Exception("User lookup failed")):
+            result = import_tokens(bad_token_data, update_existing_tokens=True, assign_to_user=True)
 
-        # Now send the correct OTP value
-        r, reply_dict = check_token_list([tok, tok2], self.valid_otp_values[1], user=user_obj,
-                                         options={"transaction_id": transaction_id,
-                                                  "g": g})
-        self.assertFalse(r)
-        self.assertEqual("Please enter a new PIN", reply_dict.get("message"))
-        transaction_id = reply_dict.get("transaction_id")
+        # The token should be in failed list
+        self.assertIn("EXISTING002", result.failed_tokens)
+        # The pre-existing token must NOT have been deleted
+        tokens = get_tokens(serial="EXISTING002")
+        self.assertEqual(len(tokens), 1)
+        self.assertEqual(tokens[0].token.description, "Pre-existing token 2")
 
-        # Now send a new PIN
-        newpin = "test2"
-        r, reply_dict = check_token_list([tok, tok2], newpin, user=user_obj,
-                                         options={"transaction_id": transaction_id,
-                                                  "g": g})
-        self.assertFalse(r)
-        self.assertEqual("Please enter the new PIN again", reply_dict.get("message"))
-        transaction_id = reply_dict.get("transaction_id")
+        # Clean up
+        existing.delete_token()
 
-        # Now send the new PIN a 2nd time
-        r, reply_dict = check_token_list([tok, tok2], newpin, user=user_obj,
-                                         options={"transaction_id": transaction_id,
-                                                  "g": g})
-        self.assertTrue(r)
-        self.assertEqual("PIN successfully set.", reply_dict.get("message"))
+    def test_68_import_new_token_deleted_on_failure(self):
+        """Test that a newly created token IS deleted when import_token fails."""
+        # Make sure this token does NOT exist yet
+        self.assertEqual(get_tokens(serial="NEWTOKEN001"), [])
 
-        self.assertFalse(tok.is_pin_change())
+        token_data = [
+            {"serial": "NEWTOKEN001", "type": "hotp", "otpkey": self.otpkey}
+        ]
 
-        # Run an authentication with the new PIN
-        r, reply_dict = check_token_list([tok, tok2], "{0!s}{1!s}".format(newpin, self.valid_otp_values[2]),
-                                         user=user_obj, options={"g": g})
-        self.assertTrue(r)
-        self.assertFalse(reply_dict.get("pin_change"))
-        self.assertTrue("next_pin_change" in reply_dict)
+        # Patch import_token to fail after creation
+        with mock.patch("privacyidea.lib.tokens.hotptoken.HotpTokenClass.import_token",
+                        side_effect=Exception("Import failed")):
+            result = import_tokens(token_data, update_existing_tokens=True)
 
-    def test_02_failed_change_pin(self):
-        """
-        Authentication with an HOTP token and then fail to
-        change pin, since we present two different PINs.
-        """
-        g = FakeFlaskG()
-        g.client_ip = "10.0.0.1"
-        g.policy_object = PolicyClass()
-        g.audit_object = FakeAudit()
-        user_obj = User("cornelius", realm=self.realm1)
-        # remove all tokens of cornelius
-        remove_token(user=user_obj)
-        tok = init_token({"type": "hotp",
-                          "otpkey": self.otpkey, "pin": "test",
-                          "serial": "PINCHANGE"}, tokenrealms=["r1"], user=user_obj)
-        tok2 = init_token({"type": "hotp",
-                          "otpkey": self.otpkey, "pin": "fail",
-                          "serial": "NOTNEEDED"}, tokenrealms=["r1"], user=user_obj)
-        # Set, that the token needs to change the pin
-        tok.set_next_pin_change("-1d")
-        # Check it
-        self.assertTrue(tok.is_pin_change())
+        # The token should be in failed list
+        self.assertIn("NEWTOKEN001", result.failed_tokens)
+        # The newly created token SHOULD be deleted on failure
+        self.assertEqual(get_tokens(serial="NEWTOKEN001"), [])
 
-        # successfully authenticate, but thus trigger a PIN change
-        r, reply_dict = check_token_list([tok, tok2], "test{0!s}".format(self.valid_otp_values[1]),
-                                         user=user_obj, options={"g": g})
-        self.assertFalse(r)
-        self.assertEqual("Please enter a new PIN", reply_dict.get("message"))
-        transaction_id = reply_dict.get("transaction_id")
+    def test_69_import_update_existing_token_without_type(self):
+        """Test that updating an existing token succeeds even when the entry omits a type."""
+        existing = init_token(param={'serial': "UPDATE001",
+                                     'type': 'hotp',
+                                     'otpkey': self.otpkey,
+                                     "otplen": '6',
+                                     "description": "Original description"})
+        db.session.commit()
 
-        # Now send a new PIN
-        newpin = "test2"
-        r, reply_dict = check_token_list([tok, tok2], newpin, user=user_obj,
-                                         options={"transaction_id": transaction_id,
-                                                  "g": g})
-        self.assertFalse(r)
-        self.assertEqual("Please enter the new PIN again", reply_dict.get("message"))
-        transaction_id = reply_dict.get("transaction_id")
+        # An update entry that carries no "type" key: type is only required to create a token
+        update_data = [
+            {"serial": "UPDATE001", "otpkey": self.otpkey, "description": "Updated description"}
+        ]
+        result = import_tokens(update_data, update_existing_tokens=True)
 
-        # Now send the new PIN a 2nd time
-        r, reply_dict = check_token_list([tok, tok2], "falsePIN", user=user_obj,
-                                         options={"transaction_id": transaction_id,
-                                                  "g": g})
-        self.assertFalse(r)
-        self.assertEqual("PINs do not match", reply_dict.get("message"))
+        # The update must succeed, not be reported as failed for a missing type
+        self.assertEqual(result.failed_tokens, [])
+        self.assertIn("UPDATE001", result.updated_tokens)
+        tokens = get_tokens(serial="UPDATE001")
+        self.assertEqual(len(tokens), 1)
+        self.assertEqual(tokens[0].token.description, "Updated description")
 
-        # The PIN still needs to be changed!
-        self.assertTrue(tok.is_pin_change())
+        # Clean up
+        existing.delete_token()
 
-    def test_03_failed_change_pin(self):
-        """
-        Authentication with an HOTP token and then fail to
-        change pin, since we do not comply to the PIN policies :-)
-        """
-        g = FakeFlaskG()
-        g.client_ip = "10.0.0.1"
-        g.policy_object = PolicyClass()
-        g.audit_object = FakeAudit()
-        user_obj = User("cornelius", realm=self.realm1)
-        # remove all tokens of cornelius
-        remove_token(user=user_obj)
-        tok = init_token({"type": "hotp",
-                          "otpkey": self.otpkey, "pin": "test",
-                          "serial": "PINCHANGE"}, tokenrealms=["r1"], user=user_obj)
-        tok2 = init_token({"type": "hotp",
-                          "otpkey": self.otpkey, "pin": "fail",
-                          "serial": "NOTNEEDED"}, tokenrealms=["r1"], user=user_obj)
-        # Set, that the token needs to change the pin
-        tok.set_next_pin_change("-1d")
-        # Check it
-        self.assertTrue(tok.is_pin_change())
-        # Require minimum length of 5
-        set_policy("minpin", scope=SCOPE.USER, action="{0!s}=5".format(ACTION.OTPPINMINLEN))
+    def test_70_import_new_token_deleted_when_tokenclass_object_fails(self):
+        """Test that a create-time failure after the DB row is saved does not leave an orphan row."""
+        self.assertEqual(get_tokens(serial="ORPHAN001"), [])
 
-        # successfully authenticate, but thus trigger a PIN change
-        r, reply_dict = check_token_list([tok, tok2], "test{0!s}".format(self.valid_otp_values[1]),
-                                         user=user_obj, options={"g": g})
-        self.assertFalse(r)
-        self.assertEqual("Please enter a new PIN", reply_dict.get("message"))
-        transaction_id = reply_dict.get("transaction_id")
+        token_data = [
+            {"serial": "ORPHAN001", "type": "hotp", "otpkey": self.otpkey}
+        ]
 
-        # Now send a new PIN, which has only length 4 :-/
-        newpin = "test"
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', category=DeprecationWarning)
-            self.assertRaisesRegexp(
-                PolicyError, "The minimum OTP PIN length is 5", check_token_list,
-                [tok, tok2], newpin, user=user_obj,
-                options={"transaction_id": transaction_id,
-                         "g": g})
+        # Fail right after db_token.save(), while building the token class object
+        with mock.patch("privacyidea.lib.token.importexport.create_tokenclass_object",
+                        side_effect=Exception("Could not build token class")):
+            result = import_tokens(token_data, update_existing_tokens=True)
 
-        delete_policy("minpin")
-
-
-class TokenGroupTestCase(MyTestCase):
-
-    def test_01_add_tokengroups(self):
-        # Create tokens
-        serials = ["s1", "s2"]
-        for s in serials:
-            tok = init_token({"serial": s, "type": "spass"})
-
-        # create tokengroups
-        groups = [("g1", "Test A"), ("g2", "test B")]
-        for g in groups:
-            set_tokengroup(g[0], g[1])
-
-        assign_tokengroup("s1", "g1")
-        assign_tokengroup("s1", "g2")
-        assign_tokengroup("s2", "g2")
-
-        # Check the tokengroups of the first token
-        tok1 = get_one_token(serial="s1")
-        self.assertEqual(tok1.token.tokengroup_list[0].tokengroup.name, "g1")
-        self.assertEqual(tok1.token.tokengroup_list[1].tokengroup.name, "g2")
-
-        # check the tokengroups of the 2nd token
-        tok2 = get_one_token(serial="s2")
-        self.assertEqual(tok2.token.tokengroup_list[0].tokengroup.name, "g2")
-
-        # Test a missing group information
-        self.assertRaises(ResourceNotFoundError, assign_tokengroup, "s1")
-
-        # list tokengroup assignments
-        grouplist = list_tokengroups()
-        self.assertEqual(len(grouplist), 3)
-        # one token in group1
-        grouplist = list_tokengroups("g1")
-        self.assertEqual(len(grouplist), 1)
-        self.assertEqual(grouplist[0].token.serial, "s1")
-        # two tokens in group2
-        grouplist = list_tokengroups("g2")
-        self.assertEqual(len(grouplist), 2)
-
-        # unassign tokengroups
-        r = tok1.del_tokengroup("g1")
-        # only the 2nd group remains
-        self.assertEqual(tok1.token.tokengroup_list[0].tokengroup.name, "g2")
-        # remove it
-        unassign_tokengroup("s2", "g2")
-        tok2 = get_one_token(serial="s2")
-        self.assertEqual(len(tok2.token.tokengroup_list), 0)
-
-        # cleanup
-        for s in serials:
-            remove_token(s)
+        self.assertIn("ORPHAN001", result.failed_tokens)
+        # The persisted row must have been rolled back, not left orphaned
+        self.assertEqual(get_tokens(serial="ORPHAN001"), [])

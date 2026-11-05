@@ -1,0 +1,661 @@
+@use "table";
+
+// Material gives .mat-mdc-table its own surface colour from component styles that are injected
+// after this sheet, and a bare "table" selector loses to that class. Naming the class next to
+// the element wins on specificity instead - the same reason the header cells below do it. Cells
+// inherit this background, so losing it tints every unstriped cell.
+table,
+table.mat-mdc-table {
+  background-color: table.$table-bg;
+}
+
+.mdc-checkbox
+  .mdc-checkbox__native-control:not(.mdc-checkbox--selected):not([aria-checked="mixed"])
+  ~ .mdc-checkbox__background {
+  border: 2px solid var(--mat-sys-outline);
+}
+
+// Material styles the paginator's own parts with the same specificity from component styles
+// that are injected after this sheet, so the host element has to carry the weight here too.
+mat-paginator .mat-mdc-paginator-page-size {
+  margin-right: 0;
+}
+
+mat-paginator .mat-mdc-paginator-page-size-label {
+  margin: 0;
+  white-space: nowrap;
+}
+
+// The label is redundant with the tooltip PaginatorPageSizeTooltipDirective puts on the size
+// picker itself - kept as a class rather than the default so a paginator without the directive
+// still shows its own label text.
+mat-paginator.hide-page-size-label .mat-mdc-paginator-page-size-label {
+  display: none;
+}
+
+mat-paginator .mat-mdc-paginator-range-label {
+  margin: 0 16px;
+  white-space: nowrap;
+}
+
+mat-paginator .mat-mdc-paginator-container {
+  padding: 0 0 0 16px;
+  flex-wrap: nowrap !important;
+  --mat-paginator-container-size: 0px;
+}
+
+a {
+  text-decoration: none;
+  color: table.$link-color;
+  cursor: pointer;
+}
+
+// A table picks its striping mode by class; each mode is applied here exactly once, so a table
+// never has to reset the rules of a mode it is not in. The default mode holds for every table
+// that names none of them, so it has to exclude all of them.
+$striping-modes: "row-striped", "column-striped-explicit", "unstriped";
+$default-mode: "";
+
+@each $mode in $striping-modes {
+  $default-mode: $default-mode + ":not(.#{$mode})";
+}
+
+table#{$default-mode} {
+  @include table.column-stripes;
+}
+
+table.row-striped {
+  @include table.row-stripes;
+}
+
+table.column-striped-explicit {
+  @include table.column-stripes-explicit;
+}
+
+// "unstriped" needs no rules of its own: excluded from the default mode above, its cells keep
+// whatever background the table itself gives them.
+
+// The table itself is transparent so it blends with the ancestor card's gradient (see the
+// table-bg variable in table.scss), but a sticky header cell scrolls over the rows beneath it
+// and can't stay see-through. The opaque fill lives on a ::before that overhangs the cell rather
+// than on the cell itself: a cell whose box rounds to a half-pixel leaves a sliver of the rows
+// behind it uncovered, and the overhang absorbs that. Material sets "background: inherit" and
+// clips the same cell from its own component styles, which are injected after this sheet;
+// leading with the "table" element beats that on specificity rather than on order, so none of
+// these need !important.
+table.mat-mdc-table .mat-mdc-header-cell {
+  background: transparent;
+  // A clipped cell would cut the ::before overhang back to the cell box and bring the sliver
+  // straight back. Nothing in a header cell relies on being clipped: the label wraps.
+  overflow: visible;
+
+  // The fill below is positioned against the cell. A sticky cell is already positioned; a header
+  // that does not stick needs it too, or the fill spans the nearest positioned ancestor instead and
+  // its side overhang widens the whole page by a pixel.
+  &:not(.mat-mdc-table-sticky) {
+    position: relative;
+  }
+
+  &::before {
+    content: "";
+    position: absolute;
+    // Overhangs the bottom edge; the top edge only once scrolled (below). At rest, the cell's top
+    // border is the table's own top edge, which an overhang there would paint over. It overhangs
+    // both sides too: the table paints a sticky cell's collapsed borders where the cell sits
+    // unscrolled, so once scrolled, the border strip between two header cells is a see-through
+    // gap onto the rows passing underneath. The later cell's fill covers the overlap.
+    inset: 0 -1px -1px;
+    // --surface-raised is the ancestor card's depth-tinted gradient, so the header tracks the
+    // Depth setting instead of being pinned to one swatch.
+    background: var(--surface-raised);
+    // The column line the overhang covers, redrawn on the fill: each cell draws its left one, the
+    // last cell its right one as well (below). A border rather than an inset box-shadow: borders
+    // snap to whole device pixels, a shadow blurs or drops out on a fractional zoom.
+    box-sizing: border-box;
+    border-left: 1px solid var(--mat-sys-outline-variant);
+    // Behind the cell's own content, still inside the sticky cell's stacking context (Material
+    // gives it z-index 100), so it stays above the rows scrolling underneath.
+    z-index: -1;
+  }
+
+  // The fill above overhangs onto the row border below the header, so redraw that line here, on
+  // top of it. It doubles as the divider against the rows once they scroll under the header: a
+  // border-bottom is not painted on a position:sticky cell under border-collapse:collapse
+  // (Material tables), and a box-shadow would land under the fill rather than over it.
+  &:last-child::before {
+    border-right: 1px solid var(--mat-sys-outline-variant);
+  }
+
+  &::after {
+    content: "";
+    position: absolute;
+    // As wide as the fill, so the line runs on under the column lines.
+    left: -1px;
+    right: -1px;
+    bottom: -1px;
+    height: 1px;
+    background: var(--mat-sys-outline-variant);
+  }
+}
+
+// Once scrolled, the sticky cell sits flush with the top of the region's scrollport, and its top
+// border - the strip between that edge and the cell's padding box, where the fill starts - is not
+// painted on a sticky cell either (as with its border-bottom above), so the rows scrolling beneath
+// show through it. Overhanging the fill across it closes that strip; anything above the scrollport
+// is clipped, so the region's own border-top divider (outside the scrollport) stays visible.
+.table-scroll-region.scrolled-from-top table.mat-mdc-table .mat-mdc-header-cell::before {
+  top: -1px;
+}
+
+// Once a table is scrolled far enough to collapse the controls above it (controls-collapsed - see
+// ScrollEdgesDirective), the hint under its filter input is just noise above the sticky header - the
+// content the hint describes is already scrolled out of view. Global and keyed off the table's card
+// (the scroll region's parent), so it reaches every table, including a filter row drawn by its own
+// component (e.g. the policies filter).
+// Collapsed to no height rather than display: none, so the hint still counts towards the width the filter row asks for
+// and the table does not shrink when the header turns sticky.
+:has(> .table-scroll-region.controls-collapsed) .filter-paginator-container mat-hint {
+  height: 0;
+  overflow: hidden;
+  visibility: hidden;
+}
+
+// Elevate the header once rows have scrolled under it, so it reads as raised above them rather
+// than flush. Cast on .sticky-header-shadow (a plain div ScrollEdgesDirective inserts next to the
+// table, sized to the header row's height via its --sticky-header-height custom property) rather
+// than on each header cell: a shadow per cell doubles up at every column boundary where two
+// adjacent cells' shadows overlap, seaming the header instead of reading as one continuous edge.
+// The shadow div shares the header's own sticky top:0 offset and height, so it sits exactly behind
+// the header cells (z-index below their 100) and its box-shadow spills out under their shared
+// bottom edge. --elevation-3 is unsuitable here - it is the ambient, two-directional "raised card"
+// shadow used for depth-tinted surfaces, which is faint and symmetric rather than a shadow cast
+// downward, so it barely reads on a header that is only ever raised on its bottom edge.
+// --mat-sys-shadow is unsuitable too: it resolves to an opaque, near-background grey in dark mode,
+// so it disappears against the row it falls on - this needs its own alpha to stay visible on any
+// surface colour.
+.table-scroll-region {
+  .sticky-header-shadow {
+    position: sticky;
+    top: 0;
+    z-index: 90;
+    height: var(--sticky-header-height, 0);
+    // Matches the actual header row's rendered width (see scroll-edges.directive.ts) rather than
+    // stretching to this flex column's full width: a narrow table sets its own width to auto so its
+    // columns do not stretch to fill the row, and this div is the region's flex child, not the
+    // table's, so without this it would cast its shadow (and, before there was anything to clip it,
+    // read as a bare bordered box) past the table's real right edge.
+    width: var(--sticky-header-width, 100%);
+    margin-bottom: calc(-1 * var(--sticky-header-height, 0px));
+    pointer-events: none;
+  }
+
+  // Follows the UI settings' depth like every other shadow (--depth-scale, see html.depth-* in
+  // styles.scss), measured against the default level's 0.6 so that level casts exactly this shadow:
+  // subtle halves it, very strong doubles it, and flat (0) casts none - the header's own bottom
+  // border is then all that separates it from the rows, as on every other flat surface.
+  &.scrolled-from-top .sticky-header-shadow {
+    --sticky-header-shadow-scale: calc(var(--depth-scale) / 0.6);
+    box-shadow: 0 calc(4px * var(--sticky-header-shadow-scale)) calc(6px * var(--sticky-header-shadow-scale))
+      calc(-2px * var(--sticky-header-shadow-scale)) rgba(0, 0, 0, 0.4);
+  }
+}
+
+// The fill covers the cell's own background, so a striped header cell carries its stripe on the
+// fill rather than on the cell.
+table.mat-mdc-table#{$default-mode} .mat-mdc-header-cell:nth-child(even)::before,
+table.mat-mdc-table.column-striped-explicit .mat-mdc-header-cell.col-stripe::before {
+  background: var(--mat-sys-surface-variant);
+}
+
+.mat-mdc-form-field {
+  color: table.$link-color;
+}
+
+.filter-paginator-container {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+
+  // Groups the filter field with its adjacent buttons (More Filter, bulk actions, ...) into one
+  // block, capped at a comfortable reading width instead of letting the row stretch edge-to-edge on
+  // wide screens. It carries the width the filter field and buttons used to size against directly
+  // on .filter-paginator-container, so their own flex rules below now target it through this group
+  // rather than as its own direct children.
+  //
+  // flex: 1 1 0 (not width: 100%, and not flex-basis: auto) so it claims exactly the free space left
+  // once the paginator has taken its own content width, up to the cap - and, since it is the only
+  // child here with flex-grow, shrinks first as that free space runs out: the paginator's own
+  // flex: 0 1 max-content below never grows past its content and never shrinks past it either, so
+  // this group gives up width - down to the filter field's own min-width - before the paginator is
+  // ever pushed to wrap onto the next line. A flex-basis of auto instead of 0 measures the group by
+  // its children's own preferred size to size the parent, which - because the filter field inside
+  // uses flex-basis: 0% itself (an intentional "grow from nothing" pattern, not a real size) -
+  // resolves inconsistently across browsers, and even in the same browser depending on how many
+  // sibling buttons are visible (the bulk-actions trigger button toggles on scroll): basis 0 removes
+  // that ambiguity by giving the group a definite starting size instead of one derived from content.
+  > .filter-actions-group {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex: 1 1 0;
+    min-width: 0;
+    max-width: calc(932px + 48px + 48px);
+  }
+
+  // The filter field is taller than its input: a hint line sits underneath it. Centring the row
+  // would centre on that too, so give the paginator the input's own height from the top of the row
+  // and centre it inside that - it then lines up on the middle of the input itself, whether or not
+  // a hint is showing. It also grows into the free space in the row, so its controls are kept
+  // against the right edge of that space rather than the left one flex would start them at.
+  > .mat-mdc-paginator {
+    align-self: flex-start;
+    height: table.$field-input-height;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+  }
+
+  // The filter trigger is the same control on every table, whichever utility classes a given
+  // table's markup puts on it, so it is sized here rather than per table. It stays square - it is
+  // drawn as a circle, and matching the input's height instead would draw it as an ellipse - and
+  // is shifted onto the middle of the input row: a translate percentage resolves against the
+  // element's own height, so the offset holds whatever the size above is.
+  .filter-actions-group > button {
+    align-self: flex-start;
+    height: table.$filter-trigger-size;
+    width: table.$filter-trigger-size;
+    // Material centres the icon on padding rather than on alignment, so this has to keep pace with
+    // the size above or the icon sits against the left edge.
+    padding: calc((#{table.$filter-trigger-size} - #{table.$filter-trigger-icon-size}) / 2);
+    // .filter-button offsets itself for the compact copies that sit inline in a header cell.
+    top: auto;
+    right: auto;
+    transform: translateY(calc(#{table.$field-input-height} / 2 - 50%));
+
+    span.mat-mdc-button-touch-target {
+      height: table.$filter-trigger-size !important;
+      width: table.$filter-trigger-size !important;
+    }
+  }
+
+  .selfservice-paginator-label {
+    margin: 0;
+    flex: 1 1 200px;
+  }
+
+  .mat-mdc-paginator {
+    background-color: table.$paginator-bg;
+    // No flex-grow: it only ever needs its own content width, and growing left it stretching to
+    // fill whatever the filter-actions-group didn't claim, wider than its own controls needed.
+    flex: 0 1 max-content;
+    min-width: max-content;
+
+    @media (max-width: 1100px) {
+      width: 100%;
+      justify-content: center;
+    }
+  }
+}
+
+.table-container {
+  overflow-x: auto;
+  width: 100%;
+  // Ensure the container doesn't expand beyond its parent
+  display: block;
+}
+
+.highlight-true,
+.highlight-warning,
+.highlight-false,
+.highlight-true-clickable,
+.highlight-warning-clickable,
+.highlight-false-clickable,
+.highlight-disabled {
+  border-radius: var(--border-radius);
+  padding: table.$highlight-padding;
+  color: white;
+  display: inline-block;
+
+  &.highlight-true,
+  &.highlight-true-clickable {
+    background-color: var(--green-light);
+  }
+
+  &.highlight-warning,
+  &.highlight-warning-clickable {
+    background-color: var(--yellow-light-active);
+  }
+
+  &.highlight-false,
+  &.highlight-false-clickable {
+    background-color: var(--red-light);
+  }
+
+  &.highlight-disabled {
+    background-color: var(--grey-light);
+  }
+
+  &.highlight-true-clickable,
+  &.highlight-warning-clickable,
+  &.highlight-false-clickable {
+    cursor: pointer;
+  }
+}
+
+.table-keyword-filter-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  width: 100%;
+}
+
+.filter-keyword-container {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  padding: 10px 76px 10px 0;
+  width: fit-content;
+  flex-wrap: wrap;
+
+  .filter-keyword-title {
+    margin-top: -4px;
+    min-width: 89px;
+  }
+}
+
+.edit-button-container {
+  display: flex;
+  justify-content: center;
+}
+
+.edit-column-cell {
+  min-width: 86px;
+  padding: 0;
+}
+
+// Material sets border-top-color on .mat-divider itself with the same specificity, from styles
+// injected after this sheet - go through its token rather than outweigh the selector.
+.mat-divider {
+  --mat-divider-color: var(--mat-sys-color-on-surface);
+}
+
+.height-52 {
+  height: 52px;
+}
+
+.container-form-field {
+  height: 51px;
+}
+
+.height-115 {
+  height: 115px;
+}
+
+.height-136 {
+  height: 136px;
+}
+
+.height-137 {
+  height: 137px;
+}
+
+.height-77 {
+  height: 77px;
+}
+
+.height-78 {
+  height: 78px;
+}
+
+.scroll-margin-pad {
+  margin-right: -16px;
+  padding-right: 16px;
+}
+
+.flex-column {
+  display: flex;
+  flex-direction: column;
+}
+
+.height-auto {
+  height: auto;
+}
+
+table.mat-mdc-table {
+  min-width: 0;
+}
+
+.details-key-row {
+  min-width: 9rem;
+}
+
+.table-checkbox {
+  padding: 0;
+  width: 72px;
+  max-width: 72px;
+}
+
+.details-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid var(--mat-sys-outline-variant);
+  border-radius: var(--border-radius);
+  background: var(--mat-sys-surface-container-lowest);
+  padding: 8px 12px 12px;
+}
+
+.details-field-list {
+  display: flex;
+  flex-direction: column;
+  // Match the Material table cell size used by the user card (.mat-mdc-row).
+  font-size: 14px;
+
+  > * {
+    display: grid;
+    grid-template-columns: 35% 65%;
+    align-items: stretch;
+    min-height: 52px;
+    border: 1px solid var(--mat-sys-outline-variant);
+    border-top-width: 0;
+  }
+
+  // A direct app-detail-field-row child is the grid row itself; the element selector outranks the
+  // component's own `:host { display: contents }`, which only applies when the row is nested.
+  > app-detail-field-row {
+    display: grid;
+  }
+
+  > :first-child {
+    border-top-width: 1px;
+  }
+
+  > :nth-child(odd) {
+    background: var(--mat-sys-surface-variant);
+  }
+
+  .detail-field-label {
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    min-width: 0;
+    border-right: 1px solid var(--mat-sys-outline-variant);
+  }
+
+  .detail-field-value {
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    min-width: 0;
+  }
+
+  .value-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+  }
+
+  .value-content {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .value-edit {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+  }
+}
+
+// Card titles. The margin goes on the row and the h3/h4 reset below keeps the browser's em-based
+// heading margins out of it. Scoped by app-details-card, so a page-level .details-header keeps
+// its own spacing.
+.details-card-title,
+app-details-card .details-header {
+  margin: 8px;
+}
+
+app-details-card .details-header {
+  h3,
+  h4 {
+    margin: 0;
+  }
+}
+
+.details-cards-column {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.details-cards-grid {
+  display: grid;
+  gap: 16px;
+  align-items: start;
+}
+
+.details-container {
+  .details-table {
+    border-collapse: collapse;
+
+    th,
+    td {
+      border: 1px solid var(--mat-sys-outline-variant);
+    }
+  }
+
+  .details-table.border-bottom-none {
+    tr:last-child td,
+    tr:last-child th {
+      border-bottom: none !important;
+    }
+  }
+
+  .details-header {
+    display: flex;
+    align-items: center;
+  }
+
+  .details-flex-layout {
+    display: flex;
+    box-sizing: border-box;
+    background: var(--mat-sys-surface-container-lowest);
+  }
+
+  .details-description-div {
+    display: flex;
+    overflow-wrap: anywhere;
+    padding-right: 16px;
+    align-items: center;
+    overflow-y: auto;
+    white-space: normal;
+  }
+
+  .details-scrollable-container {
+    display: block;
+    overflow-y: auto;
+    overflow-wrap: anywhere;
+  }
+
+  .details-description {
+    display: flex;
+    width: table.$description-width;
+  }
+
+  .details-table-item {
+    margin-left: 5px;
+  }
+
+  .details-value {
+    margin-top: 7px;
+  }
+
+  .container-details-token-table-layout .mat-mdc-text-field-wrapper,
+  .add-token .mat-mdc-text-field-wrapper {
+    padding-left: 16px !important;
+  }
+
+  .details-table
+    .mat-mdc-form-field:not(.height-77):not(.height-115):not(.height-126):not(.height-136):not(.height-137) {
+    --mat-form-field-container-height: 52px;
+    --mat-form-field-container-vertical-padding: 8px;
+  }
+
+  .mat-mdc-row {
+    font-size: 14px;
+  }
+}
+
+.selfservice-paginator-label {
+  flex: 1;
+  margin-right: 16px;
+}
+
+.mat-mdc-autocomplete-panel.token-option-panel {
+  max-height: 400px;
+}
+
+.token-option {
+  border: 1px solid var(--mat-sys-surface-container-highest);
+  background: var(--mat-sys-surface-container-low);
+  margin: 0 1px;
+  border-radius: var(--border-radius);
+}
+
+.token-option-span {
+  background: var(--mat-sys-surface-container-lowest);
+  padding: 6px;
+  border-radius: var(--border-radius);
+  margin-right: 8px;
+}
+
+.mat-mdc-option.mdc-list-item.token-option .mdc-list-item__primary-text {
+  height: 28px;
+  display: flex;
+  align-items: center;
+  border-left: 2px solid var(--mat-sys-surface-container-highest);
+  padding: 10px;
+}
+
+// The filter input's info icon lines up with the typed text and the clear button, which sit below the floating label,
+// rather than with the middle of the whole field.
+.mat-mdc-text-field-wrapper:has(app-clearable-input) .mat-mdc-form-field-icon-suffix:has(> app-info-hint) {
+  align-self: flex-end;
+}
+
+// A cell value cut to the width its column leaves it, kept on one line with an ellipsis instead of breaking anywhere.
+// Paired with appTruncationTooltip for the rest of the value. A flex item of the copyable row, hence min-width: 0 to
+// let it shrink below its content. Also the hook the collapsed cell actions key on (see styles.scss).
+.cell-truncate {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

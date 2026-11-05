@@ -1,4 +1,3 @@
-# coding: utf-8
 from privacyidea.models import MonitoringStats, db
 from privacyidea.lib.monitoringstats import (write_stats, delete_stats,
                                              get_stats_keys, get_values,
@@ -27,7 +26,7 @@ class TokenModelTestCase(MyTestCase):
         # session, we need to refresh the current session in order to retrieve
         # the updated (removed) data
         db.session.commit()
-        self.assertEqual(MonitoringStats.query.filter_by(stats_key=key1).count(), 1)
+        self.assertEqual(1, MonitoringStats.query.filter_by(stats_key=key1).count())
 
     def test_02_delete_stats(self):
         key1 = "otherkey"

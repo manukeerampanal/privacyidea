@@ -1,0 +1,79 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+
+import { ComponentFixture, TestBed } from "@angular/core/testing";
+import { MatDialogRef } from "@angular/material/dialog";
+import { Router } from "@angular/router";
+import { ROUTE_PATHS } from "@app/route_paths";
+import { AbstractDialogComponent } from "@components/shared/dialog/abstract-dialog/abstract-dialog.component";
+import { AuthService } from "@services/auth/auth.service";
+import { DialogService } from "@services/dialog/dialog.service";
+import { PolicyDetail, PolicyService } from "@services/policies/policies.service";
+import { MockRouter } from "@testing/mock-services";
+import { MockAuthService } from "@testing/mock-services/mock-auth-service";
+import { MockDialogService } from "@testing/mock-services/mock-dialog-service";
+import { MockPolicyService } from "@testing/mock-services/mock-policies-service";
+import { of } from "rxjs";
+import { PoliciesTableActionsComponent } from "./policies-table-actions.component";
+
+describe("PoliciesTableActionsComponent", () => {
+  let component: PoliciesTableActionsComponent;
+  let fixture: ComponentFixture<PoliciesTableActionsComponent>;
+  let dialogService: MockDialogService;
+  let policyService: MockPolicyService;
+  let router: Router;
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [PoliciesTableActionsComponent],
+      providers: [
+        { provide: DialogService, useClass: MockDialogService },
+        { provide: AuthService, useClass: MockAuthService },
+        { provide: PolicyService, useClass: MockPolicyService },
+        { provide: Router, useClass: MockRouter }
+      ]
+    }).compileComponents();
+
+    fixture = TestBed.createComponent(PoliciesTableActionsComponent);
+    component = fixture.componentInstance;
+    dialogService = TestBed.inject(DialogService) as unknown as MockDialogService;
+    policyService = TestBed.inject(PolicyService) as unknown as MockPolicyService;
+    router = TestBed.inject(Router);
+    fixture.componentRef.setInput("policySelection", [{ name: "policy1" } as PolicyDetail]);
+    fixture.detectChanges();
+  });
+
+  it("should create", () => {
+    expect(component).toBeTruthy();
+  });
+
+  it("should navigate to new policy page on createNewPolicy", () => {
+    component.createNewPolicy();
+    expect(router.navigateByUrl).toHaveBeenCalledWith(ROUTE_PATHS.POLICIES_NEW);
+  });
+
+  it("should call delete on confirmed policies", async () => {
+    jest
+      .spyOn(dialogService, "openDialog")
+      .mockReturnValue({ afterClosed: () => of(true) } as unknown as MatDialogRef<AbstractDialogComponent<unknown, unknown>, unknown>);
+    const spy = jest.spyOn(policyService, "deletePolicy");
+    await component.deleteSelectedPolicies();
+    expect(spy).toHaveBeenCalledWith("policy1");
+  });
+});

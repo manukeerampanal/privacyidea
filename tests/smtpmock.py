@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 2016-01-20 Cornelius Kölbel <cornelius@privacyidea.org>
            Support STARTTLS mock
@@ -22,28 +21,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-
-from __future__ import (
-    absolute_import, print_function, division, unicode_literals
-)
-
-import six
+import inspect
 import smtplib
-
-try:
-    from inspect import formatargspec, getfullargspec as getargspec
-except ImportError:
-    from inspect import formatargspec, getargspec
-
-try:
-    from collections import Sequence, Sized
-except ImportError:
-    from collections.abc import Sequence, Sized
-
 from collections import namedtuple
+from collections.abc import Sequence, Sized
 from functools import update_wrapper
 from smtplib import SMTPException
-
 
 Call = namedtuple('Call', ['request', 'response'])
 
@@ -57,17 +40,13 @@ def wrapper%(signature)s:
 def get_wrapped(func, wrapper_template, evaldict):
     # Preserve the argspec for the wrapped function so that testing
     # tools such as pytest can continue to use their fixture injection.
-    args = getargspec(func)
-    values = args.args[-len(args.defaults):] if args.defaults else None
 
-    signature = formatargspec(*args)
+    signature = inspect.signature(func, follow_wrapped=False)
     is_bound_method = hasattr(func, '__self__')
-    if is_bound_method:
-        args.args = args.args[1:]     # Omit 'self'
-    callargs = formatargspec(*args, formatvalue=lambda v: '=' + v)
+    callargs = str(signature)
 
-    ctx = {'signature': signature, 'funcargs': callargs}
-    six.exec_(wrapper_template % ctx, evaldict)
+    ctx = {'signature': str(signature), 'funcargs': callargs}
+    exec(wrapper_template % ctx, evaldict, evaldict)
 
     wrapper = evaldict['wrapper']
 
@@ -96,7 +75,8 @@ class CallList(Sequence, Sized):
     def reset(self):
         self._calls = []
 
-class SmtpMock(object):
+
+class SmtpMock:
 
     def __init__(self):
         self._calls = CallList()
@@ -107,6 +87,9 @@ class SmtpMock(object):
     def reset(self):
         self._request_data = {}
         self._calls.reset()
+        self.sent_message = None
+        self.sent_sender = None
+        self.sent_recipient = None
 
     def get_smtp_ssl(self):
         return self.smtp_ssl
@@ -114,7 +97,7 @@ class SmtpMock(object):
     def setdata(self, response=None, authenticated=True,
                 config=None, exception=False, support_tls=True):
         if response is None:
-                response = {}
+            response = {}
         config = config or {}
         self.support_tls = support_tls
         self.exception = exception
@@ -127,6 +110,12 @@ class SmtpMock(object):
 
     def get_sent_message(self):
         return self.sent_message
+
+    def get_sent_sender(self):
+        return self.sent_sender
+
+    def get_sent_recipient(self):
+        return self.sent_recipient
 
     @property
     def calls(self):
@@ -159,10 +148,8 @@ class SmtpMock(object):
             response = (535, "authentication failed (#5.7.1)")
         return {self._request_data.get("recipient"): response}
 
-#    def _on_init(self, SMTP_instance, host, port=25, timeout=3):
     def _on_init(self, *args, **kwargs):
         SMTP_instance = args[0]
-        host = args[1]
         if isinstance(SMTP_instance, smtplib.SMTP_SSL):
             # in case we need sth. to do with SMTL_SSL
             self.smtp_ssl = True
@@ -188,11 +175,14 @@ class SmtpMock(object):
         return None
 
     def start(self):
-        import mock
+        from unittest import mock
 
         def unbound_on_send(SMTP, sender, recipient, msg, *a, **kwargs):
             self.sent_message = msg
+            self.sent_sender = sender
+            self.sent_recipient = recipient
             return self._on_request(SMTP, sender, recipient, msg, *a, **kwargs)
+
         self._patcher = mock.patch('smtplib.SMTP.sendmail',
                                    unbound_on_send)
         self._patcher.start()

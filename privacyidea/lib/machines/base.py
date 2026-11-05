@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2015-02-25 Cornelius Kölbel <cornelius@privacyidea.org>
 #             Initial writup
 #
@@ -25,10 +23,9 @@ machine ID.
 This file is tested in tests/test_lib_machines.py
 """
 import netaddr
-from six import string_types
 
 
-class Machine(object):
+class Machine:
 
     """
     The Machine object is returned by the resolver for a given machine_id.
@@ -36,28 +33,32 @@ class Machine(object):
     information like expiry or decommission...
     """
 
-    def __init__(self, resolver_name, machine_id, hostname=None, ip=None):
+    def __init__(self, resolver_name: str, machine_id: str,
+                 hostname: str | list[str] | None = None,
+                 ip: str | netaddr.IPAddress | None = None) -> None:
         self.id = machine_id
         self.resolver_name = resolver_name
-        self.hostname = hostname
-        if isinstance(ip, string_types):
+        if hostname is None:
+            self.hostname: list[str] = []
+        elif isinstance(hostname, str):
+            self.hostname = [hostname]
+        else:
+            self.hostname = list(hostname)
+        if isinstance(ip, str):
             self.ip = netaddr.IPAddress(ip)
         else:
             self.ip = ip
 
-    def has_hostname(self, hostname):
+    def has_hostname(self, hostname: str) -> bool:
         """
         Checks if the machine has the given hostname.
-        A machine might have more than one hostname. The hostname is then
-        provided as a list
+        A machine might have more than one hostname, so the hostname is always
+        stored as a list.
+
         :param hostname: The hostname searched for
-        :type hostname: basestring
         :return: True or false
         """
-        if type(self.hostname) == list:
-            return hostname in self.hostname
-        elif isinstance(self.hostname, string_types):
-            return hostname.lower() == self.hostname.lower()
+        return any(hostname.lower() == h.lower() for h in self.hostname)
 
     def has_ip(self, ip):
         """
@@ -69,12 +70,12 @@ class Machine(object):
         :return: True or false
         """
         # convert to IPAddress
-        if isinstance(ip, string_types):
+        if isinstance(ip, str):
             ip = netaddr.IPAddress(ip)
 
-        if type(self.ip) == list:
+        if isinstance(self.ip, list):
             return ip in self.ip
-        elif type(self.ip) == netaddr.IPAddress:
+        elif isinstance(self.ip, netaddr.IPAddress):
             return ip == self.ip
 
     def get_dict(self):
@@ -83,10 +84,10 @@ class Machine(object):
         :return: dict of attributes
         """
         ip = self.ip
-        if type(self.ip) == list:
-            ip = ["{0!s}".format(i) for i in ip]
-        elif type(self.ip) == netaddr.IPAddress:
-            ip = "{0!s}".format(ip)
+        if isinstance(self.ip, list):
+            ip = [f"{i!s}" for i in ip]
+        elif isinstance(self.ip, netaddr.IPAddress):
+            ip = f"{ip!s}"
 
         d = {"hostname": self.hostname,
              "ip": ip,
@@ -98,7 +99,7 @@ class MachineResolverError(Exception):
     pass
 
 
-class BaseMachineResolver(object):
+class BaseMachineResolver:
 
     type = "base"
 
@@ -123,7 +124,7 @@ class BaseMachineResolver(object):
         Return a list of all machine objects in this resolver
 
         :param substring: If set to true, it will also match search_hostnames,
-        that only are a subnet of the machines hostname.
+                          that only are a subnet of the machines hostname.
         :type substring: bool
         :param any: a substring that matches EITHER hostname, machineid or ip
         :type any: basestring
@@ -176,8 +177,7 @@ class BaseMachineResolver(object):
         machine resolver.
 
         :param params:
-        :return: tupple of success and description
+        :return: tuple of success and description
         :rtype: (bool, string)
         """
         return False, "Not Implemented"
-

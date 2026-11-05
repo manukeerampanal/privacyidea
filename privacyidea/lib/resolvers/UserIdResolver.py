@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 # 2015-06-05   Cornelius Kölbel <cornelius@privacyidea.org>
 #              Add interface to edit and add users
 # Dec 01, 2014 Cornelius Kölbel <cornelius@privacyidea.org>
@@ -22,6 +20,8 @@
 #  contact:  http://www.linotp.org
 #            http://www.lsexperts.de
 #            linotp@lsexperts.de
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # This code is free software; you can redistribute it and/or
 # modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
@@ -51,8 +51,7 @@ Defines the rough interface for a UserId Resolver
 """
 
 
-class UserIdResolver(object):
-
+class UserIdResolver:
     fields = {"username": 1, "userid": 1,
               "description": 0,
               "phone": 0, "mobile": 0, "email": 0,
@@ -135,6 +134,7 @@ class UserIdResolver(object):
     def getUsername(self, userid):
         """
         Returns the username/loginname for a given userid
+
         :param userid: The userid in this resolver
         :type userid: string
         :return: username
@@ -142,32 +142,92 @@ class UserIdResolver(object):
         """
         return "dummy_user_name"
 
-    def getUserInfo(self, userid):
+    def get_user_info(self, user_id: int or str, attributes: list[str] = None) -> dict:
         """
         This function returns all user information for a given user object
         identified by UserID.
-        :param userid: ID of the user in the resolver
-        :type userid: int or string
+
+        :param user_id: ID of the user in the resolver
+        :param attributes: list of attribute names to be returned for the user. If None, all attributes are returned.
         :return:  dictionary, if no object is found, the dictionary is empty
-        :rtype: dict
         """
         return {}
 
-    def getUserList(self, searchDict=None):
+    def get_user_info_batch(self, user_ids: list, attributes: list[str] = None) -> dict:
+        """
+        Return the user information for several users at once.
+
+        The default implementation loops over :py:func:`get_user_info`, so every resolver supports
+        this method. Resolvers whose backend can answer for several users in one request should
+        override it, which is what saves the caller a round trip per user. Such a resolver should
+        override :py:func:`get_usernames_batch` as well, since that is the one a token list calls.
+
+        User IDs that do not resolve to a user are omitted from the result, they do not raise.
+
+        :param user_ids: IDs of the users in the resolver
+        :param attributes: list of attribute names to be returned for each user. If None, all attributes are returned.
+        :return: dictionary mapping each resolved user ID to its user information
+        """
+        user_info_map = {}
+        # dict.fromkeys drops duplicate IDs but keeps their order, so a user that several tokens
+        # share is only looked up once
+        for user_id in dict.fromkeys(user_ids):
+            user_info = self.get_user_info(user_id, attributes=attributes)
+            if user_info:
+                user_info_map[user_id] = user_info
+        return user_info_map
+
+    def get_usernames_batch(self, user_ids: list) -> dict:
+        """
+        Return the login names of several users at once.
+
+        The default implementation loops over :py:func:`getUsername`, which for some resolvers is
+        considerably cheaper than reading the full user information of every user. A resolver that
+        can answer for several users in one request should override this.
+
+        :param user_ids: IDs of the users in the resolver
+        :return: dictionary mapping each user ID to its login name
+        """
+        # dict.fromkeys drops duplicate IDs, so a user that several tokens share is only looked up
+        # once even though the result would be the same
+        return {user_id: self.getUsername(user_id) for user_id in dict.fromkeys(user_ids)}
+
+    def _usernames_via_user_info_batch(self, user_ids: list) -> dict:
+        """
+        Shared :py:func:`get_usernames_batch` body for a resolver whose :py:func:`get_user_info_batch`
+        is the real batched implementation: read just the username attribute of each user through
+        it, defaulting an ID without a match to "" -- exactly like :py:func:`getUsername` does for a
+        single user.
+
+        :param user_ids: IDs of the users in the resolver
+        :return: dictionary mapping each user ID to its login name
+        """
+        user_info_map = self.get_user_info_batch(user_ids, attributes=["username"])
+        return {user_id: user_info_map.get(user_id, {}).get("username", "") for user_id in user_ids}
+
+    def get_available_info_keys(self) -> list[str]:
+        """
+        This function returns a list of known privacyIDEA user attributes which can be used, e.g. for getUserList or
+        get_user_info
+
+        :return: list of possible keys for searching users
+        """
+        return []
+
+    def getUserList(self, search_dict: dict = None, attributes: list[str] = None) -> list[dict]:
         """
         This function finds the user objects,
         that have the term 'value' in the user object field 'key'
 
-        :param searchDict:  dict with key values of user attributes -
+        :param search_dict:  dict with key values of user attributes -
                     the key may be something like 'loginname' or 'email'
                     the value is a regular expression.
-        :type searchDict: dict
+        :param attributes: list of attributes to be returned for each user
 
         :return: list of dictionaries (each dictionary contains a
                  user object) or an empty string if no object is found.
-        :rtype: list of dicts
         """
-        searchDict = searchDict or {}
+        search_dict = search_dict or {}
         return [{}]
 
     def getResolverId(self):
@@ -204,19 +264,16 @@ class UserIdResolver(object):
         """
         return False
 
-    def add_user(self, attributes=None):
+    def add_user(self, attributes: dict=None):
         """
         Add a new user in the useridresolver.
         This is only possible, if the UserIdResolver supports this and if
         we have write access to the user store.
 
-        :param username: The login name of the user
-        :type username: basestring
         :param attributes: Attributes according to the attribute mapping
         :return: The new UID of the user. The UserIdResolver needs to
-        determine the way how to create the UID.
+                 determine the way how to create the UID.
         """
-        attributes = attributes or {}
         return None
 
     def delete_user(self, uid):
@@ -283,3 +340,9 @@ class UserIdResolver(object):
         :return: bool
         """
         return False
+
+    def get_config(self) -> dict:
+        """
+        Returns the configuration of the resolver.
+        """
+        return {}

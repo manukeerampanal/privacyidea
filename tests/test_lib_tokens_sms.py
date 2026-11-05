@@ -3,22 +3,21 @@ This test file tests the lib.tokens.smstoken
 """
 import logging
 
-from .base import MyTestCase, FakeFlaskG, FakeAudit
-from privacyidea.lib.resolver import (save_resolver)
-from privacyidea.lib.realm import (set_realm)
-from privacyidea.lib.user import (User)
-from privacyidea.lib.utils import is_true
-from privacyidea.lib.token import init_token, remove_token
-from privacyidea.lib.tokens.smstoken import SmsTokenClass, SMSACTION
-from privacyidea.models import (Token, Config, Challenge)
-from privacyidea.lib.config import (set_privacyidea_config, set_prepend_pin)
-from privacyidea.lib.policy import set_policy, SCOPE, PolicyClass
-from privacyidea.lib import _
-import datetime
-import mock
-import six
+from unittest import mock
 import responses
 from testfixtures import log_capture
+
+from privacyidea.lib import _
+from privacyidea.lib.config import set_privacyidea_config, set_prepend_pin
+from privacyidea.lib.policy import set_policy, SCOPE, PolicyClass
+from privacyidea.lib.realm import set_realm
+from privacyidea.lib.resolver import save_resolver
+from privacyidea.lib.token import init_token, remove_token, import_tokens, get_tokens
+from privacyidea.lib.tokens.smstoken import SmsTokenClass, SMSAction
+from privacyidea.lib.user import User
+from privacyidea.lib.utils import is_true
+from privacyidea.models import Token, Config
+from .base import MyTestCase, FakeFlaskG, FakeAudit
 
 PWFILE = "tests/testdata/passwords"
 
@@ -52,17 +51,15 @@ class SMSTokenTestCase(MyTestCase):
     }'''
     success_body = "ID 12345"
 
-
     # add_user, get_user, reset, set_user_identifiers
 
     def test_00_create_user_realm(self):
         rid = save_resolver({"resolver": self.resolvername1,
-                               "type": "passwdresolver",
-                               "fileName": PWFILE})
+                             "type": "passwdresolver",
+                             "fileName": PWFILE})
         self.assertTrue(rid > 0, rid)
 
-        (added, failed) = set_realm(self.realm1,
-                                    [self.resolvername1])
+        (added, failed) = set_realm(self.realm1, [{'name': self.resolvername1}])
         self.assertTrue(len(failed) == 0)
         self.assertTrue(len(added) == 1)
 
@@ -70,13 +67,13 @@ class SMSTokenTestCase(MyTestCase):
                     realm=self.realm1,
                     resolver=self.resolvername1)
 
-        user_str = "{0!s}".format(user)
+        user_str = f"{user!s}"
         self.assertTrue(user_str == "<root.resolver1@realm1>", user_str)
 
         self.assertFalse(user.is_empty())
         self.assertTrue(User().is_empty())
 
-        user_repr = "{0!r}".format(user)
+        user_repr = f"{user!r}"
         expected = "User(login='root', realm='realm1', resolver='resolver1')"
         self.assertTrue(user_repr == expected, user_repr)
 
@@ -203,6 +200,16 @@ class SMSTokenTestCase(MyTestCase):
         token.set_sync_window(53)
         self.assertTrue(token.get_sync_window() == 53)
 
+    def test_05_get_set_realms(self):
+        set_realm(self.realm2)
+        db_token = Token.query.filter_by(serial=self.serial1).first()
+        token = SmsTokenClass(db_token)
+        realms = token.get_realms()
+        self.assertTrue(len(realms) == 1, realms)
+        token.set_realms([self.realm1, self.realm2])
+        realms = token.get_realms()
+        self.assertTrue(len(realms) == 2, realms)
+
     def test_06_set_pin(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = SmsTokenClass(db_token)
@@ -218,27 +225,11 @@ class SMSTokenTestCase(MyTestCase):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = SmsTokenClass(db_token)
         token.enable(False)
-        self.assertTrue(token.token.active is False)
+        self.assertFalse(token.token.active)
         token.enable()
         self.assertTrue(token.token.active)
-
-    def test_05_get_set_realms(self):
-        set_realm(self.realm2)
-        db_token = Token.query.filter_by(serial=self.serial1).first()
-        token = SmsTokenClass(db_token)
-        realms = token.get_realms()
-        self.assertTrue(len(realms) == 1, realms)
-        token.set_realms([self.realm1, self.realm2])
-        realms = token.get_realms()
-        self.assertTrue(len(realms) == 2, realms)
-
-    def test_99_delete_token(self):
-        db_token = Token.query.filter_by(serial=self.serial1).first()
-        token = SmsTokenClass(db_token)
-        token.delete_token()
-
-        db_token = Token.query.filter_by(serial=self.serial1).first()
-        self.assertTrue(db_token is None, db_token)
+        # we need to safe the token explicitly here to persist it to the db
+        token.save()
 
     def test_08_info(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
@@ -377,8 +368,7 @@ class SMSTokenTestCase(MyTestCase):
 
         # check for the challenges response
         r = token.check_challenge_response(passw=otp,
-                                           options={"transaction_id":
-                                                        transactionid})
+                                           options={"transaction_id": transactionid})
         self.assertTrue(r, r)
 
     @responses.activate
@@ -399,8 +389,7 @@ class SMSTokenTestCase(MyTestCase):
 
         # check for the challenges response
         r = token.check_challenge_response(passw=otp,
-                                           options={"transaction_id":
-                                                        transactionid})
+                                           options={"transaction_id": transactionid})
         self.assertTrue(r, r)
 
     @responses.activate
@@ -410,12 +399,16 @@ class SMSTokenTestCase(MyTestCase):
                       body=self.success_body)
         transactionid = "123456098712"
         set_privacyidea_config("sms.providerConfig", self.SMSProviderConfig)
+        # The mock replaces the resolver, which the Redis user cache answers
+        # before: reading token.user.info below would then cache the real number
+        # and the mocked one would never be seen
+        self.pin_to_database("users")
         db_token = Token.query.filter_by(serial=self.serial2).first()
         token = SmsTokenClass(db_token)
         # if the email is a multi-value attribute, the first address should be chosen
         new_user_info = token.user.info.copy()
         new_user_info['mobile'] = ['1234', '5678']
-        with mock.patch('privacyidea.lib.resolvers.PasswdIdResolver.IdResolver.getUserInfo') as mock_user_info:
+        with mock.patch('privacyidea.lib.resolvers.PasswdIdResolver.IdResolver.get_user_info') as mock_user_info:
             mock_user_info.return_value = new_user_info
             c = token.create_challenge(transactionid)
             self.assertTrue(c[0], c)
@@ -432,7 +425,7 @@ class SMSTokenTestCase(MyTestCase):
         for pol_text, result_text in smstext_tests.items():
             # create a SMSTEXT policy:
             p = set_policy(name="smstext",
-                           action="{0!s}={1!s}".format(SMSACTION.SMSTEXT, pol_text),
+                           action=f"{SMSAction.SMSTEXT!s}={pol_text!s}",
                            scope=SCOPE.AUTH)
             self.assertTrue(p > 0)
 
@@ -458,11 +451,11 @@ class SMSTokenTestCase(MyTestCase):
             smstext = token._get_sms_text(options)
             self.assertEqual(pol_text.strip("'"), smstext)
             r, message = token._send_sms(smstext, options)
-            self.assertRegexpMatches(message, result_text)
+            self.assertRegex(message, result_text)
 
         # Test AUTOSMS
         p = set_policy(name="autosms",
-                       action=SMSACTION.SMSAUTO,
+                       action=SMSAction.SMSAUTO,
                        scope=SCOPE.AUTH)
         self.assertTrue(p > 0)
 
@@ -475,7 +468,7 @@ class SMSTokenTestCase(MyTestCase):
         r = token.check_otp(self.valid_otp_values[5 + len(smstext_tests)], options=options)
         self.assertTrue(r > 0, r)
 
-    @ log_capture(level=logging.WARN)
+    @log_capture(level=logging.WARN)
     def test_21_failed_loading(self, capture):
         token = init_token({'type': 'sms', 'phone': self.phone1})
         transactionid = "123456098712"
@@ -488,12 +481,8 @@ class SMSTokenTestCase(MyTestCase):
             c = token.create_challenge(transactionid)
             self.assertFalse(c[0], c)
             self.assertTrue(c[1].startswith("The PIN was correct, but"), c[1])
-            if six.PY2:
-                expected = "Failed to load SMSProvider: ImportError" \
-                           "(u'privacyidea.lib.smsprovider.HttpSMSProvider has no attribute HttpSMSProviderWRONG',)"
-            else:
-                expected = "Failed to load SMSProvider: ImportError" \
-                           "('privacyidea.lib.smsprovider.HttpSMSProvider has no attribute HttpSMSProviderWRONG'"
+            expected = "Failed to load SMSProvider: ImportError" \
+                       "('privacyidea.lib.smsprovider.HttpSMSProvider has no attribute HttpSMSProviderWRONG'"
             mock_log.mock_called()
             mocked_str = mock_log
             self.assertTrue(mocked_str.startswith(expected), mocked_str)
@@ -506,17 +495,118 @@ class SMSTokenTestCase(MyTestCase):
             c = token.create_challenge(transactionid)
             self.assertFalse(c[0], c)
             self.assertTrue(c[1].startswith("The PIN was correct, but"), c[1])
-            if six.PY2:
-                expected = "Failed to load sms.providerConfig: ValueError('No JSON object could be decoded',)"
-            else:
-                expected = "Failed to load sms.providerConfig: " \
-                           "JSONDecodeError('Expecting value: line 1 column 1 (char 0)')"
+            expected = "Failed to load sms.providerConfig: " \
+                       "JSONDecodeError('Expecting value: line 1 column 1 (char 0)')"
             mock_log.mock_called()
             mocked_str = mock_log
             self.assertTrue(mocked_str.startswith(expected), mocked_str)
         capture.clear()
 
-        #test with the parameter exception=1
+        # test with the parameter exception=1
         self.assertRaises(Exception, token.create_challenge, transactionid, {"exception": "1"})
 
         remove_token(token.get_serial())
+
+    def test_22_sms_token_export(self):
+        # Set up the SMSTokenClass for testing
+        smstoken = init_token(
+            param={'serial': "SMS12345678", 'type': 'sms', 'otpkey': '12345', "phone": "+49123456789"})
+        smstoken.set_description("this is a sms token export test")
+        smstoken.write_tokeninfo("hashlib", "sha256")
+
+        # Test that all expected keys are present in the exported dictionary
+        exported_data = smstoken.export_token()
+
+        expected_keys = ["serial", "type", "description", "otpkey", "issuer"]
+        self.assertTrue(set(expected_keys).issubset(exported_data.keys()))
+
+        expected_tokeninfo_keys = ["phone", "hashlib", "tokenkind"]
+        self.assertTrue(set(expected_tokeninfo_keys).issubset(exported_data["info_list"].keys()))
+
+        # Test that the exported values match the token's data
+        exported_data = smstoken.export_token()
+        self.assertEqual(exported_data["serial"], "SMS12345678")
+        self.assertEqual(exported_data["type"], "sms")
+        self.assertEqual(exported_data["info_list"]["phone"], "+49123456789")
+        self.assertEqual(exported_data["description"], "this is a sms token export test")
+        self.assertEqual(exported_data["info_list"]["hashlib"], "sha256")
+        self.assertEqual(exported_data["otpkey"], '12345')
+        self.assertEqual(exported_data["info_list"]["tokenkind"], "software")
+        self.assertEqual(exported_data["issuer"], "privacyIDEA")
+
+        # Clean up
+        remove_token(smstoken.token.serial)
+
+    def test_23_sms_token_import(self):
+        # Define the token data to be imported
+        token_data = [{
+            "serial": "SMS12345678",
+            "type": "sms",
+            "description": "this is a sms token import test",
+            "otpkey": self.otpkey,
+            "info_list": {"phone": "+49123456789", "hashlib": "sha256", "tokenkind": "software"},
+            "issuer": "privacyIDEA"
+        }]
+
+        # Import the token
+        import_tokens(token_data)
+
+        # Retrieve the imported token
+        smstoken = get_tokens(serial=token_data[0]["serial"])[0]
+
+        # Verify that the token data matches the imported data
+        self.assertEqual(smstoken.token.serial, token_data[0]["serial"])
+        self.assertEqual(smstoken.type, token_data[0]["type"])
+        self.assertEqual(smstoken.token.description, token_data[0]["description"])
+        self.assertEqual(smstoken.token.get_otpkey().getKey().decode("utf-8"), token_data[0]["otpkey"])
+        self.assertEqual(smstoken.get_tokeninfo("phone"), token_data[0]["info_list"]["phone"])
+        self.assertEqual(smstoken.get_tokeninfo("hashlib"), token_data[0]["info_list"]["hashlib"])
+        self.assertEqual(smstoken.get_tokeninfo("tokenkind"), token_data[0]["info_list"]["tokenkind"])
+
+        # Check that token works
+        self.assertEqual(0, smstoken.check_otp('875740'))
+
+        # Clean up
+        remove_token(smstoken.token.serial)
+
+    def test_24_update_dynamic_phone_replaces_static_phone(self):
+        """
+        Test that updating a token with dynamic_phone removes the static phone
+        number and vice versa.
+        """
+        # 1. Create a token with a static phone number
+        token = init_token(param={'serial': "PISM_DYN_TEST1", 'type': 'sms', 'otpkey': '12345',
+                                  "phone": "+49 111111111"})
+
+        # Verify the static phone is set and dynamic_phone is not
+        self.assertEqual("+49 111111111", token.get_tokeninfo("phone"))
+        self.assertIsNone(token.get_tokeninfo("dynamic_phone"))
+
+        # Now update the token to use dynamic_phone
+        token.update({"dynamic_phone": True})
+        token.save()
+
+        # Verify that the static phone number has been removed
+        # and dynamic_phone is set
+        self.assertTrue(is_true(token.get_tokeninfo("dynamic_phone")))
+        self.assertIsNone(token.get_tokeninfo("phone"))
+
+        # 2. Now update back to a static phone number
+        token.update({"phone": "+49 222222222"})
+        token.save()
+
+        # Verify that dynamic_phone has been removed
+        # and the static phone number is set
+        self.assertEqual("+49 222222222", token.get_tokeninfo("phone"))
+        self.assertIsNone(token.get_tokeninfo("dynamic_phone"))
+
+        # Clean up
+        remove_token("PISM_DYN_TEST1")
+
+    def test_99_delete_token(self):
+        db_token = Token.query.filter_by(serial=self.serial1).first()
+        token = SmsTokenClass(db_token)
+        token.delete_token()
+
+        db_token = Token.query.filter_by(serial=self.serial1).first()
+        self.assertTrue(db_token is None, db_token)

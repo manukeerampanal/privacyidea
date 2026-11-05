@@ -1,0 +1,110 @@
+<!--
+ (c) NetKnights GmbH 2025,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div
+  appScrollToTop
+  aria-label="Details"
+  class="details-container"
+  i18n-aria-label="@@common.details">
+  <div class="details-flex-layout flex-column">
+    <app-details-header
+      [serial]="tokenSerial()"
+      entityLabel="Token"
+      [showAuditButton]="authService.actionAllowed('auditlog')"
+      [auditRoute]="ROUTE_PATHS.AUDIT"
+      auditTooltip="Show token in audit log"
+      (auditClick)="showTokenAuditLog()">
+      <ng-container headerExtra>
+        @if ((tokenType() === "passkey" || tokenType() === "hotp") && isAttachedToMachine()) {
+          <h3 i18n="@@token.offline">(Offline)</h3>
+        }
+      </ng-container>
+    </app-details-header>
+
+    @if (authService.actionAllowed("delete")) {
+      <div class="header-status-actions">
+        <button
+          (click)="deleteToken()"
+          class="action-button-delete-secondary button-width-l"
+          mat-stroked-button>
+          <mat-icon>delete</mat-icon>
+          <span i18n="@@common.delete">Delete</span>
+        </button>
+      </div>
+    }
+
+    <div class="details-grid">
+      <app-token-details-status
+        [tokenDetails]="tokenDetails()"
+        [isAnyEditingOrRevoked]="isAnyEditingOrRevoked()"
+        [selfService]="true" />
+
+      @if (showCounters()) {
+        <app-token-details-counters
+          [tokenDetails]="tokenDetails()"
+          [isAnyEditingOrRevoked]="isAnyEditingOrRevoked()" />
+      }
+
+      <app-token-details-user-self-service
+        class="details-card--user"
+        [isAnyEditingOrRevoked]="isAnyEditingOrRevoked"
+        [isEditingInfo]="isEditingInfo"
+        [isEditingUser]="isEditingUser"
+        [tokenSerial]="tokenSerial"
+        [userData]="userData"></app-token-details-user-self-service>
+
+      <app-token-details-assignments
+        [tokenDetails]="tokenDetails()"
+        [userRealm]="userRealm"
+        [isAnyEditingOrRevoked]="isAnyEditingOrRevoked()"
+        [selfService]="true" />
+
+      @if (tokenType() === "sshkey" || tokenType() === "hotp") {
+        <app-token-details-machine class="details-card--machine" />
+      }
+
+      <app-token-details-actions
+        class="details-card--actions"
+        [repeatPinValue]="repeatPinValue"
+        [setPinValue]="setPinValue"
+        [tokenType]="tokenType"
+        [token]="tokenDetails()"></app-token-details-actions>
+
+      @if (descriptionRow(); as desc) {
+        <app-token-details-description
+          [element]="desc"
+          [editable]="isEditableElement(desc.keyMap.key)"
+          [isAnyEditingOrRevoked]="isAnyEditingOrRevoked()"
+          [isEditingInfo]="isEditingInfo()"
+          [isEditingUser]="isEditingUser()"
+          [selfService]="true"
+          [cancelEdit]="cancelTokenEdit.bind(this)"
+          [saveEdit]="saveTokenEdit.bind(this)"
+          [toggleEdit]="toggleTokenEdit.bind(this)" />
+      }
+
+      <app-token-details-info
+        class="details-info-area"
+        [detailData]="tokenDetailData"
+        [infoData]="infoData"
+        [isAnyEditingOrRevoked]="isAnyEditingOrRevoked"
+        [isEditingInfo]="isEditingInfo"
+        [isEditingUser]="isEditingUser"></app-token-details-info>
+    </div>
+  </div>
+</div>

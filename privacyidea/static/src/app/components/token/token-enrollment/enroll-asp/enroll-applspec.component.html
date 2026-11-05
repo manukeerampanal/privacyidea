@@ -1,0 +1,56 @@
+<!--
+ (c) NetKnights GmbH 2025,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div class="flex-column">
+  @if (!wizard()) {
+    <mat-checkbox
+      [checked]="generateOnServer()"
+      [disabled]="authService.checkForceServerGenerateOTPKey('applspec') || disabled()"
+      (change)="generateOnServer.set($event.checked)"
+      class="server-checkbox"
+      i18n="@@token.generateStatic"
+      >Generate the static password on the Server</mat-checkbox
+    >
+  }
+
+  <div class="flex-row gap-16">
+    @if (!authService.checkForceServerGenerateOTPKey("applspec")) {
+      <mat-form-field class="input-width-l">
+        <mat-label i18n="@@token.applicationSpecific">Application Specific Password</mat-label>
+        <input
+          [formField]="otpKeyForm"
+          i18n-placeholder="@@token.enterStaticPassword"
+          matInput
+          placeholder="Enter static password" />
+      </mat-form-field>
+    }
+
+    <mat-form-field
+      class="input-width-l"
+      [matTooltip]="enrollmentBlockedReason() ?? ''"
+      [matTooltipDisabled]="!enrollmentBlockedReason()">
+      <mat-label i18n="@@common.serviceId">Service ID</mat-label>
+      <mat-select [formField]="serviceIdForm">
+        @for (option of serviceIdOptions(); track option) {
+          <mat-option [value]="option">{{ option }}</mat-option>
+        }
+      </mat-select>
+      <mat-error i18n="@@token.serviceIdRequired">Service ID is <strong>required</strong></mat-error>
+    </mat-form-field>
+  </div>
+</div>

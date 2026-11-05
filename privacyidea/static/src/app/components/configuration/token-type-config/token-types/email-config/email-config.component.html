@@ -1,0 +1,84 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<mat-expansion-panel
+  id="email"
+  [expanded]="expanded()">
+  <mat-expansion-panel-header>
+    <mat-panel-title i18n="@@tokenTypeConfig.eMail">E-Mail</mat-panel-title>
+  </mat-expansion-panel-header>
+  <div class="panel-content expansion-well">
+    <p i18n="@@tokenTypeConfig.eMailTokenChallenge"
+      >The E-Mail token is a challenge response token that sends the OTP value to the given email address, when the
+      correct OTP PIN was presented by the user.</p
+    >
+
+    <div class="flex-row gap-16 ali-center margin-bottom-16">
+      <mat-form-field
+        appearance="fill"
+        class="input-width-l responsive-margin-bottom-1090">
+        <mat-label i18n="@@tokenTypeConfig.smtpServerConfiguration">SMTP Server Configuration</mat-label>
+        @if (smtpServersListable()) {
+          <mat-select
+            [value]="formData()[EMAIL_SMTP_SERVER_KEY]"
+            (valueChange)="updateFormData(EMAIL_SMTP_SERVER_KEY, $event)">
+            @for (server of smtpServers(); track server) {
+              <mat-option [value]="server">{{ server }}</mat-option>
+            }
+          </mat-select>
+        } @else {
+          <input
+            matInput
+            [value]="formData()[EMAIL_SMTP_SERVER_KEY] ?? ''"
+            (input)="updateFormData(EMAIL_SMTP_SERVER_KEY, $event.target.value)" />
+        }
+        <app-clear-button
+          matSuffix
+          (clearButtonClick)="clearField(EMAIL_SMTP_SERVER_KEY); $event.stopPropagation()"></app-clear-button>
+        @if (smtpServersListable()) {
+          <mat-hint i18n="@@tokenTypeConfig.selectPredefinedSmtp"
+            >Select a predefined
+            <a [routerLink]="[ROUTE_PATHS.EXTERNAL_SERVICES_SMTP]"
+              ><strong>SMTP server configuration</strong>.
+            </a></mat-hint
+          >
+        } @else {
+          <mat-hint
+            class="red"
+            i18n="@@tokenTypeConfig.smtpServerNeedsReadRight"
+            >Type the identifier: listing the SMTP servers needs the smtpserver_read right.</mat-hint
+          >
+        }
+      </mat-form-field>
+
+      <mat-form-field
+        appearance="fill"
+        class="input-width-l">
+        <mat-label i18n="@@tokenTypeConfig.otpValidityTime">OTP Validity Time</mat-label>
+        <input
+          [value]="formData()[EMAIL_VALIDITY_TIME_KEY] ?? ''"
+          (input)="updateFormData(EMAIL_VALIDITY_TIME_KEY, $any($event.target).valueAsNumber)"
+          matInput
+          type="number" />
+        <mat-hint i18n="@@tokenTypeConfig.timeSecondsWhich"
+          >The time in seconds for which the sent OTP value is valid for authentication.</mat-hint
+        >
+      </mat-form-field>
+    </div>
+  </div>
+</mat-expansion-panel>

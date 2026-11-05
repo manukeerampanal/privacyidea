@@ -1,0 +1,114 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<app-details-card
+  class="details-card--identity"
+  title="Status"
+  i18n-title="@@common.status">
+  <div class="details-field-list">
+    <app-detail-field
+      label="Type"
+      i18n-label="@@common.type"
+      [displayText]="tokenTypeDisplay()" />
+    @if (selfService()) {
+      <app-detail-field
+        label="Status"
+        i18n-label="@@common.status"
+        [displayText]="activeDisplay()"
+        [spanClass]="
+          tableUtilsService.getSpanClassForKey({ key: 'active', value: tokenIsActive(), maxfail: maxfail() })
+        " />
+    } @else {
+      <app-detail-field-row
+        label="Status"
+        i18n-label="@@common.status">
+        <ng-container fieldValue>
+          @if (!isAnyEditingOrRevoked() && authService.actionAllowed(tokenIsActive() ? "disable" : "enable")) {
+            <button
+              type="button"
+              class="status-toggle"
+              (click)="toggleActive()"
+              aria-label="Toggle Status"
+              i18n-aria-label="@@token.toggleStatus">
+              <span
+                [ngClass]="[
+                  tableUtilsService.getSpanClassForKey({ key: 'active', value: tokenIsActive(), maxfail: maxfail() })
+                ]">
+                {{ activeDisplay() }}
+              </span>
+            </button>
+          } @else {
+            <div [ngClass]="[tableUtilsService.getDivClassForKey('active')]">
+              <span
+                [ngClass]="[
+                  tableUtilsService.getSpanClassForKey({ key: 'active', value: tokenIsActive(), maxfail: maxfail() })
+                ]">
+                {{ activeDisplay() }}
+              </span>
+            </div>
+          }
+        </ng-container>
+      </app-detail-field-row>
+    }
+    <app-detail-field
+      label="Rollout State"
+      i18n-label="@@token.rolloutState"
+      [displayText]="rolloutStateDisplay()" />
+    <app-detail-field-row
+      label="Fail Count"
+      i18n-label="@@token.failCount">
+      <div
+        fieldValue
+        [ngClass]="[tableUtilsService.getDivClassForKey('failcount')]">
+        <span
+          [ngClass]="[
+            tableUtilsService.getSpanClassForKey({
+              key: 'failcount',
+              value: tokenDetails().failcount,
+              maxfail: maxfail()
+            })
+          ]">
+          {{ str(tokenDetails().failcount) }}
+        </span>
+      </div>
+      <ng-container fieldEdit>
+        @if (!isAnyEditingOrRevoked() && authService.actionAllowed("reset")) {
+          <button
+            mat-icon-button
+            (click)="resetFailCount()"
+            aria-label="Reset Fail Count"
+            i18n-aria-label="@@token.resetFailCount">
+            <mat-icon>lock_reset</mat-icon>
+          </button>
+        }
+      </ng-container>
+    </app-detail-field-row>
+    @if (createdDisplay()) {
+      <app-detail-field
+        label="Created"
+        i18n-label="@@token.created"
+        [displayText]="createdDisplay()" />
+    }
+    @if (lastAuthDisplay()) {
+      <app-detail-field
+        label="Last Authentication"
+        i18n-label="@@common.lastAuthentication"
+        [displayText]="lastAuthDisplay()" />
+    }
+  </div>
+</app-details-card>

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #   2016-06-15 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #              Add allowed parameters to the SMS Provider
 #
@@ -54,6 +52,7 @@ class SmtpSMSProvider(ISMSProvider):
         In case of a failure an exception is raised
         """
         if self.smsgateway:
+            phone = self._mangle_phone(phone, self.smsgateway.option_dict)
             identifier = self.smsgateway.option_dict.get("SMTPIDENTIFIER")
             recipient = self.smsgateway.option_dict.get("MAILTO").format(
                 otp=message, phone=phone)
@@ -63,6 +62,7 @@ class SmtpSMSProvider(ISMSProvider):
             body = self.smsgateway.option_dict.get("BODY", "{otp}").format(
                 otp=message, phone=phone)
         else:
+            phone = self._mangle_phone(phone, self.config)
             identifier = self.config.get("IDENTIFIER")
             server = self.config.get("MAILSERVER")
             sender = self.config.get("MAILSENDER")
@@ -72,17 +72,17 @@ class SmtpSMSProvider(ISMSProvider):
 
             if not (server and recipient and sender) and not (identifier and \
                     recipient):
-                log.error("incomplete config: %s. MAILTO and (IDENTIFIER or "
-                          "MAILSERVER and MAILSENDER) needed" % self.config)
+                log.error(f"incomplete config: {self.config}. MAILTO and (IDENTIFIER or "
+                          "MAILSERVER and MAILSENDER) needed")
                 raise SMSError(-1, "Incomplete SMS config.")
 
-            log.debug("submitting message {0!r} to {1!s}".format(body, phone))
             recipient = recipient.replace(PHONE_TAG, phone)
             subject = subject.replace(PHONE_TAG, phone)
             subject = subject.replace(MSG_TAG, message)
             body = body.replace(PHONE_TAG, phone)
             body = body.replace(MSG_TAG, message)
 
+        log.debug(f"submitting message {body!r} to {phone!s}")
         if identifier:
             r = send_email_identifier(identifier, recipient, subject, body)
         else:
@@ -126,7 +126,10 @@ class SmtpSMSProvider(ISMSProvider):
                       "BODY": {
                           "description": "The optional body of the email. "
                                          "Use tags {phone} and {otp}.",
-                          "type": "text" }
+                          "type": "text"},
+                      "REGEXP": {
+                          "description": cls.regexp_description
+                      }
                   }
                   }
         return params

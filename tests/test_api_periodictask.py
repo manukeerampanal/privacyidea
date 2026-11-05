@@ -5,10 +5,11 @@ This tests api/periodictask.py
 """
 import jwt
 from contextlib import contextmanager
-import mock
+from unittest import mock
 from dateutil.parser import parse as parse_timestamp
 
 from privacyidea.lib.periodictask import TASK_MODULES
+from privacyidea.models import NodeName, db
 from tests.base import MyApiTestCase
 
 
@@ -19,7 +20,9 @@ class APIPeriodicTasksTestCase(MyApiTestCase):
         Mock a UnitTest task module, use as ``with self.mock_task_module() as module:``
         """
         taskmodule = mock.MagicMock()
-        cls = lambda config: taskmodule
+
+        def cls(config):
+            return taskmodule
         with mock.patch.dict(TASK_MODULES, {"UnitTest": cls}, clear=True):
             yield taskmodule
 
@@ -44,8 +47,10 @@ class APIPeriodicTasksTestCase(MyApiTestCase):
         self.assertEqual(data['result']['value'], [])
 
         # need authorization
-        fake_auth_token = jwt.encode({"role": "admin"}, key="313233343536", algorithm="HS256")
-        status_code, data = self.simulate_request('/periodictask/', method='GET', headers={'Authorization': fake_auth_token})
+        fake_auth_token = jwt.encode({"role": "admin"}, key="wrong-key-not-the-server-secret-0123456789",
+                                     algorithm="HS256")
+        status_code, data = self.simulate_request('/periodictask/', method='GET',
+                                                  headers={'Authorization': fake_auth_token})
         self.assertEqual(status_code, 401)
         self.assertFalse(data['result']['status'])
 
@@ -67,70 +72,28 @@ class APIPeriodicTasksTestCase(MyApiTestCase):
             ptask_id1 = data['result']['value']
 
         # some invalid tasks
-        invalid_task_dicts = [
-            # invalid ordering
-            {
-                'name': 'some other task',
-                'active': False,
-                'nodes': 'a, b',
-                'interval': '0 8 * * *',
-                'taskmodule': 'UnitTest',
-                'ordering': '-3',
-                'options': '{"something": "123", "else": true}',
-            },
-            # no nodes
-            {
-                'name': 'some other task',
-                'active': False,
-                'interval': '0 8 * * *',
-                'taskmodule': 'UnitTest',
-                'options': '{"something": "123", "else": true}',
-            },
-            # empty nodes
-            {
-                'name': 'some other task',
-                'active': False,
-                'interval': '0 8 * * *',
-                'nodes': '    ',
-                'taskmodule': 'UnitTest',
-                'options': '{"something": "123", "else": true}',
-            },
-            # unknown taskmodule
-            {
-                'name': 'some other task',
-                'nodes': 'pinode1, pinode2',
-                'active': False,
-                'interval': '0 8 * * *',
-                'taskmodule': 'Unknown',
-                'options': '{"something": "123"}',
-            },
-            # invalid interval
-            {
-                'name': 'some other task',
-                'nodes': 'pinode1, pinode2',
-                'active': False,
-                'interval': 'every day',
-                'taskmodule': 'UnitTest',
-                'options': '{"something": "123"}',
-            },
-            # invalid options
-            {
-                'name': 'some task',
-                'nodes': 'pinode1, pinode2',
-                'active': False,
-                'interval': '0 8 * * *',
-                'taskmodule': 'UnitTest',
-                'options': '[1, 2]',
-            }
+        # Each invalid task carries every other parameter it needs, so that it is refused for its own reason
+        valid_task = {'name': 'some other task', 'active': False, 'nodes': 'pinode1, pinode2',
+                      'interval': '0 8 * * *', 'taskmodule': 'UnitTest', 'ordering': '0',
+                      'options': '{"something": "123"}'}
+        no_nodes = {key: value for key, value in valid_task.items() if key != 'nodes'}
+        invalid_tasks = [
+            ({**valid_task, 'ordering': '-3'}, "Invalid ordering: -3"),
+            (no_nodes, "nodes"),
+            ({**valid_task, 'nodes': '    '}, "nodes: expected at least one node"),
+            ({**valid_task, 'taskmodule': 'Unknown'}, "Unknown task module: 'Unknown'"),
+            ({**valid_task, 'interval': 'every day'}, "Invalid interval"),
+            ({**valid_task, 'options': '[1, 2]'}, "options: expected dictionary, got [1, 2]"),
         ]
         # all result in ERR905
         with self.mock_task_module():
-            for invalid_task_dict in invalid_task_dicts:
+            for invalid_task_dict, expected_message in invalid_tasks:
                 status_code, data = self.simulate_request('/periodictask/', method='POST',
                                                           data=invalid_task_dict)
                 self.assertEqual(status_code, 400)
                 self.assertFalse(data['result']['status'])
                 self.assertIn('ERR905', data['result']['error']['message'])
+                self.assertIn(expected_message, data['result']['error']['message'])
 
         # create another task
         with self.mock_task_module():
@@ -171,9 +134,8 @@ class APIPeriodicTasksTestCase(MyApiTestCase):
         self.assertIsNotNone(last_update)
         self.assertEqual(result_dict['options'], {'something': '123', 'else': 'True'})
 
-
         # get one
-        status_code, data = self.simulate_request('/periodictask/{}'.format(ptask_id1), method='GET')
+        status_code, data = self.simulate_request(f'/periodictask/{ptask_id1}', method='GET')
         self.assertEqual(status_code, 200)
         self.assertEqual(data['result']['value']['id'], ptask_id1)
 
@@ -203,7 +165,7 @@ class APIPeriodicTasksTestCase(MyApiTestCase):
         self.assertIn('some other task', [task['name'] for task in data['result']['value']], data)
 
         # get updated task
-        status_code, data = self.simulate_request('/periodictask/{}'.format(ptask_id1), method='GET')
+        status_code, data = self.simulate_request(f'/periodictask/{ptask_id1}', method='GET')
         self.assertEqual(status_code, 200)
         self.assertEqual(data['result']['value']['id'], ptask_id1)
         self.assertEqual(data['result']['value']['ordering'], 2)
@@ -214,11 +176,11 @@ class APIPeriodicTasksTestCase(MyApiTestCase):
         last_update = parse_timestamp(data['result']['value']['last_update'])
 
         # enable
-        status_code, data = self.simulate_request('/periodictask/enable/{}'.format(ptask_id1), method='POST')
+        status_code, data = self.simulate_request(f'/periodictask/enable/{ptask_id1}', method='POST')
         self.assertEqual(status_code, 200)
 
         # get updated task
-        status_code, data = self.simulate_request('/periodictask/{}'.format(ptask_id1), method='GET')
+        status_code, data = self.simulate_request(f'/periodictask/{ptask_id1}', method='GET')
         self.assertEqual(status_code, 200)
         self.assertEqual(data['result']['value']['name'], 'new name')
         self.assertEqual(data['result']['value']['active'], True)
@@ -227,11 +189,11 @@ class APIPeriodicTasksTestCase(MyApiTestCase):
         last_update = parse_timestamp(data['result']['value']['last_update'])
 
         # disable
-        status_code, data = self.simulate_request('/periodictask/disable/{}'.format(ptask_id1), method='POST')
+        status_code, data = self.simulate_request(f'/periodictask/disable/{ptask_id1}', method='POST')
         self.assertEqual(status_code, 200)
 
         # get updated task
-        status_code, data = self.simulate_request('/periodictask/{}'.format(ptask_id1), method='GET')
+        status_code, data = self.simulate_request(f'/periodictask/{ptask_id1}', method='GET')
         self.assertEqual(status_code, 200)
         self.assertEqual(data['result']['value']['name'], 'new name')
         self.assertEqual(data['result']['value']['active'], False)
@@ -239,22 +201,22 @@ class APIPeriodicTasksTestCase(MyApiTestCase):
                            last_update)
 
         # disable again without effect
-        status_code, data = self.simulate_request('/periodictask/disable/{}'.format(ptask_id1), method='POST')
+        status_code, data = self.simulate_request(f'/periodictask/disable/{ptask_id1}', method='POST')
         self.assertEqual(status_code, 200)
 
         # get updated task
-        status_code, data = self.simulate_request('/periodictask/{}'.format(ptask_id1), method='GET')
+        status_code, data = self.simulate_request(f'/periodictask/{ptask_id1}', method='GET')
         self.assertEqual(status_code, 200)
         self.assertEqual(data['result']['value']['name'], 'new name')
         self.assertEqual(data['result']['value']['active'], False)
 
         # delete
-        status_code, data = self.simulate_request('/periodictask/{}'.format(ptask_id1), method='DELETE')
+        status_code, data = self.simulate_request(f'/periodictask/{ptask_id1}', method='DELETE')
         self.assertEqual(status_code, 200)
         self.assertEqual(data['result']['value'], ptask_id1)
 
         # get updated task impossible now
-        status_code, data = self.simulate_request('/periodictask/{}'.format(ptask_id1), method='GET')
+        status_code, data = self.simulate_request(f'/periodictask/{ptask_id1}', method='GET')
         self.assertEqual(status_code, 404)
         self.assertFalse(data['result']['status'], False)
 
@@ -265,7 +227,7 @@ class APIPeriodicTasksTestCase(MyApiTestCase):
         self.assertEqual(len(data['result']['value']), 1)
 
         # delete the second task as well
-        status_code, data = self.simulate_request('/periodictask/{}'.format(ptask_id2), method='DELETE')
+        status_code, data = self.simulate_request(f'/periodictask/{ptask_id2}', method='DELETE')
         self.assertEqual(status_code, 200)
         self.assertEqual(data['result']['value'], ptask_id2)
 
@@ -292,7 +254,12 @@ class APIPeriodicTasksTestCase(MyApiTestCase):
             self.assertEqual(data['result']['value'], options)
 
     def test_03_nodes(self):
+        node1 = NodeName(id="8e4272a9-9037-40df-8aa3-976e4a04b5a9", name="Node1")
+        node2 = NodeName(id="d1d7fde6-330f-4c12-88f3-58a1752594bf", name="Node2")
+        db.session.add_all([node1, node2])
         status_code, data = self.simulate_request('/periodictask/nodes/', method='GET')
         self.assertEqual(status_code, 200)
         self.assertTrue(data['result']['status'])
-        self.assertEqual(set(data['result']['value']), set(['Node2', 'Node1']))
+        self.assertEqual({'Node2', 'Node1'}, set(data['result']['value']), data)
+        db.session.delete(node1)
+        db.session.delete(node2)

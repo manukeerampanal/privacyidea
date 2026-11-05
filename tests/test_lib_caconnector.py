@@ -2,24 +2,17 @@
 This test file tests the lib.caconnector.py and
 lib.caconnectors.localca.py
 """
-import unittest
-
-import OpenSSL.crypto
-
-import privacyidea.lib.caconnectors.msca
-from .base import MyTestCase
+import datetime
 import os
-import glob
-import six
 import shutil
-import mock
+import tempfile
+import unittest
 from io import StringIO
-from mock import patch
-from privacyidea.lib.caconnectors.localca import LocalCAConnector, ATTR
-from privacyidea.lib.caconnectors.msca import MSCAConnector, ATTR as MS_ATTR
-from OpenSSL import crypto
-from privacyidea.lib.utils import int_to_hex, to_unicode
-from privacyidea.lib.error import CAError, CSRError, CSRPending
+
+from unittest import mock
+from cryptography import x509
+from sqlalchemy import select
+
 from privacyidea.lib.caconnector import (get_caconnector_list,
                                          get_caconnector_class,
                                          get_caconnector_config,
@@ -28,16 +21,18 @@ from privacyidea.lib.caconnector import (get_caconnector_list,
                                          get_caconnector_type,
                                          get_caconnector_types,
                                          save_caconnector, delete_caconnector)
-from privacyidea.lib.caconnectors.baseca import AvailableCAConnectors
-from .mscamock import (MyTemplateReply, MyCAReply, MyCSRReply,
-                       MyCertReply, MyCertificateReply, MyCSRStatusReply, CAServiceMock)
-
-
+from privacyidea.lib.caconnectors.localca import LocalCAConnector, ATTR
+from privacyidea.lib.caconnectors.msca import MSCAConnector, ATTR as MS_ATTR, _grpc_available
+from privacyidea.lib.error import CAError, CSRError, CSRPending
+from privacyidea.lib.utils import int_to_hex
+from privacyidea.models import db, CAConnectorConfig
+from .base import MyTestCase
+from .conftest import prepare_ca_directory
+from .mscamock import CAServiceMock
 
 CAKEY = "cakey.pem"
 CACERT = "cacert.pem"
 OPENSSLCNF = "openssl.cnf"
-WORKINGDIR = "tests/testdata/ca"
 REQUEST = """-----BEGIN CERTIFICATE REQUEST-----
 MIICmTCCAYECAQAwVDELMAkGA1UEBhMCREUxDzANBgNVBAgMBkhlc3NlbjEUMBIG
 A1UECgwLcHJpdmFjeWlkZWExHjAcBgNVBAMMFXJlcXVlc3Rlci5sb2NhbGRvbWFp
@@ -115,28 +110,12 @@ ub8B4Q4BtcXwyX1IjkSRVGhpmBKc+cykTR1GGR0L0JihMK85qWF/8vyYiwBq3z08
 TdIfRtrzkM5Zw/U/p2/LWzbe/fCkqSC6SheI+/FDR7Bjz7xNxIZHonk=
 -----END CERTIFICATE-----"""
 
-SPKAC = "SPKAC=MIICQDCCASgwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggE" \
-        "KAoIBAQDSgYkgUUgPc/QRMiTVHxz9XPW25sXwUoHc0q9mSnyTMWFcr" \
-        "9FtBnADYHxyDIjdSc2eAmzSWtdTD" \
-        "/PavmlktQ8MAOOzUEejs5u6E1DWWFpLqzngEcoKJ2cDeCJmbZIeG1xJru" \
-        "Zr0Y47nQbTxqxNU0MQq+iWwYeCl5mPINOZEjcxhOGK/ykDXyKQPn+b4CDBr" \
-        "dyuTDkaMZYXAoyy2bQNIBKbfYZU/TP9wSpiRvhgls9uAW8i3xNH55fsBXIjo2" \
-        "L4+u+snHLwN8svN8+QqCdRhsbXeAiPfiWiFXCi+xy2FV6gl4uBTAkoiic7lLxx2" \
-        "1txN5orFuBvtcn1S08gumXPr62tAgMBAAEWADANBgkqhkiG9w0BAQQFAAOCAQEAe" \
-        "nI3N4LdQF3R0Jn+pjldo65K4BERTnfhtcyYH4nCTNKvvwSvTv9eBvuJ6ZWqIy9aRFX" \
-        "Zngl4ZFyrqZYNufPPdlMVMwbJ4L6iphkcQjzCbrvQDvzVwH4SOGmuIHYyjrIzmg" \
-        "P+e7XvXVr0Vl6zMHWalGGSNPWwrSj6FXw6G7qm7Qd9CYvGDxA0qxo6tL/KCjv" \
-        "q+4qNB1rfy9Gy3xBr3ZfIa15/bLSvO9dPx6cW8Jv6Vb8w6UizwhGMfh55KOc1wVf" \
-        "ofEpwbLM9PyvVAoszL9JpQHIs6S0zZ5bwt2eUjzc7GnzxxIVlR7/xIQiizzbW22" \
-        "rmtBFA3aIp5RExiEpvBD88hg==\n" \
-        "CN=Steve Test\n" \
-        "emailAddress=steve@openssl.org"
-
 
 class CAConnectorTestCase(MyTestCase):
     """
     Test the CA connector lib functions
     """
+
     def test_01_base_functions(self):
         types = get_caconnector_types()
         self.assertIn("local", types)
@@ -153,14 +132,25 @@ class CAConnectorTestCase(MyTestCase):
         self.assertEqual(description.get("local").get("cacert"), "string")
 
     def test_02_db_caconnector(self):
-        pass
         # save a CA connector
         ca_id = save_caconnector({"caconnector": "myCA",
                                   "type": "local",
                                   "cakey": "/opt/ca/key.pem",
                                   "cacert": "/opt/ca/cert.pem"})
         self.assertTrue(ca_id > 0, ca_id)
-        # Update the CA connector. Thus we check if SharedConfigClass is updated.
+        # check if connector is in DB
+        calist = get_caconnector_list()
+        self.assertEqual(1, len(calist))
+        # check the config values of "myCA"
+        my_ca = calist[0]
+        self.assertEqual("local", my_ca.get("type"))
+        self.assertEqual("myCA", my_ca.get("connectorname"))
+        my_ca_config = my_ca.get("data")
+        self.assertEqual(2, len(my_ca_config))
+        self.assertEqual("/opt/ca/key.pem", my_ca_config.get("cakey"))
+        self.assertEqual("/opt/ca/cert.pem", my_ca_config.get("cacert"))
+
+        # Update the CA connector. Thus, we check if SharedConfigClass is updated.
         save_caconnector({"caconnector": "myCA",
                           "type": "local",
                           "WorkingDir": "/opt/ca",
@@ -171,9 +161,16 @@ class CAConnectorTestCase(MyTestCase):
         self.assertEqual(len(calist), 1)
         calist = get_caconnector_list(filter_caconnector_type="local")
         self.assertEqual(len(calist), 1)
+        my_ca = calist[0]
+        self.assertEqual("local", my_ca.get("type"))
+        self.assertEqual("myCA", my_ca.get("connectorname"))
         # check the config values of "myCA"
-        self.assertEqual(calist[0].get("data").get("WorkingDir"), "/opt/ca")
-        self.assertEqual(calist[0].get("data").get("cakey"), "/opt/ca/key.pem")
+        my_ca_config = my_ca.get("data")
+        self.assertEqual(4, len(my_ca_config))
+        self.assertEqual("/opt/ca/key.pem", my_ca_config.get("cakey"))
+        self.assertEqual("/opt/ca/cert.pem", my_ca_config.get("cacert"))
+        self.assertEqual("/opt/ca", my_ca_config.get("WorkingDir"))
+        self.assertEqual("secret", my_ca_config.get("Password"))
 
         # get the CA connector list without a config
         calist = get_caconnector_list(return_config=False)
@@ -195,7 +192,12 @@ class CAConnectorTestCase(MyTestCase):
         delete_caconnector("myCA")
 
         # check if connector is deleted from DB
-        self.assertEqual(len(calist), 1)
+        calist = get_caconnector_list(return_config=False)
+        self.assertEqual(0, len(calist))
+        # Check corresponding config is also deleted
+        config_stmt = select(CAConnectorConfig)
+        config_entries = db.session.scalars(config_stmt).all()
+        self.assertEqual(len(config_entries), 0)
 
     def test_03_errors(self):
         # unknown type
@@ -214,45 +216,14 @@ class LocalCATestCase(MyTestCase):
     @classmethod
     def setUpClass(cls):
         # call parent
-        super(MyTestCase, cls).setUpClass()
-
-        # Backup the original index and serial
-        shutil.copyfile("{0!s}/serial".format(WORKINGDIR),
-                        "{0!s}/serial.orig".format(WORKINGDIR))
-        shutil.copyfile("{0!s}/index.txt".format(WORKINGDIR),
-                        "{0!s}/index.txt.orig".format(WORKINGDIR))
+        super().setUpClass()
+        cls.ca_path = prepare_ca_directory(tempfile.mkdtemp())
 
     @classmethod
     def tearDownClass(cls):
-        filelist = glob.glob("{0!s}/100*.pem".format(WORKINGDIR))
-        for f in filelist:
-            os.remove(f)
-
-        FILES = ["DE_Hessen_privacyidea_requester.localdomain.req",
-                 "DE_Hessen_privacyidea_requester.localdomain.pem",
-                 "DE_Hessen_privacyidea_usercert.pem",
-                 "DE_Hessen_privacyidea_usercert.req",
-                 "index.txt.attr.old",
-                 "index.txt.old",
-                 "serial.old",
-                 "crl.pem",
-                 "Steve_Test.der",
-                 "Steve_Test.txt"]
-        for f in FILES:
-            try:
-                os.remove("{0!s}/{1!s}".format(WORKINGDIR, f))
-            except OSError:
-                print("File {0!s} could not be deleted.".format(f))
-
-        # restore backup of index.txt and serial
-        shutil.copyfile("{0!s}/serial.orig".format(WORKINGDIR),
-                        "{0!s}/serial".format(WORKINGDIR))
-        shutil.copyfile("{0!s}/index.txt.orig".format(WORKINGDIR),
-                        "{0!s}/index.txt".format(WORKINGDIR))
-        os.remove("{0!s}/serial.orig".format(WORKINGDIR))
-        os.remove("{0!s}/index.txt.orig".format(WORKINGDIR))
+        shutil.rmtree(cls.ca_path)
         # call parent
-        super(MyTestCase, cls).tearDownClass()
+        super().tearDownClass()
 
     def test_01_create_ca_connector(self):
         # cakey missing
@@ -271,24 +242,26 @@ class LocalCATestCase(MyTestCase):
         cacon = LocalCAConnector("localCA", {"cacert": "...",
                                              "cakey": "..."})
         # set the parameters:
-        cwd = os.getcwd()
         cacon.set_config({"cakey": CAKEY, "cacert": CACERT,
                           "openssl.cnf": OPENSSLCNF,
-                          "WorkingDir": cwd + "/" + WORKINGDIR})
+                          "WorkingDir": self.ca_path})
 
         _r, cert = cacon.sign_request(REQUEST,
                                       {"CSRDir": "",
                                        "CertificateDir": "",
-                                       "WorkingDir": cwd + "/" + WORKINGDIR})
-        serial = cert.get_serial_number()
+                                       "WorkingDir": self.ca_path})
+        cert_obj = x509.load_pem_x509_certificate(cert.encode())
+        serial = cert_obj.serial_number
 
-        self.assertEqual("{0!r}".format(cert.get_issuer()),
-                         "<X509Name object "
-                         "'/C=DE/ST=Hessen/O=privacyidea/CN=CA001'>")
-        self.assertEqual("{0!r}".format(cert.get_subject()),
-                         "<X509Name object "
-                         "'/C=DE/ST=Hessen/O=privacyidea/CN=requester"
-                         ".localdomain'>")
+        self.assertEqual("<Name(CN=CA001,O=privacyidea,ST=Hessen,C=DE)>", f"{cert_obj.issuer!r}")
+        self.assertEqual("<Name(CN=requester.localdomain,O=privacyidea,ST=Hessen,C=DE)>", f"{cert_obj.subject!r}")
+
+        # Check output files
+        self.assertTrue(os.path.isfile(f"{self.ca_path}/DE_Hessen_privacyidea_requester.localdomain.pem"))
+        self.assertTrue(os.path.isfile(f"{self.ca_path}/DE_Hessen_privacyidea_requester.localdomain.req"))
+
+        # Fail to revoke certificate due to non-existing-reasing
+        self.assertRaises(CAError, cacon.revoke_cert, cert, reason="$(rm -fr)")
 
         # Revoke certificate
         r = cacon.revoke_cert(cert)
@@ -299,19 +272,12 @@ class LocalCATestCase(MyTestCase):
         r = cacon.create_crl()
         self.assertEqual(r, "crl.pem")
         # Check if the serial number is contained in the CRL!
-        filename = os.path.join(cwd, WORKINGDIR, "crl.pem")
-        f = open(filename)
-        buff = f.read()
-        f.close()
-        crl = crypto.load_crl(crypto.FILETYPE_PEM, buff)
-        revoked_certs = crl.get_revoked()
-        found_revoked_cert = False
-        for revoked_cert in revoked_certs:
-            s = to_unicode(revoked_cert.get_serial())
-            if s == serial_hex:
-                found_revoked_cert = True
-                break
-        self.assertTrue(found_revoked_cert)
+        filename = os.path.join(self.ca_path, "crl.pem")
+        with open(filename) as f:
+            buff = f.read()
+        crl = x509.load_pem_x509_crl(buff.encode())
+        revoked_cert = crl.get_revoked_certificate_by_serial_number(serial)
+        self.assertIsNotNone(revoked_cert)
 
         # Create the CRL and check the overlap period. But no need to create
         # a new CRL.
@@ -321,61 +287,44 @@ class LocalCATestCase(MyTestCase):
         # Now we overlap at any cost!
         cacon.set_config({"cakey": CAKEY, "cacert": CACERT,
                           "openssl.cnf": OPENSSLCNF,
-                          "WorkingDir": cwd + "/" + WORKINGDIR,
+                          "WorkingDir": self.ca_path,
                           ATTR.CRL_OVERLAP_PERIOD: 1000})
         r = cacon.create_crl(check_validity=True)
         self.assertEqual(r, "crl.pem")
 
     def test_03_sign_user_cert(self):
-        cwd = os.getcwd()
         cacon = LocalCAConnector("localCA",
                                  {"cakey": CAKEY,
                                   "cacert": CACERT,
                                   "openssl.cnf": OPENSSLCNF,
-                                  "WorkingDir": cwd + "/" + WORKINGDIR})
+                                  "WorkingDir": self.ca_path})
 
         _, cert = cacon.sign_request(REQUEST_USER)
-        self.assertEqual("{0!r}".format(cert.get_issuer()),
-                         "<X509Name object "
-                         "'/C=DE/ST=Hessen/O=privacyidea/CN=CA001'>")
-        self.assertEqual("{0!r}".format(cert.get_subject()),
-                         "<X509Name object "
-                         "'/C=DE/ST=Hessen/O=privacyidea/CN=usercert'>")
+        cert_obj = x509.load_pem_x509_certificate(cert.encode())
+        self.assertEqual(f"{cert_obj.issuer!r}",
+                         "<Name(CN=CA001,O=privacyidea,ST=Hessen,C=DE)>")
+        self.assertEqual(f"{cert_obj.subject!r}",
+                         "<Name(CN=usercert,O=privacyidea,ST=Hessen,C=DE)>")
 
-    def test_04_sign_SPKAC_request(self):
-        cwd = os.getcwd()
-        cacon = LocalCAConnector("localCA",
-                                 {"cakey": CAKEY,
-                                  "cacert": CACERT,
-                                  "openssl.cnf": OPENSSLCNF,
-                                  "WorkingDir": cwd + "/" + WORKINGDIR})
-
-        _, cert = cacon.sign_request(SPKAC, options={"spkac": 1})
-        self.assertEqual("{0!r}".format(cert.get_issuer()),
-                         "<X509Name object "
-                         "'/C=DE/ST=Hessen/O=privacyidea/CN=CA001'>")
-        self.assertEqual("{0!r}".format(cert.get_subject()),
-                         "<X509Name object '/CN=Steve Test"
-                         "/emailAddress=steve@openssl.org'>")
+        # Check output files
+        self.assertTrue(os.path.isfile(f"{self.ca_path}/DE_Hessen_privacyidea_usercert.pem"))
+        self.assertTrue(os.path.isfile(f"{self.ca_path}/DE_Hessen_privacyidea_usercert.req"))
 
     def test_05_templates(self):
-        cwd = os.getcwd()
         cacon = LocalCAConnector("localCA",
                                  {"cakey": CAKEY,
                                   "cacert": CACERT,
                                   "openssl.cnf": OPENSSLCNF,
-                                  "WorkingDir": cwd + "/" + WORKINGDIR,
+                                  "WorkingDir": self.ca_path,
                                   ATTR.TEMPLATE_FILE: "templates.yaml"})
         templates = cacon.get_templates()
         self.assertTrue("user" in templates)
         self.assertTrue("webserver" in templates)
         self.assertTrue("template3" in templates)
-        _, cert = cacon.sign_request(SPKAC, options={"spkac": 1,
-                                                     "template": "webserver"})
-        expires = to_unicode(cert.get_notAfter())
-        import datetime
-        dt = datetime.datetime.strptime(expires, "%Y%m%d%H%M%SZ")
-        ddiff = dt - datetime.datetime.now()
+        _, cert = cacon.sign_request(REQUEST_USER, options={"template": "webserver"})
+        cert_obj = x509.load_pem_x509_certificate(cert.encode())
+        expires = cert_obj.not_valid_after_utc
+        ddiff = expires - datetime.datetime.now(tz=datetime.UTC)
         # The certificate is signed for 750 days
         self.assertTrue(ddiff.days > 740, ddiff.days)
         self.assertTrue(ddiff.days < 760, ddiff.days)
@@ -429,7 +378,6 @@ WYx05kOaYFFvb1u8ub+qSExyHGX9Lh6w32RCoM8kJP7F6YCepKJRboka1/BY3GbF
 17qsUVtb+0YLznMdHEFtWc51SpzA0h3a7w==
 -----END CERTIFICATE-----"""
 
-
 CONF = {MS_ATTR.HOSTNAME: MY_CA_NAME,
         MS_ATTR.PORT: 50061,
         MS_ATTR.HTTP_PROXY: "0",
@@ -441,7 +389,7 @@ CONF_LAB = {MS_ATTR.HOSTNAME: "10.0.5.100",
             MS_ATTR.CA: "CA03.nilsca.com\\nilsca-CA03-CA"}
 
 
-@unittest.skipUnless("privacyidea.lib.caconnectors.msca.MSCAConnector" in AvailableCAConnectors,
+@unittest.skipUnless(_grpc_available,
                      "Can not test MSCA. grpc module seems not available.")
 class MSCATestCase(MyTestCase):
     """
@@ -470,10 +418,10 @@ class MSCATestCase(MyTestCase):
             self.assertEqual(description[key], "string")
 
         # Check, if an error is raised if a required attribute is missing:
-        self.assertRaisesRegexp(CAError, "required argument 'port' is missing.",
-                                MSCAConnector, "billsCA", {MS_ATTR.HOSTNAME: "hans"})
-        self.assertRaisesRegexp(CAError, "required argument 'hostname' is missing.",
-                                MSCAConnector, "billsCA", {MS_ATTR.PORT: "shanghai"})
+        self.assertRaisesRegex(CAError, "required argument 'port' is missing.",
+                               MSCAConnector, "billsCA", {MS_ATTR.HOSTNAME: "hans"})
+        self.assertRaisesRegex(CAError, "required argument 'hostname' is missing.",
+                               MSCAConnector, "billsCA", {MS_ATTR.PORT: "shanghai"})
 
     def test_02_test_get_templates(self):
         # Mock the connection to the worker
@@ -504,16 +452,16 @@ class MSCATestCase(MyTestCase):
                                                                "ca_templates": MOCK_CA_TEMPLATES,
                                                                "csr_disposition": 5})
             cacon = MSCAConnector("billsCA", CONF)
-            self.assertRaisesRegexp(CSRPending, "ERR505: CSR pending",
-                                    cacon.sign_request, REQUEST, {"template": "ApprovalRequired"})
+            self.assertRaisesRegex(CSRPending, "ERR505: CSR pending",
+                                   cacon.sign_request, REQUEST, {"template": "ApprovalRequired"})
             # Mock the CA to simulate a failed Request - dispoisition -1
             mock_conncect_worker.return_value = CAServiceMock(CONF,
                                                               {"available_cas": MOCK_AVAILABLE_CAS,
                                                                "ca_templates": MOCK_CA_TEMPLATES,
                                                                "csr_disposition": -1})
             cacon = MSCAConnector("billsCA", CONF)
-            self.assertRaisesRegexp(CSRError, "ERR504: CSR invalid",
-                                    cacon.sign_request, REQUEST, {"template": "NonExisting"})
+            self.assertRaisesRegex(CSRError, "ERR504: CSR invalid",
+                                   cacon.sign_request, REQUEST, {"template": "NonExisting"})
             # Mock the CA to simulate a signed request - disposition 3
             mock_conncect_worker.return_value = CAServiceMock(CONF,
                                                               {"available_cas": MOCK_AVAILABLE_CAS,
@@ -522,7 +470,8 @@ class MSCATestCase(MyTestCase):
                                                                "certificate": MOCK_USER_CERT})
             cacon = MSCAConnector("billsCA", CONF)
             request_id, cert = cacon.sign_request(REQUEST_USER, {"template": "User"})
-            self.assertIsInstance(cert, OpenSSL.crypto.X509)
+            self.assertIsInstance(cert, str)
+            self.assertEqual(cert, MOCK_USER_CERT)
             self.assertEqual(4711, request_id)
 
     def test_04_test_pending_request(self):
@@ -535,7 +484,7 @@ class MSCATestCase(MyTestCase):
                                                                "certificate": CERTIFICATE})
             cacon = MSCAConnector("billsCA", CONF_LAB)
             try:
-                r = cacon.sign_request(REQUEST, {"template": "ApprovalRequired"})
+                cacon.sign_request(REQUEST, {"template": "ApprovalRequired"})
             except CSRPending as e:
                 request_id = e.requestId
 
@@ -607,13 +556,21 @@ class CreateLocalCATestCase(MyTestCase):
     """
     test creating a new CA using the local caconnector
     """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.workdir = tempfile.mkdtemp()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.workdir)
+        super().tearDownClass()
+
     def test_01_create_ca(self):
-        cwd = os.getcwd()
-        workdir = os.path.join(cwd, WORKINGDIR + '2')
-        if os.path.exists(workdir):
-            shutil.rmtree(workdir)
-        inputstr = six.text_type(workdir + '\n\n\n\n\n\ny\n')
-        with patch('sys.stdin', StringIO(inputstr)):
+        workdir = self.workdir
+        inputstr = str(workdir + '\n\n\n\n\n\ny\n')
+        with mock.patch('sys.stdin', StringIO(inputstr)):
             caconfig = LocalCAConnector.create_ca('localCA2')
             self.assertEqual(caconfig.get("WorkingDir"), workdir)
             cacon = LocalCAConnector('localCA2', caconfig)
@@ -621,12 +578,3 @@ class CreateLocalCATestCase(MyTestCase):
             self.assertEqual(cacon.workingdir, workdir)
             # check if the generated files exist
             self.assertTrue(os.path.exists(os.path.join(workdir, 'cacert.pem')))
-
-    def test_02_cleanup(self):
-        filelist = glob.glob("{0!s}2/*".format(WORKINGDIR))
-        for f in filelist:
-            try:
-                os.remove(f)
-            except OSError:
-                print("Error deleting file {0!s}.".format(f))
-        os.rmdir("{0!s}2".format(WORKINGDIR))

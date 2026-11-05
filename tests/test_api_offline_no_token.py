@@ -1,14 +1,14 @@
-# -*- coding: utf-8 -*-
-from .base import MyApiTestCase
-from privacyidea.lib.user import (User)
-from privacyidea.lib.token import init_token
-from privacyidea.lib.policy import SCOPE, ACTION, set_policy
 from privacyidea.lib.machine import attach_token
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.policy import SCOPE, set_policy
+from privacyidea.lib.token import init_token
+from privacyidea.lib.user import (User)
+from .base import MyApiTestCase
 
 
 class OfflinePassNoTokenTestCase(MyApiTestCase):
     """
-    Ensure that an user with no tokens do not receive any offline values
+    Ensure that a user with no tokens do not receive any offline values
     https://github.com/privacyidea/privacyidea/issues/3333
     """
 
@@ -20,16 +20,15 @@ class OfflinePassNoTokenTestCase(MyApiTestCase):
 
         userA = User("shadow", self.realm1, self.resolvername1)
         userB = User("cornelius", self.realm1, self.resolvername1)
-        userC = User("usernotoken", self.realm1, self.resolvername1)
-        tokA = init_token({"otpkey": self.otpkey, "serial": "tokA"},
-                          user=userA)
-        tokB = init_token({"otpkey": self.otpkey, "serial": "tokB"},
-                          user=userB)
+        init_token({"otpkey": self.otpkey, "serial": "tokA"},
+                   user=userA)
+        init_token({"otpkey": self.otpkey, "serial": "tokB"},
+                   user=userB)
         # attach tokens to offline
         attach_token("tokA", "offline")
         attach_token("tokB", "offline")
         # set passonnotoken
-        set_policy(name="pol1", scope=SCOPE.AUTH, action=ACTION.PASSNOTOKEN)
+        set_policy(name="pol1", scope=SCOPE.AUTH, action=PolicyAction.PASSONNOTOKEN)
 
         # Validate userB
         with self.app.test_request_context('/validate/check',

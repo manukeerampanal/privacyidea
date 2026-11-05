@@ -1,7 +1,9 @@
+:orphan:
+
 .. _todolist:
 
 To Do List
-------
+----------
 
 You may enable the display of to do items by using::
 

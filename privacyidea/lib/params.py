@@ -1,0 +1,279 @@
+# privacyIDEA is a fork of LinOTP
+#
+# This code is free software; you can redistribute it and/or
+# modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+# License as published by the Free Software Foundation; either
+# version 3 of the License, or any later version.
+#
+# This code is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+#
+# You should have received a copy of the GNU Affero General Public
+# License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+"""
+Parameter helpers for extracting values from request-parameter dictionaries.
+
+These functions operate on plain ``dict`` objects and have no dependency on
+Flask or any other framework layer.  They are the canonical location for
+parameter extraction in ``lib/`` code.
+
+The old ``getParam`` / ``optional`` / ``required`` API that lived in
+``api/lib/utils.py`` is kept there as a thin compatibility shim so that
+existing API-layer call sites continue to work without changes.
+"""
+
+import re
+from collections.abc import Iterable
+from datetime import datetime
+from typing import Any
+
+from dateutil.parser import isoparse
+
+from privacyidea.lib.error import ParameterError
+
+# Upper bound for the ``pagesize`` of a paginated listing, see get_pagination_params().
+# Well above anything the WebUI asks for (its largest page size is 100), so it only ever
+# bounds a hand-crafted request.
+MAX_PAGE_SIZE = 1000
+
+
+def _get_param(dictionary: dict, key: str, default: Any = None) -> Any:
+    """
+    Get the parameter from the dictionary.
+    If the parameter is not present, return the default value or None.
+    """
+    if dictionary and key in dictionary:
+        return dictionary[key]
+    if default is not None:
+        return default
+    return None
+
+
+def get_required(dictionary: dict, key: str, allow_empty: bool = False) -> Any:
+    """
+    Get the required parameter from the dictionary.
+
+    :param dictionary: the parameter dictionary
+    :param key: the key to look up
+    :param allow_empty: if False (default), raise a ParameterError when the
+        value is present but is an empty string
+    :raises ParameterError: if the key is missing or (when allow_empty=False)
+        if the value is an empty string
+    :return: the value
+    """
+    ret = _get_param(dictionary, key, None)
+    if ret is None or (not allow_empty and ret == ""):
+        raise ParameterError(f"Missing parameter: {key}", id=905)
+    return ret
+
+
+def _parse_timestamp(value: str, key: str) -> datetime:
+    """
+    Parse an ISO 8601 value, reporting a malformed one as a ParameterError naming *key*.
+
+    :func:`~dateutil.parser.isoparse` signals a malformed value with a ValueError, which is caught and turned into a
+    ParameterError.
+    """
+    try:
+        return isoparse(value)
+    except ValueError:
+        raise ParameterError(f"Invalid ISO 8601 timestamp for {key}: {value!r}")
+
+
+def get_required_timestamp(param: dict, key: str) -> datetime:
+    """
+    Get a required ISO 8601 timestamp parameter, parsed into a datetime.
+
+    :param param: the parameter dictionary
+    :param key: the key to look up
+    :raises ParameterError: if the key is missing, empty, or not a valid ISO 8601 timestamp
+    :return: the parsed value, timezone-aware if the value carried an offset
+    """
+    return _parse_timestamp(get_required(param, key), key)
+
+
+def get_optional_timestamp(param: dict, key: str, default: datetime | None = None) -> datetime | None:
+    """
+    Get an optional ISO 8601 timestamp parameter, parsed into a datetime, or *default* when absent or empty.
+
+    A *present but malformed* value is still an error: not filtering on a timestamp the caller asked to filter on
+    would silently answer a different question than the one asked.
+
+    :param param: the parameter dictionary
+    :param key: the key to look up
+    :param default: what to return when the parameter is absent or an empty string
+    :raises ParameterError: if the value is present but not a valid ISO 8601 timestamp
+    :return: the parsed value, timezone-aware if the value carried an offset, else *default*
+    """
+    value = get_optional(param, key)
+    if value is None or value == "":
+        return default
+    return _parse_timestamp(value, key)
+
+
+def get_required_one_of(param: dict, keys: Iterable[str], allow_empty: bool = False) -> Any:
+    """
+    Return the first value from *param* whose key is in *keys* and is
+    non-empty.
+
+    :param param: the parameter dictionary
+    :param keys: iterable of candidate keys
+    :param allow_empty: if False (default), skip keys whose value is an empty
+        string
+    :raises ParameterError: if none of the keys are present with a valid value
+    :return: the first matching value
+    """
+    for key in keys:
+        ret = _get_param(param, key, None)
+        if ret is not None:
+            if not allow_empty and ret == "":
+                continue
+            return ret
+    raise ParameterError(f"Missing one of the following parameters: {keys}", id=905)
+
+
+def get_optional(param: dict, key: str, default: Any = None,
+                 allowed_values: Iterable[Any] | None = None) -> Any:
+    """
+    Get the optional parameter from the dictionary.
+
+    :param param: the parameter dictionary
+    :param key: the key to look up
+    :param default: value to return when the key is absent (default: None)
+    :param allowed_values: if given, return *default* when the value is not in
+        this list (same behaviour as the old ``getParam`` ``allowed_values``
+        argument)
+    :return: the value, or *default* if the key is absent or not in allowed_values
+    """
+    value = _get_param(param, key, default)
+    if allowed_values is not None and value not in allowed_values:
+        return default
+    return value
+
+
+def get_optional_one_of(param: dict, keys: Iterable[str], default: Any = None) -> Any:
+    """
+    Return the first value from *param* whose key is in *keys*.
+
+    :param param: the parameter dictionary
+    :param keys: iterable of candidate keys
+    :param default: value to return when none of the keys are present
+        (default: None)
+    :return: the first matching value, or *default*
+    """
+    for key in keys:
+        ret = _get_param(param, key, None)
+        if ret is not None:
+            return ret
+    return default
+
+
+def get_optional_int(param: dict, key: str, default: int | None = None) -> int | None:
+    """
+    Get an optional integer parameter from the dictionary.
+
+    Request parameters arrive as strings, so a caller that wants a number has to
+    convert. A bare ``int()`` on a non-numeric value raises ``ValueError``, which
+    no error handler covers and which therefore surfaces as an HTTP 500 instead
+    of telling the caller which parameter was wrong.
+
+    :param param: the parameter dictionary
+    :param key: the key to look up
+    :param default: value to return when the key is absent (default: None)
+    :raises ParameterError: if the value is present but is not an integer
+    :return: the value as an int, or *default* if the key is absent or empty
+    """
+    value = _get_param(param, key, default)
+    if value is None or value == "":
+        # An empty value carries no number. Treating it as absent rather than as
+        # an error keeps a caller that always appends the parameter working, and
+        # matches how get_required() treats an empty string as a missing value.
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ParameterError(f"Invalid value for parameter {key}: expected an integer.", id=905)
+
+
+def require_in(value: Any, allowed: Iterable[Any], key: str) -> Any:
+    """
+    Check a parameter against the set of values that exist for it.
+
+    This is for a parameter that does not carry free text but names something the server
+    then looks up - a handler module, an action, a position. Checking it where it enters
+    means the lookup is only ever reached with a name that exists, and that the caller is
+    told which names do, instead of the request failing further in with a message about an
+    object that could not be found.
+
+    :param value: the value the request supplied
+    :param allowed: the values that exist for this parameter
+    :param key: the name of the parameter, for the error message
+    :raises ParameterError: if the value is not one of the allowed ones
+    :return: the value
+    """
+    allowed = list(allowed)
+    if value not in allowed:
+        raise ParameterError(f"Unknown {key}: {value}. Allowed are: {', '.join(sorted(map(str, allowed)))}")
+    return value
+
+
+def get_pagination_params(param: dict, default_page_size: int = 15) -> tuple[int, int]:
+    """
+    Get the ``page`` and ``pagesize`` parameters of a paginated listing.
+
+    Both are floored at 1: the paginating queries compute their offset as
+    ``(page - 1) * pagesize``, and a page below 1 makes that offset negative.
+    SQLite silently treats a negative OFFSET as 0, but PostgreSQL rejects it
+    ("OFFSET must not be negative"), so an unfloored value answers on one
+    backend and fails on another.
+
+    ``pagesize`` is capped at :data:`MAX_PAGE_SIZE` so a single request cannot
+    ask the database and the serializer for an unbounded number of rows, which
+    is what paginating these listings is meant to prevent in the first place.
+
+    :param param: the parameter dictionary
+    :param default_page_size: page size to use when ``pagesize`` is absent
+    :raises ParameterError: if either value is present but is not an integer
+    :return: a ``(page, page_size)`` tuple
+    """
+    page = max(1, get_optional_int(param, "page", default=1))
+    page_size = min(MAX_PAGE_SIZE, max(1, get_optional_int(param, "pagesize", default=default_page_size)))
+    return page, page_size
+
+
+def attestation_certificate_allowed(cert_info: dict | None,
+                                    allowed_certs_pols: Iterable[str] | None) -> bool:
+    """
+    Check a certificate against a set of policies.
+
+    This will check an attestation certificate of a WebAuthn token
+    against a list of policies to verify whether a token with the given
+    attestation may be enrolled or authorized.
+
+    The certificate info may be None, in which case True will be returned if
+    the policies are also empty.
+
+    :param cert_info: The ``attestation_issuer``, ``attestation_serial``, and
+        ``attestation_subject`` of the cert.
+    :param allowed_certs_pols: The policies restricting enrollment or
+        authorization.
+    :return: Whether the token should be allowed to complete enrollment or
+        authorization based on its attestation.
+    """
+    if not cert_info:
+        return not allowed_certs_pols
+
+    if allowed_certs_pols:
+        for allowed_cert in allowed_certs_pols:
+            tag, matching, _rest = allowed_cert.split("/", 3)
+            tag_value = cert_info.get(f"attestation_{tag!s}")
+            m = re.search(matching, tag_value) if matching and tag_value else None
+            if matching and not m:
+                return False
+
+    return True
+
+

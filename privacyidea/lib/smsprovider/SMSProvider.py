@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #   2016-06-14 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #              Enhance the base class according to
 #              https://github.com/privacyidea/privacyidea/wiki/concept:-Delivery-Gateway
@@ -26,29 +24,48 @@
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-__doc__ = """This is the base class for SMS Modules, that can send SMS via
+"""This is the base class for SMS Modules, that can send SMS via
 different means.
 The function get_sms_provider_class loads an SMS Provider Module dynamically
 and returns an instance.
 
 The code is tested in tests/test_lib_smsprovider
 """
+import logging
+import re
+import time
 
+from sqlalchemy import select, update
+
+from privacyidea.lib import lazy_gettext
+from privacyidea.config import ConfigKey
+from privacyidea.lib.crypto import is_censored, censor_dict, encryptPassword, decryptPassword
+from privacyidea.lib.utils import check_module_allowed
 from privacyidea.lib.error import ConfigAdminError
-from privacyidea.models import SMSGateway, SMSGatewayOption
+from privacyidea.lib.metrics import inc, observe
 from privacyidea.lib.utils import fetch_one_resource, get_module_class
 from privacyidea.lib.utils.export import (register_import, register_export)
-import logging
-log = logging.getLogger(__name__)
+from privacyidea.models import SMSGateway, SMSGatewayOption, db
 
+log = logging.getLogger(__name__)
 
 SMS_PROVIDERS = [
     "privacyidea.lib.smsprovider.HttpSMSProvider.HttpSMSProvider",
-    "privacyidea.lib.smsprovider.SipgateSMSProvider.SipgateSMSProvider",
     "privacyidea.lib.smsprovider.SmtpSMSProvider.SmtpSMSProvider",
     "privacyidea.lib.smsprovider.SmppSMSProvider.SmppSMSProvider",
     "privacyidea.lib.smsprovider.FirebaseProvider.FirebaseProvider",
     "privacyidea.lib.smsprovider.ScriptSMSProvider.ScriptSMSProvider"]
+
+# Keywords in option keys that indicate the value is sensitive and must be
+# stored encrypted in the database (case-insensitive substring match).
+SENSITIVE_OPTION_KEYWORDS = ("PASSWORD", "SECRET")
+ALLOW_PUSH = "ALLOW_PUSH"
+
+
+def _is_sensitive_key(key):
+    """Return True if the given option/header key name indicates a secret value."""
+    upper_key = key.upper()
+    return any(kw in upper_key for kw in SENSITIVE_OPTION_KEYWORDS)
 
 
 class SMSError(Exception):
@@ -58,18 +75,50 @@ class SMSError(Exception):
         self.description = description
 
     def __repr__(self):
-        ret = '{0!s}(error_id={1!r}, description={2!r})'.format(type(self).__name__,
-                                                   self.error_id,
-                                                   self.description)
+        ret = f'{type(self).__name__!s}(error_id={self.error_id!r}, description={self.description!r})'
         return ret
 
     def __str__(self):
-        ret = '{0!s}'.format(self.description)
+        ret = f'{self.description!s}'
         return ret
 
 
-class ISMSProvider(object):
-    """ the SMS Provider Interface - BaseClass """
+class ISMSProvider:
+    """
+    The SMS provider interface.
+
+    Providers that accept structured push payloads set ``supports_push_messages``
+    to ``True``. Individual gateways require ``ALLOW_PUSH=yes`` unless the
+    provider enables PUSH by default.
+    """
+
+    supports_push_messages = False
+    push_messages_enabled_by_default = False
+
+    @classmethod
+    def allows_push_messages(cls, smsgateway):
+        if not cls.supports_push_messages:
+            return False
+        configured = smsgateway.option_dict.get(ALLOW_PUSH)
+        if configured in (None, ""):
+            return cls.push_messages_enabled_by_default
+        return str(configured).lower() == "yes"
+
+    @staticmethod
+    def allow_push_parameter():
+        return {
+            "required": False,
+            "description": lazy_gettext(
+                "Allow this gateway to deliver PUSH messages. Defaults to yes for Firebase and no for all other "
+                "providers."
+            ),
+            "values": ["yes", "no"]
+        }
+
+    regexp_description = lazy_gettext("Regular expression to modify the phone number to make it compatible with"
+                                      " the provider. For example to remove pluses and slashes"
+                                      " enter something like '/[\\+/]//'.")
+
     def __init__(self, db_smsprovider_object=None, smsgateway=None):
         """
         Create a new SMS Provider object fom a DB SMS provider object
@@ -135,11 +184,25 @@ class ISMSProvider(object):
                   }
         return params
 
+    @staticmethod
+    def _mangle_phone(phone, config):
+        regexp = config.get("REGEXP")
+        if regexp:
+            try:
+                m = re.match("^/(.*)/(.*)/$", regexp)
+                if m:
+                    phone = re.sub(m.group(1), m.group(2), phone)
+            except re.error:
+                log.warning("Can not mangle phone number. "
+                            f"Please check your REGEXP: {regexp!s}")
+
+        return phone
+
     def load_config(self, config_dict):
         """
         Load the configuration dictionary
 
-        :param config_dict: The conifugration of the SMS provider
+        :param config_dict: The configuration of the SMS provider
         :type config_dict: dict
         :return: None
         """
@@ -150,22 +213,21 @@ def get_sms_provider_class(packageName, className):
     """
     helper method to load the SMSProvider class from a given
     package in literal:
-    
+
     example:
-    
+
         get_sms_provider_class("HTTPSMSProvider", "SMSProvider")()
-    
+
     check:
         checks, if the submit_message method exists
         if not an error is thrown
-    
     """
     return get_module_class(packageName, className, "submit_message")
 
 
 def set_smsgateway(identifier, providermodule=None, description=None,
-                   options=None, headers=None):
-
+                   options=None, headers=None,
+                   secret_options=None, secret_headers=None):
     """
     Set an SMS Gateway configuration
 
@@ -178,15 +240,111 @@ def set_smsgateway(identifier, providermodule=None, description=None,
     :param description: A description of this gateway definition
     :param options: Options and Parameter for this module
     :param headers: Headers for this module
+    :param secret_options: Set of option key names whose values are secret
+        and must be stored encrypted. If None, falls back to the key-name
+        heuristic (PASSWORD/SECRET).
+    :param secret_headers: Set of header key names whose values are secret
+        and must be stored encrypted. If None, falls back to the key-name
+        heuristic (PASSWORD/SECRET).
     :type options: dict
     :type headers: dict
+    :type secret_options: set or None
+    :type secret_headers: set or None
     :return: The id of the event.
     """
-    smsgateway = SMSGateway(identifier, providermodule,
-                            description=description,
-                            options=options, headers=headers)
+    stmt = select(SMSGateway).filter_by(identifier=identifier)
+    sms_gateway = db.session.execute(stmt).scalar_one_or_none()
+
+    if sms_gateway:
+        # update existing sms gateway
+        if providermodule is not None:
+            sms_gateway.providermodule = providermodule
+        sms_gateway.description = description
+    else:
+        # create new provider
+        sms_gateway = SMSGateway(identifier, providermodule, description=description)
+        db.session.add(sms_gateway)
+    db.session.flush()
+
+    options = options or {}
+    new_option_keys = set(options.keys())
+    headers = headers or {}
+    new_header_keys = set(headers.keys())
+    # Delete options/headers that are not in the new options/headers
+    for option in sms_gateway.options:
+        if option.Type == "option" and option.Key not in new_option_keys:
+            db.session.delete(option)
+        if option.Type == "header" and option.Key not in new_header_keys:
+            db.session.delete(option)
+
+    # Update / Create options and headers
+    existing_option_keys = {opt.Key for opt in sms_gateway.options if opt.Type == "option"}
+    existing_header_keys = {opt.Key for opt in sms_gateway.options if opt.Type == "header"}
+    secret_sets = {"option": secret_options, "header": secret_headers}
+    sections = {"option": options, "header": headers}
+    for option_type, key_values in sections.items():
+        for key in key_values:
+            value = key_values[key]
+            explicit_secrets = secret_sets[option_type]
+            # If the user keeps a censored value, we can still apply an explicit
+            # secret checkbox change by toggling encryption state in-place.
+            if is_censored(value):
+                if explicit_secrets is None:
+                    continue
+                existing_row = sms_gateway.options.filter_by(Key=key, Type=option_type).first()
+                if not existing_row:
+                    continue
+                should_be_secret = key in explicit_secrets
+                if should_be_secret == bool(existing_row.Encrypted):
+                    continue
+                if should_be_secret:
+                    current_value = existing_row.Value or ""
+                    existing_row.Value = encryptPassword(current_value) if current_value else ""
+                    existing_row.Encrypted = True
+                    continue
+
+                current_value = existing_row.Value or ""
+                if current_value:
+                    decrypted = decryptPassword(current_value)
+                    if not decrypted or decrypted.startswith("FAILED TO DECRYPT"):
+                        # Keep encrypted data untouched if decryption fails.
+                        continue
+                    current_value = decrypted
+                existing_row.Value = current_value
+                existing_row.Encrypted = False
+                continue
+            # Determine if this value is secret: use explicit set if provided,
+            # otherwise fall back to the key-name heuristic.
+            if explicit_secrets is not None:
+                is_secret = key in explicit_secrets
+            else:
+                is_secret = _is_sensitive_key(key)
+            encrypted = False
+            if is_secret and value:
+                value = encryptPassword(value)
+                encrypted = True
+            if (option_type == "option" and key in existing_option_keys) or (
+                    option_type == "header" and key in existing_header_keys):
+                # Update existing option
+                update_stmt = update(SMSGatewayOption).where(
+                    SMSGatewayOption.gateway_id == sms_gateway.id,
+                    SMSGatewayOption.Key == key,
+                    SMSGatewayOption.Type == option_type
+                ).values(Value=value, Encrypted=encrypted)
+                db.session.execute(update_stmt)
+            else:
+                # Create new option
+                sms_option = SMSGatewayOption(gateway_id=sms_gateway.id,
+                                              Key=key,
+                                              Value=value,
+                                              Type=option_type,
+                                              Encrypted=encrypted)
+                db.session.add(sms_option)
+    db.session.commit()
+
+    # Validate configuration
     create_sms_instance(identifier).check_configuration()
-    return smsgateway.id
+    return sms_gateway.id
 
 
 def delete_smsgateway(identifier):
@@ -223,11 +381,11 @@ def delete_smsgateway_header(id, header_key):
 
 def delete_smsgateway_key_generic(id, key, Type="option"):
     """
-    Delete the SMS gateway header
+    Delete an SMS gateway option or header.
 
     :param id: The id of the SMS Gateway definition
     :param key: The identifier/key
-    :param type: The type of the key
+    :param Type: The type of the key ("option" or "header")
     :return: True
     """
     return fetch_one_resource(SMSGatewayOption, gateway_id=id, Key=key, Type=Type).delete()
@@ -245,27 +403,28 @@ def get_smsgateway(identifier=None, id=None, gwtype=None):
     :return: list of gateway definitions
     """
     res = []
-    sqlquery = SMSGateway.query
+    stmt = select(SMSGateway)
     if id:
         try:
             id = int(id)
-            sqlquery = sqlquery.filter_by(id=id)
+            stmt = stmt.filter_by(id=id)
         except Exception:
-            log.info("We can not filter for smsgateway {0!s}".format(id))
+            log.info(f"We can not filter for smsgateway {id!s}")
     if gwtype:
-        sqlquery = sqlquery.filter_by(providermodule=gwtype)
+        stmt = stmt.filter_by(providermodule=gwtype)
     if identifier:
-        sqlquery = sqlquery.filter_by(identifier=identifier)
+        stmt = stmt.filter_by(identifier=identifier)
 
-    for gw in sqlquery.all():
+    gateways = db.session.scalars(stmt).all()
+    for gw in gateways:
         res.append(gw)
     return res
 
 
 def create_sms_instance(identifier):
     """
-    This function creates and instance of SMS Provider (either HTTP, Smtp,
-    Sipgate) depending on the given sms gateway identifier.
+    This function creates an instance of the SMS provider (e.g. HTTP, SMTP or SMPP)
+    configured for the given sms gateway identifier.
 
     :param identifier: The name of the SMS gateway configuration
     :return: SMS Provider object
@@ -273,8 +432,14 @@ def create_sms_instance(identifier):
     gateway_definition = get_smsgateway(identifier)
     if not gateway_definition:
         raise ConfigAdminError('Could not find gateway definition with '
-                               'identifier "{0!s}"'.format(identifier))
-    package_name, class_name = gateway_definition[0].providermodule.rsplit(".", 1)
+                               f'identifier "{identifier!s}"')
+    provider_module = gateway_definition[0].providermodule
+    # Also here and not only where a gateway is written: a definition can reach the database
+    # through a configuration import or predate the check, and this is where the class is
+    # actually imported.
+    check_module_allowed(provider_module, SMS_PROVIDERS, ConfigKey.SMS_PROVIDER_MODULES,
+                         "SMS provider class")
+    package_name, class_name = provider_module.rsplit(".", 1)
     sms_klass = get_sms_provider_class(package_name, class_name)
     sms_object = sms_klass(smsgateway=gateway_definition[0])
     return sms_object
@@ -290,47 +455,60 @@ def send_sms_identifier(identifier, phone, message):
     :return: True in case of success
     """
     sms = create_sms_instance(identifier)
-    return sms.submit_message(phone, message)
-
-
-def list_smsgateways(identifier=None, id=None, gwtype=None):
-    """
-    This returns a list of all sms gateways matching the criterion.
-    If no identifier or server is provided, it will return a list of all sms
-    gateway definitions.
-
-    :param identifier: The identifier or the name of the SMSGateway definition.
-        As the identifier is unique, providing an identifier will return a
-        list with either one or no sms gateway
-    :type identifier: basestring
-    :param id: The id of the sms gateway in the database
-    :type id: basestring
-    :return: dict of SMSGateway configurations with gateway identifiers as keys.
-    """
-    res = {}
-    for gw in get_smsgateway(identifier=identifier, id=id, gwtype=gwtype):
-        res[gw.identifier] = gw.as_dict()
-        res[gw.identifier].pop('name')
-        res[gw.identifier].pop('id')
-
-    return res
+    labels = {"gateway": identifier}
+    start = time.monotonic()
+    try:
+        result = sms.submit_message(phone, message)
+    except Exception:
+        observe("sms_send_duration_seconds", time.monotonic() - start, labels)
+        inc("sms_send_total", {**labels, "result": "failed"})
+        raise
+    observe("sms_send_duration_seconds", time.monotonic() - start, labels)
+    inc("sms_send_total", {**labels, "result": "ok" if result else "failed"})
+    return result
 
 
 @register_export('smsgateway')
-def export_smsgateway(name=None):
-    """ Export given or all sms gateway configuration """
-    res = list_smsgateways(identifier=name)
+def export_smsgateway(name=None, censor=False):
+    """ Export given or all sms gateway configuration
 
+    :param censor: If True, secret option and header values are replaced with
+        the ``__CENSORED__`` placeholder instead of being returned in clear
+        text. A value counts as secret when it is stored encrypted (marked via
+        the explicit ``secret.option.<key>`` / ``secret.header.<key>`` flag) or
+        when its key name looks sensitive (e.g. contains ``PASSWORD`` or
+        ``SECRET``). Censoring by the stored encryption state is what catches
+        secrets whose key name gives no hint - the name heuristic alone would
+        leak them.
+    """
+    res = {}
+    for gw in get_smsgateway(identifier=name):
+        gateway = gw.as_dict()
+        gateway.pop('name')
+        gateway.pop('id')
+        if censor:
+            encrypted_keys = {"option": set(), "header": set()}
+            for option in gw.options:
+                if option.Encrypted:
+                    # Type is "header" for headers, "option" or empty for options
+                    # (mirrors SMSGateway._get_options_by_type).
+                    encrypted_keys["header" if option.Type == "header" else "option"].add(option.Key)
+            for section, option_type in (("options", "option"), ("headers", "header")):
+                values = gateway.get(section, {})
+                secret_keys = [key for key in values
+                               if _is_sensitive_key(key) or key in encrypted_keys[option_type]]
+                gateway[section] = censor_dict(values, secret_keys)
+        res[gw.identifier] = gateway
     return res
 
 
 @register_import('smsgateway')
 def import_smsgateway(data, name=None):
     """Import sms gateway configuration"""
-    log.debug('Import smsgateway config: {0!s}'.format(data))
+    log.debug(f'Import smsgateway config: {data!s}')
     for res_name, res_data in data.items():
         if name and name != res_name:
             continue
         rid = set_smsgateway(res_name, **res_data)
-        log.info('Import of smsgateway "{0!s}" finished,'
-                 ' id: {1!s}'.format(res_name, rid))
+        log.info(f'Import of smsgateway "{res_name!s}" finished,'
+                 f' id: {rid!s}')

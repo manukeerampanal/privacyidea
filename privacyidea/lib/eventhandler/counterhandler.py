@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2018-23-09 Paul Lettich <paul.lettich@netknights.it>
 #             Add decrease and reset counter actions
 #  2018-02-28 Cornelius Kölbel <cornelius.koelbel@netknights.it>
@@ -32,7 +30,6 @@ from privacyidea.lib import _
 from privacyidea.lib.counter import increase, decrease, reset
 import logging
 from privacyidea.lib.utils import is_true
-import traceback
 
 log = logging.getLogger(__name__)
 
@@ -101,13 +98,13 @@ class CounterEventHandler(BaseEventHandler):
 
         if action == "increase_counter":
             increase(counter_name)
-            log.debug(u"Increased the counter {0!s}.".format(counter_name))
+            log.debug(f"Increased the counter {counter_name!s}.")
         elif action == "decrease_counter":
             allow_negative = is_true(handler_options.get("allow_negative_values", False))
             decrease(counter_name, allow_negative)
-            log.debug(u"Decreased the counter {0!s}.".format(counter_name))
+            log.debug(f"Decreased the counter {counter_name!s}.")
         elif action == "reset_counter":
             reset(counter_name)
-            log.debug(u"Reset the counter {0!s} to 0.".format(counter_name))
+            log.debug(f"Reset the counter {counter_name!s} to 0.")
 
         return ret

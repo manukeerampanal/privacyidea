@@ -1,0 +1,367 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { ComponentFixture, TestBed } from "@angular/core/testing";
+
+import { provideHttpClient } from "@angular/common/http";
+import { provideHttpClientTesting } from "@angular/common/http/testing";
+import { PiResponse } from "@app/app.component";
+import {
+  EnrollmentResponse,
+  EnrollmentResponseDetail,
+  TokenEnrollmentData
+} from "@app/mappers/token-api-payload/_token-api-payload.mapper";
+import { PushApiPayloadMapper } from "@app/mappers/token-api-payload/push-token-api-payload.mapper";
+import { EnrollTokenBase, ReopenDialogAction } from "@components/token/token-enrollment/enroll-token-base";
+import { ENROLLMENT_CANCELLED } from "@components/token/token-enrollment/token-enrollment.constants";
+import { AuthService } from "@services/auth/auth.service";
+import { DialogService } from "@services/dialog/dialog.service";
+import { TokenDetails, Tokens, TokenService } from "@services/token/token.service";
+import { MockTokenService } from "@testing/mock-services";
+import { MockAuthService } from "@testing/mock-services/mock-auth-service";
+import { MockDialogService } from "@testing/mock-services/mock-dialog-service";
+import { lastValueFrom, of, throwError } from "rxjs";
+import { EnrollPushComponent } from "./enroll-push.component";
+
+function makeInitResp(serial = "S-1"): EnrollmentResponse {
+  return {
+    result: { status: true, value: true },
+    detail: { serial } as EnrollmentResponseDetail,
+    type: "push"
+  } as EnrollmentResponse;
+}
+
+function makePollResp(rollout_state: string): PiResponse<Tokens, unknown> {
+  return {
+    result: {
+      status: true,
+      value: {
+        tokens: [{ rollout_state } as TokenDetails],
+        count: 1,
+        current: 1
+      }
+    }
+  } as PiResponse<Tokens, unknown>;
+}
+
+class DummyPushApiPayloadMapper {
+  map<T>(x: T): T {
+    return x;
+  }
+}
+
+describe("EnrollPushComponent", () => {
+  let fixture: ComponentFixture<EnrollPushComponent>;
+  let component: EnrollPushComponent;
+  let tokenService: jest.Mocked<MockTokenService>;
+  let dialogService: MockDialogService;
+  let authService: MockAuthService;
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [EnrollPushComponent],
+      providers: [
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        { provide: TokenService, useClass: MockTokenService },
+        { provide: DialogService, useClass: MockDialogService },
+        { provide: PushApiPayloadMapper, useClass: DummyPushApiPayloadMapper },
+        { provide: AuthService, useClass: MockAuthService }
+      ]
+    }).compileComponents();
+
+    fixture = TestBed.createComponent(EnrollPushComponent);
+    component = fixture.componentInstance;
+    tokenService = TestBed.inject(TokenService) as unknown as jest.Mocked<MockTokenService>;
+    dialogService = TestBed.inject(DialogService) as unknown as MockDialogService;
+    authService = TestBed.inject(AuthService) as unknown as MockAuthService;
+    fixture.detectChanges();
+  });
+
+  it("creates", () => {
+    expect(component).toBeTruthy();
+  });
+
+  it("does not show the enrollment data in the last step dialog", () => {
+    expect(component.showEnrollDataInLastStep).toBe(false);
+  });
+
+  it("buildEnrollmentArgs returns a push-typed payload bound to the push mapper", () => {
+    const args = component.buildEnrollmentArgs({ type: "push", realm: "r", username: "u" });
+    expect(args).not.toBeNull();
+    expect(args!.data.type).toBe("push");
+    expect(args!.mapper).toBe(TestBed.inject(PushApiPayloadMapper));
+  });
+
+  it("enrolls, opens dialog, polls to done, closes dialog and returns initResp", async () => {
+    const initResp = makeInitResp("S-1");
+    const pollResp = makePollResp("enrolled");
+
+    tokenService.enrollToken.mockReturnValue(of(initResp));
+    tokenService.pollTokenRolloutState.mockReturnValue(of(pollResp));
+
+    const enrollmentArgs = component.buildEnrollmentArgs({} as TokenEnrollmentData);
+    const initResponse = await lastValueFrom(tokenService.enrollToken(enrollmentArgs!));
+
+    const finalResponsePromise = component.onEnrollmentResponse(initResponse as EnrollmentResponse);
+
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    const finalResponse = await finalResponsePromise;
+
+    expect(finalResponse).toEqual({
+      detail: { rollout_state: "enrolled", serial: "S-1" },
+      result: { status: true, value: true },
+      type: "push"
+    });
+
+    expect(tokenService.enrollToken).toHaveBeenCalledTimes(1);
+    expect(dialogService.openDialog).toHaveBeenCalledTimes(1);
+    expect(tokenService.pollTokenRolloutState).toHaveBeenCalledTimes(1);
+
+    expect(component.pollResponse()).toBeUndefined();
+  });
+
+  it("opens the first-step dialog so it cannot be dismissed by clicking outside of it", async () => {
+    const initResp = makeInitResp("S-1");
+    const pollResp = makePollResp("enrolled");
+
+    tokenService.enrollToken.mockReturnValue(of(initResp));
+    tokenService.pollTokenRolloutState.mockReturnValue(of(pollResp));
+
+    const enrollmentArgs = component.buildEnrollmentArgs({} as TokenEnrollmentData);
+    const initResponse = await lastValueFrom(tokenService.enrollToken(enrollmentArgs!));
+
+    await component.onEnrollmentResponse(initResponse as EnrollmentResponse);
+
+    expect(dialogService.openDialog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        configOverride: { disableClose: true }
+      })
+    );
+  });
+
+  it("keeps dialog open when rollout_state is clientwait", async () => {
+    const pollResp = makePollResp("clientwait");
+    tokenService.enrollToken.mockReturnValue(of(makeInitResp()));
+    tokenService.pollTokenRolloutState.mockReturnValue(of(pollResp));
+
+    const enrollmentArgs = component.buildEnrollmentArgs({} as TokenEnrollmentData);
+    const initResponse = await lastValueFrom(tokenService.enrollToken(enrollmentArgs!));
+
+    const finalResponsePromise = component.onEnrollmentResponse(initResponse as EnrollmentResponse);
+    await Promise.resolve();
+    fixture.detectChanges();
+
+    expect(dialogService.openDialog).toHaveBeenCalled();
+    expect(component.pollResponse()).toEqual(pollResp);
+
+    // The rollout is still pending, so the dialog stays open until the user closes it.
+    component.firstStepDialogRef?.close();
+    expect(await finalResponsePromise).toBeNull();
+  });
+
+  it("strategy.reopenDialog exposes a Promise callback that re-triggers polling when dialog is not open", async () => {
+    const initResp = makeInitResp("S-2");
+    const pollResp = makePollResp("done");
+    tokenService.enrollToken.mockReturnValue(of(initResp));
+    tokenService.pollTokenRolloutState.mockReturnValue(of(pollResp));
+
+    const enrollmentArgs = component.buildEnrollmentArgs({} as TokenEnrollmentData);
+    const initResponse = await lastValueFrom(tokenService.enrollToken(enrollmentArgs!));
+
+    await component.onEnrollmentResponse(initResponse as EnrollmentResponse);
+    fixture.detectChanges();
+
+    const reopenFn = component.reopenDialog() as ReopenDialogAction | undefined;
+    expect(typeof reopenFn).toBe("function");
+
+    dialogService.closeAllDialogs();
+    fixture.detectChanges();
+    const r2 = await reopenFn!();
+
+    expect(r2).toEqual({
+      ...initResp,
+      detail: {
+        ...initResp.detail,
+        rollout_state: "done"
+      }
+    });
+    expect(tokenService.pollTokenRolloutState).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns null when polling errors out", async () => {
+    const initResp = makeInitResp("S-4");
+    tokenService.enrollToken.mockReturnValue(of(initResp));
+    tokenService.pollTokenRolloutState.mockReturnValue(throwError(() => new Error("poll failed")));
+
+    const enrollmentArgs = component.buildEnrollmentArgs({} as TokenEnrollmentData);
+    const initResponse = await lastValueFrom(tokenService.enrollToken(enrollmentArgs!));
+
+    const finalResponse = await component.onEnrollmentResponse(initResponse as EnrollmentResponse);
+    fixture.detectChanges();
+
+    expect(finalResponse).toBeNull();
+    expect(dialogService.openDialog).toHaveBeenCalledTimes(1);
+    expect(component.pollResponse()).toBeUndefined();
+  });
+
+  it("reopenDialog returns null without polling again while the first step dialog is still open", async () => {
+    const initResp = makeInitResp("S-5");
+    tokenService.enrollToken.mockReturnValue(of(initResp));
+    tokenService.pollTokenRolloutState.mockReturnValue(of(makePollResp("clientwait")));
+
+    const enrollmentArgs = component.buildEnrollmentArgs({} as TokenEnrollmentData);
+    const initResponse = await lastValueFrom(tokenService.enrollToken(enrollmentArgs!));
+
+    const finalResponsePromise = component.onEnrollmentResponse(initResponse as EnrollmentResponse);
+    await Promise.resolve();
+    fixture.detectChanges();
+
+    const reopenFn = component.reopenDialog() as ReopenDialogAction | undefined;
+    expect(await reopenFn!()).toBeNull();
+    expect(dialogService.isDialogOpen).toHaveBeenCalledWith(component.firstStepDialogRef);
+    expect(tokenService.pollTokenRolloutState).toHaveBeenCalledTimes(1);
+
+    component.firstStepDialogRef?.close();
+    await finalResponsePromise;
+  });
+
+  it("falls back to the rollout_state of the init response when the poll response carries no token", async () => {
+    const initResp = {
+      ...makeInitResp("S-6"),
+      detail: { serial: "S-6", rollout_state: "enrolled" } as EnrollmentResponseDetail
+    };
+    tokenService.enrollToken.mockReturnValue(of(initResp));
+    tokenService.pollTokenRolloutState.mockReturnValue(of({ result: { status: true } } as PiResponse<Tokens, unknown>));
+
+    const enrollmentArgs = component.buildEnrollmentArgs({} as TokenEnrollmentData);
+    const initResponse = await lastValueFrom(tokenService.enrollToken(enrollmentArgs!));
+
+    const finalResponse = await component.onEnrollmentResponse(initResponse as EnrollmentResponse);
+    fixture.detectChanges();
+
+    expect(finalResponse).toEqual(initResp);
+  });
+
+  it("returns null without opening a dialog when there is no enrollment response", async () => {
+    const finalResponse = await component.onEnrollmentResponse(null as unknown as EnrollmentResponse);
+
+    expect(finalResponse).toBeNull();
+    expect(dialogService.openDialog).not.toHaveBeenCalled();
+    expect(tokenService.pollTokenRolloutState).not.toHaveBeenCalled();
+  });
+
+  it("provides itself as EnrollTokenBase", () => {
+    expect(fixture.debugElement.injector.get(EnrollTokenBase)).toBe(component);
+  });
+
+  it("stopPolling is invoked when dialog afterClosed emits", async () => {
+    const initResp = makeInitResp("S-3");
+    const pollResp = makePollResp("done");
+    tokenService.enrollToken.mockReturnValue(of(initResp));
+    tokenService.pollTokenRolloutState.mockReturnValue(of(pollResp));
+
+    const enrollmentArgs = component.buildEnrollmentArgs({} as TokenEnrollmentData);
+    const initResponse = await lastValueFrom(tokenService.enrollToken(enrollmentArgs!));
+
+    await component.onEnrollmentResponse(initResponse as EnrollmentResponse);
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    expect(tokenService.stopPolling).toHaveBeenCalled();
+  });
+
+  describe("cancelling the rollout", () => {
+    const startPendingRollout = async (serial = "S-C") => {
+      tokenService.enrollToken.mockReturnValue(of(makeInitResp(serial)));
+      tokenService.pollTokenRolloutState.mockReturnValue(of(makePollResp("clientwait")));
+
+      const enrollmentArgs = component.buildEnrollmentArgs({} as TokenEnrollmentData);
+      const initResponse = await lastValueFrom(tokenService.enrollToken(enrollmentArgs!));
+      const pending = component.onEnrollmentResponse(initResponse as EnrollmentResponse);
+      await Promise.resolve();
+      // Wrapped so that awaiting the helper does not await the enrollment itself.
+      return { pending };
+    };
+
+    const dialogData = () => dialogService.openDialog.mock.calls[0][0].data;
+
+    it("lets the dialog offer a cancel button with a push specific confirmation", async () => {
+      authService.actionAllowed.mockImplementation((action: string) => action === "delete");
+
+      const { pending } = await startPendingRollout();
+
+      expect(dialogData()).toEqual(
+        expect.objectContaining({
+          showCancelButton: true,
+          showCloseButton: true,
+          cancelConfirmationMessage: expect.stringContaining("QR code")
+        })
+      );
+
+      component.firstStepDialogRef?.close();
+      await pending;
+    });
+
+    it("hides the cancel button without the delete right", async () => {
+      authService.actionAllowed.mockReturnValue(false);
+
+      const { pending } = await startPendingRollout();
+
+      expect(dialogData()).toEqual(expect.objectContaining({ showCancelButton: false, showCloseButton: true }));
+
+      component.firstStepDialogRef?.close();
+      await pending;
+    });
+
+    it("never offers to cancel a rollover", async () => {
+      authService.actionAllowed.mockImplementation((action: string) => action === "delete");
+      tokenService.enrollToken.mockReturnValue(of(makeInitResp("S-R")));
+      tokenService.pollTokenRolloutState.mockReturnValue(of(makePollResp("clientwait")));
+
+      const enrollmentArgs = component.buildEnrollmentArgs({} as TokenEnrollmentData);
+      const initResponse = await lastValueFrom(tokenService.enrollToken(enrollmentArgs!));
+      const pending = component.onEnrollmentResponse(
+        initResponse as EnrollmentResponse,
+        {
+          type: "push",
+          rollover: true
+        } as TokenEnrollmentData
+      );
+      await Promise.resolve();
+
+      expect(dialogData()).toEqual(expect.objectContaining({ showCancelButton: false }));
+
+      component.firstStepDialogRef?.close();
+      await pending;
+    });
+
+    it("reports the cancellation and drops the reopen action", async () => {
+      const { pending } = await startPendingRollout();
+      expect(component.reopenDialog()).toBeDefined();
+
+      component.firstStepDialogRef?.close(ENROLLMENT_CANCELLED);
+
+      expect(await pending).toBe(ENROLLMENT_CANCELLED);
+      expect(component.reopenDialog()).toBeUndefined();
+      expect(tokenService.stopPolling).toHaveBeenCalled();
+    });
+  });
+});

@@ -1,0 +1,74 @@
+<div class="form-group">
+    <label for="realm" translate>Realm</label>
+    <select class="form-control" id="realm"
+            name="realm" ng-model="newUserObject.realm"
+            ng-options="realmname as realmname for (realmname, realm) in realms">
+    </select>
+    <div ng-show="enableRealmOnly">
+        <input type="checkbox" id="realmOnly"
+               ng-model="newUserObject.realmOnly">
+        <label for="realmOnly" translate>Only add to the realm (no user assignment)</label>
+    </div>
+</div>
+
+<div class="form-group">
+    <label for="username" translate>Username</label>
+    <!-- If searchOnEnter is enabled, use a different input, because it does not properly with the typeahead -->
+    <div ng-if="!searchOnEnter">
+        <input name="username" id="username" type="text" ng-model="newUserObject.user"
+               autocomplete="new-password"
+               placeholder="{{ 'start typing a username'|translate }}"
+               typeahead-wait-ms="100"
+               typeahead-focus-first="true"
+               uib-typeahead="user.username as user.display for user in loadUsers($viewValue)"
+               uib-typeahead-template-url="'static/components/directives/views/typeahead-user-item.html'"
+               typeahead-no-results="noResults"
+               typeahead-loading="loadingUsers" class="form-control"
+               ng-disabled="newUserObject.realmOnly">
+    </div>
+
+    <div ng-if="searchOnEnter">
+        <div class="input-group">
+            <input name="username_enter" id="username_enter" type="text" ng-model="newUserObject.user"
+                   autocomplete="new-password"
+                   placeholder="{{ 'Type username and press Enter'|translate }}"
+                   ng-keypress="$event.which === 13 && triggerEnterSearch()"
+                   class="form-control"
+                   ng-disabled="newUserObject.realmOnly">
+            <span class="input-group-btn">
+                <button class="btn btn-default" type="button" ng-click="triggerEnterSearch()" ng-disabled="newUserObject.realmOnly">
+                    <span class="glyphicon glyphicon-search"></span>
+                </button>
+            </span>
+        </div>
+
+        <ul class="dropdown-menu assign-user-search-dropdown" ng-show="newUserObject.loadedUsers.length > 0">
+             <li ng-repeat="user in newUserObject.loadedUsers">
+                 <a href="" ng-click="selectUser(user)">
+                     <span ng-bind-html="user.display"></span>
+                 </a>
+             </li>
+        </ul>
+    </div>
+
+    <div ng-show="loadingUsers">
+        <i class="glyphicon glyphicon-refresh"></i><span translate>Loading users...</span>
+    </div>
+    <div ng-show="noResults">
+        <i class="glyphicon glyphicon-remove"></i><span translate>No user found</span>
+    </div>
+</div>
+
+<div class="form-group" ng-show="enableSetPin">
+    <label for="otppin" translate>PIN/Password</label>
+    <input name="otppin" id="otppin" ng-model="newUserObject.pin"
+           autocomplete="new-password"
+           type=password class="form-control"
+           equals="{{ pin2 }}"
+           placeholder="{{ 'Type a PIN or password'|translate }}">
+    <input name="otppin2" ng-model="pin2"
+           autocomplete="new-password"
+           type=password class="form-control"
+           equals="{{ newUserObject.pin }}"
+           placeholder="{{ 'Repeat PIN or password'|translate }}">
+</div>

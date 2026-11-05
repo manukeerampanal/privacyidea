@@ -1,0 +1,74 @@
+/*
+This file contains all styles for actions as used e.g. in policies, event handlers, periodic tasks, etc.
+*/
+
+.selected-actions-container {
+  display: flex;
+  flex-direction: column;
+  gap: calc(16px / 4);
+  min-width: 0;
+  flex: 1;
+}
+
+.action-label {
+  padding: 4px 0px;
+}
+
+.action-value {
+  padding: 4px 0px;
+  text-align: right;
+  flex-grow: 1;
+}
+
+.action-value-input {
+  background-color: transparent;
+  border: none;
+  border-bottom: 1px solid var(--mat-sys-outline-variant);
+  border-radius: 0;
+  box-sizing: border-box;
+  font-size: 1rem;
+  padding: 8px 0;
+  width: 100%;
+}
+
+.action-value-textarea {
+  background-color: transparent;
+  border: none;
+  border-bottom: 1px solid var(--mat-sys-outline-variant);
+  border-radius: 0;
+  box-sizing: border-box;
+  font-size: 1rem;
+  min-height: 80px;
+  padding: 8px 0;
+  resize: vertical;
+  width: 100%;
+}
+
+.action-value-input:focus {
+  border-bottom-color: var(--mat-sys-primary);
+  outline: none;
+}
+
+// Call-to-action group projected into an app-table-state panel. Global rather than scoped to that
+// component, because the element is declared in the template of whichever component projects it and
+// so carries that component's encapsulation attribute.
+.table-state-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+
+  // A field sized as a percentage of this row would be squeezed by whatever sits beside it, ending
+  // up far narrower than the same field outside the panel. Giving it the full row keeps the width
+  // the .input-width-* class asked for and pushes the buttons onto their own line. This has to match
+  // the direct child, which is often a wrapper around the field rather than the field itself: the
+  // percentage resolves against the flex item, so sizing anything deeper leaves it at the mercy of
+  // the wrapper's own shrink-to-fit width.
+  > mat-form-field,
+  > :has(mat-form-field) {
+    flex: 1 0 100%;
+    // The row is spaced by the gap; a wrapper's own stacking margin would double it up here.
+    margin-top: 0;
+  }
+}

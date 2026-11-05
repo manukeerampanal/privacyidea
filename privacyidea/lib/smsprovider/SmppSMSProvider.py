@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #    2017-12-27 Cornelius Kölbel <cornelius.koelbel@netknights.i>
 #               Restructuring Code.
 #
@@ -22,7 +20,7 @@
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 __doc__ = """This is the SMSClass to send SMS via SMPP protocol to SMS center
-It requires smpplib installation, this lib works with ascii only, but message support unicode 
+It requires smpplib installation, this lib works with ascii only, but message support unicode
 
 """
 
@@ -41,17 +39,19 @@ class SmppSMSProvider(ISMSProvider):
 
     def submit_message(self, phone, message):
         """
-        send a message to a phone via an smpp protocol to smsc
+        send a message to a phone via a smpp protocol to smsc
 
         :param phone: the phone number
         :param message: the message to submit to the phone
         :return:
         """
-        log.debug("submitting message {0!s} to {1!s}".format(message, phone))
         if not self.smsgateway:
             # this should not happen. We now always use sms gateway definitions.
             log.warning("Missing smsgateway definition!")
             raise SMSError(-1, "Missing smsgateway definition!")
+
+        phone = self._mangle_phone(phone, self.smsgateway.option_dict)
+        log.debug(f"submitting message {message!r} to {phone!s}")
 
         smsc_host = self.smsgateway.option_dict.get("SMSC_HOST")
         smsc_port = self.smsgateway.option_dict.get("SMSC_PORT")
@@ -73,7 +73,7 @@ class SmppSMSProvider(ISMSProvider):
 
         # Initialize the SMPP Client
         client = None
-        error_message = None 
+        error_message = None
         try:
             msg_parts, encoding_flag, msg_type_flag = smpplib.gsm.make_parts(message)
             client = smpplib.client.Client(smsc_host,
@@ -81,7 +81,7 @@ class SmppSMSProvider(ISMSProvider):
             client.connect()
             r = client.bind_transmitter(system_id=sys_id,
                                         password=passwd)
-            log.debug("bind_transmitter returns {0!r}".format(r.get_status_desc()))
+            log.debug(f"bind_transmitter returns {r.get_status_desc()!r}")
             for part in msg_parts:
                 r = client.send_message(source_addr_ton=s_addr_ton,
                                         source_addr_npi=s_addr_npi,
@@ -92,12 +92,12 @@ class SmppSMSProvider(ISMSProvider):
                                         short_message=part,
                                         data_coding=encoding_flag,
                                         esm_class=msg_type_flag)
-                log.debug("send_message returns {0!r}".format(r.get_status_desc()))
+                log.debug(f"send_message returns {r.get_status_desc()!r}")
 
         except Exception as err:
-            error_message = "{0!r}".format(err)
-            log.warning("Failed to send message: {0!r}".format(error_message))
-            log.debug("{0!s}".format(traceback.format_exc()))
+            error_message = f"{err!r}"
+            log.warning(f"Failed to send message: {error_message!r}")
+            log.debug(f"{traceback.format_exc()!s}")
 
         finally:
             if client:
@@ -105,7 +105,7 @@ class SmppSMSProvider(ISMSProvider):
 
         if error_message:
             raise SMSError(error_message, "SMS could not be "
-                                          "sent: {0!r}".format(error_message))
+                                          f"sent: {error_message!r}")
         return True
 
     @classmethod
@@ -129,7 +129,8 @@ class SmppSMSProvider(ISMSProvider):
                         "SYSTEM_ID": {
                             "description": _("SMSC Service ID")},
                         "PASSWORD": {
-                            "description": _("Password for authentication on SMSC")},
+                            "description": _("Password for authentication on SMSC"),
+                            "secret": True},
                         "S_ADDR_TON": {
                             "description": _("SOURCE_ADDR_TON Special Flag")},
                         "S_ADDR_NPI": {
@@ -137,7 +138,10 @@ class SmppSMSProvider(ISMSProvider):
                         "S_ADDR": {
                             "description": _("Source address (SMS sender)")},
                         "D_ADDR_TON": {"description": _("DESTINATION_ADDR_TON Special Flag")},
-                        "D_ADDR_NPI": {"description": _("D_ADDR_NPI Special Flag")}
+                        "D_ADDR_NPI": {"description": _("D_ADDR_NPI Special Flag")},
+                        "REGEXP": {
+                            "description": cls.regexp_description
+                        }
                     }
                     }
         return params

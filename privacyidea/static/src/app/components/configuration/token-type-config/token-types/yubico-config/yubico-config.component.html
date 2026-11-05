@@ -1,0 +1,98 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<mat-expansion-panel
+  id="yubico"
+  [expanded]="expanded()">
+  <mat-expansion-panel-header>
+    <mat-panel-title i18n="@@tokenTypeConfig.yubico">Yubico</mat-panel-title>
+  </mat-expansion-panel-header>
+  <div class="panel-content expansion-well">
+    <p i18n="@@tokenTypeConfig.yubicoTokenYubikey"
+      >The Yubico Token is a Yubikey that is registered with the YubiCloud service.</p
+    >
+    <p i18n="@@tokenTypeConfig.yubikeyEmits44Character">The Yubikey emits a 44 character one time password.</p>
+    <p i18n="@@tokenTypeConfig.first12Characters"
+      >The first 12 characters are a unique ID which is used to bind the device to the user.</p
+    >
+    <p i18n="@@tokenTypeConfig.authenticationRequest">The authentication request is forwarded to the YubiCloud.</p>
+    <p i18n="@@tokenTypeConfig.accessingYubicloud"
+      >For accessing the YubiCloud you need to enter an API Client ID and an API Key, which you can request
+      <a
+        href="https://upgrade.yubico.com/getapikey/"
+        target="_blank"
+        >here
+      </a></p
+    >
+
+    <div class="flex-row gap-16 ali-center margin-bottom-16">
+      <mat-form-field
+        appearance="fill"
+        class="input-width-l">
+        <mat-label i18n="@@tokenTypeConfig.apiKey">API Key</mat-label>
+        <input
+          #apiKeyInput
+          [value]="formData()[YUBICO_SECRET] ?? ''"
+          (input)="updateFormData(YUBICO_SECRET, $any($event.target).value)"
+          matInput
+          i18n-placeholder="@@tokenTypeConfig.apiKey"
+          placeholder="API Key"
+          required />
+        @if (apiKeyInput.validity.valueMissing) {
+          <mat-error i18n="@@tokenTypeConfig.apiKeyRequired">API Key is <strong>required</strong></mat-error>
+        }
+      </mat-form-field>
+
+      <mat-form-field
+        appearance="fill"
+        class="input-width-l">
+        <mat-label i18n="@@tokenTypeConfig.apiClientId">API Client ID</mat-label>
+        <input
+          #clientIdInput
+          [value]="formData()[YUBICO_ID] ?? ''"
+          (input)="updateFormData(YUBICO_ID, $any($event.target).value)"
+          matInput
+          i18n-placeholder="@@tokenTypeConfig.clientIdPlaceholderLong"
+          placeholder="The client ID"
+          required />
+        @if (clientIdInput.validity.valueMissing) {
+          <mat-error i18n="@@tokenTypeConfig.apiClientIdRequired">API Client ID is <strong>required</strong></mat-error>
+        }
+      </mat-form-field>
+    </div>
+
+    <div class="flex-row gap-16 ali-center">
+      <mat-form-field
+        appearance="fill"
+        class="input-width-xl">
+        <mat-label i18n="@@tokenTypeConfig.yubicoUrl">Yubico URL</mat-label>
+        <input
+          #urlInput
+          [value]="formData()[YUBICO_URL] ?? ''"
+          (input)="updateFormData(YUBICO_URL, $any($event.target).value)"
+          matInput
+          placeholder="https://api.yubico.com/wsapi/2.0/verify"
+          required
+          type="url" />
+        @if (urlInput.validity.valueMissing) {
+          <mat-error i18n="@@tokenTypeConfig.yubicoUrlRequired">Yubico URL is <strong>required</strong></mat-error>
+        }
+      </mat-form-field>
+    </div>
+  </div>
+</mat-expansion-panel>

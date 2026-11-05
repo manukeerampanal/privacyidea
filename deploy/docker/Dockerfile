@@ -1,0 +1,108 @@
+# SPDX-FileCopyrightText: (C) 2025 NetKnights GmbH <https://netknights.it>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+#  Stage 1: Build the Angular frontend 
+FROM cgr.dev/chainguard/wolfi-base AS node-builder
+
+ARG NODEJS_VERSION=22
+
+RUN apk add --no-cache nodejs-${NODEJS_VERSION} npm
+
+WORKDIR /build/privacyidea/static
+
+# Install dependencies first (better layer caching — only re-runs when
+# package.json / package-lock.json change, not on every source change).
+COPY privacyidea/static/package.json privacyidea/static/package-lock.json ./
+RUN npm ci
+
+COPY privacyidea/static/ ./
+RUN npm run build
+
+#  Stage 2: Build the Python virtualenv 
+FROM cgr.dev/chainguard/wolfi-base AS python-builder
+
+ARG PYTHON_VERSION=3.13
+ARG GUNICORN=23.0.0
+ARG PSYCOPG2=2.9.10
+
+# To override the package version since we copy only part of the repository.
+# See https://setuptools-scm.readthedocs.io/en/latest/usage/#with-dockerpodman
+ARG GIT_VERSION
+
+# Set environment variables to optimize Python for docker
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Split into two RUN commands so a transient network timeout on one package
+# group does not force a full re-download of everything.
+RUN apk add --no-cache python-${PYTHON_VERSION} python-${PYTHON_VERSION}-dev py${PYTHON_VERSION}-pip
+# build-base + the python dev headers (Python.h) + krb5-dev (krb5 headers /
+# krb5-config) are needed to compile the gssapi extension — the [kerberos] extra
+# builds from source (no wheel for this platform), used for SASL-Kerberos LDAP.
+RUN apk add --no-cache build-base git krb5-dev
+
+RUN python3 -m venv /opt/privacyidea
+
+WORKDIR /build
+
+ENV PATH="/opt/privacyidea/bin:$PATH"
+
+RUN pip install --no-cache-dir --upgrade pip setuptools
+
+RUN pip install --no-cache-dir psycopg2-binary==${PSYCOPG2} gunicorn==${GUNICORN}
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY README.rst MANIFEST.in pyproject.toml ./
+COPY ./.git ./.git
+COPY ./deploy/ ./deploy
+COPY ./tools/ ./tools
+COPY ./privacyidea/ ./privacyidea
+
+# Copy the pre-built Angular frontend from the node-builder stage
+COPY --from=node-builder /build/privacyidea/static/dist/ ./privacyidea/static/dist/
+
+RUN SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PRIVACYIDEA=${GIT_VERSION} pip install --no-cache-dir ".[kerberos]"
+
+#  Stage 3: Final slim runtime image 
+FROM cgr.dev/chainguard/wolfi-base
+
+ARG PYTHON_VERSION=3.13
+# krb5 provides the runtime shared libs the built gssapi extension links against.
+RUN apk add --no-cache python-${PYTHON_VERSION} krb5
+
+WORKDIR /opt/privacyidea
+
+RUN mkdir /etc/privacyidea && \
+    chown -R nonroot:nonroot /etc/privacyidea
+
+USER nonroot
+
+COPY --chown=nonroot:nonroot ./deploy/privacyidea/NetKnights.pem /etc/privacyidea/
+COPY --chown=nonroot:nonroot ./deploy/privacyidea/dictionary* /etc/privacyidea/
+
+# Note: no VOLUME /etc/privacyidea. Config comes from env vars and /run/secrets/
+# in both the single-container and HA deployments. An anonymous VOLUME here would
+# accumulate stray entries in `docker volume ls` on every `compose up`.
+
+EXPOSE 8080
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/privacyidea/bin:$PATH" \
+    PI_CONFIG_NAME="docker"
+
+COPY --chown=nonroot:nonroot --from=python-builder /opt/privacyidea/ /opt/privacyidea/
+COPY --chown=nonroot:nonroot --chmod=755 deploy/docker/entrypoint.sh /opt/privacyidea/
+COPY --chown=nonroot:nonroot --chmod=755 deploy/docker/cron-runner.py /opt/privacyidea/
+COPY --chown=nonroot:nonroot --chmod=755 deploy/docker/enckey-canary.py /opt/privacyidea/
+
+ENTRYPOINT ["./entrypoint.sh"]
+
+# Uses stdlib urllib (no `requests` dependency) and the /healthz/readyz endpoint
+# on gunicorn's port 8080. Matches the healthcheck used by ha-compose.yaml for
+# the pi service, so standalone-image users get the same behaviour.
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=15s \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz/readyz', timeout=3)"

@@ -2,11 +2,14 @@
 This test file tests the lib.tokens.papertoken
 This depends on lib.tokenclass
 """
+import logging
 
-from .base import MyTestCase
+from testfixtures import LogCapture
+
+from privacyidea.lib.token import init_token, import_token, remove_token, import_tokens, get_tokens
 from privacyidea.lib.tokens.tantoken import TanTokenClass
-from privacyidea.lib.token import init_token, get_tokens_paginate, import_token
 from privacyidea.models import Token
+from .base import MyTestCase
 
 OTPKEY = "3132333435363738393031323334353637383930"
 
@@ -15,7 +18,7 @@ class TanTokenTestCase(MyTestCase):
     serial1 = "ser1"
 
     # add_user, get_user, reset, set_user_identifiers
-    
+
     def test_01_create_token(self):
         db_token = Token(self.serial1, tokentype="tan")
         db_token.save()
@@ -67,6 +70,17 @@ class TanTokenTestCase(MyTestCase):
         # previous OTP
         r = token.check_otp("755224")
         self.assertEqual(r, -1)
+        with LogCapture(level=logging.INFO) as lc:
+            self.assertEqual(-1, token.check_otp("12345"))
+            lc.check_present(
+                ('privacyidea.lib.decorators', 'INFO',
+                 f'OTP value for token {token.token.serial} (type: {token.type}) '
+                 f'has wrong length (5 != 6)'))
+            self.assertEqual(-1, token.check_otp("1234567"))
+            lc.check_present(
+                ('privacyidea.lib.decorators', 'INFO',
+                 f'OTP value for token {token.token.serial} (type: {token.type}) '
+                 f'has wrong length (7 != 6)'))
 
     def test_05_import(self):
         params = TanTokenClass.get_import_csv(["se1", "121212", "tan",
@@ -107,7 +121,7 @@ class TanTokenTestCase(MyTestCase):
         self.assertEqual(tok.token.otplen, 4)
 
     def test_10_import_tan(self):
-        # This are example values that are imported from a file and end up at
+        # These are example values that are imported from a file and end up at
         # lib/token.import_token
         serial = "ABC123"
         params = {'hashlib': 'sha1',
@@ -129,3 +143,67 @@ class TanTokenTestCase(MyTestCase):
         self.assertEqual(r, -1)
         r = tok.check_otp("123465")
         self.assertEqual(r, 1)
+
+    def test_11_tan_token_export(self):
+        # Set up the TANTokenClass for testing
+        token = init_token(param={'serial': "PITN0000B9CE", 'type': 'tan'})
+        token.set_description("this is a tan token export test")
+        token.write_tokeninfo("hashlib", "sha256")
+
+        # Test that all expected keys are present in the exported dictionary
+        exported_data = token.export_token()
+        expected_keys = ["serial", "type", "description", "count", "otplen", "otpkey", "issuer"]
+        self.assertTrue(set(expected_keys).issubset(exported_data.keys()))
+
+        expected_tokeninfo_keys = ["hashlib", "tokenkind"]
+        self.assertTrue(set(expected_tokeninfo_keys).issubset(exported_data["info_list"].keys()))
+
+        # Test that the exported values match the token's data
+        self.assertEqual(exported_data["serial"], "PITN0000B9CE")
+        self.assertEqual(exported_data["type"], "tan")
+        self.assertEqual(exported_data["description"], "this is a tan token export test")
+        self.assertEqual(exported_data["info_list"]["hashlib"], "sha256")
+        self.assertEqual(exported_data["otpkey"], token.token.get_otpkey().getKey().decode("utf-8"))
+        self.assertEqual(exported_data["info_list"]["tokenkind"], "software")
+        self.assertEqual(exported_data["issuer"], "privacyIDEA")
+
+        # Clean up
+        remove_token(token.token.serial)
+
+    def test_12_paper_token_import(self):
+        # Define the token data to be imported
+        token_data = [{
+            "serial": "PITN0000B9CE",
+            "type": "paper",
+            "description": "this is a paper token import test",
+            "otpkey": OTPKEY,
+            "info_list": {'hashlib': 'sha256',
+                          'tan.tan0': '3224ea1f:1f234536a59c4998c43d3d18247e210be9a42e38e43c71ab5de8e8879068dde0',
+                          'tan.tan1': '2de3b273:417b3ca840815c976b0d78b540011fc738081772bf60940a70d2f09111165896',
+                          'tan.tan10': '2d61bc1a:5310cfda92e6dc5e33be36e55bc204084e61068e97c869343ab0c77b06aa9c58',
+                          'tan.tan11': '8a728e30:62ff370f0919562ce673cf3f346a64addbb7a37284eba9da8a4a84800aa49f17',
+                          'tan.tan12': '9312d86b:e1ee5961f29fd8d9a4dfde467b129840ceb44c7a9059c09189ef967229558f19',
+                          'tokenkind': 'software'},
+            "issuer": "privacyIDEA"
+        }]
+
+        # Import the token
+        import_tokens(token_data)
+
+        # Retrieve the imported token
+        token = get_tokens(serial=token_data[0]["serial"])[0]
+
+        # Verify that the token data matches the imported data
+        self.assertEqual(token.token.serial, token_data[0]["serial"])
+        self.assertEqual(token.type, token_data[0]["type"])
+        self.assertEqual(token.token.description, token_data[0]["description"])
+        self.assertEqual(token.token.get_otpkey().getKey().decode("utf-8"), token_data[0]["otpkey"])
+        self.assertEqual(token.get_tokeninfo("hashlib"), token_data[0]["info_list"]["hashlib"])
+        self.assertEqual(token.get_tokeninfo("tokenkind"), token_data[0]["info_list"]["tokenkind"])
+
+        # Check that the token works
+        r = token.check_otp('875740')
+        self.assertEqual(r, 0)
+
+        # Clean up
+        remove_token(token.token.serial)

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  privacyIDEA is a fork of LinOTP
 #  May 08, 2014 Cornelius Kölbel
 #  License:  AGPLv3
@@ -23,20 +21,22 @@
 #
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#    
+#
 """
 contains Errors and Exceptions
 """
 
-import six
-from privacyidea.lib import _
 import logging
+
+from flask_babel import LazyString
+
 log = logging.getLogger(__name__)
 
 
-class ERROR:
+class Error:
     SUBSCRIPTION = 101
     TOKENADMIN = 301
+    TOKEN_LOCKED = 1007
     CONFIGADMIN = 302
     POLICY = 303
     IMPORTADMIN = 304
@@ -49,150 +49,213 @@ class ERROR:
     AUTHENTICATE_DECODING_ERROR = 4304
     AUTHENTICATE_TOKEN_EXPIRED = 4305
     AUTHENTICATE_MISSING_RIGHT = 4306
+    AUTHENTICATE_ILLEGAL_METHOD = 4307
     ENROLLMENT = 404
     CA = 503
     CA_CSR_INVALID = 504
     CA_CSR_PENDING = 505
     RESOURCE_NOT_FOUND = 601
+    CONFLICT = 602
     HSM = 707
     SELFSERVICE = 807
+    DATABASE = 902
     SERVER = 903
     USER = 904
     PARAMETER = 905
+    RESOLVER = 907
+    REALM_DELETE_CUSTOM_ATTRIBUTES = 908
+    REALM_DELETE_CA_POLICY_REFERENCE = 909
+    PARAMETER_USER_MISSING = 9051
+    CONTAINER = 3000
+    CONTAINER_NOT_REGISTERED = 3001
+    CONTAINER_INVALID_CHALLENGE = 3002
+    CONTAINER_ROLLOVER = 3003
 
 
-@six.python_2_unicode_compatible
-class privacyIDEAError(Exception):
+class PrivacyIDEAError(Exception):
 
-    def __init__(self, description=u"privacyIDEAError!", id=10):
+    def __init__(self, description="privacyIDEAError!", id=10):
         self.id = id
         self.message = description
         Exception.__init__(self, description)
 
-    def getId(self):
+    def get_id(self):
         return self.id
 
-    def getDescription(self):
+    def get_description(self):
         return self.message
 
     def __str__(self):
-        pstr = u"ERR%d: %r"
-        if isinstance(self.message, six.string_types):
-            pstr = u"ERR%d: %s"
+        if isinstance(self.message, str) or isinstance(self.message, LazyString):
+            return f"ERR{self.id}: {self.message}"
+        return f"ERR{self.id}: {self.message!r}"
 
-        ### if we have here unicode, we might fail with conversion error
-        try:
-            res = pstr % (self.id, self.message)
-        except Exception as exx:
-            res = u"ERR{0:d}: {1!r}".format(self.id, self.message)
-        return res
 
     def __repr__(self):
-        ret = '{0!s}(description={1!r}, id={2:d})'.format(type(self).__name__,
-                                             self.message, self.id)
-        return ret
+        return f"{type(self).__name__}(description={self.message!r}, id={self.id:d})"
 
 
-class SubscriptionError(privacyIDEAError):
-    def __init__(self, description=None, application=None, id=ERROR.SUBSCRIPTION):
+class SubscriptionError(PrivacyIDEAError):
+    def __init__(self, description=None, application=None, id=Error.SUBSCRIPTION):
         self.id = id
         self.message = description
         self.application = application
-        privacyIDEAError.__init__(self, description, id=self.id)
+        PrivacyIDEAError.__init__(self, description, id=self.id)
 
     def __str__(self):
         return self.__repr__()
 
     def __repr__(self):
-        ret = '{0!s}({1!r}, application={2!s})'.format(type(
+        ret = '{!s}({!r}, application={!s})'.format(type(
             self).__name__, self.message, self.application)
         return ret
 
 
-class TokenImportException(privacyIDEAError):
-    def __init__(self, description, id=ERROR.IMPORTADMIN):
-        privacyIDEAError.__init__(self, description=description, id=id)
+class TokenImportException(PrivacyIDEAError):
+    def __init__(self, description, id=Error.IMPORTADMIN):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
 
-class AuthError(privacyIDEAError):
-    def __init__(self, description, id=ERROR.AUTHENTICATE, details=None):
+class AuthError(PrivacyIDEAError):
+    def __init__(self, description, id=Error.AUTHENTICATE, details=None):
         self.details = details
-        privacyIDEAError.__init__(self, description=description, id=id)
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
 
-class ResourceNotFoundError(privacyIDEAError):
-    def __init__(self, description, id=ERROR.RESOURCE_NOT_FOUND):
-        privacyIDEAError.__init__(self, description=description, id=id)
+class ResourceNotFoundError(PrivacyIDEAError):
+    def __init__(self, description, id=Error.RESOURCE_NOT_FOUND):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
 
-class PolicyError(privacyIDEAError):
-    def __init__(self, description, id=ERROR.POLICY):
-        privacyIDEAError.__init__(self, description=description, id=id)
+class ConflictError(PrivacyIDEAError):
+    """
+    The request was well-formed but the resource changed since the client read
+    it, so applying it would silently overwrite someone else's write. Maps to
+    HTTP 409 so a client can tell "reload and retry" apart from "fix your input".
+    """
+
+    def __init__(self, description, id=Error.CONFLICT):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
 
-class ValidateError(privacyIDEAError):
-    def __init__(self, description="validation error!", id=ERROR.VALIDATE):
-        privacyIDEAError.__init__(self, description=description, id=id)
+class PolicyError(PrivacyIDEAError):
+    def __init__(self, description, id=Error.POLICY):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
 
-class RegistrationError(privacyIDEAError):
-    def __init__(self, description="registration error!", id=ERROR.REGISTRATION):
-        privacyIDEAError.__init__(self, description=description, id=id)
+class ValidateError(PrivacyIDEAError):
+    def __init__(self, description="validation error!", id=Error.VALIDATE):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
 
-class EnrollmentError(privacyIDEAError):
-    def __init__(self, description="enrollment error!", id=ERROR.ENROLLMENT):
-        privacyIDEAError.__init__(self, description=description, id=id)
+class RegistrationError(PrivacyIDEAError):
+    def __init__(self, description="registration error!", id=Error.REGISTRATION):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
 
-class TokenAdminError(privacyIDEAError):
-    def __init__(self, description="token admin error!", id=ERROR.TOKENADMIN):
-        privacyIDEAError.__init__(self, description=description, id=id)
+class EnrollmentError(PrivacyIDEAError):
+    def __init__(self, description="enrollment error!", id=Error.ENROLLMENT):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
 
-class ConfigAdminError(privacyIDEAError):
-    def __init__(self, description="config admin error!", id=ERROR.CONFIGADMIN):
-        privacyIDEAError.__init__(self, description=description, id=id)
+class TokenAdminError(PrivacyIDEAError):
+    def __init__(self, description="token admin error!", id=Error.TOKENADMIN):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
 
-class CAError(privacyIDEAError):
-    def __init__(self, description="CA error!", id=ERROR.CA):
-        privacyIDEAError.__init__(self, description=description, id=id)
+class ConfigAdminError(PrivacyIDEAError):
+    def __init__(self, description="config admin error!", id=Error.CONFIGADMIN):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
+
+
+class CAError(PrivacyIDEAError):
+    def __init__(self, description="CA error!", id=Error.CA):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
 
 class CSRError(CAError):
-    def __init__(self, description="CSR invalid", id=ERROR.CA_CSR_INVALID):
-        privacyIDEAError.__init__(self, description=description, id=id)
+    def __init__(self, description="CSR invalid", id=Error.CA_CSR_INVALID):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
 
 class CSRPending(CAError):
-    def __init__(self, description="CSR pending", id=ERROR.CA_CSR_PENDING, requestId=None):
-        privacyIDEAError.__init__(self, description=description, id=id)
+    def __init__(self, description="CSR pending", id=Error.CA_CSR_PENDING, requestId=None):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
         self.requestId = requestId
 
 
-class UserError(privacyIDEAError):
-    def __init__(self, description="user error!", id=ERROR.USER):
-        privacyIDEAError.__init__(self, description=description, id=id)
+class UserError(PrivacyIDEAError):
+    def __init__(self, description="user error!", id=Error.USER):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
 
-class ServerError(privacyIDEAError):
-    def __init__(self, description="server error!", id=ERROR.SERVER):
-        privacyIDEAError.__init__(self, description=description, id=id)
+class ServerError(PrivacyIDEAError):
+    def __init__(self, description="server error!", id=Error.SERVER):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
 
-class HSMException(privacyIDEAError):
-    def __init__(self, description="hsm error!", id=ERROR.HSM):
-        privacyIDEAError.__init__(self, description=description, id=id)
+class HandlerAbortError(ServerError):
+    """Raised by an event handler to intentionally abort the current request.
+
+    This is the only handler exception that is allowed to propagate out of
+    the event-handling loop and turn the API response into an error.
+    Handlers that want to abort the request (e.g. the Script handler with
+    ``raise_error`` enabled) should raise this instead of a plain
+    :class:`ServerError`.
+    """
+    pass
 
 
-class SelfserviceException(privacyIDEAError):
-    def __init__(self, description="selfservice error!", id=ERROR.SELFSERVICE):
-        privacyIDEAError.__init__(self, description=description, id=id)
+class HSMException(PrivacyIDEAError):
+    def __init__(self, description="hsm error!", id=Error.HSM):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
 
-class ParameterError(privacyIDEAError):
-    USER_OR_SERIAL = _('You either need to provide user or serial')
+class SelfserviceException(PrivacyIDEAError):
+    def __init__(self, description="selfservice error!", id=Error.SELFSERVICE):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
 
-    def __init__(self, description="unspecified parameter error!", id=ERROR.PARAMETER):
-        privacyIDEAError.__init__(self, description=description, id=id)
+
+class ParameterError(PrivacyIDEAError):
+
+    def __init__(self, description="unspecified parameter error!", id=Error.PARAMETER):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
+
+
+class DatabaseError(PrivacyIDEAError):
+    """Error in the database layer"""
+
+    def __init__(self, description="database error!", eid=Error.DATABASE):
+        PrivacyIDEAError.__init__(self, description=description, id=eid)
+
+
+class ResolverError(PrivacyIDEAError):
+    """Error in user resolver"""
+    def __init__(self, description="resolver error!", eid=Error.RESOLVER):
+        PrivacyIDEAError.__init__(self, description=description, id=eid)
+
+
+class NoLongerSupportedError(PrivacyIDEAError):
+    """Raised when an operation targets a token type that is no longer supported."""
+    def __init__(self, description="This token is no longer supported!", id=Error.PARAMETER):
+        PrivacyIDEAError.__init__(self, description=description, id=id)
+
+
+class ContainerError(PrivacyIDEAError):
+    def __init__(self, description="container error!", eid=Error.CONTAINER):
+        PrivacyIDEAError.__init__(self, description=description, id=eid)
+
+
+class ContainerNotRegistered(ContainerError):
+    def __init__(self, description="container is not registered error!", eid=Error.CONTAINER_NOT_REGISTERED):
+        ContainerError.__init__(self, description=description, eid=eid)
+
+
+class ContainerInvalidChallenge(ContainerError):
+    def __init__(self, description="container challenge error!", eid=Error.CONTAINER_INVALID_CHALLENGE):
+        ContainerError.__init__(self, description=description, eid=eid)
+
+
+class ContainerRollover(ContainerError):
+    def __init__(self, description="container rollover error", eid=Error.CONTAINER_ROLLOVER):
+        ContainerError.__init__(self, description=description, eid=eid)

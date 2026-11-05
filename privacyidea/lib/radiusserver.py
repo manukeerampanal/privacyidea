@@ -1,40 +1,28 @@
-# -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: (C) 2016 Cornelius Kölbel <cornelius.koelbel@netknights.it>
+# SPDX-FileCopyrightText: (C) 2016 NetKnights GmbH <https://netknights.it>
+# SPDX-FileCopyrightText: (C) 2019 Paul Lettich <paul.lettich@netknights.it>
 #
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# This code is free software; you can redistribute it and/or
+# modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+# as published by the Free Software Foundation; either
+# version 3 of the License, or any later version.
+#
+# This code is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+#
+# You should have received a copy of the GNU Affero General Public
+# License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 #  2017-10-30 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Add timeout handling
 #  2016-02-19 Cornelius Kölbel <cornelius@privacyidea.org>
 #             RADIUS Server implementation
 #
-# This code is free software; you can redistribute it and/or
-# modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
-# License as published by the Free Software Foundation; either
-# version 3 of the License, or any later version.
-#
-# This code is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU AFFERO GENERAL PUBLIC LICENSE for more details.
-#
-# You should have received a copy of the GNU Affero General Public
-# License along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#
-#
-from privacyidea.models import RADIUSServer as RADIUSServerDB
-from privacyidea.lib.crypto import (decryptPassword, encryptPassword,
-                                    FAILED_TO_DECRYPT_PASSWORD)
-from privacyidea.lib.config import get_from_config
-import logging
-from privacyidea.lib.log import log_with
-from privacyidea.lib.error import ConfigAdminError, privacyIDEAError
-import pyrad.packet
-from pyrad.client import Client
-from pyrad.client import Timeout
-from pyrad.dictionary import Dictionary
-from privacyidea.lib import _
-from privacyidea.lib.utils import fetch_one_resource, to_bytes
-from privacyidea.lib.utils.export import (register_import, register_export)
-
-__doc__ = """
+"""
 This is the library for creating, listing and deleting RADIUS server objects in
 the Database.
 
@@ -42,19 +30,40 @@ It depends on the RADIUSserver in the database model models.py. This module can
 be tested standalone without any webservices.
 This module is tested in tests/test_lib_radiusserver.py
 """
+from __future__ import annotations
+
+import logging
+import secrets
+
+import pyrad.packet
+from pyrad.client import Client
+from pyrad.client import Timeout
+from pyrad.dictionary import Dictionary
+from sqlalchemy import select
+
+from privacyidea.lib import _
+from privacyidea.lib.config import get_from_config
+from privacyidea.lib.crypto import (decryptPassword, encryptPassword,
+                                    FAILED_TO_DECRYPT_PASSWORD, CENSORED, censor_dict)
+from privacyidea.lib.error import (ConfigAdminError, PrivacyIDEAError,
+                                   ResourceNotFoundError)
+from privacyidea.lib.log import log_with
+from privacyidea.lib.utils import fetch_one_resource, to_bytes
+from privacyidea.lib.utils.export import (register_import, register_export)
+from privacyidea.models import db, RADIUSServer as RADIUSServerDB
 
 log = logging.getLogger(__name__)
 
 
-class RADIUSServer(object):
+class RADIUSServer:
     """
     RADIUS Server object with configuration. The RADIUS Server object
     contains a test functionality so that the configuration can be tested.
     """
 
-    def __init__(self, db_radius_object):
+    def __init__(self, db_radius_object: RADIUSServerDB):
         """
-        Create a new RADIUSServer instance from a DB RADIUS object
+        Create a new RADIUSServer instance from a RADIUSServer database row
 
         :param db_radius_object: The database object
         :return: A RADIUS Server object
@@ -64,8 +73,8 @@ class RADIUSServer(object):
     def get_secret(self):
         return decryptPassword(self.config.secret)
 
-    @staticmethod
-    def request(config, user, password):
+    @log_with(log)
+    def request(self, user: str, password: str, radius_state: bytes = None) -> pyrad.packet | None:
         """
         Perform a RADIUS request to a RADIUS server.
         The RADIUS configuration contains the IP address, the port and the
@@ -77,62 +86,83 @@ class RADIUSServer(object):
         * config.retries
         * config.timeout
 
-        :param config: The RADIUS configuration
-        :type config: RADIUSServer Database Model
         :param user: the radius username
-        :type user: str
         :param password: the radius password
-        :type password: str
-        :return: True or False. If any error occurs, an exception is raised.
+        :param radius_state: Challenge attribute for the RADIUS request
+        :return: The response object from the RADIUS request
         """
-        success = False
-
+        # TODO: Identifier and dictionary should be part of the server configuration
+        #       and not initialized when running the request
         nas_identifier = get_from_config("radius.nas_identifier",
                                          "privacyIDEA")
-        r_dict = config.dictionary or get_from_config("radius.dictfile",
-                                                      "/etc/privacyidea/"
-                                                      "dictionary")
-        log.debug("NAS Identifier: %r, "
-                  "Dictionary: %r" % (nas_identifier, r_dict))
-        log.debug("constructing client object "
-                  "with server: %r, port: %r, secret: %r" %
-                  (config.server, config.port, config.secret))
+        radius_dictionary = self.config.dictionary or get_from_config("radius.dictfile",
+                                                                      "/etc/privacyidea/dictionary")
+        verify_message_authenticator = False
+        if self.config.options:
+            verify_message_authenticator = self.config.options.get("message_authenticator", False)
+        log.debug(f"NAS Identifier: {nas_identifier!r}, Dictionary: {radius_dictionary!r}")
+        log.debug(f"Constructing client object with server: {self.config.server!r}, port: {self.config.port!r}")
+        log.debug("Using Message-Authenticator: %r", verify_message_authenticator)
 
-        srv = Client(server=config.server,
-                     authport=config.port,
-                     secret=to_bytes(decryptPassword(config.secret)),
-                     dict=Dictionary(r_dict))
+        srv = Client(server=self.config.server,
+                     authport=self.config.port,
+                     secret=to_bytes(decryptPassword(self.config.secret)),
+                     dict=Dictionary(radius_dictionary))
 
         # Set retries and timeout of the client
-        if config.timeout:
-            srv.timeout = config.timeout
-        if config.retries:
-            srv.retries = config.retries
+        srv.timeout = self.config.timeout
+        srv.retries = self.config.retries
 
         req = srv.CreateAuthPacket(code=pyrad.packet.AccessRequest,
                                    User_Name=user.encode('utf-8'),
-                                   NAS_Identifier=nas_identifier.encode('ascii'))
+                                   NAS_Identifier=nas_identifier.encode('ascii'),
+                                   message_authenticator=verify_message_authenticator)
 
         # PwCrypt encodes unicode strings to UTF-8
         req["User-Password"] = req.PwCrypt(password)
+
+        if radius_state:
+            req["State"] = radius_state
+            log.debug(f"Sending Challenge to RADIUS server: {radius_state!r}")
+
         try:
+            # The authenticator is available after the call to PwCrypt
+            request_authenticator = req.authenticator
             response = srv.SendPacket(req)
-
-            if response.code == pyrad.packet.AccessAccept:
-                log.info("Radiusserver %s granted "
-                         "access to user %s." % (config.server, user))
-                success = True
-            else:
-                log.warning("Radiusserver %s rejected "
-                            "access to user %s." % (config.server, user))
         except Timeout:
-            log.warning("Receiving timeout from remote radius server {0!s}".format(config.server))
+            log.warning(f"Timeout while contacting remote radius server {self.config.server!s}")
+            return None
 
-        return success
+        # Check the Message-Authenticator attribute in the Response
+        try:
+            if not response.verify_message_authenticator(original_authenticator=request_authenticator):
+                log.warning("Verification of Message-Authenticator Attribute in response failed!")
+                if verify_message_authenticator:
+                    raise PrivacyIDEAError("Verification of Message-Authenticator Attribute in response failed!")
+        except Exception as e:
+            # Either there was no Message-Authenticator Attribute in the response or the secret is missing
+            log.warning(f"Unable to verify Message-Authenticator Attribute in response: {e}")
+            if verify_message_authenticator:
+                raise PrivacyIDEAError("Unable to verify Message-Authenticator Attribute in response!")
+
+        return response
 
 
 @log_with(log)
-def get_radius(identifier):
+def get_temporary_radius_server(server: str, secret: str, port: int = 1812,
+                                timeout: int = 5, retries: int = 3,
+                                dictionary: str = "/etc/privacyidea/dictionary") -> RADIUSServer:
+    """Return a temporary RADIUS server instance for old RADIUS configuration."""
+    s = RADIUSServerDB(identifier=f"tmp_rad_{secrets.token_urlsafe(4)}",
+                       server=server, port=port,
+                       secret=encryptPassword(secret), dictionary=dictionary,
+                       retries=retries, timeout=timeout)
+    radius_server = RADIUSServer(s)
+    return radius_server
+
+
+@log_with(log)
+def get_radius(identifier: str) -> RADIUSServer:
     """
     This returns the RADIUSServer object of the RADIUSServer definition
     "identifier".
@@ -143,13 +173,13 @@ def get_radius(identifier):
     """
     server_list = get_radiusservers(identifier=identifier)
     if not server_list:
-        raise ConfigAdminError("The specified RADIUSServer configuration does "
-                               "not exist.")
+        raise ConfigAdminError(f"The specified RADIUSServer configuration "
+                               f"'{identifier}' does not exist.")
     return server_list[0]
 
 
 @log_with(log)
-def get_radiusservers(identifier=None, server=None):
+def get_radiusservers(identifier: str = None, server: str = None) -> list[RADIUSServer]:
     """
     This returns a list of all RADIUSServers matching the criterion.
     If no identifier or server is provided, it will return a list of all RADIUS
@@ -159,46 +189,48 @@ def get_radiusservers(identifier=None, server=None):
         definition.
         As the identifier is unique, providing an identifier will return a
         list with either one or no RADIUSServer
-    :type identifier: basestring
     :param server: The FQDN or IP address of the RADIUSServer
-    :type server: basestring
     :return: list of RADIUSServer Objects.
     """
-    res = []
-    sql_query = RADIUSServerDB.query
+    result = []
+    stmt = select(RADIUSServerDB)
     if identifier:
-        sql_query = sql_query.filter(RADIUSServerDB.identifier == identifier)
+        stmt = stmt.filter_by(identifier=identifier)
     if server:
-        sql_query = sql_query.filter(RADIUSServerDB.server == server)
+        stmt = stmt.filter_by(server=server)
 
-    for row in sql_query.all():
-        res.append(RADIUSServer(row))
+    for row in db.session.execute(stmt).scalars():
+        result.append(RADIUSServer(row))
 
-    return res
+    return result
 
-@log_with(log)
+
+@log_with(log, log_exit=False)
 def list_radiusservers(identifier=None, server=None):
     res = {}
     server_list = get_radiusservers(identifier=identifier, server=server)
     for server in server_list:
-        decrypted_password = decryptPassword(server.config.secret)
+        decrypted_secret = decryptPassword(server.config.secret)
         # If the database contains garbage, use the empty password as fallback
-        if decrypted_password == FAILED_TO_DECRYPT_PASSWORD:
-            decrypted_password = ""
+        if decrypted_secret == FAILED_TO_DECRYPT_PASSWORD:
+            decrypted_secret = ""  # nosec B105 # Reset password in case of error
         res[server.config.identifier] = {"server": server.config.server,
                                          "port": server.config.port,
                                          "dictionary": server.config.dictionary,
                                          "description": server.config.description,
-                                         "password": decrypted_password,
+                                         "secret": decrypted_secret,
                                          "timeout": server.config.timeout,
-                                         "retries": server.config.retries}
+                                         "retries": server.config.retries,
+                                         "options": server.config.options}
 
     return res
 
 
 @log_with(log)
-def add_radius(identifier, server=None, secret=None, port=1812, description="",
-               dictionary='/etc/privacyidea/dictionary', retries=3, timeout=5):
+def add_radius(identifier: str, server: str = None, secret: str = None,
+               port: int = 1812, description: str = "",
+               dictionary: str = '/etc/privacyidea/dictionary',
+               retries: int = 3, timeout: int = 5, options: dict = None) -> int:
     """
     This adds a RADIUS server to the RADIUSServer database table.
 
@@ -208,32 +240,59 @@ def add_radius(identifier, server=None, secret=None, port=1812, description="",
         definition.
         As the identifier is unique, providing an identifier will return a
         list with either one or no radius server
-    :type identifier: basestring
     :param server: The FQDN or IP address of the RADIUS server
-    :type server: basestring
     :param secret: The RADIUS secret
-    :type secret: str
     :param port: the radius port
-    :type port: int
     :param description: Human readable description of the RADIUS server
         definition
     :param dictionary: The RADIUS dictionary
+    :param retries: Number of times to retry the request RADIUS request
+    :param timeout: Timeout in seconds for the RADIUS request
+    :param options: Additional options for the RADIUS server
     :return: The Id of the database object
     """
-    cryptedSecret = encryptPassword(secret)
-    if len(cryptedSecret) > 255:
-        raise privacyIDEAError(description=_("The RADIUS secret is too long"),
-                               id=2234)
-    r = RADIUSServerDB(identifier=identifier, server=server, port=port,
-                       secret=cryptedSecret, description=description,
-                       dictionary=dictionary,
-                       retries=retries, timeout=timeout).save()
-    return r
+    existing_server = db.session.scalars(select(RADIUSServerDB).filter_by(identifier=identifier)).one_or_none()
+
+    encrypted_secret = encryptPassword(secret)
+    if secret == CENSORED and existing_server:
+        encrypted_secret = existing_server.secret
+
+    if len(encrypted_secret) > 255:
+        raise PrivacyIDEAError(description=_("The RADIUS secret is too long"), id=2234)
+
+    if existing_server:
+        if server is not None:
+            existing_server.server = server
+        if encrypted_secret is not None:
+            existing_server.secret = encrypted_secret
+        if port is not None:
+            existing_server.port = port
+        if description is not None:
+            existing_server.description = description
+        if dictionary is not None:
+            existing_server.dictionary = dictionary
+        if retries is not None:
+            existing_server.retries = int(retries)
+        if timeout is not None:
+            existing_server.timeout = int(timeout)
+        if options is not None:
+            existing_server.options = options
+        db.session.commit()
+        server_id = existing_server.id
+    else:
+        new_server = RADIUSServerDB(identifier=identifier, server=server, port=port, secret=encrypted_secret,
+                                    description=description, dictionary=dictionary, retries=retries, timeout=timeout,
+                                    options=options)
+        db.session.add(new_server)
+        db.session.commit()
+        server_id = new_server.id
+    return server_id
 
 
 @log_with(log)
 def test_radius(identifier, server, secret, user, password, port=1812, description="",
-               dictionary='/etc/privacyidea/dictionary', retries=3, timeout=5):
+                dictionary='/etc/privacyidea/dictionary', retries=3, timeout=5,
+                options=None):
     """
     This tests a RADIUS server configuration by sending an access request.
 
@@ -250,17 +309,44 @@ def test_radius(identifier, server, secret, user, password, port=1812, descripti
     :param description: Human readable description of the RADIUS server
         definition
     :param dictionary: The RADIUS dictionary
+    :param retries: Number of times to retry the request RADIUS request
+    :param timeout: Timeout in seconds for the RADIUS request
+    :param options: Additional options for the RADIUS server
     :return: The result of the access request
     """
-    cryptedSecret = encryptPassword(secret)
-    if len(cryptedSecret) > 255:
-        raise privacyIDEAError(description=_("The RADIUS secret is too long"),
-                               id=2234)
+    result = False
+    # Check if the secret is censored. If it is, we can assume a configuration exists and use its secret
+    encrypted_secret = encryptPassword(secret)
+    if secret == CENSORED:
+        try:
+            rad_serv = fetch_one_resource(RADIUSServerDB, identifier=identifier)
+            encrypted_secret = rad_serv.secret
+        except ResourceNotFoundError:
+            # Maybe __CENSORED__ is the secret?
+            pass
+    if len(encrypted_secret) > 255:
+        raise PrivacyIDEAError("The RADIUS secret is too long")
+    # Create a (temporary) RADIUS Server database object in order to initialize the RADUISServer object
     s = RADIUSServerDB(identifier=identifier, server=server, port=port,
-                       secret=cryptedSecret, dictionary=dictionary,
+                       secret=encrypted_secret, dictionary=dictionary,
                        retries=retries, timeout=timeout,
-                       description=description)
-    return RADIUSServer.request(s, user, password)
+                       description=description, options=options)
+    radius_server = RADIUSServer(s)
+    response = radius_server.request(user, password)
+    if response is not None:
+        # TODO: Add message to Audit info
+        if response.code == pyrad.packet.AccessAccept:
+            log.info("RADIUS Server test successful!")
+            result = True
+        elif response.code == pyrad.packet.AccessChallenge:
+            log.info("RADIUS Server test failed! Server requires "
+                     "Challenge-Response (Answer: {!r})".format(response["Reply-Message"]))
+            result = False
+        else:
+            log.info("RADIUS Server test failed! Server rejected authentication.")
+            result = False
+    # TODO: Return test result message to frontend
+    return result
 
 
 @log_with(log)
@@ -275,19 +361,35 @@ def delete_radius(identifier):
 
 
 @register_export('radiusserver')
-def export_radiusserver(name=None):
-    """ Export given or all radiusserver configuration """
-    return list_radiusservers(identifier=name)
+def export_radiusserver(name=None, censor=False):
+    """ Export given or all radiusserver configuration
+
+    :param censor: If True, the RADIUS secret is replaced with the
+        ``__CENSORED__`` placeholder instead of being returned in clear text.
+    """
+    res = list_radiusservers(identifier=name)
+    if censor:
+        for identifier, server in res.items():
+            res[identifier] = censor_dict(server, ("secret",))
+    return res
 
 
 @register_import('radiusserver')
 def import_radiusserver(data, name=None):
     """Import radiusserver configuration"""
-    log.debug('Import radiusserver config: {0!s}'.format(data))
+    log.debug(f'Import radiusserver config: {data!s}')
     for res_name, res_data in data.items():
         if name and name != res_name:
             continue
-        res_data['secret'] = res_data.pop('password')
+        # Copy before normalizing so the caller's dict is left untouched.
+        res_data = dict(res_data)
+        # Current exports provide the RADIUS secret under the 'secret' key, but
+        # config files written by older privacyIDEA versions use the legacy
+        # 'password' key. Map it onto 'secret' (what add_radius() expects) so
+        # those files still import instead of raising a TypeError.
+        legacy_secret = res_data.pop("password", None)
+        if legacy_secret is not None and "secret" not in res_data:
+            res_data["secret"] = legacy_secret
         rid = add_radius(res_name, **res_data)
-        log.info('Import of smtpserver "{0!s}" finished,'
-                 ' id: {1!s}'.format(res_name, rid))
+        log.info(f'Import of radiusserver "{res_name!s}" finished,'
+                 f' id: {rid!s}')

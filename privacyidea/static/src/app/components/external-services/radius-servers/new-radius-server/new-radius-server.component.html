@@ -1,0 +1,251 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div
+  #scrollContainer
+  appScrollToTop
+  class="radius-server-page-layout">
+  <div class="radius-server-page-container">
+    @if (isEditMode()) {
+      <h3
+        class="margin-8"
+        i18n="@@radiusServer.editRadiusServer"
+        >Edit RADIUS Server</h3
+      >
+    } @else {
+      <h3
+        class="margin-8"
+        i18n="@@common.createRadiusServer"
+        >Create RADIUS Server</h3
+      >
+    }
+
+    <div
+      class="header-row sticky-header"
+      [appStickyHeader]="scrollContainer">
+      <div class="action-buttons">
+        @if (isEditMode() && authService.actionAllowed("radiusserver_write")) {
+          <button
+            (click)="deleteServer()"
+            class="action-button-delete-secondary button-width-s"
+            mat-stroked-button>
+            <mat-icon>delete</mat-icon>
+            <span i18n="@@common.delete">Delete</span>
+          </button>
+        }
+        <button
+          (click)="onCancel()"
+          class="action-button-secondary button-width-s"
+          mat-stroked-button>
+          <span i18n="@@common.cancel">Cancel</span>
+        </button>
+        <button
+          (click)="save()"
+          [disabled]="!radiusForm().valid()"
+          class="action-button-primary button-width-s"
+          mat-stroked-button>
+          <mat-icon>save</mat-icon>
+          <span i18n="@@common.save">Save</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="radius-form">
+      <mat-form-field
+        appearance="fill"
+        class="input-width-l margin-bottom-32">
+        <mat-label i18n="@@common.identifier">Identifier</mat-label>
+        <app-clearable-input
+          (clearButtonClick)="radiusModel.update(m => ({...m, identifier: ''}))"
+          [showClearButton]="!isEditMode() && !!radiusModel().identifier">
+          <input
+            [formField]="radiusForm.identifier"
+            matInput
+            placeholder="myRadiusServer" />
+        </app-clearable-input>
+        <mat-hint i18n="@@radiusServer.uniqueIdentifying"
+          >The unique identifying name of the RADIUS server definition.</mat-hint
+        >
+        @if (radiusForm.identifier().errors().some(e => e.kind === 'required')) {
+          <mat-error i18n="@@common.identifierRequired">Identifier is <strong>required</strong></mat-error>
+        }
+        @if (radiusForm.identifier().errors().some(e => e.kind === 'pattern')) {
+          <mat-error i18n="@@common.identifierContains"
+            >Identifier contains <strong>invalid characters</strong>. Only alphanumeric characters, dots, underscores
+            and hyphens are allowed.</mat-error
+          >
+        }
+        @if (radiusForm.identifier().errors().some(e => e.kind === 'reservedName')) {
+          <mat-error i18n="@@common.cannotBeNamed">Cannot be named "{{ radiusForm.identifier().value() }}".</mat-error>
+        }
+      </mat-form-field>
+
+      <div class="flex-row gap-16 margin-bottom-16">
+        <mat-form-field
+          appearance="fill"
+          class="input-width-l">
+          <mat-label i18n="@@common.ipFqdn">IP or FQDN</mat-label>
+          <app-clearable-input
+            (clearButtonClick)="radiusModel.update(m => ({...m, server: ''}))"
+            [showClearButton]="!!radiusModel().server">
+            <input
+              [formField]="radiusForm.server"
+              matInput
+              placeholder="1.2.3.4" />
+          </app-clearable-input>
+          @if (radiusForm.server().errors().some(e => e.kind === 'required')) {
+            <mat-error i18n="@@common.serverRequired">Server is <strong>required</strong></mat-error>
+          }
+        </mat-form-field>
+
+        <mat-form-field
+          appearance="fill"
+          class="input-width-s">
+          <mat-label i18n="@@common.port">Port</mat-label>
+          <input
+            [formField]="radiusForm.port"
+            matInput
+            placeholder="1812"
+            type="number" />
+        </mat-form-field>
+      </div>
+
+      <div class="flex-row gap-16 margin-bottom-16">
+        <mat-form-field
+          appearance="fill"
+          class="input-width-l">
+          <mat-label i18n="@@common.secret">Secret</mat-label>
+          <app-clearable-input
+            (clearButtonClick)="radiusModel.update(m => ({...m, secret: ''}))"
+            [showClearButton]="!!radiusModel().secret">
+            <input
+              [formField]="radiusForm.secret"
+              matInput
+              type="password" />
+          </app-clearable-input>
+          @if (radiusForm.secret().errors().some(e => e.kind === 'required')) {
+            <mat-error i18n="@@radiusServer.secretRequired">Secret is <strong>required</strong></mat-error>
+          }
+        </mat-form-field>
+
+        <mat-form-field
+          appearance="fill"
+          class="input-width-s">
+          <mat-label i18n="@@common.timeout">Timeout</mat-label>
+          <input
+            [formField]="radiusForm.timeout"
+            matInput
+            placeholder="5"
+            type="number" />
+        </mat-form-field>
+      </div>
+
+      <div class="flex-row gap-16">
+        <mat-form-field
+          appearance="fill"
+          class="input-width-l">
+          <mat-label i18n="@@radiusServer.radiusDictionary">RADIUS Dictionary</mat-label>
+          <app-clearable-input
+            (clearButtonClick)="radiusModel.update(m => ({...m, dictionary: ''}))"
+            [showClearButton]="!!radiusModel().dictionary">
+            <input
+              [formField]="radiusForm.dictionary"
+              matInput
+              placeholder="/etc/privacyidea/dictionary" />
+          </app-clearable-input>
+        </mat-form-field>
+
+        <mat-form-field
+          appearance="fill"
+          class="input-width-s">
+          <mat-label i18n="@@radiusServer.retries">Retries</mat-label>
+          <input
+            [formField]="radiusForm.retries"
+            matInput
+            placeholder="3"
+            type="number" />
+        </mat-form-field>
+      </div>
+
+      <mat-form-field
+        appearance="fill"
+        class="input-width-xl">
+        <mat-label i18n="@@common.description">Description</mat-label>
+        <app-clearable-input
+          (clearButtonClick)="radiusModel.update(m => ({...m, description: ''}))"
+          [showClearButton]="!!radiusModel().description">
+          <textarea
+            [formField]="radiusForm.description"
+            matInput
+            placeholder="some wise words"
+            rows="3"></textarea>
+        </app-clearable-input>
+      </mat-form-field>
+
+      <div class="checkbox-group">
+        <mat-checkbox
+          [checked]="radiusModel().message_authenticator"
+          (change)="radiusModel.update(m => ({...m, message_authenticator: $event.checked}))"
+          i18n="@@radiusServer.requireMessage"
+          >Require Message-Authenticator</mat-checkbox
+        >
+      </div>
+
+      <h4 i18n="@@radiusServer.testRadiusServer">Test RADIUS Server</h4>
+
+      <div class="flex-row gap-16">
+        <mat-form-field
+          appearance="fill"
+          class="input-width-m">
+          <mat-label i18n="@@common.username">Username</mat-label>
+          <app-clearable-input
+            (clearButtonClick)="radiusModel.update(m => ({...m, username: ''}))"
+            [showClearButton]="!!radiusModel().username">
+            <input
+              [formField]="radiusForm.username"
+              matInput />
+          </app-clearable-input>
+        </mat-form-field>
+        <div class="flex ali-center">
+          <mat-form-field
+            appearance="fill"
+            class="input-width-m">
+            <mat-label i18n="@@common.password">Password</mat-label>
+            <app-clearable-input
+              (clearButtonClick)="radiusModel.update(m => ({...m, password: ''}))"
+              [showClearButton]="!!radiusModel().password">
+              <input
+                [formField]="radiusForm.password"
+                matInput
+                type="password" />
+            </app-clearable-input>
+          </mat-form-field>
+          <button
+            (click)="test()"
+            [disabled]="isTesting()"
+            class="margin-bottom-16 margin-left-16"
+            i18n-matTooltip="@@radiusServer.sendRadiusTest"
+            mat-icon-button
+            matTooltip="Send RADIUS test request">
+            <mat-icon>send</mat-icon>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

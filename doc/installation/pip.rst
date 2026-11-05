@@ -9,54 +9,95 @@ You can install privacyidea usually on any Linux distribution in a python
 virtual environment. This way you keep all privacyIDEA code in one defined
 subdirectory.
 
-privacyIDEA currently runs with Python 2.7 and 3.5, 3.6, 3.7 and 3.8. Other
-versions either do not work or are not tested.
-
-You first need to install a package for creating a python `virtual environment
-<https://virtualenv.pypa.io/en/stable/>`_.
-
-Now you can setup the virtual environment for privacyIDEA like this::
-
-  virtualenv /opt/privacyidea
-
-  cd /opt/privacyidea
-  source bin/activate
-
 .. note::
-    Some distributions still ship Python 2.7 as the system python. If you want
-    to use Python 3 you can create the virtual environment like this:
-    `virtualenv -p /usr/bin/python3 /opt/privacyidea`
+    privacyIDEA runs with Python 3.11 to 3.15. Other
+    versions either do not work or are not tested.
 
-Now you are within the python virtual environment and you can run::
+Setting up a virtual environment
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-  pip install privacyidea
+privacyIDEA is installed into a Python `virtual environment
+<https://docs.python.org/3/library/venv.html>`_. Some distributions ship the
+``venv`` module as a separate package (e.g. ``python3-venv`` on Debian and Ubuntu).
 
-in order to install the latest privacyIDEA version from
-`PyPI <https://pypi.org/project/privacyIDEA>`_.
+Now you can set up the virtual environment for privacyIDEA like this::
+
+  $ python3 -m venv /opt/privacyidea
+
+  $ cd /opt/privacyidea
+  $ source bin/activate
+  (privacyidea)$
+
+Now you are within the python virtual environment and you can proceed with the
+:ref:`deterministic installation <pip_deterministic_installation>`.
+
+.. _pip_deterministic_installation:
 
 Deterministic Installation
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The privacyIDEA package contains dependencies with a minimal required version. However, newest
-versions of dependencies are not always tested and might cause problems.
-If you want to achieve a deterministic installation, you can now install the pinned and tested
-versions of the dependencies::
+The privacyIDEA package declares its dependencies without minimal versions (only ``ldap3`` has
+an upper bound), so pip may install any version of them. The newest versions of the dependencies
+are not always tested and might cause problems.
+To achieve a deterministic installation, you must install the pinned and tested
+versions of the dependencies *before* installing privacyIDEA::
 
-  pip install -r lib/privacyidea/requirements.txt
+    (privacyidea)$ pip install -r https://raw.githubusercontent.com/privacyidea/privacyidea/v<version>/requirements.txt
 
-It would even be safer to install the pinned dependencies *before* installing privacyIDEA.
-So if you e.g. know that you are going to install version 3.6 you can run::
+Replace ``<version>`` with the privacyIDEA version you want to install. Then
+install this version from `PyPI <https://pypi.org/project/privacyIDEA>`_::
 
-    pip install -r https://raw.githubusercontent.com/privacyidea/privacyidea/v3.6/requirements.txt
-    pip install privacyidea==3.6
+    (privacyidea)$ pip install privacyidea==<version>
+
+The requirements are also available after the installation at ``/opt/privacyidea/lib/privacyidea/requirements.txt``.
+
+.. _pip_extras:
+
+Optional features (extras)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Some features need optional dependencies that are not installed by default. They
+are declared as pip *extras* and installed on demand::
+
+    (privacyidea)$ pip install "privacyidea[postgres]"    # PostgreSQL driver (psycopg2)
+    (privacyidea)$ pip install "privacyidea[kerberos]"    # SASL-Kerberos bind for LDAP resolvers (gssapi)
+    (privacyidea)$ pip install "privacyidea[hsm]"          # PKCS#11 hardware security module support (PyKCS11)
+
+Extras can be combined, e.g. ``pip install "privacyidea[postgres,kerberos]"``.
+
+All three extras build native extensions that link against system libraries, so
+the matching OS packages must be present:
+
+* ``postgres`` (``psycopg2``): needs the PostgreSQL client library and its
+  headers (``libpq-dev`` / ``postgresql-devel``), the ``pg_config`` executable
+  they ship, the Python development headers (``python3-dev`` /
+  ``python3-devel``, ``python3.11-devel`` with the ``python3.11`` packages of
+  RHEL 8 and 9) and a C compiler. Without them pip aborts with ``Error: pg_config
+  executable not found``. The prebuilt ``psycopg2-binary`` wheel needs no build
+  tools and is a practical choice for development and testing, but upstream
+  advises against it in production, as it bundles its own libssl and libcrypto.
+* ``kerberos`` (``gssapi``): there are no prebuilt wheels for Linux, so pip
+  always builds it from source. Install the Kerberos development files
+  (``libkrb5-dev`` / ``krb5-devel``, which also provide ``krb5-config``), the
+  Python development headers (see above) and a C compiler. At runtime the host
+  needs the MIT Kerberos libraries (``libkrb5`` / ``krb5-libs``) and a valid
+  ``/etc/krb5.conf`` for the realm.
+* ``hsm`` (``PyKCS11``): additionally needs your HSM vendor's PKCS#11 module.
+
+.. note::
+
+    The official Docker image already includes the ``kerberos`` extra and the
+    Kerberos runtime libraries, so a containerized deployment only needs a
+    mounted ``krb5.conf``. It also ships ``psycopg2-binary``, so the
+    ``postgres`` extra is not needed there either.
 
 .. _pip_configuration:
 
 Configuration
-.............
+^^^^^^^^^^^^^
 
 Database
-^^^^^^^^
+........
 
 privacyIDEA makes use of `SQLAlchemy <https://www.sqlalchemy.org>`_ to be able
 to talk to different SQL-based databases. Our best experience is with
@@ -67,67 +108,85 @@ The database server should be installed on the host or be otherwise reachable.
 
 In order for privacyIDEA to use the database, a database user with the
 appropriate privileges is needed.
-The following SQL commands will create the database as well as a user in `MySQL`::
+The following SQL commands will create the database as well as a user in MySQL::
 
     CREATE DATABASE pi;
     CREATE USER "pi"@"localhost" IDENTIFIED BY "<dbsecret>";
     GRANT ALL PRIVILEGES ON pi.* TO "pi"@"localhost";
 
-You must then add the database name, user and password to your `pi.cfg`. See
+You must then add the database name, user and password to your ``pi.cfg``. See
 :ref:`cfgfile` for more information on the configuration.
 
 Setting up privacyIDEA
-^^^^^^^^^^^^^^^^^^^^^^
-Additionally to the database connection a new ``PI_PEPPER`` and ``SECRET_KEY``
+......................
+In addition to the database connection a new ``PI_PEPPER`` and ``SECRET_KEY``
 must be generated in order to secure the installation::
 
     PEPPER="$(tr -dc A-Za-z0-9_ </dev/urandom | head -c24)"
-    echo "PI_PEPPER = '$PEPPER'" >> /path/to/pi.cfg
+    echo "PI_PEPPER = '$PEPPER'" >> /etc/privacyidea/pi.cfg
     SECRET="$(tr -dc A-Za-z0-9_ </dev/urandom | head -c24)"
-    echo "SECRET_KEY = '$SECRET'" >> /path/to/pi.cfg
+    echo "SECRET_KEY = '$SECRET'" >> /etc/privacyidea/pi.cfg
 
 An encryption key for encrypting the secrets in the database and a key for
-signing the :ref:`audit` log is also needed (the following commands should be
-executed inside the virtual environment)::
+signing the :ref:`audit` log are also needed. The following commands write them
+to the paths set in ``PI_ENCFILE``, ``PI_AUDIT_KEY_PRIVATE`` and
+``PI_AUDIT_KEY_PUBLIC``, so first set these in ``pi.cfg`` to a place outside the
+virtual environment, e.g. ``/etc/privacyidea/enckey``,
+``/etc/privacyidea/private.pem`` and ``/etc/privacyidea/public.pem`` as in the
+example in :ref:`cfgfile`. Without them the files are created inside the virtual
+environment, next to the ``privacyidea`` package: they are lost when the virtual
+environment is recreated, and ``pi-manage backup create`` does not include them.
+Losing the encryption key makes the encrypted data in the database, e.g. the
+token secrets, unreadable.
 
-    pi-manage create_enckey  # encryption key for the database
-    pi-manage create_audit_keys  # key for verification of audit log entries
+Execute the commands inside the virtual environment::
+
+    (privacyidea)$ pi-manage setup create_enckey  # encryption key for the database
+    (privacyidea)$ pi-manage setup create_audit_keys  # key for verification of audit log entries
 
 To create the database tables execute::
 
-    pi-manage create_tables
-
-Stamping the database to the current database schema version is important for
-the update process later::
-
-    pi-manage db stamp head -d /opt/privacyidea/lib/privacyidea/migrations/
+    (privacyidea)$ pi-manage setup create_tables
 
 After creating a local administrative user with::
 
-    pi-manage admin add <login>
+    (privacyidea)$ pi-manage admin add <login>
 
 the development server can be started with::
 
-    pi-manage runserver
+    (privacyidea)$ pi-manage run
+
+.. versionchanged:: 3.10
+    To start the development server with an earlier version use ``runserver``. The
+    command is still available but deprecated.
 
 .. warning::
-    The development server should not be used for a productive environment.
+    The development server should not be used for a production environment.
 
 Webserver
-^^^^^^^^^
+.........
 
 To serve authentication requests and provide the management UI a
-`WSGI <https://wsgi.readthedocs.io/en/latest/index.html>`_ capable webserver
-like `Apache2 <https://httpd.apache.org/>`_ or `nginx <https://nginx.org/en>`_
-is needed.
+`WSGI <https://wsgi.readthedocs.io/en/latest/index.html>`_ server is needed,
+e.g. `Apache2 <https://httpd.apache.org/>`_ with ``mod_wsgi``, or uWSGI or
+gunicorn behind a web server like `nginx <https://nginx.org/en>`_. nginx itself
+cannot run the application, it forwards the requests to the WSGI server.
 
 Setup and configuration of a webserver can be a complex procedure depending on
-several parameter (host OS, SSL, internal network structure, ...).
+several parameters (host OS, SSL, internal network structure, ...).
 Some example configuration can be found in the NetKnights GitHub
 repositories [#nkgh]_. More on the WSGI setup for privacyIDEA can be found in
 :ref:`wsgiscript`.
 
+Cleanup jobs
+............
+
+An installation from PyPI does not schedule any jobs. Set up the cron jobs
+described in :ref:`cleanup_jobs`, otherwise several database tables grow
+without limit.
+
+
 .. rubric:: Footnotes
 
-.. [#sqlaDialects] https://docs.sqlalchemy.org/en/13/dialects/index.html
+.. [#sqlaDialects] https://docs.sqlalchemy.org/en/20/dialects/index.html
 .. [#nkgh] https://github.com/NetKnights-GmbH/ubuntu/tree/master/deploy

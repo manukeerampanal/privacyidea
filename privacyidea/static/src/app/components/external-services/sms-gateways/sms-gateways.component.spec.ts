@@ -1,0 +1,138 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { provideHttpClient } from "@angular/common/http";
+import { provideHttpClientTesting } from "@angular/common/http/testing";
+import { ComponentFixture, TestBed } from "@angular/core/testing";
+import { Router, provideRouter } from "@angular/router";
+import { ROUTE_PATHS } from "@app/route_paths";
+import { SaveAndExitDialogResult } from "@components/shared/dialog/save-and-exit-dialog/save-and-exit-dialog.component";
+import { AuthService } from "@services/auth/auth.service";
+import { DialogService } from "@services/dialog/dialog.service";
+import { SmsGatewayService } from "@services/sms-gateway/sms-gateway.service";
+import { TableUtilsService } from "@services/table-utils/table-utils.service";
+import { MockMatDialogRef } from "@testing/mock-mat-dialog-ref";
+import { expectsTableStateGating } from "@testing/table-state-gating";
+import {
+  MockAuthService,
+  MockDialogService,
+  MockSmsGatewayService,
+  MockTableUtilsService
+} from "@testing/mock-services";
+import { Subject } from "rxjs";
+import { SmsGatewaysComponent } from "./sms-gateways.component";
+
+describe("SmsGatewaysComponent", () => {
+  let component: SmsGatewaysComponent;
+  let fixture: ComponentFixture<SmsGatewaysComponent>;
+  let smsGatewayServiceMock: MockSmsGatewayService;
+  let dialogServiceMock: MockDialogService;
+  let confirmClosed: Subject<SaveAndExitDialogResult>;
+  let router: Router;
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [SmsGatewaysComponent],
+      providers: [
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        provideRouter([]),
+        { provide: SmsGatewayService, useClass: MockSmsGatewayService },
+        { provide: AuthService, useClass: MockAuthService },
+        { provide: DialogService, useClass: MockDialogService },
+        { provide: TableUtilsService, useClass: MockTableUtilsService }
+      ]
+    }).compileComponents();
+
+    smsGatewayServiceMock = TestBed.inject(SmsGatewayService) as unknown as MockSmsGatewayService;
+    smsGatewayServiceMock.smsGateways.set([
+      { name: "gw1", providermodule: "mod1", options: {}, headers: {} },
+      { name: "gw2", providermodule: "mod2", options: {}, headers: {} }
+    ]);
+
+    fixture = TestBed.createComponent(SmsGatewaysComponent);
+    dialogServiceMock = TestBed.inject(DialogService) as unknown as MockDialogService;
+    router = TestBed.inject(Router);
+    jest.spyOn(router, "navigateByUrl").mockResolvedValue(true);
+    confirmClosed = new Subject();
+    const dialogRefMock = new MockMatDialogRef();
+    dialogRefMock.afterClosed.mockReturnValue(confirmClosed);
+    dialogServiceMock.openDialog.mockReturnValue(dialogRefMock);
+
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+  });
+
+  it("gates the table on its read right, row count and filter", () => {
+    expectsTableStateGating({
+      state: component.tableState,
+      right: "smsgateway_read"
+    });
+  });
+
+  it("should create", () => {
+    expect(component).toBeTruthy();
+  });
+
+  it("should display gateways from service", () => {
+    expect(component.smsDataSource().data.length).toBe(2);
+    expect(component.smsDataSource().data[0].name).toBe("gw1");
+  });
+
+  it("should filter gateways", () => {
+    component.onFilterInput("gw1");
+    expect(component.smsDataSource().filter).toBe("gw1");
+  });
+
+  it("should navigate to create page", () => {
+    component.onCreateNewGateway();
+    expect(router.navigateByUrl).toHaveBeenCalledWith(ROUTE_PATHS.EXTERNAL_SERVICES_SMS_NEW);
+  });
+
+  it("should navigate to edit page when editing a gateway", () => {
+    const gateway = smsGatewayServiceMock.smsGateways()[0];
+    component.onEditGateway(gateway);
+    expect(router.navigateByUrl).toHaveBeenCalledWith(ROUTE_PATHS.EXTERNAL_SERVICES_SMS_DETAILS + gateway.name);
+  });
+
+  it("should only select the gateways left by the filter", async () => {
+    component.onFilterInput("gw1");
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    component.selector.selectAllRows();
+
+    expect(component.selector.selectedRows().map((row) => row.name)).toEqual(["gw1"]);
+  });
+
+  it("should delete the selected gateways after confirmation", () => {
+    const gateway = smsGatewayServiceMock.smsGateways()[0];
+    component.selector.selectRow(gateway);
+    component.deleteSelected();
+    expect(dialogServiceMock.openDialog).toHaveBeenCalled();
+    confirmClosed.next("discard");
+    confirmClosed.complete();
+    expect(smsGatewayServiceMock.deleteSmsGateway).toHaveBeenCalledWith("gw1");
+    expect(component.selector.selectedCount()).toBe(0);
+  });
+
+  it("should not open the dialog when nothing is selected", () => {
+    component.deleteSelected();
+    expect(dialogServiceMock.openDialog).not.toHaveBeenCalled();
+  });
+});

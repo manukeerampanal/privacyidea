@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: (C) 2014 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: CC0-1.0
+#
+name: Run WebUI tests
+on:
+  pull_request:
+    paths:
+      - 'privacyidea/static/**'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: ./privacyidea/static
+
+jobs:
+  test-webui:
+    name: Jest with Codecov
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js for testing the new WebUI
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*  # Use the latest LTS-release
+          cache: npm
+          cache-dependency-path: privacyidea/static/package-lock.json
+      - name: Install Node.js dependencies
+        run: npm ci
+      - name: Run tests for the new WebUI
+        id: jest_run
+        # maxWorkers is capped in jest.config.ts to avoid OOMing a dev laptop running
+        # ng serve alongside it; that constraint doesn't apply here, and the runner's
+        # 2 CPUs are the whole budget, so use all of them.
+        run: npm run test:coverage -- --maxWorkers=100%
+      - name: Codecov upload
+        if: ${{ steps.jest_run.outcome == 'success' }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ./privacyidea/static/coverage/lcov.info
+          flags: frontend
+          token: ${{ secrets.CODECOV_TOKEN }}

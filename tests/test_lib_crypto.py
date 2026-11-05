@@ -1,12 +1,26 @@
-# -*- coding: utf-8 -*-
 """
 This test file tests the lib.crypto and lib.security.default
 """
-from mock import call
+import base64
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey, Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PublicKey, Ed448PrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.x448 import X448PublicKey, X448PrivateKey
+from unittest.mock import call
 import binascii
 
 from privacyidea.config import TestingConfig
-from privacyidea.lib.error import HSMException
+from privacyidea.lib.error import HSMException, ParameterError
+from privacyidea.lib.framework import get_app_local_store
 from .base import MyTestCase, OverrideConfigTestCase
 # need to import pkcs11mock before PyKCS11, because it may be replaced by a mock module
 from .pkcs11mock import PKCS11Mock
@@ -15,17 +29,26 @@ from privacyidea.lib.crypto import (encryptPin, encryptPassword, decryptPin,
                                     geturandom, get_alphanum_str, hash_with_pepper,
                                     verify_with_pepper, aes_encrypt_b64, aes_decrypt_b64,
                                     get_hsm, init_hsm, set_hsm_password, hash,
-                                    encrypt, decrypt, Sign, generate_keypair,
-                                    generate_password, pass_hash, verify_pass_hash)
+                                    encrypt, decrypt, Sign, get_sign_object, generate_keypair,
+                                    generate_password, pass_hash, verify_pass_hash, build_pass_context,
+                                    generate_keypair_ecc,
+                                    ecc_key_pair_to_b64url_str, b64url_str_key_pair_to_ecc_obj, sign_ecc,
+                                    ecdh_key_exchange, encrypt_aes, decrypt_aes, verify_ecc)
 from privacyidea.lib.utils import to_bytes, to_unicode
 from privacyidea.lib.security.default import (SecurityModule,
                                               DefaultSecurityModule)
 from privacyidea.lib.security.aeshsm import AESHardwareSecurityModule
 
-from flask import current_app
-from six import text_type
+import unittest
+from unittest import mock
+
+from flask import Flask, current_app
+from passlib.context import CryptContext
+from passlib.exc import MissingBackendError
+from passlib.handlers.argon2 import argon2
 import PyKCS11
 from PyKCS11 import PyKCS11Error
+import re
 import string
 import passlib.hash
 
@@ -81,13 +104,13 @@ class SecurityModuleTestCase(MyTestCase):
         # check that we can decrypt values with legacy padding
         self.assertEqual(b'Hallo Welt', hsm.decrypt(binascii.unhexlify(legacy_cipher), iv))
 
-        cipher = hsm.encrypt_pin(u"pin")
+        cipher = hsm.encrypt_pin("pin")
         text = hsm.decrypt_pin(cipher)
-        self.assertEqual(text, u"pin")
+        self.assertEqual(text, "pin")
 
-        cipher = hsm.encrypt_password(u"password")
+        cipher = hsm.encrypt_password("password")
         text = hsm.decrypt_password(cipher)
-        self.assertEqual(text, u"password")
+        self.assertEqual(text, "password")
 
     def test_06_password_encrypt_decrypt(self):
         res = DefaultSecurityModule.password_encrypt("secrettext", "password1")
@@ -169,16 +192,16 @@ class CryptoTestCase(MyTestCase):
         self.assertEqual(decryptPin(pin3), '1234')
 
     def test_01_encrypt_decrypt_pass(self):
-        r = encryptPassword(u"passwörd".encode('utf8'))
+        r = encryptPassword("passwörd".encode())
         # encryptPassword returns unicode
-        self.assertTrue(isinstance(r, text_type))
+        self.assertTrue(isinstance(r, str))
         pin = decryptPassword(r)
         # decryptPassword always returns unicode
-        self.assertEqual(pin, u"passwörd")
+        self.assertEqual(pin, "passwörd")
 
-        r = encryptPassword(u"passwörd")
+        r = encryptPassword("passwörd")
         pin = decryptPassword(r)
-        self.assertEqual(pin, u"passwörd")
+        self.assertEqual(pin, "passwörd")
 
         # decrypt some passwords generated with 2.23
         pw1 = '3d1bf9db4c75469b4bb0bc7c70133181:2c27ac3839ed2213b8399d0471b17136'
@@ -186,7 +209,7 @@ class CryptoTestCase(MyTestCase):
         pw2 = '3a1be65a234f723fe5c6969b818582e1:08e51d1c65aa74c4988d094c40cb972c'
         self.assertEqual(decryptPassword(pw2), 'test123')
         pw3 = '7a4d5e2f26978394e33715bc3e8188a3:90b2782112ad7bbc5b48bd10e5c7c096cfe4ef7d9d11272595dc5b6c7f21d98a'
-        self.assertEqual(decryptPassword(pw3, ), u'passwörd')
+        self.assertEqual(decryptPassword(pw3, ), 'passwörd')
 
         # TODO: add checks for broken paddings/encrypted values and malformed enc_data
 
@@ -246,7 +269,7 @@ class CryptoTestCase(MyTestCase):
         d = decrypt(binascii.unhexlify(c), iv)
         self.assertEqual(data, d)
 
-        s = u"Encryption Text with unicode chars: äöü"
+        s = "Encryption Text with unicode chars: äöü"
         c = encrypt(s, iv)
         d = decrypt(binascii.unhexlify(c), iv)
         self.assertEqual(s, d.decode('utf8'))
@@ -254,7 +277,7 @@ class CryptoTestCase(MyTestCase):
         # TODO: add checks for broken paddings/encrypted values and malformed enc_data
 
         # check some data generated with 2.23
-        s = u'passwörd'.encode('utf8')
+        s = 'passwörd'.encode()
         iv_hex = 'cd5245a2875007d30cc049c2e7eca0c5'
         enc_data_hex = '7ea55168952b33131077f4249cf9e52b5f2b572214ace13194c436451fe3788c'
         self.assertEqual(s, decrypt(binascii.unhexlify(enc_data_hex),
@@ -271,7 +294,7 @@ class CryptoTestCase(MyTestCase):
     def test_05_encode_decode(self):
         b_str = b'Hello World'
         self.assertEqual(to_unicode(b_str), b_str.decode('utf8'))
-        u_str = u'Hello Wörld'
+        u_str = 'Hello Wörld'
         self.assertEqual(to_unicode(u_str), u_str)
         self.assertEqual(to_bytes(b_str), b_str)
         self.assertEqual(to_bytes(u_str), u_str.encode('utf8'))
@@ -280,6 +303,186 @@ class CryptoTestCase(MyTestCase):
         keypub, keypriv = generate_keypair(rsa_keysize=4096)
         self.assertTrue(keypub.startswith("-----BEGIN RSA PUBLIC KEY-----"), keypub)
         self.assertTrue(keypriv.startswith("-----BEGIN RSA PRIVATE KEY-----"), keypriv)
+
+
+class EllipticCurveCryptoTestCase(MyTestCase):
+
+    def test_01_generate_keypair_ecc_success(self):
+        key_pair = generate_keypair_ecc("secp384r1")
+        self.assertTrue(isinstance(key_pair.public_key, ec.EllipticCurvePublicKey))
+        self.assertTrue(isinstance(key_pair.private_key, ec.EllipticCurvePrivateKey))
+
+        key_pair = generate_keypair_ecc("x25519")
+        self.assertTrue(isinstance(key_pair.public_key, X25519PublicKey))
+        self.assertTrue(isinstance(key_pair.private_key, X25519PrivateKey))
+
+        key_pair = generate_keypair_ecc("x448")
+        self.assertTrue(isinstance(key_pair.public_key, X448PublicKey))
+        self.assertTrue(isinstance(key_pair.private_key, X448PrivateKey))
+
+        key_pair = generate_keypair_ecc("ed25519")
+        self.assertTrue(isinstance(key_pair.public_key, Ed25519PublicKey))
+        self.assertTrue(isinstance(key_pair.private_key, Ed25519PrivateKey))
+
+        key_pair = generate_keypair_ecc("ed448")
+        self.assertTrue(isinstance(key_pair.public_key, Ed448PublicKey))
+        self.assertTrue(isinstance(key_pair.private_key, Ed448PrivateKey))
+
+    def test_02_generate_keypair_ecc_fail(self):
+        self.assertRaises(ParameterError, generate_keypair_ecc, "unknown")
+
+    def test_03_convert_ecc_keys_to_str_and_back(self):
+        ecc_keys = generate_keypair_ecc("secp384r1")
+        # ECC to string
+        str_keys = ecc_key_pair_to_b64url_str(ecc_keys.public_key, ecc_keys.private_key)
+        # String to ECC
+        new_ecc_keys = b64url_str_key_pair_to_ecc_obj(str_keys.public_key, str_keys.private_key)
+
+        # Sign with old private key and verify with new public key
+        message = b"Hello World"
+        signature = ecc_keys.private_key.sign(message, ec.ECDSA(hashes.SHA256()))
+        self.assertIsNone(new_ecc_keys.public_key.verify(signature, message, ec.ECDSA(hashes.SHA256())))
+
+        # Sign with new private key, verify with old public key
+        signature = new_ecc_keys.private_key.sign(message, ec.ECDSA(hashes.SHA256()))
+        self.assertIsNone(ecc_keys.public_key.verify(signature, message, ec.ECDSA(hashes.SHA256())))
+
+    def test_04_ecc_key_pair_to_b64url_str_single_key(self):
+        ecc_keys = generate_keypair_ecc("secp384r1")
+        # only public key
+        str_keys = ecc_key_pair_to_b64url_str(public_key=ecc_keys.public_key)
+        self.assertNotEqual("", str_keys.public_key)
+        self.assertEqual("", str_keys.private_key)
+        # only private key
+        str_keys = ecc_key_pair_to_b64url_str(private_key=ecc_keys.private_key)
+        self.assertNotEqual("", str_keys.private_key)
+        self.assertEqual("", str_keys.public_key)
+        # No key
+        str_keys = ecc_key_pair_to_b64url_str()
+        self.assertEqual("", str_keys.public_key)
+        self.assertEqual("", str_keys.private_key)
+
+    def test_05_b64url_str_key_pair_to_ecc_obj(self):
+        ecc_keys = generate_keypair_ecc("secp384r1")
+        str_keys = ecc_key_pair_to_b64url_str(public_key=ecc_keys.public_key, private_key=ecc_keys.private_key)
+
+        # only public key
+        ecc_keys = b64url_str_key_pair_to_ecc_obj(public_key_str=str_keys.public_key)
+        self.assertTrue(isinstance(ecc_keys.public_key, ec.EllipticCurvePublicKey))
+        self.assertIsNone(ecc_keys.private_key)
+        # only private key
+        ecc_keys = b64url_str_key_pair_to_ecc_obj(private_key_str=str_keys.private_key)
+        self.assertTrue(isinstance(ecc_keys.private_key, ec.EllipticCurvePrivateKey))
+        self.assertIsNone(ecc_keys.public_key)
+        # No key
+        ecc_keys = b64url_str_key_pair_to_ecc_obj()
+        self.assertIsNone(ecc_keys.public_key)
+        self.assertIsNone(ecc_keys.private_key)
+
+    def test_06_sign_ecc_sha256(self):
+        ecc_keys = generate_keypair_ecc("secp384r1")
+        message = b"Hello World"
+        hash_algorithm = "SHA256"
+        sign_res = sign_ecc(message, ecc_keys.private_key, hash_algorithm)
+        self.assertIsNotNone(sign_res["signature"])
+        self.assertEqual(hash_algorithm.lower(), sign_res["hash_algorithm"])
+
+    def test_07_sign_ecc_sha512(self):
+        ecc_keys = generate_keypair_ecc("secp384r1")
+        message = b"Hello World"
+        # Correct name
+        hash_algorithm = "SHA512"
+        sign_res = sign_ecc(message, ecc_keys.private_key, hash_algorithm)
+        self.assertIsNotNone(sign_res["signature"])
+        self.assertEqual(hash_algorithm.lower(), sign_res["hash_algorithm"])
+
+        # Name in lower cases
+        hash_algorithm = "sha512"
+        sign_res = sign_ecc(message, ecc_keys.private_key, hash_algorithm)
+        self.assertIsNotNone(sign_res["signature"])
+        self.assertEqual(hash_algorithm.lower(), sign_res["hash_algorithm"])
+
+        # Name capitalized
+        hash_algorithm = "Sha512"
+        sign_res = sign_ecc(message, ecc_keys.private_key, hash_algorithm)
+        self.assertIsNotNone(sign_res["signature"])
+        self.assertEqual(hash_algorithm.lower(), sign_res["hash_algorithm"])
+
+        # Invalid name
+        hash_algorithm = "invalid"
+        sign_res = sign_ecc(message, ecc_keys.private_key, hash_algorithm)
+        self.assertIsNotNone(sign_res["signature"])
+        self.assertEqual("sha256", sign_res["hash_algorithm"])
+
+    def test_08_sign_ecc_message_not_bytes(self):
+        ecc_keys = generate_keypair_ecc("secp384r1")
+        message = "Hello World"
+        sign_res = sign_ecc(message, ecc_keys.private_key, "SHA256")
+        self.assertIsNotNone(sign_res["signature"])
+
+    def test_09_verify_ecc_valid(self):
+        # Sign message
+        ecc_keys = generate_keypair_ecc("secp384r1")
+        message = b"Hello World"
+        hash_algorithm = "SHA256"
+        sign_res = sign_ecc(message, ecc_keys.private_key, hash_algorithm)
+
+        # Verify signature
+        verify_res = verify_ecc(message, sign_res["signature"], ecc_keys.public_key, hash_algorithm)
+        self.assertTrue(verify_res["valid"])
+        self.assertEqual(hash_algorithm, verify_res["hash_algorithm"].upper())
+
+    def test_10_verify_ecc_invalid(self):
+        # Sign message
+        ecc_keys = generate_keypair_ecc("secp384r1")
+        message = b"Hello World"
+        hash_algorithm = "SHA256"
+        sign_res = sign_ecc(message, ecc_keys.private_key, hash_algorithm)
+
+        # Verify signature: Wrong pub_key
+        wrong_keys = generate_keypair_ecc("secp384r1")
+        self.assertRaises(InvalidSignature, verify_ecc, message, sign_res["signature"], wrong_keys.public_key,
+                          hash_algorithm)
+
+        # Verify signature: Wrong message/signature
+        another_message = b'Top Secret!'
+        self.assertRaises(InvalidSignature, verify_ecc, another_message, sign_res["signature"], wrong_keys.public_key,
+                          hash_algorithm)
+
+        # Verify signature: Wrong hash_algorithm
+        self.assertRaises(InvalidSignature, verify_ecc, message, sign_res["signature"], ecc_keys.public_key, "SHA512")
+
+        # Verify signature: Unknown hash_algorithm (uses per default SHA256)
+        sign_res = sign_ecc(message, ecc_keys.private_key, "SHA512")
+        self.assertRaises(InvalidSignature, verify_ecc, message, sign_res["signature"], ecc_keys.public_key, "Unknown")
+
+    def test_09_ecdh_encryption_decryption(self):
+        server_keys = generate_keypair_ecc("x25519")
+        client_keys = generate_keypair_ecc("x25519")
+
+        derived_key = ecdh_key_exchange(client_keys.private_key, server_keys.public_key)
+
+        message = b"Hello World"
+        enc_params = encrypt_aes(message, derived_key)
+        decrypted_message = decrypt_aes(enc_params["cipher"], derived_key, enc_params)
+
+        self.assertEqual(message, decrypted_message)
+
+    def test_10_ecdh_encryption_decryption_serialization(self):
+        server_keys = generate_keypair_ecc("x25519")
+        client_keys = generate_keypair_ecc("x25519")
+
+        # serialize pub_key_client RAW
+        pub_key_client_str = base64.urlsafe_b64encode(client_keys.public_key.public_bytes_raw()).decode("utf-8")
+        pub_key_client = X25519PublicKey.from_public_bytes(base64.urlsafe_b64decode(pub_key_client_str))
+
+        derived_key = ecdh_key_exchange(server_keys.private_key, pub_key_client)
+
+        message = b"Hello World"
+        enc_params = encrypt_aes(message, derived_key)
+        decrypted_message = decrypt_aes(enc_params["cipher"], derived_key, enc_params)
+
+        self.assertEqual(message, decrypted_message)
 
 
 class RandomTestCase(MyTestCase):
@@ -678,7 +881,7 @@ class SignObjectTestCase(MyTestCase):
         # now test a broken signature
         data = 'short text'
         sig = so.sign(data)
-        sig_broken = sig[:-1] + '{:x}'.format((int(sig[-1], 16) + 1) % 16)
+        sig_broken = sig[:-1] + f'{(int(sig[-1], 16) + 1) % 16:x}'
         self.assertFalse(so.verify(data, sig_broken))
 
         # test with non hex string
@@ -687,12 +890,12 @@ class SignObjectTestCase(MyTestCase):
 
         # now try to verify old signatures
         # first without enabling old signatures in config
-        short_text_sig = 15197717811878792093921885389298262311612396877333963031070812155820116863657342817645537537961773450510020137791036591085713379948816070430789598146539509027948592633362217308056639775153575635684961642110792013775709164803544619582232081442445758263838942315386909453927493644845757192298617925455779136340217255670113943560463286896994555184188496806420559078552626485909484729552861477888246423469461421103010299470836507229490718177625822972845024556897040292571751452383573549412451282884349017186147757238775308192484937929135306435242403555592741059466194258607967889051881221759976135386624406095324595765010
+        short_text_sig = 15197717811878792093921885389298262311612396877333963031070812155820116863657342817645537537961773450510020137791036591085713379948816070430789598146539509027948592633362217308056639775153575635684961642110792013775709164803544619582232081442445758263838942315386909453927493644845757192298617925455779136340217255670113943560463286896994555184188496806420559078552626485909484729552861477888246423469461421103010299470836507229490718177625822972845024556897040292571751452383573549412451282884349017186147757238775308192484937929135306435242403555592741059466194258607967889051881221759976135386624406095324595765010  # noqa: E501
         data = 'short text'
         self.assertFalse(so.verify(data, short_text_sig))
 
         # now we enable the checking of old signatures
-        short_text_sig = 15197717811878792093921885389298262311612396877333963031070812155820116863657342817645537537961773450510020137791036591085713379948816070430789598146539509027948592633362217308056639775153575635684961642110792013775709164803544619582232081442445758263838942315386909453927493644845757192298617925455779136340217255670113943560463286896994555184188496806420559078552626485909484729552861477888246423469461421103010299470836507229490718177625822972845024556897040292571751452383573549412451282884349017186147757238775308192484937929135306435242403555592741059466194258607967889051881221759976135386624406095324595765010
+        short_text_sig = 15197717811878792093921885389298262311612396877333963031070812155820116863657342817645537537961773450510020137791036591085713379948816070430789598146539509027948592633362217308056639775153575635684961642110792013775709164803544619582232081442445758263838942315386909453927493644845757192298617925455779136340217255670113943560463286896994555184188496806420559078552626485909484729552861477888246423469461421103010299470836507229490718177625822972845024556897040292571751452383573549412451282884349017186147757238775308192484937929135306435242403555592741059466194258607967889051881221759976135386624406095324595765010  # noqa: E501
         data = 'short text'
         self.assertTrue(so.verify(data, short_text_sig, verify_old_sigs=True))
 
@@ -700,13 +903,137 @@ class SignObjectTestCase(MyTestCase):
         broken_short_text_sig = short_text_sig + 1
         self.assertFalse(so.verify(data, broken_short_text_sig, verify_old_sigs=True))
 
-        long_data_sig = 991763198885165486007338893972384496025563436289154190056285376683148093829644985815692167116166669178171916463844829424162591848106824431299796818231239278958776853940831433819576852350691126984617641483209392489383319296267416823194661791079316704545017249491961092046751201670544843607206698682190381208022128216306635574292359600514603728560982584561531193227312370683851459162828981766836503134221347324867936277484738573153562229478151744446530191383660477390958159856842222437156763388859923477183453362567547792824054461704970820770533637185477922709297916275611571003099205429044820469679520819043851809079
+        long_data_sig = 991763198885165486007338893972384496025563436289154190056285376683148093829644985815692167116166669178171916463844829424162591848106824431299796818231239278958776853940831433819576852350691126984617641483209392489383319296267416823194661791079316704545017249491961092046751201670544843607206698682190381208022128216306635574292359600514603728560982584561531193227312370683851459162828981766836503134221347324867936277484738573153562229478151744446530191383660477390958159856842222437156763388859923477183453362567547792824054461704970820770533637185477922709297916275611571003099205429044820469679520819043851809079  # noqa: E501
         long_data = b'\x01\x02' * 5000
         self.assertTrue(so.verify(long_data, long_data_sig, verify_old_sigs=True))
 
 
-class DefaultHashAlgoListTestCase(MyTestCase):
+class SignObjectCacheTestCase(MyTestCase):
+    """ tests that the Sign object is loaded once per key file version and then shared """
+
+    def setUp(self):
+        super().setUp()
+        self.private_key_file = current_app.config.get("PI_AUDIT_KEY_PRIVATE")
+        self.public_key_file = current_app.config.get("PI_AUDIT_KEY_PUBLIC")
+
+    def _copy_key_files(self):
+        """
+        Copy the audit keys to a temporary directory, so a test may modify them.
+
+        :return: the names of the private and the public key file
+        """
+        key_directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, key_directory)
+        private_key_file = os.path.join(key_directory, "private.pem")
+        public_key_file = os.path.join(key_directory, "public.pem")
+        shutil.copy(self.private_key_file, private_key_file)
+        shutil.copy(self.public_key_file, public_key_file)
+        return private_key_file, public_key_file
+
+    def test_00_the_same_key_files_share_one_object(self):
+        sign_object = get_sign_object(self.private_key_file, self.public_key_file)
+        self.assertIs(sign_object, get_sign_object(self.private_key_file, self.public_key_file))
+        signature = sign_object.sign("data to sign")
+        self.assertTrue(sign_object.verify("data to sign", signature))
+
+    def test_01_different_arguments_are_different_objects(self):
+        sign_object = get_sign_object(self.private_key_file, self.public_key_file)
+        # The response signature asks for the private key alone, so it gets its own object
+        # instead of evicting the one the audit log uses.
+        private_only_object = get_sign_object(self.private_key_file)
+        self.assertIsNot(sign_object, private_only_object)
+        self.assertIs(private_only_object, get_sign_object(self.private_key_file))
+        self.assertIs(sign_object, get_sign_object(self.private_key_file, self.public_key_file))
+        # Whether the private key is checked is part of the object as well
+        self.assertIsNot(sign_object, get_sign_object(self.private_key_file, self.public_key_file,
+                                                      check_private_key=False))
+
+    def test_02_a_replaced_key_file_is_loaded_again(self):
+        private_key_file, public_key_file = self._copy_key_files()
+        sign_object = get_sign_object(private_key_file, public_key_file)
+        self.assertIs(sign_object, get_sign_object(private_key_file, public_key_file))
+        old_signature = sign_object.sign("data to sign")
+
+        # Replace the keys, as an administrator would who rotates the audit keys
+        new_public_key, new_private_key = generate_keypair()
+        for key_file, key in ((private_key_file, new_private_key), (public_key_file, new_public_key)):
+            with open(key_file, "w") as key_file_handle:
+                key_file_handle.write(key)
+
+        new_sign_object = get_sign_object(private_key_file, public_key_file)
+        self.assertIsNot(sign_object, new_sign_object)
+        # The new object signs and verifies with the new keys, and no longer accepts a
+        # signature the old key created
+        self.assertTrue(new_sign_object.verify("data to sign", new_sign_object.sign("data to sign")))
+        self.assertFalse(new_sign_object.verify("data to sign", old_signature))
+
+    def test_02a_a_key_file_of_the_same_size_and_age_is_not_served_from_the_cache(self):
+        # A key rotated with cp -p, rsync -a or a restored backup keeps its modification time,
+        # and two RSA keys of the same size usually have the same file size. So neither of
+        # those may decide whether the cached key is still the one that is configured. Here the
+        # replacement is not a usable key, which makes the point without a second key: what
+        # must not happen is that the cached object is handed out.
+        private_key_file, public_key_file = self._copy_key_files()
+        self.assertIsNotNone(get_sign_object(private_key_file, public_key_file))
+        file_stat = os.stat(private_key_file)
+
+        with open(private_key_file, "rb") as private_key_handle:
+            private_key = bytearray(private_key_handle.read())
+        # Change the key material in place, so the file keeps its length, and give the file
+        # back the modification time it had
+        private_key[len(private_key) // 2] ^= 0xFF
+        with open(private_key_file, "wb") as private_key_handle:
+            private_key_handle.write(private_key)
+        os.utime(private_key_file, ns=(file_stat.st_atime_ns, file_stat.st_mtime_ns))
+
+        stat_after = os.stat(private_key_file)
+        self.assertEqual(file_stat.st_size, stat_after.st_size)
+        self.assertEqual(file_stat.st_mtime_ns, stat_after.st_mtime_ns)
+        with self.assertRaises(Exception):
+            get_sign_object(private_key_file, public_key_file)
+
+    def test_03_a_missing_key_file_is_not_cached(self):
+        private_key_file, public_key_file = self._copy_key_files()
+        sign_object = get_sign_object(private_key_file, public_key_file)
+        # The same key files have to fail and then work again, otherwise this says nothing
+        # about whether the failure was cached
+        os.unlink(private_key_file)
+        with self.assertRaises(OSError):
+            get_sign_object(private_key_file, public_key_file)
+        shutil.copy(self.private_key_file, private_key_file)
+        new_sign_object = get_sign_object(private_key_file, public_key_file)
+        self.assertTrue(new_sign_object.verify("data to sign", new_sign_object.sign("data to sign")))
+        # The key files hold what they held before, so the object that was cached for them
+        # is still the right one
+        self.assertIs(sign_object, new_sign_object)
+
+    def test_04_an_unconfigured_private_key_raises(self):
+        # An unset PI_AUDIT_KEY_PRIVATE has to be an error. A Sign object without a private key
+        # signs everything with an empty signature instead.
+        with self.assertRaises(TypeError):
+            get_sign_object(None, self.public_key_file)
+
+    def test_05_a_broken_key_file_does_not_keep_serving_the_old_object(self):
+        private_key_file, public_key_file = self._copy_key_files()
+        self.assertIsNotNone(get_sign_object(private_key_file, public_key_file))
+        with open(private_key_file, "wb") as private_key_handle:
+            private_key_handle.write(b"This is not a private key")
+        for _ in range(2):
+            with self.assertRaises(Exception):
+                get_sign_object(private_key_file, public_key_file)
+        # The entry the broken key file superseded is gone, rather than being served on
+        with self.assertRaises(KeyError):
+            get_app_local_store()["sign_objects"][(private_key_file, public_key_file, True)]
+
+
+class DefaultHashAlgoListTestCase(OverrideConfigTestCase):
     """Check if the default hash algorithm list is used."""
+
+    class Config(TestingConfig):
+        # TestingConfig weakens the argon2 parameters so the suite is not dominated by the key
+        # derivation function. This class asserts the parameters a deployment actually gets, so it
+        # drops that override and takes the defaults from privacyidea.lib.crypto.
+        PI_HASH_ALGO_PARAMS = {}
 
     def test_01_default_hash_algorithm_list(self):
         password = "password"
@@ -780,3 +1107,122 @@ class CustomHashAlgoListTestCase(OverrideConfigTestCase):
         self.assertRaises(passlib.exc.UnknownHashError, verify_pass_hash, password, 'password')
         # Checks if a faulty hash is failing.
         self.assertFalse(verify_pass_hash(password, argon2_fail_hash))
+
+
+class BuildPassContextTestCase(unittest.TestCase):
+    """
+    passlib accepts a PI_HASH_ALGO_LIST or PI_HASH_ALGO_PARAMS it can not hash with: a missing
+    backend only fails at the first hash or verification, an overflowing value at the first hash,
+    and a value out of range is clipped with a warning. build_pass_context() runs at startup and
+    must reject all of them.
+    """
+
+    @staticmethod
+    def _app(**config):
+        app = Flask(__name__)
+        app.config.update(config)
+        return app
+
+    def _build(self, **config):
+        with self._app(**config).app_context():
+            return build_pass_context()
+
+    def test_01_unknown_scheme(self):
+        with self.assertRaisesRegex(RuntimeError, "PI_HASH_ALGO_LIST.*nosuchscheme"):
+            self._build(PI_HASH_ALGO_LIST=["argon2", "nosuchscheme"])
+
+    def test_02_empty_list(self):
+        with self.assertRaisesRegex(RuntimeError, "PI_HASH_ALGO_LIST.*at least one hash algorithm"):
+            self._build(PI_HASH_ALGO_LIST=[])
+
+    def test_03_missing_backend(self):
+        with mock.patch.object(argon2, "get_backend",
+                               side_effect=MissingBackendError("argon2: no backends available")):
+            with self.assertRaisesRegex(RuntimeError, "PI_HASH_ALGO_LIST.*no backends available"):
+                self._build(PI_HASH_ALGO_LIST=["pbkdf2_sha512", "argon2"])
+
+    def test_04_failing_backend(self):
+        with mock.patch.object(argon2, "get_backend",
+                               side_effect=ValueError("password cannot be longer than 72 bytes")):
+            with self.assertRaisesRegex(RuntimeError, "PI_HASH_ALGO_LIST.*argon2: password cannot"):
+                self._build(PI_HASH_ALGO_LIST=["pbkdf2_sha512", "argon2"])
+
+    def test_05_unknown_parameter(self):
+        with self.assertRaisesRegex(RuntimeError, "PI_HASH_ALGO_PARAMS.*nosuchparam"):
+            self._build(PI_HASH_ALGO_PARAMS={"argon2__nosuchparam": 1})
+
+    def test_06_unusable_parameter_value(self):
+        with self.assertRaisesRegex(RuntimeError, "PI_HASH_ALGO_PARAMS.*'many'"):
+            self._build(PI_HASH_ALGO_PARAMS={"argon2__rounds": "many"})
+
+    def test_07_parameters_not_a_mapping(self):
+        for hash_algo_params, reason in [("argon2__rounds=5", "dictionary update sequence"),
+                                         (5, "'int' object is not iterable")]:
+            with self.subTest(hash_algo_params=hash_algo_params):
+                with self.assertRaisesRegex(RuntimeError, f"PI_HASH_ALGO_PARAMS.*{reason}"):
+                    self._build(PI_HASH_ALGO_PARAMS=hash_algo_params)
+
+    def test_08_clipped_parameter_value(self):
+        with self.assertRaisesRegex(RuntimeError, "PI_HASH_ALGO_PARAMS.*too low"):
+            self._build(PI_HASH_ALGO_LIST=["pbkdf2_sha512"], PI_HASH_ALGO_PARAMS={"pbkdf2_sha512__rounds": 0})
+
+    def test_09_deprecated_parameter(self):
+        with self.assertRaisesRegex(RuntimeError, "PI_HASH_ALGO_PARAMS.*vary_rounds"):
+            self._build(PI_HASH_ALGO_LIST=["pbkdf2_sha512"], PI_HASH_ALGO_PARAMS={"pbkdf2_sha512__vary_rounds": 0.1})
+
+    def test_10_parameter_value_failing_at_hash(self):
+        with mock.patch.object(CryptContext, "hash", side_effect=OverflowError("iteration value is too great.")):
+            with self.assertRaisesRegex(RuntimeError, "PI_HASH_ALGO_PARAMS.*too great"):
+                self._build(PI_HASH_ALGO_LIST=["pbkdf2_sha512"])
+
+    def test_11_parameter_for_unlisted_scheme(self):
+        for hash_algo_params in [{"argon2id__rounds": 5}, {"bcrypt__rounds": 5}, {"admin__argon2id__rounds": 5},
+                                 {"argon2id.rounds": 5}]:
+            with self.subTest(hash_algo_params=hash_algo_params):
+                with self.assertRaisesRegex(RuntimeError, f"PI_HASH_ALGO_PARAMS.*"
+                                                          f"{re.escape(next(iter(hash_algo_params)))}"):
+                    self._build(PI_HASH_ALGO_PARAMS=hash_algo_params)
+
+    def test_12_default_parameter_for_unlisted_scheme(self):
+        # DEFAULT_HASH_ALGO_PARAMS holds argon2 parameters, which must not block a list without argon2.
+        pass_ctx = self._build(PI_HASH_ALGO_LIST=["pbkdf2_sha512"], PI_HASH_ALGO_PARAMS={"pbkdf2_sha512__rounds": 1000})
+        self.assertEqual(("pbkdf2_sha512",), pass_ctx.schemes())
+
+    def test_13_valid_config_hashes_with_it_and_builds_once(self):
+        app = self._app(PI_HASH_ALGO_LIST=["pbkdf2_sha512", "argon2"],
+                        PI_HASH_ALGO_PARAMS={"pbkdf2_sha512__rounds": 1000})
+        with app.app_context():
+            build_pass_context()
+            with mock.patch("privacyidea.lib.crypto.CryptContext") as crypt_context:
+                password_hash = pass_hash("secret")
+                self.assertTrue(verify_pass_hash("secret", password_hash))
+            crypt_context.assert_not_called()
+        self.assertTrue(password_hash.startswith("$pbkdf2-sha512$1000$"), password_hash)
+
+    def test_14_parameter_pairs_for_unlisted_scheme(self):
+        # A JSON list of key-value pairs, as the Docker environment can deliver it, is checked
+        # like the mapping it spells out.
+        with self.assertRaisesRegex(RuntimeError, "PI_HASH_ALGO_PARAMS.*argon2id__rounds names a hash algorithm"):
+            self._build(PI_HASH_ALGO_PARAMS=[["argon2id__rounds", 5]])
+
+    def test_15_bcrypt_in_a_fresh_interpreter(self):
+        # passlib loads the bcrypt backend on first use, so bcrypt in PI_HASH_ALGO_LIST must work with only the
+        # modules privacyidea.lib.crypto imports - no resolver module, which a test process has usually loaded.
+        # A password longer than bcrypt's 72 bytes is truncated as bcrypt did before 5.0.0, not rejected.
+        script = ("import sys\n"
+                  "from flask import Flask\n"
+                  "from privacyidea.lib.crypto import build_pass_context\n"
+                  "app = Flask(__name__)\n"
+                  "app.config['PI_HASH_ALGO_LIST'] = ['bcrypt', 'argon2']\n"
+                  "with app.app_context():\n"
+                  "    pass_ctx = build_pass_context()\n"
+                  "password_hash = pass_ctx.hash('secret')\n"
+                  "assert password_hash.startswith('$2b$'), password_hash\n"
+                  "assert pass_ctx.verify('secret', password_hash)\n"
+                  "assert not pass_ctx.verify('wrong', password_hash)\n"
+                  "long_password_hash = pass_ctx.hash('x' * 100)\n"
+                  "assert pass_ctx.verify('x' * 72 + 'y', long_password_hash)\n"
+                  "assert not any(module.startswith('privacyidea.lib.resolvers') for module in sys.modules)\n")
+        repository_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        result = subprocess.run([sys.executable, "-c", script], cwd=repository_root, capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)

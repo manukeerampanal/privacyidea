@@ -1,0 +1,269 @@
+import base64
+import json
+from contextlib import contextmanager
+from unittest import mock
+from .pkcs11mock import PKCS11Mock
+from privacyidea.lib.policy import SCOPE, PolicyAction, delete_policy, set_policy
+from privacyidea.lib.resolver import delete_resolver, save_resolver
+from privacyidea.lib.security.aeshsm import AESHardwareSecurityModule
+from tests import ldap3mock
+from tests.base import MyApiTestCase
+from tests.test_api_validate import LDAPDirectory
+
+
+@contextmanager
+def setup_policy(name: str, *args, **kwargs):
+    """Create a policy as specified, and delete it after the block is done."""
+    r = set_policy(name, *args, **kwargs)
+    assert r > 0, f"Failed creating policy {name!r}."
+    try:
+        yield
+    finally:
+        delete_policy(name)
+
+@contextmanager
+def setup_resolver(name: str, **kwargs):
+    kwargs["resolver"] = name
+    r = save_resolver(kwargs)
+    assert r > 0, f"Failed creating resolver {name!r}."
+    try:
+        yield
+    finally:
+        delete_resolver(name)
+
+
+class APIHealthcheckTestCase(MyApiTestCase):
+    def test_livez(self):
+        with self.app.test_request_context('/healthz/livez', method='GET'):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, f"Expected status code 200, got {res.status_code}")
+            result = res.json.get("result")
+            self.assertIsNotNone(result, "Expected 'result' in response JSON, but got None")
+            self.assertIn("value", result, f"Expected 'value' key in result, got {result}")
+            self.assertEqual(result.get("value").get("status"), "OK",
+                             f"Expected 'OK' as value, got {result.get('value')}")
+
+    def test_startupz(self):
+        def check_status(expected_status_code, expected_ready_status, app_ready_value):
+            self.app.config['APP_READY'] = app_ready_value
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, expected_status_code,
+                             f"Expected status code {expected_status_code}, got {res.status_code}")
+            result = res.json.get("result")
+            self.assertIsNotNone(result, "Expected JSON result, got None")
+            self.assertIn("value", result, f"Expected 'value' in result, got {result}")
+            self.assertEqual(result.get("value").get("status"), expected_ready_status,
+                             f"Expected status '{expected_ready_status}', got {result.get('value').get('status')}")
+
+        with self.app.test_request_context('/healthz/startupz', method='GET'):
+            check_status(503, "not started", False)
+            check_status(200, "started", True)
+
+    def test_readyz_and_healthz(self):
+        def check_status(expected_status_code, expected_ready_status, app_ready_value):
+            with PKCS11Mock():
+                hsm = AESHardwareSecurityModule({
+                    "module": "testmodule",
+                    "password": "test123!"
+                })
+                self.assertIsNotNone(hsm)
+                self.app.config['APP_READY'] = app_ready_value
+                res = self.app.full_dispatch_request()
+                self.assertEqual(res.status_code, expected_status_code,
+                                 f"Expected status code {expected_status_code}, got {res.status_code}")
+                result = res.json.get("result")
+                self.assertIsNotNone(result, "Expected JSON result, got None")
+                self.assertIn("value", result, f"Expected 'value' in result, got {result}")
+                self.assertEqual(result.get("value").get("status"), expected_ready_status,
+                                 f"Expected status '{expected_ready_status}', got {result.get('value').get('status')}")
+
+        with self.app.test_request_context('/healthz/readyz', method='GET'):
+            check_status(503, "not ready", False)
+            check_status(200, "ready", True)
+        with self.app.test_request_context('/healthz/', method='GET'):
+            check_status(503, "not ready", False)
+            check_status(200, "ready", True)
+
+    def test_readyz_and_healthz_hsm_not_ready(self):
+        # get_hsm() must not raise for a not-ready HSM; readyz reports it as 503 instead.
+        not_ready_hsm = mock.MagicMock(is_ready=False)
+        saved_app_ready = self.app.config.get('APP_READY')
+        self.app.config['APP_READY'] = True
+        try:
+            with mock.patch('privacyidea.lib.crypto.init_hsm', return_value=not_ready_hsm):
+                for url in ('/healthz/readyz', '/healthz/'):
+                    with self.app.test_request_context(url, method='GET'):
+                        res = self.app.full_dispatch_request()
+                        self.assertEqual(res.status_code, 503, res.data)
+                        result = res.json.get('result')
+                        self.assertIsNotNone(result, res.data)
+                        self.assertEqual({'status': 'not ready', 'hsm': 'fail'},
+                                         result.get('value'))
+        finally:
+            self.app.config['APP_READY'] = saved_app_ready
+
+    @ldap3mock.activate
+    def test_resolversz(self):
+        def check_resolvers(expected_status_code: int,
+                            expected_status: str | None = None,
+                            ldap_expected_status: str | None = None,
+                            sql_expected_status: str | None = None,
+                            auth_token: str | None = None) -> None:
+            headers = {'Authorization': auth_token} if auth_token is not None else {}
+            with self.app.test_request_context('/healthz/resolversz', method='GET', headers=headers):
+                res = self.app.full_dispatch_request()
+                assert res.status_code == expected_status_code, (f"Expected status code {expected_status_code}, "
+                                                                 f"got {res.status_code}")
+
+                if expected_status is None:
+                    return
+
+                result = res.json.get("result")
+                assert result is not None, "Expected JSON result, got None"
+                assert result.get("value").get("status") == expected_status, (
+                    f"Expected '{expected_status}' status, "
+                    f"got {result.get('value').get('status')}"
+                )
+
+                result_value = result.get("value")
+                ldap_resolvers = result_value.get("ldapresolver")
+                sql_resolvers = result_value.get("sqlresolver")
+
+                if ldap_expected_status is None:
+                    assert 'ldapresolver' not in result_value, ("Expected missing 'ldapresolver' in result, "
+                                                                "but is present")
+                else:
+                    assert ldap_resolvers is not None, "Expected 'ldapresolver' in result, but got None"
+                    assert all(status == ldap_expected_status for status in ldap_resolvers.values()), (
+                        f"At least one LDAP resolver does not have '{ldap_expected_status}' status."
+                    )
+
+                if sql_expected_status is None:
+                    assert 'sqlresolver' not in result_value, "Expected missing 'sqlresolver' in result, but is present"
+                else:
+                    assert sql_resolvers is not None, "Expected 'sqlresolver' in result, but got None"
+                    assert all(status == sql_expected_status for status in sql_resolvers.values()), (
+                        f"At least one SQL resolver does not have '{sql_expected_status}' status."
+                    )
+
+        @contextmanager
+        def setup_test_resolvers():
+            ldap3mock.setLDAPDirectory(LDAPDirectory)
+            ldapr = setup_resolver("test_ldapresolver", type="ldapresolver",
+                LDAPURI="ldap://localhost", LDAPBASE="o=test",
+                BINDDN="cn=manager,ou=example,o=test", BINDPW="ldaptest",
+                LOGINNAMEATTRIBUTE="cn", LDAPSEARCHFILTER="(cn=*)",
+                MULTIVALUEATTRIBUTES='["groups"]', UIDTYPE="DN",
+                USERINFO=json.dumps({
+                    "username": "cn",
+                    "phone": "telephoneNumber",
+                    "mobile": "mobile",
+                    "email": "mail",
+                    "surname": "sn",
+                    "groups": "memberOf",
+                    "givenname": "givenName",
+                }),
+            )
+            sqlr = setup_resolver("test_sqlresolver", type="sqlresolver",
+                Driver="sqlite", Server="/tests/testdata/",
+                Database="testuser.sqlite", Table="users",
+                Encoding="utf8", Editable=True,
+                Map=json.dumps({
+                    "username": "username",
+                    "userid": "id",
+                    "email": "email",
+                    "surname": "name",
+                    "givenname": "givenname",
+                    "password": "password",
+                    "phone": "phone",
+                    "mobile": "mobile",
+                }),
+            )
+            with ldapr, sqlr:
+                yield
+
+        # /healthz/resolversz stays anonymous so orchestrators can probe it, but it
+        # returns only the overall status to anonymous callers — the per-resolver
+        # names are revealed solely to an authenticated admin.
+        check_resolvers(200, "OK")  # anonymous: status only, no resolver names
+        check_resolvers(200, "OK", ldap_expected_status="fail", sql_expected_status="fail", auth_token=self.at)
+        with setup_test_resolvers():
+            check_resolvers(200, "OK")  # anonymous: still status only
+            check_resolvers(200, "OK", ldap_expected_status="OK", sql_expected_status="OK", auth_token=self.at)
+
+        # With the require_auth_for_resolver_details policy set, the names stay
+        # admin-only as always, but a *present* but invalid token is rejected with
+        # 401 (legacy behavior) — while a header-less probe is still served the
+        # status anonymously.
+        with setup_policy("auth_for_resolvers", scope=SCOPE.AUTHZ,
+                          action=f"{PolicyAction.REQUIRE_AUTH_FOR_RESOLVER_DETAILS}=true"):
+            check_resolvers(200, "OK")  # anonymous (no header): status only
+            check_resolvers(200, "OK", ldap_expected_status="fail", sql_expected_status="fail", auth_token=self.at)
+            check_resolvers(401, auth_token="")  # present but invalid token -> rejected
+            with setup_test_resolvers():
+                check_resolvers(200, "OK")  # anonymous (no header): status only
+                check_resolvers(200, "OK", ldap_expected_status="OK", sql_expected_status="OK", auth_token=self.at)
+                check_resolvers(401, auth_token="")  # present but invalid token -> rejected
+
+    def test_resolversz_without_before_request_context(self):
+        # /healthz has no before_request hook, so resolversz must build the policy
+        # context (g.policy_object, g.client_ip) it needs to evaluate the
+        # require_auth_for_resolver_details policy by itself. The test base keeps a
+        # shared app context across requests, so leftovers from earlier requests
+        # (e.g. /auth) pre-seed g.audit_object and friends and would mask missing
+        # setup. We therefore clear every request-scoped field a prior request might
+        # have left behind to mirror a truly fresh request, and restore them in a
+        # finally so the deletions do not leak into later tests sharing the context.
+        from flask import g
+        cleared_attrs = ("client_ip", "policy_object", "policies", "audit_object",
+                         "request_headers", "request_data", "user_agent", "logged_in_user")
+        with setup_policy("auth_for_resolvers", scope=SCOPE.AUTHZ,
+                          action=f"{PolicyAction.REQUIRE_AUTH_FOR_RESOLVER_DETAILS}=true"):
+            with self.app.test_request_context('/healthz/resolversz', method='GET'):
+                saved = {attr: getattr(g, attr) for attr in cleared_attrs if hasattr(g, attr)}
+                for attr in cleared_attrs:
+                    if hasattr(g, attr):
+                        delattr(g, attr)
+                try:
+                    res = self.app.full_dispatch_request()
+                finally:
+                    for attr, value in saved.items():
+                        setattr(g, attr, value)
+                self.assertEqual(res.status_code, 200, res.data)
+                value = res.json["result"]["value"]
+                self.assertIn("status", value)
+                # Anonymous probe (no Authorization header) with the policy on must
+                # not disclose per-resolver names.
+                self.assertNotIn("ldapresolver", value)
+                self.assertNotIn("sqlresolver", value)
+
+    def test_resolversz_returns_503_when_config_unavailable(self):
+        # Building the policy context reads config/policies from the DB. If that
+        # fails (e.g. DB outage), resolversz must degrade to its documented 503
+        # status response, not raise an unhandled exception that becomes a 500.
+        from unittest.mock import patch
+        with patch("privacyidea.api.healthcheck.get_from_config",
+                   side_effect=Exception("DB down")):
+            with self.app.test_request_context('/healthz/resolversz', method='GET'):
+                res = self.app.full_dispatch_request()
+                self.assertEqual(503, res.status_code, res.data)
+                self.assertEqual("error", res.json["result"]["value"]["status"])
+
+    def test_resolversz_rejects_crafted_jwt_alg(self):
+        # A token whose header alg is a trusted-JWT algorithm (e.g. RS256) but matches no
+        # PI_TRUSTED_JWT entry decodes against HS256 and would raise jwt.InvalidAlgorithmError.
+        # The endpoint must treat such an invalid token as anonymous (200, status only),
+        # never let the exception escape as an HTTP 500.
+        header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=")
+        payload = base64.urlsafe_b64encode(b'{"role":"admin","username":"x"}').rstrip(b"=")
+        signature = base64.urlsafe_b64encode(b"sig").rstrip(b"=")
+        crafted_token = b".".join([header, payload, signature]).decode()
+        with self.app.test_request_context('/healthz/resolversz', method='GET',
+                                           headers={'Authorization': crafted_token}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res.data)
+            value = res.json["result"]["value"]
+            self.assertIn("status", value)
+            # An invalid token is anonymous, so the per-resolver names must not be disclosed.
+            self.assertNotIn("ldapresolver", value)
+            self.assertNotIn("sqlresolver", value)

@@ -1,0 +1,41 @@
+<!--
+ (c) NetKnights GmbH 2025,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+@for (machine of machineData(); track machine.id) {
+  <app-details-card
+    class="machine-panel"
+    title="Offline Parameter"
+    i18n-title="@@token.offlineParameter">
+    <div class="machine-panel-row">
+      <dl class="machine-grid">
+        @for (entry of visibleEntries(machine); track entry[0]) {
+          <dt class="machine-key">{{ entry[0] }}</dt>
+          <dd class="machine-value">{{ entry[1] }}</dd>
+        }
+      </dl>
+      <button
+        mat-icon-button
+        class="machine-delete-button"
+        (click)="unassignMachine(machine.id, machine.type)"
+        aria-label="Delete Offline Parameter"
+        i18n-aria-label="@@token.deleteOfflineParameter">
+        <mat-icon>delete_outlined</mat-icon>
+      </button>
+    </div>
+  </app-details-card>
+}

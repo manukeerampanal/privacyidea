@@ -1,0 +1,322 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div class="smtp-page-layout">
+  <div
+    #scrollContainer
+    class="smtp-page-container">
+    @if (isEditMode()) {
+      <h3
+        class="margin-8"
+        i18n="@@smtpServer.editSmtpServer"
+        >Edit SMTP Server</h3
+      >
+    } @else {
+      <h3
+        class="margin-8"
+        i18n="@@common.createSmtpServer"
+        >Create SMTP Server</h3
+      >
+    }
+
+    <div
+      class="sticky-header"
+      [appStickyHeader]="scrollContainer">
+      <div class="sticky-controls ali-center">
+        @if (isEditMode() && authService.actionAllowed("smtpserver_write")) {
+          <button
+            (click)="deleteServer()"
+            class="action-button-delete-secondary button-width-s"
+            mat-stroked-button>
+            <mat-icon>delete</mat-icon>
+            <span i18n="@@common.delete">Delete</span>
+          </button>
+        }
+        <button
+          (click)="onCancel()"
+          class="action-button-secondary button-width-s"
+          mat-stroked-button>
+          <span i18n="@@common.cancel">Cancel</span>
+        </button>
+        <button
+          (click)="save()"
+          [disabled]="!smtpForm().valid()"
+          class="action-button-primary button-width-s"
+          mat-stroked-button>
+          <mat-icon>save</mat-icon>
+          <span i18n="@@common.save">Save</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="smtp-dialog-content">
+      <div class="smtp-form">
+        <mat-form-field
+          appearance="fill"
+          class="input-width-l margin-bottom-32">
+          <mat-label i18n="@@common.identifier">Identifier</mat-label>
+          <app-clearable-input
+            (clearButtonClick)="smtpModel.update(m => ({...m, identifier: ''}))"
+            [showClearButton]="!isEditMode() && !!smtpModel().identifier">
+            <input
+              [formField]="smtpForm.identifier"
+              matInput
+              placeholder="mySmtpServer" />
+          </app-clearable-input>
+          <mat-hint i18n="@@smtpServer.uniqueIdentifying"
+            >The unique identifying name of the SMTP server definition.</mat-hint
+          >
+          @if (smtpForm.identifier().errors().some(e => e.kind === 'required')) {
+            <mat-error i18n="@@common.identifierRequired">Identifier is <strong>required</strong></mat-error>
+          }
+          @if (smtpForm.identifier().errors().some(e => e.kind === 'pattern')) {
+            <mat-error i18n="@@common.identifierContains"
+              >Identifier contains <strong>invalid characters</strong>. Only alphanumeric characters, dots, underscores
+              and hyphens are allowed.</mat-error
+            >
+          }
+          @if (smtpForm.identifier().errors().some(e => e.kind === 'reservedName')) {
+            <mat-error i18n="@@common.cannotBeNamed">Cannot be named "{{ smtpForm.identifier().value() }}".</mat-error>
+          }
+        </mat-form-field>
+
+        <div class="flex-row gap-16 margin-bottom-16">
+          <mat-form-field
+            appearance="fill"
+            class="input-width-l">
+            <mat-label i18n="@@common.ipFqdn">IP or FQDN</mat-label>
+            <app-clearable-input
+              (clearButtonClick)="smtpModel.update(m => ({...m, server: ''}))"
+              [showClearButton]="!!smtpModel().server">
+              <input
+                [formField]="smtpForm.server"
+                matInput
+                placeholder="smtp://mail.example.com" />
+            </app-clearable-input>
+            @if (smtpForm.server().errors().some(e => e.kind === 'required')) {
+              <mat-error i18n="@@common.serverRequired">Server is <strong>required</strong></mat-error>
+            }
+          </mat-form-field>
+
+          <mat-form-field
+            appearance="fill"
+            class="input-width-s">
+            <mat-label i18n="@@common.port">Port</mat-label>
+            <input
+              [formField]="smtpForm.port"
+              matInput
+              placeholder="25"
+              type="number" />
+          </mat-form-field>
+        </div>
+
+        <div class="flex-row gap-16 margin-bottom-16">
+          <mat-form-field
+            appearance="fill"
+            class="input-width-l">
+            <mat-label i18n="@@smtpServer.senderEmail">Sender Email</mat-label>
+            <app-clearable-input
+              (clearButtonClick)="smtpModel.update(m => ({...m, sender: ''}))"
+              [showClearButton]="!!smtpModel().sender">
+              <input
+                [formField]="smtpForm.sender"
+                matInput
+                placeholder="privacyidea@example.com" />
+            </app-clearable-input>
+            @if (smtpForm.sender().errors().some(e => e.kind === 'required')) {
+              <mat-error i18n="@@smtpServer.senderEmailRequired">Sender email is <strong>required</strong></mat-error>
+            }
+            @if (smtpForm.sender().errors().some(e => e.kind === 'email')) {
+              <mat-error i18n="@@smtpServer.invalidEmailFormat">Invalid email format</mat-error>
+            }
+          </mat-form-field>
+
+          <mat-form-field
+            appearance="fill"
+            class="input-width-s">
+            <mat-label i18n="@@common.timeout">Timeout</mat-label>
+            <input
+              [formField]="smtpForm.timeout"
+              matInput
+              placeholder="10"
+              type="number" />
+          </mat-form-field>
+        </div>
+
+        <div class="flex-row gap-16">
+          <mat-form-field
+            appearance="fill"
+            class="input-width-l margin-bottom-16">
+            <mat-label i18n="@@common.username">Username</mat-label>
+            <app-clearable-input
+              (clearButtonClick)="smtpModel.update(m => ({...m, username: ''}))"
+              [showClearButton]="!!smtpModel().username">
+              <input
+                [formField]="smtpForm.username"
+                matInput
+                placeholder="user@example.com" />
+            </app-clearable-input>
+            <mat-hint i18n="@@smtpServer.ifSmtpServerRequires">If the SMTP server requires authentication.</mat-hint>
+          </mat-form-field>
+
+          <mat-form-field
+            appearance="fill"
+            class="input-width-l margin-bottom-16">
+            <mat-label i18n="@@common.password">Password</mat-label>
+            <app-clearable-input
+              (clearButtonClick)="smtpModel.update(m => ({...m, password: ''}))"
+              [showClearButton]="!!smtpModel().password">
+              <input
+                [formField]="smtpForm.password"
+                matInput
+                placeholder="topsecret"
+                type="password" />
+            </app-clearable-input>
+          </mat-form-field>
+        </div>
+
+        <mat-form-field
+          appearance="fill"
+          class="input-width-xl">
+          <mat-label i18n="@@common.description">Description</mat-label>
+          <app-clearable-input
+            (clearButtonClick)="smtpModel.update(m => ({...m, description: ''}))"
+            [showClearButton]="!!smtpModel().description">
+            <textarea
+              [formField]="smtpForm.description"
+              matInput
+              placeholder="some wise words"
+              rows="3"></textarea>
+          </app-clearable-input>
+        </mat-form-field>
+
+        @if (showTLS()) {
+          <div class="checkbox-group">
+            <mat-checkbox
+              [checked]="smtpModel().tls"
+              (change)="smtpModel.update(m => ({...m, tls: $event.checked}))"
+              i18n="@@smtpServer.useStarttls"
+              >Use StartTLS</mat-checkbox
+            >
+          </div>
+        }
+
+        <mat-divider />
+
+        <h3 i18n="@@smtpServer.sMime">S/MIME</h3>
+
+        <div class="flex-column">
+          <input
+            class="hidden-input"
+            type="text" />
+          <input
+            class="hidden-input"
+            type="password" />
+          <div class="flex-row gap-16">
+            <mat-form-field
+              appearance="fill"
+              class="input-width-l">
+              <mat-label i18n="@@smtpServer.certificate">Certificate</mat-label>
+              <app-clearable-input
+                (clearButtonClick)="smtpModel.update(m => ({...m, certificate: ''}))"
+                [showClearButton]="!!smtpModel().certificate">
+                <input
+                  [formField]="smtpForm.certificate"
+                  i18n-placeholder="@@smtpServer.pathCertificate"
+                  matInput
+                  placeholder="The path to the certificate file" />
+              </app-clearable-input>
+            </mat-form-field>
+          </div>
+
+          <div class="checkbox-group">
+            <mat-checkbox
+              [checked]="smtpModel().smime"
+              (change)="smtpModel.update(m => ({...m, smime: $event.checked}))"
+              i18n="@@smtpServer.sMimeSigning"
+              >S/MIME signing</mat-checkbox
+            >
+            <mat-checkbox
+              [checked]="smtpModel().dont_send_on_error"
+              (change)="smtpModel.update(m => ({...m, dont_send_on_error: $event.checked}))"
+              i18n="@@smtpServer.donTSendSigning"
+              >Don't send on signing error</mat-checkbox
+            >
+          </div>
+
+          <div class="flex-row gap-16">
+            <mat-form-field
+              appearance="fill"
+              class="input-width-l">
+              <mat-label i18n="@@smtpServer.privateKey">Private Key</mat-label>
+              <app-clearable-input
+                (clearButtonClick)="smtpModel.update(m => ({...m, private_key: ''}))"
+                [showClearButton]="!!smtpModel().private_key">
+                <input
+                  [formField]="smtpForm.private_key"
+                  i18n-placeholder="@@smtpServer.pathPrivateKey"
+                  matInput
+                  placeholder="The path to the private key file" />
+              </app-clearable-input>
+            </mat-form-field>
+
+            <mat-form-field
+              appearance="fill"
+              class="input-width-l">
+              <mat-label i18n="@@common.passwordPrivate">Password for the Private Key</mat-label>
+              <app-clearable-input
+                (clearButtonClick)="smtpModel.update(m => ({...m, private_key_password: ''}))"
+                [showClearButton]="!!smtpModel().private_key_password">
+                <input
+                  [formField]="smtpForm.private_key_password"
+                  matInput
+                  placeholder="topsecret"
+                  type="password" />
+              </app-clearable-input>
+            </mat-form-field>
+          </div>
+        </div>
+
+        <mat-divider />
+
+        <mat-form-field
+          appearance="fill"
+          class="input-width-l margin-top-16">
+          <mat-label i18n="@@smtpServer.recipientTesting">Recipient for Testing</mat-label>
+          <app-clearable-input
+            (clearButtonClick)="smtpModel.update(m => ({...m, recipient: ''}))"
+            [showClearButton]="!!smtpModel().recipient">
+            <input
+              [formField]="smtpForm.recipient"
+              matInput />
+          </app-clearable-input>
+          <button
+            (click)="test()"
+            [disabled]="isTesting()"
+            class="margin-right-16"
+            i18n-matTooltip="@@smtpServer.sendTestEmail"
+            mat-icon-button
+            matSuffix
+            matTooltip="Send Test Email">
+            <mat-icon>send</mat-icon>
+          </button>
+        </mat-form-field>
+      </div>
+    </div>
+  </div>
+</div>

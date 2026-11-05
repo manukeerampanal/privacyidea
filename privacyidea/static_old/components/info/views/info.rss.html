@@ -1,0 +1,32 @@
+<!--
+(c) NetKnights GmbH 2024,  https://netknights.it
+This code is free software; you can redistribute it and/or
+modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+as published by the Free Software Foundation; either
+version 3 of the License, or any later version.
+This code is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+You should have received a copy of the GNU Affero General Public
+License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+SPDX-FileCopyrightText: 2024 Cornelius Kölbel <cornelius.koelbel@netknights.it>
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
+<div class="well">
+    <p class="text-muted small" translate>
+        Viewing the RSS feeds for the last {{ rss_age }} days.
+    </p>
+    <div ng-repeat="(source, feed) in rss">
+        <h3>{{ source }}</h3>
+        <div class="panel panel-default" ng-repeat="item in feed">
+            <div class="panel-heading">
+                <strong>{{ item.title }}</strong>
+                <small class="text-muted pull-right">{{ item.pub_date | date:'medium' }}</small>
+            </div>
+            <div class="panel-body" ng-bind-html="item.summary"></div>
+        </div>
+    </div>
+</div>

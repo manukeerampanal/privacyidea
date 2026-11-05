@@ -1,0 +1,25 @@
+// Flex instead of inline layout, so the wrapper is exactly as tall as the button and does not add a text line box
+// that would grow the input it sits in.
+:host,
+.clear-button-container {
+  display: flex;
+  align-items: center;
+}
+
+.clear-button-container button {
+  color: var(--grey-light-active);
+  height: 24px;
+  width: 24px;
+  padding: 0;
+  margin-right: 16px;
+  margin-left: 8px;
+}
+
+.clear-button-container button mat-icon {
+  font-size: 24px;
+}
+
+.clear-button-container button :hover {
+  color: var(--red-light);
+  cursor: pointer;
+}

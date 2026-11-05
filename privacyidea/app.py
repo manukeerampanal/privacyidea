@@ -1,4 +1,8 @@
-# -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: (C) 2015 NetKnights GmbH <https://netknights.it>
+# SPDX-FileCopyrightText: (C) 2015 Cornelius Kölbel, <info@privacyidea.org>
+# SPDX-FileCopyrightText: (C) 2025 Paul Lettich <paul.lettich@netknights.it>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # 2014-11-15 Cornelius Kölbel, info@privacyidea.org
 #            Initial creation
@@ -19,78 +23,453 @@
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-import os
-import os.path
+import atexit
+import datetime
+import json
 import logging
 import logging.config
+import os
+import os.path
+import re
+import secrets
 import sys
+import time
+import uuid
+from importlib import metadata
+from importlib.metadata import PackageNotFoundError
+from pathlib import Path, PurePath
+
+import sqlalchemy as sa
 import yaml
-from flask import Flask, request, Response
+from flask import Flask, current_app, jsonify, request, redirect
 from flask_babel import Babel
 from flask_migrate import Migrate
-from flaskext.versioned import Versioned
+from flask_talisman import Talisman
 
 # we need this import to add the before/after request function to the blueprints
-import privacyidea.api.before_after
-from privacyidea.api.validate import validate_blueprint
-from privacyidea.api.token import token_blueprint
-from privacyidea.api.system import system_blueprint
-from privacyidea.api.resolver import resolver_blueprint
-from privacyidea.api.realm import realm_blueprint
-from privacyidea.api.realm import defaultrealm_blueprint
-from privacyidea.api.policy import policy_blueprint
-from privacyidea.api.user import user_blueprint
-from privacyidea.api.audit import audit_blueprint
+# noinspection PyUnresolvedReferences
+import privacyidea.api.before_after  # noqa: F401
 from privacyidea.api.application import application_blueprint
-from privacyidea.api.caconnector import caconnector_blueprint
-from privacyidea.api.register import register_blueprint
+from privacyidea.api.audit import audit_blueprint
+from privacyidea.api.authentication_log import authentication_log_blueprint
 from privacyidea.api.auth import jwtauth
-from privacyidea.webui.login import login_blueprint, get_accepted_language
-from privacyidea.webui.certificate import cert_blueprint
-from privacyidea.api.machineresolver import machineresolver_blueprint
-from privacyidea.api.machine import machine_blueprint
-from privacyidea.api.ttype import ttype_blueprint
-from privacyidea.api.smtpserver import smtpserver_blueprint
-from privacyidea.api.radiusserver import radiusserver_blueprint
-from privacyidea.api.periodictask import periodictask_blueprint
-from privacyidea.api.privacyideaserver import privacyideaserver_blueprint
-from privacyidea.api.recover import recover_blueprint
-from privacyidea.api.event import eventhandling_blueprint
-from privacyidea.api.smsgateway import smsgateway_blueprint
+from privacyidea.api.caconnector import caconnector_blueprint
 from privacyidea.api.clienttype import client_blueprint
-from privacyidea.api.subscriptions import subscriptions_blueprint
+from privacyidea.api.conditional_access import conditional_access_blueprint
+from privacyidea.api.container import container_blueprint
+from privacyidea.api.event import eventhandling_blueprint
+from privacyidea.api.healthcheck import healthz_blueprint
+from privacyidea.api.info import info_blueprint
+from privacyidea.api.lib.utils import send_html
+from privacyidea.api.machine import machine_blueprint
+from privacyidea.api.machineresolver import machineresolver_blueprint
 from privacyidea.api.monitoring import monitoring_blueprint
+from privacyidea.api.periodictask import periodictask_blueprint
+from privacyidea.api.policy import policy_blueprint
+from privacyidea.api.privacyideaserver import privacyideaserver_blueprint
+from privacyidea.api.radiusserver import radiusserver_blueprint
+from privacyidea.api.realm import defaultrealm_blueprint
+from privacyidea.api.realm import realm_blueprint
+from privacyidea.api.recover import recover_blueprint
+from privacyidea.api.register import register_blueprint
+from privacyidea.api.resolver import resolver_blueprint
+from privacyidea.api.serviceid import serviceid_blueprint
+from privacyidea.api.clients import clients_blueprint
+from privacyidea.api.smsgateway import smsgateway_blueprint
+from privacyidea.api.smtpserver import smtpserver_blueprint
+from privacyidea.api.subscriptions import subscriptions_blueprint
+from privacyidea.api.system import system_blueprint
+from privacyidea.api.token import token_blueprint
 from privacyidea.api.tokengroup import tokengroup_blueprint
-from privacyidea.lib import queue
-from privacyidea.lib.log import DEFAULT_LOGGING_CONFIG
-from privacyidea.config import config
-from privacyidea.models import db
-from privacyidea.lib.crypto import init_hsm
-
+from privacyidea.api.ttype import ttype_blueprint
+from privacyidea.api.user import user_blueprint
+from privacyidea.api.validate import validate_blueprint
+from privacyidea.config import config, DockerConfig, ConfigKey, DefaultConfigValues
+from privacyidea.lib.conditional_access.session import init_ca_session
+from privacyidea.lib.crypto import build_pass_context, init_hsm
+from privacyidea.lib.framework import get_app_config_value
+from privacyidea.lib.log import DEFAULT_LOGGING_CONFIG, DOCKER_LOGGING_CONFIG
+from privacyidea.models import db, NodeName
+from privacyidea.webui.login import (DEFAULT_LANGUAGE_LIST, WEBUI_DIST_PATH, login_blueprint,
+                                     get_accepted_language)
 
 ENV_KEY = "PRIVACYIDEA_CONFIGFILE"
 
+# The directory the WebUI was previewed from while it was opt-in. Configurations naming it are
+# remapped to the current one, see _resolve_ui_folders().
+PREVIEW_STATIC_FOLDER = "static_new"
 
-class PiResponseClass(Response):
-    """Custom Response class overwriting the flask.Response.
-    To avoid caching problems with the json property in the Response class,
-    the property is overwritten using a non-caching approach.
+CSP = {
+    'default-src': [
+        '\'self\'',
+        'community.privacyidea.org',
+        'privacyidea.readthedocs.io'
+    ],
+    'img-src': [
+        '\'self\'',
+        'data:',
+        'community.privacyidea.org',
+        'privacyidea.readthedocs.io'
+    ],
+    'script-src': [
+        '\'self\''
+    ],
+    'style-src': [
+        '\'self\'',
+        "'unsafe-hashes'",
+        "'sha256-biLFinpqYMtWHmXfkA1BPeCY0/fNt46SAZ+BBk5YUog='",
+        "'sha256-7Pu3hinXdj8VFYmteOTmNXWMU+7rB6e//vfADReF/io='",
+        "'sha256-YwVkay1kjkGiuRM9oW8JUzwK2yXE5Dz412KzI4K7I9w='",
+        "'sha256-pV4RJPLWGu90gKQ1iZ+Ocf8wsPJFysB4EeJ6ulMffC8='",
+        "'sha256-sGXdRWRfaXoi2w7oxblURTZe2bZUow+NA6vowwlqX90='",
+        "'sha256-YurW9RNmdGYOW4E845uslV8U8DB3kRoDIp23Yfx2Aag='",
+        "'sha256-YYETf3tpBMRzy6KyGXJts2MStBC0P8LURMg9MhNXEJ0='",
+        "'sha256-PpZyeb/uN2vEHgWDQLqD6Fz17C0qk8EdQCN3u3ngch0='",
+        "'sha256-oTBIxtioa8VM5xoYrlusFzgFpFG1NzQ+kLPiOX3bKW4='",
+        "'sha256-AkGc/9SiOd74zk72UnCdLs+k10sM4iy2uKmgoXkaHe0='",
+        "'sha256-O2+tCymNJNXAt1PNeGpUdjx9tYTHtsUHA3yHgvt0o98='",
+        "'sha256-GAz6lAgGT4GObhjzk+HFLtlANWYun7Clm7Df+db5ka8='",
+        "'sha256-KpSV7LuPYEu58+3u9LJr9v5Drm0uIKEv0h3u/+NVNm8='",
+        "'sha256-N90MKmRow2DpYEVeqcc3uc8pOUsS4Rg4sNmkau1k0xQ='",
+        "'sha256-Vois/bpqZahvBcyohHpVvTSyXN1GBToEOBP1fnFv8OQ='",
+    ]
+}
+
+migrate = Migrate()
+babel = Babel()
+
+# We need to define the logging here to use it in the helper functions.
+# But since the logging system is not configured properly, the message might not
+# end up in the place as defined in the logging configuration
+log = logging.getLogger(__name__)
+
+
+def _register_spa_fallback(app: Flask) -> None:
     """
-    @property
-    def json(self):
-        """This will contain the parsed JSON data if the mimetype indicates
-        JSON (:mimetype:`application/json`, see :meth:`is_json`), otherwise it
-        will be ``None``.
-        Caching of the json data is disabled.
-        """
-        return self.get_json(cache=False)
+    Answer an unmatched request with the WebUI, so that its own routes survive a reload.
 
-    default_mimetype = 'application/json'
+    The WebUI routes in the browser, so a path like /app/v2/tokens exists only there and
+    reaches Flask as a 404 whenever the page is opened or reloaded directly. Both application
+    factories need this: without it every deep link into the WebUI ends on an error page.
+    """
+    @app.errorhandler(404)
+    def fallback(_):
+        lang_list = get_app_config_value("PI_PREFERRED_LANGUAGE", default=DEFAULT_LANGUAGE_LIST)
+        all_locales = list(lang_list) + [lang.replace("_", "-") for lang in lang_list if "_" in lang]
+        locale_pattern = "|".join(re.escape(lang) for lang in all_locales)
+        if request.path.startswith("/static/public/customize"):
+            return send_html("")
+        elif (re.match(rf'^/app/v2/(({locale_pattern})/)?', request.path)
+              and request.accept_mimetypes.best_match(["text/html", "application/json"]) == "text/html"):
+            from privacyidea.webui.login import _serve_locale
+            locale_match = re.match(rf'^/app/v2/({locale_pattern})/', request.path)
+            locale = locale_match.group(1) if locale_match else "en"
+            new_ui = _serve_locale(locale) or _serve_locale("en")
+            if new_ui:
+                return new_ui
+            return redirect(f"{request.script_root}/")
+        if (request.method == "GET"
+                and not request.path.startswith("/static/")
+                and request.accept_mimetypes.best_match(["text/html", "application/json"]) == "text/html"):
+            from privacyidea.webui.login import _serve_locale, get_preferred_language
+            locale_prefix_match = re.match(rf'^/({locale_pattern})(/|$)', request.path)
+            locale = locale_prefix_match.group(1) if locale_prefix_match else (get_preferred_language() or "en")
+            new_ui = _serve_locale(locale) or _serve_locale("en")
+            if new_ui:
+                return new_ui
+            return redirect(f"{request.script_root}/")
+        return jsonify(error="Not found"), 404
+
+
+def _register_blueprints(app):
+    """Register the available Flask blueprints"""
+    app.register_blueprint(validate_blueprint, url_prefix='/validate')
+    app.register_blueprint(token_blueprint, url_prefix='/token')
+    app.register_blueprint(system_blueprint, url_prefix='/system')
+    app.register_blueprint(resolver_blueprint, url_prefix='/resolver')
+    app.register_blueprint(realm_blueprint, url_prefix='/realm')
+    app.register_blueprint(defaultrealm_blueprint, url_prefix='/defaultrealm')
+    app.register_blueprint(policy_blueprint, url_prefix='/policy')
+    app.register_blueprint(login_blueprint, url_prefix='/')
+    app.register_blueprint(jwtauth, url_prefix='/auth')
+    app.register_blueprint(user_blueprint, url_prefix='/user')
+    app.register_blueprint(audit_blueprint, url_prefix='/audit')
+    app.register_blueprint(authentication_log_blueprint, url_prefix='/authenticationlog')
+    app.register_blueprint(conditional_access_blueprint, url_prefix='/conditionalaccess')
+    app.register_blueprint(machineresolver_blueprint, url_prefix='/machineresolver')
+    app.register_blueprint(machine_blueprint, url_prefix='/machine')
+    app.register_blueprint(application_blueprint, url_prefix='/application')
+    app.register_blueprint(caconnector_blueprint, url_prefix='/caconnector')
+    app.register_blueprint(ttype_blueprint, url_prefix='/ttype')
+    app.register_blueprint(register_blueprint, url_prefix='/register')
+    app.register_blueprint(smtpserver_blueprint, url_prefix='/smtpserver')
+    app.register_blueprint(recover_blueprint, url_prefix='/recover')
+    app.register_blueprint(radiusserver_blueprint, url_prefix='/radiusserver')
+    app.register_blueprint(periodictask_blueprint, url_prefix='/periodictask')
+    app.register_blueprint(privacyideaserver_blueprint, url_prefix='/privacyideaserver')
+    app.register_blueprint(eventhandling_blueprint, url_prefix='/event')
+    app.register_blueprint(smsgateway_blueprint, url_prefix='/smsgateway')
+    app.register_blueprint(client_blueprint, url_prefix='/client')
+    app.register_blueprint(subscriptions_blueprint, url_prefix='/subscriptions')
+    app.register_blueprint(monitoring_blueprint, url_prefix='/monitoring')
+    app.register_blueprint(tokengroup_blueprint, url_prefix='/tokengroup')
+    app.register_blueprint(serviceid_blueprint, url_prefix='/serviceid')
+    app.register_blueprint(clients_blueprint, url_prefix='/clients')
+    app.register_blueprint(container_blueprint, url_prefix='/container')
+    app.register_blueprint(healthz_blueprint, url_prefix='/healthz')
+    app.register_blueprint(info_blueprint, url_prefix='/info')
+
+
+def _setup_logging(app, logging_config=DEFAULT_LOGGING_CONFIG):
+    # Setup logging
+    log_read_func = {
+        'yaml': lambda x: logging.config.dictConfig(yaml.safe_load(open(x).read())),
+        'cfg': lambda x: logging.config.fileConfig(x, disable_existing_loggers=False)
+    }
+    have_config = False
+    log_exception = None
+    log_config_file = app.config.get(ConfigKey.LOGCONFIG, DefaultConfigValues.LOGGING_CFG)
+    if os.path.isfile(log_config_file):
+        for cnf_type in ['cfg', 'yaml']:
+            if app.config[ConfigKey.VERBOSE]:
+                sys.stderr.write(f"Read Logging settings from {log_config_file}\n")
+            try:
+                log_read_func[cnf_type](log_config_file)
+                have_config = True
+                break
+            except Exception as e:
+                log_exception = e
+                pass
+    if not have_config:
+        if log_exception:
+            # We tried to read the logging configuration from a given file but failed
+            sys.stderr.write(f"Could not use {ConfigKey.LOGCONFIG}: {log_exception}\n")
+        if app.config[ConfigKey.VERBOSE]:
+            sys.stderr.write(f"Using logging configuration {logging_config}.\n")
+        logging.config.dictConfig(logging_config)
+
+
+def _check_config(app: Flask):
+    if ConfigKey.ENCFILE in app.config and Path(app.config[ConfigKey.ENCFILE]).is_file():
+        # We have a proper encryption file to work with
+        pass
+    else:
+        raise RuntimeError(f"'{ConfigKey.ENCFILE}' must be set and point to "
+                           f"a file with the database encryption key!")
+    if ConfigKey.PEPPER not in app.config:
+        raise RuntimeError(f"'{ConfigKey.PEPPER}' must be defined in the app configuration")
+    if ConfigKey.SECRET_KEY not in app.config or not app.config[ConfigKey.SECRET_KEY]:
+        sys.stderr.write(f"'{ConfigKey.SECRET_KEY}' not defined in the app "
+                         f"configuration! Generating a random key.\n")
+        app.config[ConfigKey.SECRET_KEY] = secrets.token_hex()
+    if not all([x in app.config for x in [ConfigKey.AUDIT_KEY_PUBLIC, ConfigKey.AUDIT_KEY_PRIVATE]]):
+        sys.stderr.write("No keypair for audit signing defined. Disabling audit signing "
+                         "and response signing!\n")
+        app.config[ConfigKey.AUDIT_NO_SIGN] = True
+        app.config[ConfigKey.NO_RESPONSE_SIGN] = True
+
+
+def _warn_if_base_url_missing(app: Flask):
+    """
+    Emit a loud warning if ``PI_BASE_URL`` is not configured, since it is required to
+    produce links.
+    """
+    if not app.config.get(ConfigKey.BASE_URL):
+        # The loud stderr banner is meant for an interactive server startup, so
+        # it honours the same VERBOSE/silent flag as the other startup output.
+        # CLI tooling (pi-manage uses create_silent_app) and tests run silent and
+        # would otherwise get the banner on every invocation as pure noise. The
+        # log.warning below is always emitted, so the warning is never lost.
+        if app.config.get(ConfigKey.VERBOSE):
+            sys.stderr.write("SECURITY WARNING: 'PI_BASE_URL' is not configured! "
+                             "Password recovery is disabled and user-facing links are left blank. "
+                             "Set PI_BASE_URL in pi.cfg to the public URL of this privacyIDEA server.\n")
+        log.warning("'PI_BASE_URL' is not configured! Password recovery is "
+                    "disabled and user-facing links (the {url} notification tag) "
+                    "are left blank. They are never built from the untrusted HTTP "
+                    "Host header. Set PI_BASE_URL in pi.cfg to the public URL of "
+                    "this privacyIDEA server.")
+
+
+def versioned_asset(path: str) -> str:
+    """
+    Append a cache-busting version to an asset URL, for use as the ``versioned`` Jinja filter:
+    "static/css/menu.css" becomes "static/css/menu.css?v=20260914T085217".
+
+    The legacy WebUI serves its assets under stable names, so without this a browser keeps using
+    the files it cached before an update. The compiled WebUI does not need it, its file names
+    carry a content hash.
+
+    A "static/" URL is resolved through the configured static folder, since ``PI_STATIC_FOLDER``
+    may point anywhere. An asset that cannot be found is returned unchanged, so a stale path
+    costs the version rather than the whole page.
+    """
+    file_path = path
+    if not os.path.isabs(file_path):
+        if file_path.startswith(DefaultConfigValues.STATIC_FOLDER):
+            file_path = os.path.join(current_app.static_folder,
+                                     file_path[len(DefaultConfigValues.STATIC_FOLDER):])
+        else:
+            file_path = os.path.join(current_app.root_path, file_path)
+    if not os.path.isfile(file_path):
+        log.debug(f"Not adding a version to '{path}': '{file_path}' does not exist.")
+        return path
+    modified = time.strftime("%Y%m%dT%H%M%S", time.localtime(os.path.getmtime(file_path)))
+    return f"{path}?v={modified}"
+
+
+def _replace_preview_folder(folder: str) -> str | None:
+    """
+    Return the path with a "static_new" directory replaced by "static", or None if it has none.
+
+    Both relative values ("static_new/") and the absolute paths used by appliance installations
+    are handled.
+    """
+    parts = PurePath(folder).parts
+    if PREVIEW_STATIC_FOLDER not in parts:
+        return None
+    static_folder = PurePath(DefaultConfigValues.STATIC_FOLDER).name
+    return str(PurePath(*[static_folder if part == PREVIEW_STATIC_FOLDER else part for part in parts]))
+
+
+def _resolve_ui_folders(app: Flask) -> None:
+    """
+    Apply ``PI_STATIC_FOLDER`` and ``PI_TEMPLATE_FOLDER``, remapping the WebUI preview paths.
+
+    Up to version 3.13 the new WebUI was opt-in through two settings in pi.cfg::
+
+        PI_STATIC_FOLDER = "static_new/"
+        PI_TEMPLATE_FOLDER = "static_new/dist/privacyidea-webui/browser/"
+
+    It is now the default and lives in "static/", so both values are remapped to keep those
+    installations working. The template folder is reset to the default instead of being remapped,
+    because it pointed into the compiled WebUI, which holds no templates at all.
+    """
+    static_folder = app.config.get(ConfigKey.STATIC_FOLDER, DefaultConfigValues.STATIC_FOLDER)
+    template_folder = app.config.get(ConfigKey.TEMPLATE_FOLDER, DefaultConfigValues.TEMPLATE_FOLDER)
+
+    remapped_static = _replace_preview_folder(static_folder)
+    remapped_template = _replace_preview_folder(template_folder)
+    if remapped_static or remapped_template:
+        static_folder = remapped_static or static_folder
+        if remapped_template:
+            template_folder = (DefaultConfigValues.TEMPLATE_FOLDER
+                               if WEBUI_DIST_PATH[0] in PurePath(remapped_template).parts
+                               else remapped_template)
+        log.warning(f"The WebUI moved from '{PREVIEW_STATIC_FOLDER}' to "
+                    f"'{DefaultConfigValues.STATIC_FOLDER}' and is served by default. Reading it "
+                    f"from '{static_folder}' and the templates from '{template_folder}' instead. "
+                    f"Remove '{ConfigKey.STATIC_FOLDER}' and '{ConfigKey.TEMPLATE_FOLDER}' from "
+                    f"pi.cfg, this fallback is only kept for one version.")
+
+    app.static_folder = static_folder
+    app.template_folder = template_folder
+
+
+def _warn_if_webui_missing(app: Flask) -> None:
+    """
+    Emit a warning if the default static folder holds no compiled WebUI.
+
+    Only the default is checked: an administrator who points ``PI_STATIC_FOLDER`` somewhere else
+    serves their own UI and knows what is in it.
+    """
+    default_folder = os.path.join(app.root_path, DefaultConfigValues.STATIC_FOLDER)
+    if os.path.realpath(app.static_folder) != os.path.realpath(default_folder):
+        return
+    if os.path.isfile(os.path.join(app.static_folder, *WEBUI_DIST_PATH, "en", "index.html")):
+        return
+    legacy_folder = DefaultConfigValues.LEGACY_STATIC_FOLDER
+    log.warning(f"No compiled WebUI in '{app.static_folder}'. Install a package that ships the "
+                f"built WebUI, or build it with 'npm run build'. To serve the previous WebUI "
+                f"instead, set '{ConfigKey.STATIC_FOLDER} = \"{legacy_folder}\"' and "
+                f"'{ConfigKey.TEMPLATE_FOLDER} = \"{legacy_folder}templates/\"' in pi.cfg.")
+
+
+def _setup_database_engine_options(app: Flask):
+    """
+    Resolve the options for the main database engine before ``db.init_app()`` creates it.
+
+    Anything the operator put into ``SQLALCHEMY_ENGINE_OPTIONS`` is kept as is, only
+    the defaults privacyIDEA wants on top of SQLAlchemy's own are filled in.
+    """
+    # The options may come from a class attribute of the configuration object, so work
+    # on a copy. Mutating it in place would leak into later create_app() calls in the
+    # same process, which mostly hits the tests and pi-manage.
+    engine_options = dict(app.config.get(ConfigKey.SQLALCHEMY_ENGINE_OPTIONS, {}))
+
+    # Pessimistic disconnect handling: validate a connection when it is checked out and
+    # transparently replace it if the server closed it in the meantime. MariaDB/MySQL
+    # drop idle connections at wait_timeout and the pool has no way to know, so without
+    # this a request is handed a dead socket ("MySQL server has gone away"). It costs
+    # one lightweight ping per checkout, which is wasted on SQLite, where a connection
+    # cannot go stale.
+    database_uri = app.config.get(ConfigKey.SQLALCHEMY_DATABASE_URI) or ""
+    if "pool_pre_ping" not in engine_options and not database_uri.startswith("sqlite"):
+        engine_options["pool_pre_ping"] = True
+
+    app.config[ConfigKey.SQLALCHEMY_ENGINE_OPTIONS] = engine_options
+    log.debug(f"Database engine options: {engine_options}")
+    if app.config.get(ConfigKey.VERBOSE):
+        sys.stderr.write(f"Database engine options: {engine_options}\n")
+
+
+def _setup_node_configuration(app: Flask):
+    # check that we have a correct node_name -> UUID relation
+    with app.app_context():
+        # TODO: this is not multi-process-safe since every process runs its own `create_app()`
+        # First check if we have a UUID in the config file which takes precedence
+        try:
+            pi_uuid = uuid.UUID(app.config.get(ConfigKey.NODE_UUID))
+        except (ValueError, TypeError) as e:
+            log.debug(f"Could not determine UUID from config: {e}")
+            # check if we can get the UUID from an external file
+            pi_uuid_file = app.config.get(ConfigKey.UUID_FILE, DefaultConfigValues.UUID_FILE)
+            try:
+                with open(pi_uuid_file) as f:
+                    pi_uuid = uuid.UUID(f.read().strip())
+            except Exception as e:  # pragma: no cover
+                log.debug(f"Could not determine UUID from file '{pi_uuid_file}': {e}")
+
+                # we try to get the unique installation id (See <https://0pointer.de/blog/projects/ids.html>)
+                try:
+                    with open("/etc/machine-id") as f:
+                        pi_uuid = uuid.UUID(f.read().strip())
+                except Exception as e:  # pragma: no cover
+                    log.debug(f"Could not determine the machine id: {e}")
+                    # we generate a random UUID which will change on every startup
+                    # unless it is persisted to the pi_uuid_file
+                    pi_uuid = uuid.uuid4()
+                    log.warning(f"Generating a random UUID: {pi_uuid}! If "
+                                f"persisting the UUID fails, it will change on every application start")
+                    # only in case of a generated UUID we save it to the uuid file
+                    try:
+                        with open(pi_uuid_file, 'w') as f:  # pragma: no cover
+                            f.write(f"{str(pi_uuid)}\n")
+                            log.info(f"Successfully wrote current UUID to file '{pi_uuid_file}'")
+                    except OSError as exx:
+                        log.warning(f"Could not write UUID to file '{pi_uuid_file}': {exx}")
+
+            app.config[ConfigKey.NODE_UUID] = str(pi_uuid)
+            log.debug(f"Current UUID: '{pi_uuid}'")
+
+        pi_node_name = app.config.get(ConfigKey.NODE) or app.config.get(ConfigKey.AUDIT_SERVERNAME,
+                                                                        DefaultConfigValues.NODE_NAME)
+
+        inspect = sa.inspect(db.engine)
+        if inspect.has_table(NodeName.__tablename__):
+            db.session.merge(NodeName(id=str(pi_uuid),
+                                      name=pi_node_name,
+                                      lastseen=datetime.datetime.now(datetime.UTC)))
+            db.session.commit()
+        else:
+            log.warning(f"Could not update node names in db. "
+                        f"Check that table '{NodeName.__tablename__}' exists.")
+        log.debug("Finished setting up node names.")
 
 
 def create_app(config_name="development",
-               config_file='/etc/privacyidea/pi.cfg',
-               silent=False, init_hsm=False):
+               config_file=DefaultConfigValues.CFG_PATH,
+               silent=False, initialize_hsm=False) -> Flask:
     """
     First the configuration from the config.py is loaded depending on the
     config type like "production" or "development" or "testing".
@@ -106,129 +485,238 @@ def create_app(config_name="development",
     :param silent: If set to True the additional information are not printed
         to stdout
     :type silent: bool
-    :param init_hsm: Whether the HSM should be initialized on app startup
-    :type init_hsm: bool
+    :param initialize_hsm: Whether the HSM should be initialized on app startup
+    :type initialize_hsm: bool
     :return: The flask application
     :rtype: App object
     """
-    if not silent:
-        print("The configuration name is: {0!s}".format(config_name))
-    if os.environ.get(ENV_KEY):
-        config_file = os.environ[ENV_KEY]
-    if not silent:
-        print("Additional configuration will be read "
-              "from the file {0!s}".format(config_file))
-    app = Flask(__name__, static_folder="static",
-                template_folder="static/templates")
-    if config_name:
-        app.config.from_object(config[config_name])
+    app = Flask(__name__, static_folder=DefaultConfigValues.STATIC_FOLDER,
+                template_folder=DefaultConfigValues.TEMPLATE_FOLDER)
+    app.config[ConfigKey.APP_READY] = False
+    app.config[ConfigKey.VERBOSE] = not silent
 
-    # Set up flask-versioned
-    versioned = Versioned(app, format='%(path)s?v=%(version)s')
+    _register_spa_fallback(app)
+
+
+    # Overwrite default config with environment setting
+    config_name = os.environ.get(ConfigKey.CONFIG_NAME, config_name)
+    if app.config.get(ConfigKey.VERBOSE):
+        print(f"The configuration name is: {config_name!s}")
+    app.config.from_object(config[config_name])
+
+    # Load configuration from environment variables prefixed with PRIVACYIDEA_
+    app.config.from_prefixed_env("PRIVACYIDEA")
+
+    if ENV_KEY in os.environ:
+        config_file = os.environ[ENV_KEY]
+    if app.config.get(ConfigKey.VERBOSE):
+        print(f"Additional configuration will be read from the file {config_file!s}")
 
     try:
         # Try to load the given config_file.
-        # If it does not exist, just ignore it.
-        app.config.from_pyfile(config_file, silent=True)
-    except IOError:
-        sys.stderr.write("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-        sys.stderr.write("  WARNING: privacyidea create_app has no access\n")
-        sys.stderr.write("  to {0!s}!\n".format(config_file))
-        sys.stderr.write("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+        app.config.from_pyfile(config_file, silent=False)
+    except OSError as e:
+        if config_name != "docker" or ENV_KEY in os.environ:
+            sys.stderr.write("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+            sys.stderr.write("  WARNING: Unable to load additional configuration\n")
+            sys.stderr.write(f"  from {config_file}!\n")
+            if app.config.get(ConfigKey.VERBOSE):
+                sys.stderr.write(f"  ({e})\n")
+            sys.stderr.write("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 
-    # Try to load the file, that was specified in the environment variable
-    # PRIVACYIDEA_CONFIG_FILE
-    # If this file does not exist, we create an error!
-    app.config.from_envvar(ENV_KEY, silent=True)
-
-    # We allow to set different static folders
-    app.static_folder = app.config.get("PI_STATIC_FOLDER", "static/")
-    app.template_folder = app.config.get("PI_TEMPLATE_FOLDER", "static/templates/")
-
-    app.register_blueprint(validate_blueprint, url_prefix='/validate')
-    app.register_blueprint(token_blueprint, url_prefix='/token')
-    app.register_blueprint(system_blueprint, url_prefix='/system')
-    app.register_blueprint(resolver_blueprint, url_prefix='/resolver')
-    app.register_blueprint(realm_blueprint, url_prefix='/realm')
-    app.register_blueprint(defaultrealm_blueprint, url_prefix='/defaultrealm')
-    app.register_blueprint(policy_blueprint, url_prefix='/policy')
-    app.register_blueprint(login_blueprint, url_prefix='/')
-    app.register_blueprint(jwtauth, url_prefix='/auth')
-    app.register_blueprint(user_blueprint, url_prefix='/user')
-    app.register_blueprint(audit_blueprint, url_prefix='/audit')
-    app.register_blueprint(machineresolver_blueprint,
-                           url_prefix='/machineresolver')
-    app.register_blueprint(machine_blueprint, url_prefix='/machine')
-    app.register_blueprint(application_blueprint, url_prefix='/application')
-    app.register_blueprint(caconnector_blueprint, url_prefix='/caconnector')
-    app.register_blueprint(cert_blueprint, url_prefix='/certificate')
-    app.register_blueprint(ttype_blueprint, url_prefix='/ttype')
-    app.register_blueprint(register_blueprint, url_prefix='/register')
-    app.register_blueprint(smtpserver_blueprint, url_prefix='/smtpserver')
-    app.register_blueprint(recover_blueprint, url_prefix='/recover')
-    app.register_blueprint(radiusserver_blueprint, url_prefix='/radiusserver')
-    app.register_blueprint(periodictask_blueprint, url_prefix='/periodictask')
-    app.register_blueprint(privacyideaserver_blueprint,
-                           url_prefix='/privacyideaserver')
-    app.register_blueprint(eventhandling_blueprint, url_prefix='/event')
-    app.register_blueprint(smsgateway_blueprint, url_prefix='/smsgateway')
-    app.register_blueprint(client_blueprint, url_prefix='/client')
-    app.register_blueprint(subscriptions_blueprint, url_prefix='/subscriptions')
-    app.register_blueprint(monitoring_blueprint, url_prefix='/monitoring')
-    app.register_blueprint(tokengroup_blueprint, url_prefix='/tokengroup')
-    db.init_app(app)
-    migrate = Migrate(app, db)
-
-    app.response_class = PiResponseClass
+    # CSP with Talisman
+    if app.config.get(ConfigKey.ENABLE_CSP, False):
+        Talisman(app, content_security_policy=CSP, force_https=app.config.get(ConfigKey.FORCE_HTTPS, True),
+                 session_cookie_secure=app.config.get(ConfigKey.SESSION_COOKIE_SECURE, True))
+        if app.config.get(ConfigKey.VERBOSE):
+            print("Enabling CSP with Talisman")
 
     # Setup logging
-    log_read_func = {
-        'yaml': lambda x: logging.config.dictConfig(yaml.safe_load(open(x, 'r').read())),
-        'cfg': lambda x: logging.config.fileConfig(x)
-    }
-    have_config = False
-    log_exx = None
-    log_config_file = app.config.get("PI_LOGCONFIG", "/etc/privacyidea/logging.cfg")
-    if os.path.isfile(log_config_file):
-        for cnf_type in ['cfg', 'yaml']:
-            try:
-                log_read_func[cnf_type](log_config_file)
-                if not silent:
-                    print('Read Logging settings from {0!s}'.format(log_config_file))
-                have_config = True
-                break
-            except Exception as exx:
-                log_exx = exx
-                pass
-    if not have_config:
-        if log_exx:
-            sys.stderr.write("Could not use PI_LOGCONFIG: " + str(log_exx) + "\n")
-        if not silent:
-            sys.stderr.write("Using PI_LOGLEVEL and PI_LOGFILE.\n")
-        level = app.config.get("PI_LOGLEVEL", logging.INFO)
-        # If there is another logfile in pi.cfg we use this.
-        logfile = app.config.get("PI_LOGFILE", '/var/log/privacyidea/privacyidea.log')
-        if not silent:
-            sys.stderr.write("Using PI_LOGLEVEL {0!s}.\n".format(level))
-            sys.stderr.write("Using PI_LOGFILE {0!s}.\n".format(logfile))
-        DEFAULT_LOGGING_CONFIG["handlers"]["file"]["filename"] = logfile
-        DEFAULT_LOGGING_CONFIG["handlers"]["file"]["level"] = level
-        DEFAULT_LOGGING_CONFIG["loggers"]["privacyidea"]["level"] = level
-        logging.config.dictConfig(DEFAULT_LOGGING_CONFIG)
+    if config_name == "docker":
+        if ConfigKey.LOGLEVEL in app.config:
+            DOCKER_LOGGING_CONFIG["loggers"]["privacyidea"]["level"] = app.config.get(ConfigKey.LOGLEVEL)
+        _setup_logging(app, DOCKER_LOGGING_CONFIG)
+    else:
+        if ConfigKey.LOGLEVEL in app.config:
+            DEFAULT_LOGGING_CONFIG["loggers"]["privacyidea"]["level"] = app.config.get(ConfigKey.LOGLEVEL)
+        if ConfigKey.LOGFILE in app.config:
+            DEFAULT_LOGGING_CONFIG["handlers"]["file"]["filename"] = app.config.get(ConfigKey.LOGFILE)
+        _setup_logging(app, DEFAULT_LOGGING_CONFIG)
 
-    babel = Babel(app)
+    with app.app_context():
+        build_pass_context()
+    _warn_if_base_url_missing(app)
 
-    @babel.localeselector
-    def get_locale():
-        return get_accepted_language(request)
+    _resolve_ui_folders(app)
+    _warn_if_webui_missing(app)
 
-    queue.register_app(app)
+    _register_blueprints(app)
 
-    if init_hsm:
+
+    # Set up Plug-Ins
+    _setup_database_engine_options(app)
+    db.init_app(app)
+    init_ca_session(app)
+
+    # TODO: This is not necessary except for the pi-manage command line util
+    # Try to get the path of the migration directory from the installed package
+    # TODO: This still does not work with an editable installation if it is not called from the source folder
+    # By default, we assume we are in the source folder
+    migration_dir = "privacyidea/migrations"
+    try:
+        migration_path = [f for f in metadata.files("privacyidea") if f.match("migrations/env.py")][0]
+        migration_dir = str(migration_path.locate().parent.resolve())
+    except (PackageNotFoundError, IndexError):
+        pass
+    migrate.init_app(app, db, directory=migration_dir)
+    db_command = app.cli.commands.get('db')
+    if db_command is not None:
+        db_command.help = (db_command.help or "") + (
+            "\n\nNote: Negative relative revisions (e.g. -3) start with '-' and would be "
+            "interpreted as an option. Use '--' to separate them from options:\n"
+            "  pi-manage db downgrade -- -3"
+        )
+        downgrade_command = db_command.commands.get('downgrade')
+        if downgrade_command is not None:
+            downgrade_command.help = (downgrade_command.help or "") + (
+                "\n\nNote: Negative relative revisions (e.g. -3) start with '-' and would be "
+                "interpreted as an option. Use '--' to separate them from options:\n"
+                "  pi-manage db downgrade -- -3"
+            )
+
+    app.jinja_env.filters["versioned"] = versioned_asset
+
+    babel.init_app(app, locale_selector=get_accepted_language)
+
+    if initialize_hsm:
         with app.app_context():
             init_hsm()
 
-    logging.debug(u"Reading application from the static folder {0!s} and "
-                  u"the template folder {1!s}".format(app.static_folder, app.template_folder))
+    _setup_node_configuration(app)
+
+    # SQLAlchemy Oracle dialect does not (yet) support JSON serializers
+    with app.app_context():
+        engine = db.session.get_bind()
+        if engine.name == "oracle":
+            engine.dialect._json_serializer = lambda obj: json.dumps(obj, ensure_ascii=False)
+            engine.dialect._json_deserializer = lambda obj: json.loads(obj)
+
+    # Eagerly establish the Redis connection so a healthy connect logs Redis cache connected (...)" during startup.
+    # A failed connect is not fatal. get_redis() arms the unified retry cooldown (PI_REDIS_RETRY_COOLDOWN seconds)
+    # and a later request re-attempts transparently once the cooldown expires.
+    if app.config.get(ConfigKey.REDIS_URL):
+        with app.app_context():
+            from privacyidea.lib.cache import get_redis
+            get_redis()
+
+    log.debug(f"Reading application from the static folder {app.static_folder} "
+              f"and the template folder {app.template_folder}")
+    app.config[ConfigKey.APP_READY] = True
+
+    def exit_func():
+        # Destroy the engine pool and close all open database connections on exit
+        with app.app_context():
+            db.engine.dispose()
+
+    atexit.register(exit_func)
+
+    return app
+
+
+def create_docker_app():
+    """
+    Create a Flask-app for docker deployment.
+    The app is configured exclusively through environment variables and secret
+    files via docker-compose.
+    """
+    app = Flask(__name__)
+    app.config[ConfigKey.APP_READY] = False
+    app.config[ConfigKey.VERBOSE] = bool(app.debug)
+
+    _register_spa_fallback(app)
+
+    # Begin the app configuration
+    # First we load a default configuration
+    if app.debug:
+        sys.stderr.write(f"Reading default config: {DockerConfig}\n")
+    app.config.from_object(DockerConfig)
+    # Then we check if a config file is present in /etc/privacyidea/pi.cfg
+    # (either mounted or built into the container image)
+    try:
+        app.config.from_pyfile(DefaultConfigValues.CFG_PATH, silent=False)
+        if app.debug:
+            sys.stderr.write(f"Read configuration from file: '{DefaultConfigValues.CFG_PATH}'\n")
+    except OSError as _e:
+        pass
+    # Then we update the configuration with stuff from the environment
+    if app.debug:
+        sys.stderr.write("Reading configuration from environment with prefix 'PRIVACYIDEA'\n")
+    app.config.from_prefixed_env("PRIVACYIDEA")
+
+    # And then we check if we have a minimal viable config
+    _check_config(app)
+
+    # CSP with Talisman
+    if app.config.get(ConfigKey.ENABLE_CSP, False):
+        Talisman(app, content_security_policy=CSP, force_https=app.config.get(ConfigKey.FORCE_HTTPS, True),
+                 session_cookie_secure=app.config.get(ConfigKey.SESSION_COOKIE_SECURE, True))
+        if app.debug:
+            sys.stderr.write("Enabling CSP with Talisman")
+
+    if app.debug:
+        DOCKER_LOGGING_CONFIG["loggers"]["privacyidea"]["level"] = logging.DEBUG
+    if ConfigKey.LOGLEVEL in app.config:
+        DOCKER_LOGGING_CONFIG["loggers"]["privacyidea"]["level"] = app.config.get(ConfigKey.LOGLEVEL)
+    _setup_logging(app, DOCKER_LOGGING_CONFIG)
+
+    with app.app_context():
+        build_pass_context()
+    _warn_if_base_url_missing(app)
+
+    _resolve_ui_folders(app)
+    _warn_if_webui_missing(app)
+
+    _register_blueprints(app)
+
+    # Set up Plug-Ins
+    _setup_database_engine_options(app)
+    db.init_app(app)
+    init_ca_session(app)
+
+    app.jinja_env.filters["versioned"] = versioned_asset
+
+    babel.init_app(app, locale_selector=get_accepted_language)
+
+    if app.config.get(ConfigKey.HSM_INITIALIZE, False):
+        with app.app_context():
+            init_hsm()
+
+    # Check database connection
+    with app.app_context():
+        try:
+            log.debug("Test Database using URL '%s'", app.config[ConfigKey.SQLALCHEMY_DATABASE_URI])
+            db.session.execute(sa.text('SELECT 1'))
+            log.debug("Database Connection successful!")
+        except Exception as e:
+            raise RuntimeError(f"Could not connect to database: {e}")
+
+    # Eagerly establish the Redis connection so a healthy connect logs Redis cache connected (...)" during startup.
+    # A failed connect is not fatal. get_redis() arms the unified retry cooldown (PI_REDIS_RETRY_COOLDOWN seconds)
+    # and a later request re-attempts transparently once the cooldown expires.
+    if app.config.get(ConfigKey.REDIS_URL):
+        with app.app_context():
+            from privacyidea.lib.cache import get_redis
+            get_redis()
+
+    _setup_node_configuration(app)
+
+    app.config[ConfigKey.APP_READY] = True
+
+    def exit_func():
+        # Destroy the engine pool and close all open database connections on exit
+        with app.app_context():
+            db.engine.dispose()
+
+    atexit.register(exit_func)
 
     return app

@@ -1,0 +1,199 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div
+  #scrollContainer
+  appScrollToTop
+  aria-label="Event Handler Editor"
+  class="edit-event-handler-layout"
+  i18n-aria-label="@@event.eventHandlerEditor">
+  <div class="edit-event-handler-container">
+    <h3 class="margin-8 flex-row flex-nowrap ali-center">
+      {{ title() }}
+    </h3>
+
+    <div
+      [appStickyHeader]="scrollContainer"
+      class="header-row sticky-header">
+      <div class="action-buttons">
+        <mat-slide-toggle
+          (change)="updateEventHandler('active', $event.checked)"
+          [checked]="editEvent().active"
+          [disableRipple]="true"
+          [disabled]="!authService.actionAllowed('eventhandling_write')"
+          i18n-matTooltip="@@common.toggleActiveStatus"
+          matTooltip="Toggle Active Status">
+          @if (editEvent().active) {
+            <span i18n="@@common.active">Active</span>
+          } @else {
+            <span i18n="@@common.inactive">Inactive</span>
+          }
+        </mat-slide-toggle>
+        @if (eventLoaded() && !isNewEvent() && authService.actionAllowed("eventhandling_write")) {
+          <button
+            (click)="$event.stopPropagation(); deleteEvent()"
+            class="action-button-delete-secondary button-width-s"
+            mat-stroked-button>
+            <mat-icon>delete</mat-icon>
+            <span i18n="@@common.delete">Delete</span>
+          </button>
+        }
+        <button
+          (click)="$event.stopPropagation(); cancelEdit()"
+          class="action-button-secondary button-width-s"
+          mat-stroked-button>
+          <span i18n="@@common.cancel">Cancel</span>
+        </button>
+        <button
+          (click)="$event.stopPropagation(); saveEvent()"
+          [disabled]="!canSave()"
+          class="action-button-primary button-width-s"
+          mat-stroked-button>
+          <mat-icon>save</mat-icon>
+          <span i18n="@@common.save">Save</span>
+        </button>
+      </div>
+    </div>
+
+    <div>
+      <div class="two-col-grid">
+        <mat-form-field class="input-width-l">
+          <mat-label i18n="@@common.name">Name</mat-label>
+          <app-clearable-input
+            (clearButtonClick)="updateEventHandler('name', '')"
+            [showClearButton]="!!editEvent().name">
+            <input
+              (blur)="nameTouched.set(true)"
+              (input)="updateEventHandler('name', $any($event.target).value)"
+              [appErrorState]="showNameError()"
+              [disabled]="!eventLoaded()"
+              [value]="editEvent().name"
+              matInput
+              required
+              type="text" />
+          </app-clearable-input>
+          @if (showNameError() && editEvent().name === "") {
+            <mat-error i18n="@@common.nameRequired">Name is <strong>required</strong>.</mat-error>
+          }
+          @if (showNameError() && editEvent().name !== "") {
+            <mat-error i18n="@@event.nameContainsInvalid"
+              >Name contains <strong>invalid characters</strong>. Only alphanumeric characters, spaces, dots,
+              underscores and hyphens are allowed.</mat-error
+            >
+          }
+        </mat-form-field>
+        @if (isNewEvent()) {
+          <mat-form-field class="input-width-l">
+            <mat-label i18n="@@event.handlerModule">Handler Module</mat-label>
+            <mat-select
+              (selectionChange)="setNewHandlerModule($event.value)"
+              [appErrorState]="showHandlerModuleError()"
+              [value]="eventService.selectedHandlerModule()"
+              required>
+              @for (module of eventService.eventHandlerModules(); track module) {
+                <mat-option [value]="module">{{ module }}</mat-option>
+              }
+            </mat-select>
+            <mat-error i18n="@@event.selectingHandler"
+              >Selecting a handler module is <strong>required</strong>.</mat-error
+            >
+          </mat-form-field>
+        }
+      </div>
+
+      <div class="two-col-grid margin-bottom-32">
+        <mat-form-field class="input-width-l">
+          <mat-label i18n="@@event.position">Position</mat-label>
+          <mat-select
+            (selectionChange)="updateEventHandler('position', $event.value)"
+            [appErrorState]="showPositionError()"
+            [value]="editEvent().position"
+            required>
+            @for (position of eventService.modulePositions(); track position) {
+              <mat-option [value]="position">{{ position }}</mat-option>
+            }
+          </mat-select>
+          <mat-hint i18n="@@event.whetherAction"
+            >Whether the action should be taken before (pre) or after (post) the actual event.</mat-hint
+          >
+          <mat-error i18n="@@event.selectingPosition">Selecting a position is <strong>required</strong>.</mat-error>
+        </mat-form-field>
+        <mat-form-field class="input-width-l">
+          <mat-label i18n="@@common.ordering">Ordering</mat-label>
+          <input
+            (input)="updateEventHandler('ordering', +$any($event.target).value)"
+            [appErrorState]="showOrderingError()"
+            [value]="editEvent().ordering"
+            matInput
+            required
+            type="number" />
+          <mat-hint i18n="@@event.eventHandlersLower"
+            >Event handlers with lower ordering number are executed first.</mat-hint
+          >
+          <mat-error i18n="@@event.orderingRequired">Ordering is <strong>required</strong>.</mat-error>
+        </mat-form-field>
+      </div>
+
+      <div class="margin-bottom-32">
+        <mat-slide-toggle
+          (change)="setAbortOnError($event.checked)"
+          [checked]="abortOnError()">
+          <span i18n="@@event.abortRequestIf">Abort the request if the handler fails</span>
+        </mat-slide-toggle>
+        <p
+          class="checkbox-hint"
+          i18n="@@event.byDefaultFailing"
+          >By default a failing handler only adds an entry to the audit log and the request continues without it. Enable
+          this if the request depends on the result of the handler, for example a response mangler that removes data
+          from the response.</p
+        >
+      </div>
+
+      <app-event-selection
+        (newEvents)="setNewEvents($event)"
+        [events]="editEvent().event"></app-event-selection>
+    </div>
+
+    <mat-tab-group
+      animationDuration="0ms"
+      mat-align-tabs="start"
+      mat-stretch-tabs="false">
+      @for (tab of availableTabs; track tab) {
+        <mat-tab [label]="tab.toUpperCase()">
+          <div class="tab-container">
+            @switch (tab) {
+              @case ("action") {
+                <app-event-action-tab
+                  (newAction)="setNewAction($event)"
+                  (newOptions)="setNewOptions($event)"
+                  (optionsValid)="validOptions.set($event)"
+                  [action]="event().action || ''"
+                  [options]="event().options || {}"></app-event-action-tab>
+              }
+              @case ("conditions") {
+                <app-event-conditions-tab
+                  (newConditions)="setNewConditions($event)"
+                  [conditions]="event().conditions"></app-event-conditions-tab>
+              }
+            }
+          </div>
+        </mat-tab>
+      }
+    </mat-tab-group>
+  </div>
+</div>

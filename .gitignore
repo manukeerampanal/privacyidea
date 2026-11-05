@@ -14,18 +14,22 @@ build/
 DEBUILD/
 doc/_build/
 .idea/
-*.log
+*.log*
 *.old
 *.orig
-tests/testdata/ca2
+*.bak
+*.bak-*
+# Backups of a local database keep the original name as prefix (data.sqlite.bak-<date>),
+# so *.sqlite does not cover them
+*.sqlite.*
 tests/testdata/gpg/.gpg-v*-migrated
 tests/testdata/gpg/private-keys-v*.d
-tests/testdata/tmp_directory
+tests/testdata/tmp_directory*
 node_modules
 po/*.mo
 htmlcov/
-privacyidea/static/customize/views/
-privacyidea/static/customize/css/
+privacyidea/static_old/customize/views/
+privacyidea/static_old/customize/css/
 .eggs/
 privacyIDEA.egg-info/
 __pycache__/
@@ -34,3 +38,8 @@ __pycache__/
 /private.pem
 dist/
 *.swp
+/.vscode/
+/ca/
+
+# Local development environment variables (use .env.example as template)
+.env

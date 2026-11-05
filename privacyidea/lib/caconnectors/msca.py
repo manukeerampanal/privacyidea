@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 # License:  AGPLv3
 #
 # This code is free software; you can redistribute it and/or
@@ -22,33 +20,34 @@ This implementation is for the Microsoft CA via our middleware.
 This module is tested in tests/test_lib_caconnector.py
 """
 
-from privacyidea.lib.error import CAError
-from privacyidea.lib.caconnectors.baseca import BaseCAConnector, AvailableCAConnectors
-from OpenSSL import crypto
 import logging
 import traceback
-from six.moves import input
-from privacyidea.lib.utils import is_true
-from privacyidea.lib.error import CSRError, CSRPending
-from privacyidea.lib.utils import to_bytes
+
+from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
+from privacyidea.lib import _
+from privacyidea.lib.caconnectors.baseca import BaseCAConnector
+from privacyidea.lib.error import CAError
+from privacyidea.lib.error import CSRError, CSRPending
+from privacyidea.lib.utils import is_true, int_to_hex
+from privacyidea.lib.utils import to_bytes
 
 log = logging.getLogger(__name__)
+_grpc_available = False
 try:
     import grpc
     from privacyidea.lib.caconnectors.caservice_pb2_grpc import CAServiceStub
     from privacyidea.lib.caconnectors.caservice_pb2 import (GetCAsRequest,
                                                             GetTemplatesRequest,
                                                             GetCSRStatusRequest,
-                                                            GetCSRStatusReply,
                                                             SubmitCSRRequest,
                                                             GetCertificateRequest,
-                                                            GetCertificateReply)
-    AvailableCAConnectors.append("privacyidea.lib.caconnectors.msca.MSCAConnector")
+                                                            RevokeCertificateRequest,
+                                                            RevokeCertificateReply)
+    _grpc_available = True
 except ImportError:  # pragma: no cover
     log.warning("Can not import grpc modules.")
-
 
 CRL_REASONS = ["unspecified", "keyCompromise", "CACompromise",
                "affiliationChanged", "superseded", "cessationOfOperation"]
@@ -56,7 +55,7 @@ CRL_REASONS = ["unspecified", "keyCompromise", "CACompromise",
 TIMEOUT = 3
 
 
-class CONFIG(object):  # pragma: no cover
+class CONFIG:  # pragma: no cover
     # Only needed for command line creation
 
     def __init__(self, name):
@@ -71,17 +70,17 @@ class CONFIG(object):  # pragma: no cover
         self.ssl_client_key_password = None
 
     def __str__(self):
-        s = """
-        Worker HostName  : {ca.hostname}
-        Worker Port      : {ca.port}
-        Connect via HTTP Proxy      : {ca.http_proxy}
-        CA               : {ca.ca}
-        Use SSL          : {ca.use_ssl}
-        """.format(ca=self)
+        s = f"""
+        Worker HostName  : {self.hostname}
+        Worker Port      : {self.port}
+        Connect via HTTP Proxy      : {self.http_proxy}
+        CA               : {self.ca}
+        Use SSL          : {self.use_ssl}
+        """
         return s
 
 
-class ATTR(object):
+class ATTR:
     __doc__ = """This is the list Attributes of the Microsoft CA connector."""
     HOSTNAME = "hostname"
     PORT = "port"
@@ -91,7 +90,7 @@ class ATTR(object):
     SSL_CA_CERT = "ssl_ca_cert"
     SSL_CLIENT_CERT = "ssl_client_cert"
     SSL_CLIENT_KEY = "ssl_client_key"
-    SSL_CLIENT_KEY_PASSWORD = "ssl_client_key_password"
+    SSL_CLIENT_KEY_PASSWORD = "ssl_client_key_password"  # nosec B105 # key name
 
 
 class MSCAConnector(BaseCAConnector):
@@ -111,6 +110,8 @@ class MSCAConnector(BaseCAConnector):
         :param config: A dictionary with all necessary attributes.
         :return:
         """
+        self.templates = None
+        self.config = None
         self.name = name
         self.hostname = None
         self.port = None
@@ -149,15 +150,16 @@ class MSCAConnector(BaseCAConnector):
         """
         creates a connection to the middleware and returns it.
         """
+        if not _grpc_available:  # pragma: no cover
+            raise CAError(_("grpc module is not available. Cannot connect to MS CA worker."))
         if self.use_ssl:
             # Secure connection
             if not (self.ssl_ca_cert and self.ssl_client_cert and self.ssl_client_key):
                 log.error("For a secure connection we need 'ssl_ca_cert', 'ssl_client_cert'"
                           " and 'ssl_client_key'. The following configuration seems incomplete: "
-                          "({0!s}, {1!s}, {2!s})".format(self.ssl_ca_cert, self.ssl_client_cert,
-                                                         self.ssl_client_key))
+                          f"({self.ssl_ca_cert!s}, {self.ssl_client_cert!s}, {self.ssl_client_key!s})")
                 raise CAError('Incomplete TLS configuration for MSCA worker '
-                              'configuration {0!s}'.format(self.name))
+                              f'configuration {self.name!s}')
             else:
                 # Read all stuff. We need to provide all parameters as PEM encoded byte string
                 with open(self.ssl_ca_cert, 'rb') as f:
@@ -181,21 +183,21 @@ class MSCAConnector(BaseCAConnector):
                     log.debug("Client private key decrypted.")
                 except ValueError as e:
                     log.error('Could not decrypt TLS key with given password. '
-                              '({0!s})'.format(e))
+                              f'({e!s})')
                     raise CAError('Invalid TLS configuration for MSCA worker.')
                 except TypeError as e:
-                    log.error("Faulty configuration in CA '{0!s}'. "
+                    log.error(f"Faulty configuration in CA '{self.name!s}'. "
                               "Trying to use an encrypted private key "
                               "without providing a password (or vice versa)! "
-                              "The CA connector will not work! ({1!s})".format(self.name, e))
+                              f"The CA connector will not work! ({e!s})")
                     raise CAError('Invalid TLS configuration for MSCA worker.')
 
                 credentials = grpc.ssl_channel_credentials(ca_cert_pem, client_key_pem, client_cert_pem)
-                channel = grpc.secure_channel('{0!s}:{1!s}'.format(self.hostname, self.port),
+                channel = grpc.secure_channel(f'{self.hostname!s}:{self.port!s}',
                                               credentials,
                                               options=(('grpc.enable_http_proxy', int(is_true(self.http_proxy))),))
         else:
-            channel = grpc.insecure_channel('{0!s}:{1!s}'.format(self.hostname, self.port),
+            channel = grpc.insecure_channel(f'{self.hostname!s}:{self.port!s}',
                                             options=(('grpc.enable_http_proxy', int(is_true(self.http_proxy))),))
         try:
             grpc.channel_ready_future(channel).result(timeout=TIMEOUT)
@@ -214,7 +216,7 @@ class MSCAConnector(BaseCAConnector):
         Return the description of this CA connectors.
         This contains the name as a key and the possible parameters.
 
-        :return: resolver description dict
+        :return: connector description
         :rtype:  dict
         """
         typ = cls.connector_type
@@ -232,8 +234,7 @@ class MSCAConnector(BaseCAConnector):
     def _check_attributes(self):
         for req_key in [ATTR.HOSTNAME, ATTR.PORT]:
             if req_key not in self.config:
-                raise CAError("required argument '{0!s}' is missing.".format(
-                    req_key))
+                raise CAError(f"required argument '{req_key!s}' is missing.")
 
     def set_config(self, config=None):
         self.config = config or {}
@@ -250,34 +251,35 @@ class MSCAConnector(BaseCAConnector):
         self.ssl_client_key_password = self.config.get(ATTR.SSL_CLIENT_KEY_PASSWORD)
         self.templates = self.get_templates()
 
-    def sign_request(self, csr, options=None):
+    def sign_request(self, csr: str, options: dict = None) -> tuple[int, str | None]:
         """
         Send a signing request to the Microsoft CA
 
-        options can be
-        template: The name of the certificate template to issue
+        *options* may contain the following entries:
+          * ``template``: The name of the certificate template to issue
 
         :param csr: Certificate signing request
-        :type csr: PEM string or SPKAC
-        :param options: Additional options like the validity time or the template or spkac=1
+        :type csr: PEM string
+        :param options: Additional options like the validity time or the template
         :type options: dict
         :return: Returns a tuple of requestID and the certificate object if cert was provided instantly
         :rtype: (int, X509 or None)
         """
+        template_name = options.get("template") if options else None
         if self.connection:
-            reply = self.connection.SubmitCSR(SubmitCSRRequest(csr=csr, templateName=options.get("template"),
+            reply = self.connection.SubmitCSR(SubmitCSRRequest(csr=csr, templateName=template_name,
                                                                caName=self.ca))
             if reply.disposition == 3:
                 request_id = reply.requestId
-                log.info("certificate with request ID {0!s} successfully rolled out".format(request_id))
+                log.info(f"certificate with request ID {request_id!s} successfully rolled out")
                 certificate = self.connection.GetCertificate(GetCertificateRequest(id=request_id,
                                                                                    caName=self.ca)).cert
-                return request_id, crypto.load_certificate(crypto.FILETYPE_PEM, certificate)
+                return request_id, certificate
             if reply.disposition == 5:
                 log.info("cert still under submission")
                 raise CSRPending(requestId=reply.requestId)
             else:
-                log.warning("certification request could not be fulfilled! {0!s}".format(reply))
+                log.warning(f"certification request could not be fulfilled! {reply!s}")
                 raise CSRError(description=reply.dispositionMessage)
 
     def revoke_cert(self, certificate, request_id=None, reason=None):
@@ -285,40 +287,59 @@ class MSCAConnector(BaseCAConnector):
         Revoke the specified certificate. At this point only the database
         index.txt is updated.
 
-        :param certificate: The certificate to revoke
-        :type certificate: Either takes X509 object or a PEM encoded
-            certificate (string)
-        :param request_id: The Id of the certificate in the certificate authority
+        :param certificate: The certificate to revoke (PEM encodes)
+        :type certificate: str
+        :param request_id: The id of the certificate in the certificate authority
         :type request_id: int
         :param reason: One of the available reasons the certificate gets revoked
         :type reason: basestring
-        :return: Returns the serial number of the revoked certificate. Otherwise
+        :return: Returns the serial number of the revoked certificate. Otherwise,
             an error is raised.
         """
-        # TODO: here we need to revoke the cert based on the request Id.
-        pass  # pragma: no cover
+        cert_obj = x509.load_pem_x509_certificate(certificate.encode())
+        serial = cert_obj.serial_number
+        serial_hex = int_to_hex(serial)
+
+        revocation_reason = 0
+        if isinstance(reason, str) and reason not in CRL_REASONS:
+            raise CAError(f"Invalid revocation reason: {reason}")
+        elif isinstance(reason, str):
+            revocation_reason = CRL_REASONS.index(reason)
+        elif isinstance(reason, int) and len(CRL_REASONS) > reason >= 0:
+            revocation_reason = reason
+
+        if self.connection:
+            reply: RevokeCertificateReply = (
+                self.connection.RevokeCertificate(RevokeCertificateRequest(caName=self.ca,
+                                                                           serialNumber=serial_hex,
+                                                                           reason=revocation_reason)))
+            if reply.status.code == 0:
+                return serial_hex
+            else:
+                log.error(f"Revocation failed: {reply.status.message}")
+                raise CAError(f"Revocation failed: {reply.status.message}")
 
     def get_cr_status(self, request_id):
         """
         If a certificate needs a CA manager approval the request is in a pending state.
         This method fetches the state of a requested certificate.
-        This way we can know, if the certificate was issued in the meantime.
+        This way we can know if the certificate was issued in the meantime.
 
-        :param request_id: Id of the request to check
+        :param request_id: id of the request to check
         :type request_id: int
         :return: Status code of the request
         """
         if self.connection:
-            csrRequest = GetCSRStatusRequest()
-            csrRequest.certRequestId = request_id
-            csrRequest.caName = self.ca
-            csrReply = self.connection.GetCSRStatus(csrRequest)
+            csr_request = GetCSRStatusRequest()
+            csr_request.certRequestId = request_id
+            csr_request.caName = self.ca
+            csr_reply = self.connection.GetCSRStatus(csr_request)
             """
             Disposition 2: denied
             Disposition 3: issued
             Disposition 5: pending
             """
-            return csrReply.disposition
+            return csr_reply.disposition
 
     def get_issued_certificate(self, request_id):
         """
@@ -328,11 +349,11 @@ class MSCAConnector(BaseCAConnector):
         :return: The certificate as PEM string
         """
         if self.connection:
-            certRequest = GetCertificateRequest()
-            certRequest.id = request_id
-            certRequest.caName = self.ca
-            certReply = self.connection.GetCertificate(certRequest)
-            return certReply.cert
+            cert_request = GetCertificateRequest()
+            cert_request.id = request_id
+            cert_request.caName = self.ca
+            cert_reply = self.connection.GetCertificate(cert_request)
+            return cert_reply.cert
 
     def get_templates(self):
         """
@@ -342,9 +363,9 @@ class MSCAConnector(BaseCAConnector):
         """
         if self.connection:
             templ = {}
-            templateRequest = GetTemplatesRequest()
-            templateReply = self.connection.GetTemplates(templateRequest)
-            for template in templateReply.templateNames:
+            template_request = GetTemplatesRequest()
+            template_reply = self.connection.GetTemplates(template_request)
+            for template in template_reply.templateNames:
                 templ[template] = ""
             return templ
 
@@ -377,29 +398,29 @@ class MSCAConnector(BaseCAConnector):
                                                ATTR.PORT: config.port,
                                                ATTR.HTTP_PROXY: config.http_proxy})
             # returns a list of machine names\CAnames
-            cARequest = GetCAsRequest()
-            cAReply = dummy_ca.connection.GetCAs(cARequest)
-            cas = [x for x in cAReply.caNames]
+            get_cas_request = GetCAsRequest()
+            get_cas_reply = dummy_ca.connection.GetCAs(get_cas_request)
+            cas = [x for x in get_cas_reply.caNames]
             print("Available CAs: \n")
             for c in cas:
-                print("     {0!s}".format(c))
-            config.ca = input("Choose CA: ".format(config.ca))
+                print(f"     {c!s}")
+            config.ca = input("Choose CA: ")
             print("=" * 60)
-            print("{0!s}".format(config))
+            print(f"{config!s}")
             answer = input("Is this configuration correct? [y/n] ")
             if answer.lower() == "y":
                 break
 
         # return the configuration to the upper level, so that the CA
         # connector can be created in the database
-        caparms = {u"caconnector": name,
-                   u"type": u"microsoft",
-                   ATTR.HOSTNAME: config.hostname,
-                   ATTR.PORT: config.port,
-                   ATTR.HTTP_PROXY: config.http_proxy,
-                   ATTR.CA: config.ca
-                   }
-        return caparms
+        ca_params = {"caconnector": name,
+                     "type": "microsoft",
+                     ATTR.HOSTNAME: config.hostname,
+                     ATTR.PORT: config.port,
+                     ATTR.HTTP_PROXY: config.http_proxy,
+                     ATTR.CA: config.ca
+                     }
+        return ca_params
 
     def get_specific_options(self):
         """
@@ -409,7 +430,7 @@ class MSCAConnector(BaseCAConnector):
         cas = []
         if self.connection:
             # returns a list of machine names\CAnames
-            cARequest = GetCAsRequest()
-            cAReply = self.connection.GetCAs(cARequest)
-            cas = [x for x in cAReply.caNames]
+            get_cas_request = GetCAsRequest()
+            get_cas_reply = self.connection.GetCAs(get_cas_request)
+            cas = [x for x in get_cas_reply.caNames]
         return {"available_cas": cas}

@@ -1,0 +1,124 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { ComponentFixture, TestBed } from "@angular/core/testing";
+import { provideRouter } from "@angular/router";
+import { RadiusConfigComponent } from "@components/configuration/token-type-config/token-types/radius-config/radius-config.component";
+import { RADIUS_SERVER } from "@constants/token.constants";
+
+const mockRadiusServers = ["radius-server-1", "radius-server-2", "radius-server-3"];
+
+describe("RadiusConfigComponent", () => {
+  let fixture: ComponentFixture<RadiusConfigComponent>;
+  let component: RadiusConfigComponent;
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [RadiusConfigComponent],
+      providers: [provideRouter([])]
+    }).compileComponents();
+    fixture = TestBed.createComponent(RadiusConfigComponent);
+    fixture.componentRef.setInput("formData", {});
+    fixture.componentRef.setInput("radiusServers", mockRadiusServers);
+    fixture.componentRef.setInput("radiusServersListable", true);
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+  });
+
+  it("should create", () => {
+    expect(component).toBeTruthy();
+  });
+
+  it("should offer the configured RADIUS servers in a select when they can be listed", () => {
+    const element: HTMLElement = fixture.nativeElement;
+    expect(element.querySelector("mat-select")).not.toBeNull();
+    expect(element.querySelector("mat-hint")?.textContent).toContain("Select a predefined");
+    expect(element.textContent).not.toContain("enrollRADIUS");
+  });
+
+  describe("when the RADIUS servers cannot be listed", () => {
+    beforeEach(() => {
+      fixture.componentRef.setInput("radiusServersListable", false);
+      fixture.componentRef.setInput("formData", { [RADIUS_SERVER]: "radius-server-1" });
+      fixture.detectChanges();
+    });
+
+    it("should replace the select by a text input naming the missing right", () => {
+      const element: HTMLElement = fixture.nativeElement;
+      expect(element.querySelector("mat-select")).toBeNull();
+      expect(element.querySelector("mat-hint")?.textContent).toContain("enrollRADIUS");
+    });
+
+    it("should show the configured value and emit the typed one", () => {
+      const hint: HTMLElement = fixture.nativeElement.querySelector("mat-hint.red");
+      const input = hint.closest("mat-form-field")!.querySelector("input") as HTMLInputElement;
+      expect(input.value).toBe("radius-server-1");
+
+      jest.spyOn(component.formDataChange, "emit");
+      input.value = "radius-server-9";
+      input.dispatchEvent(new Event("input"));
+      expect(component.formDataChange.emit).toHaveBeenCalledWith({ [RADIUS_SERVER]: "radius-server-9" });
+    });
+  });
+
+  it("should emit formDataChange when updateFormData is called", () => {
+    jest.spyOn(component.formDataChange, "emit");
+    const newValue = "radius-server-1";
+    component.updateFormData(RADIUS_SERVER, newValue);
+    expect(component.formDataChange.emit).toHaveBeenCalledWith({ [RADIUS_SERVER]: newValue });
+  });
+
+  it("should display current formData value for radius identifier", () => {
+    const testData = {
+      [RADIUS_SERVER]: "radius-server-1"
+    };
+    fixture.componentRef.setInput("formData", testData);
+    fixture.detectChanges();
+
+    expect(component.formData()[RADIUS_SERVER]).toEqual("radius-server-1");
+  });
+
+  it("should handle empty radius identifier value", () => {
+    jest.spyOn(component.formDataChange, "emit");
+    const newValue = "";
+    component.updateFormData(RADIUS_SERVER, newValue);
+    expect(component.formDataChange.emit).toHaveBeenCalledWith({ [RADIUS_SERVER]: "" });
+  });
+
+  it("should handle radiusServers input correctly", () => {
+    expect(component.radiusServers()).toEqual(mockRadiusServers);
+    expect(component.radiusServers().length).toBe(3);
+  });
+
+  it("should handle empty radiusServers array", () => {
+    fixture.componentRef.setInput("radiusServers", []);
+    fixture.detectChanges();
+    expect(component.radiusServers()).toEqual([]);
+    expect(component.radiusServers().length).toBe(0);
+  });
+
+  it("should handle expanded input", () => {
+    fixture.componentRef.setInput("expanded", true);
+    fixture.detectChanges();
+    expect(component.expanded()).toBe(true);
+
+    fixture.componentRef.setInput("expanded", false);
+    fixture.detectChanges();
+    expect(component.expanded()).toBe(false);
+  });
+});

@@ -1,0 +1,228 @@
+# SPDX-FileCopyrightText: (C) 2025 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: CC0-1.0
+
+# Single-node privacyIDEA stack: one MariaDB plus the three roles of the
+# privacyIDEA image (init, web, cron), all built from the same Dockerfile and
+# selected by environment variables in entrypoint.sh:
+#   pi-init  PI_INIT_ONLY=true  — create tables, run migrations, bootstrap admin,
+#                                 install the enckey canary, then exit
+#   pi       (default)          — gunicorn web workers
+#   pi-cron  PI_CRON_MODE=true  — maintenance scheduler (table cleanups, audit
+#                                 rotate, UI-configured periodic tasks)
+#
+
+name: privacyIDEA
+
+# Shared build + wiring for the three privacyIDEA roles. The three services below
+# reuse this block via YAML anchors: "&pi-common" / "&pi-common-env" name these
+# mappings, and "<<: *pi-common" in a service merges their keys in. Each service
+# then only lists the env vars that make it an init/web/cron container; keys it
+# repeats override the shared value.
+#
+# "x-" prefixes an extension field, which Compose ignores as a service — it just
+# holds the anchors.
+x-pi-common: &pi-common
+  build:
+    context: "../../"
+    dockerfile: ./deploy/docker/Dockerfile
+  # image: privacyidea/privacyidea:<tag>   # use instead of build: once published
+  secrets:
+    - enckey
+    - secret_key
+    - pi_pepper
+    - mariadb_password
+    # Audit signing keypair — without it privacyIDEA silently disables audit and
+    # response signing. DockerConfig auto-detects /run/secrets/audit_key_*.
+    - audit_key_private
+    - audit_key_public
+  env_file:
+    # Optional: additional PRIVACYIDEA_-prefixed config keys, applied to all roles.
+    - ./example.env
+  environment: &pi-common-env
+    # These are DockerConfig's inputs: the DB connection parts (it builds the URI)
+    # and the file-based secrets. All other privacyIDEA config is set as
+    # PRIVACYIDEA_<key> in example.env — kept out of here so this block stays a
+    # single, consistent group. PI_DB_* names also let pi-manage work when exec'd
+    # into the container manually.
+    PI_DB_USER: pi
+    PI_DB_HOST: db
+    PI_DB_NAME: pi
+    PI_DB_PASSWORD_FILE: /run/secrets/mariadb_password
+    # enckey, pepper and secret_key are read from these files by DockerConfig.
+    PI_ENCFILE: /run/secrets/enckey
+    PI_PEPPER_FILE: /run/secrets/pi_pepper
+    PI_SECRET_KEY_FILE: /run/secrets/secret_key
+
+services:
+  db:
+    image: mariadb:10.6
+    restart: unless-stopped
+    environment:
+      MARIADB_USER: pi
+      MARIADB_PASSWORD_FILE: /run/secrets/mariadb_password
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/mariadb_root_password
+      MARIADB_DATABASE: pi
+    secrets:
+      - mariadb_password
+      # Root password is needed by scripts/backup.sh and scripts/restore.sh.
+      - mariadb_root_password
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      retries: 5
+      start_period: 30s
+
+  # One-shot: create tables, run migrations, bootstrap the admin, install the
+  # enckey canary, then exit. pi and pi-cron wait for it to complete.
+  pi-init:
+    <<: *pi-common
+    # Overrides (not extends) the anchor's secrets, so re-list them here.
+    secrets:
+      - enckey
+      - secret_key
+      - pi_pepper
+      - mariadb_password
+      - bootstrap_admin_password
+      - audit_key_private
+      - audit_key_public
+    environment:
+      <<: *pi-common-env
+      PI_INIT_ONLY: "true"
+      PI_CREATE_TABLES: "true"
+      PI_RUN_MIGRATIONS: "true"
+      PI_BOOTSTRAP_ADMIN: ${BOOTSTRAP_ADMIN:-admin}
+    # Exits after its one-shot work — disable the image HEALTHCHECK (which
+    # expects gunicorn on :8080) so it does not spuriously report unhealthy.
+    healthcheck:
+      disable: true
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Web workers (gunicorn).
+  pi:
+    <<: *pi-common
+    restart: unless-stopped
+    ports:
+      # Bound to localhost only — this is plain HTTP and must not be exposed on
+      # the network. For remote access, terminate TLS (the "tls" Caddy profile,
+      # which reaches pi over the internal network) or your own reverse proxy.
+      # Change to "8080:8080" only if you accept unencrypted access.
+      - "127.0.0.1:8080:8080"
+    environment:
+      <<: *pi-common-env
+      PI_CREATE_TABLES: "false"
+      PI_RUN_MIGRATIONS: "false"
+      PI_WORKERS: ${PI_WORKERS:-4}
+    depends_on:
+      pi-init:
+        # Workers start only after the init job has finished — no migration race.
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz/readyz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # Maintenance scheduler. Runs the tasks defined in cron-runner.py's TASKS list
+  # (periodic tasks, table cleanups, audit rotation); toggle/tune them with the
+  # PI_CRON_* variables below. Keep this at a single instance — two would race on
+  # deleting the same rows. Periodic tasks configured in the UI should target node
+  # name "pi-cron" to be picked up here.
+  pi-cron:
+    <<: *pi-common
+    restart: unless-stopped
+    environment:
+      <<: *pi-common-env
+      PI_CRON_MODE: "true"
+      # Fixed node name so UI-configured periodic tasks (EventCounter, SimpleStats,
+      # ...) can target this container. Those are configured in the
+      # web UI, not here — cron-runner.py's "periodic tasks" entry executes them.
+      PRIVACYIDEA_PI_NODE: pi-cron
+      # Audit rotation — defaults shown.
+      # Schedule: by default daily at PI_CRON_AUDIT_HOUR. Set PI_CRON_AUDIT_INTERVAL
+      # (e.g. "6h", "90m", "2d") to run on a fixed interval instead; it takes
+      # precedence over PI_CRON_AUDIT_HOUR.
+      # Amount: watermark-based by default; set PI_CRON_AUDIT_AGE (days) for
+      # age-based rotation instead, e.g. PI_CRON_AUDIT_AGE: 90.
+      #PI_CRON_AUDIT_ROTATE: "true"
+      #PI_CRON_AUDIT_HOUR: "2"
+      #PI_CRON_AUDIT_INTERVAL: "6h"
+      #PI_CRON_AUDIT_AGE: 90
+      #PI_CRON_AUDIT_HIGHWATERMARK: "50000"
+      #PI_CRON_AUDIT_LOWWATERMARK: "25000"
+      #PI_CRON_AUDIT_CHUNKSIZE: ""
+      #PI_CRON_CHALLENGE_CLEANUP: "true"
+      #PI_CRON_PERIODIC_TASKS: "true"
+      # Usercache cleanup — a no-op unless the user cache is enabled. Same
+      # schedule model as audit: PI_CRON_USERCACHE_HOUR or _INTERVAL.
+      #PI_CRON_USERCACHE_CLEANUP: "true"
+      #PI_CRON_USERCACHE_HOUR: "4"
+      #PI_CRON_USERCACHE_INTERVAL: "12h"
+      # Daily at 03:00 UTC: expired remembered devices, authentication cache
+      # entries no auth_cache policy accepts any more, metric rows older than
+      # 24 hours, expired IP blocks and user locks.
+      #PI_CRON_REMEMBERED_DEVICE_CLEANUP: "true"
+      #PI_CRON_AUTHCACHE_CLEANUP: "true"
+      #PI_CRON_METRICS_CLEANUP: "true"
+      #PI_CRON_CONDITIONAL_ACCESS_PURGE: "true"
+      # Authentication log retention in days, off by default and with 0 (the
+      # log is kept forever). Runs daily at 03:00 UTC once set.
+      #PI_CRON_AUTHLOG_AGE: 90
+    healthcheck:
+      disable: true
+    depends_on:
+      pi-init:
+        condition: service_completed_successfully
+
+  # Optional TLS-terminating reverse proxy. Not started by default; enable with:
+  #   docker compose --profile tls up -d
+  # Set PI_SITE_ADDRESS in .env to the public hostname — Caddy then obtains and
+  # renews a Let's Encrypt certificate automatically (needs public DNS + ports
+  # 80/443 reachable). For an internal host without public DNS, add "tls internal"
+  # to the Caddyfile. When fronting with Caddy you can drop the pi "ports:" mapping
+  # above so the app is only reachable through TLS.
+  caddy:
+    image: caddy:2
+    profiles: ["tls"]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      PI_SITE_ADDRESS: ${PI_SITE_ADDRESS:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      pi:
+        condition: service_healthy
+
+# Secrets are read from files in ./secrets/. Run "make init" (or the commands in
+# secrets/README.md) to generate them before the first "docker compose up".
+secrets:
+  enckey:
+    file: ./secrets/enckey
+  secret_key:
+    file: ./secrets/secret_key
+  pi_pepper:
+    file: ./secrets/pi_pepper
+  mariadb_password:
+    file: ./secrets/mariadb_password
+  mariadb_root_password:
+    file: ./secrets/mariadb_root_password
+  bootstrap_admin_password:
+    file: ./secrets/bootstrap_admin_password
+  audit_key_private:
+    file: ./secrets/audit_key_private
+  audit_key_public:
+    file: ./secrets/audit_key_public
+
+volumes:
+  db-data:
+  caddy-data:
+  caddy-config:

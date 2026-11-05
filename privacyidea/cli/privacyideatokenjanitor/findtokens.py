@@ -1,0 +1,593 @@
+#!/usr/bin/env python
+#
+# 2023-11-03 Jona-Samuel Höhmann <jona-samuel.hoehmann@netknights.it>
+#            Migrate to click
+# 2020-11-11 Timo Sturm <timo.sturm@netknights.it>
+#            Select how to validate PSKC imports
+# 2018-02-21 Cornelius Kölbel <cornelius.koelbel@netknights.it>
+#            Allow to import PSKC file
+# 2017-11-21 Cornelius Kölbel <corenlius.koelbel@netknights.it>
+#            export to CSV including usernames
+# 2017-10-18 Cornelius Kölbel <cornelius.koelbel@netknights.it>
+#            Add token export (HOTP and TOTP) to PSKC
+# 2017-05-02 Friedrich Weber <friedrich.weber@netknights.it>
+#            Improve token matching
+# 2017-04-25 Cornelius Kölbel <cornelius.koelbel@netknights.it>
+#
+# Copyright (c) 2017, Cornelius Kölbel
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+# this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from this
+# software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+import click
+from click import ClickException
+from flask.cli import AppGroup
+from dateutil import parser
+from dateutil.tz import tzlocal, tzutc
+
+from privacyidea.lib.error import PolicyError
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.utils import parse_legacy_time
+from privacyidea.lib.importotp import export_pskc
+from privacyidea.lib.token import (get_tokens, remove_token, enable_token,
+                                   unassign_token,
+                                   get_tokens_paginated_generator)
+from privacyidea.models import Token
+import re
+import sys
+from yaml import safe_dump as yaml_safe_dump
+
+find_cli = AppGroup("find")
+
+__doc__ = """
+This script can be used to clean up the token database.
+
+It can list, disable, delete or edit tokens based on
+
+Conditions:
+
+* last_auth
+* orphaned tokens
+* any tokeninfo
+* unassigned token / token has no user
+* tokentype
+
+Actions:
+
+* list
+* unassign
+* mark
+* disable
+* delete
+
+
+    privacyidea-token-janitor find
+        --last_auth=10h|7d|2y
+        --tokeninfo= 'token_info_key == token_info_value' or 'token_info_key >= token_info_value'
+                        or 'token_info_key <= token_info_value'
+        --has-not-tokeninfo-key<key>
+        --has-tokeninfo-key<key>
+        --assigned false
+        --orphaned true
+        --tokentype=<type>
+        --serial=<regexp>
+        --description=<regexp>
+
+
+.. note:: If you fail to redirect the output of this command at the commandline
+   to e.g. a file with a UnicodeEncodeError, you need to set the environment
+   variable like this:
+       export PYTHONIOENCODING=UTF-8
+   Here is a good read about it:
+   https://stackoverflow.com/questions/4545661/unicodedecodeerror-when-redirecting-to-file
+
+"""
+
+ALLOWED_ACTIONS = ["disable", "delete", "unassign", "mark", "export", "listuser", "tokenrealms"]
+
+
+def _try_convert_to_integer(given_value_string):
+    try:
+        return int(given_value_string)
+    except ValueError:
+        raise ClickException(f'Not an integer: {given_value_string}')
+
+
+def _compare_greater_than(_key, given_value_string):
+    """
+    :return: a function which returns True if its parameter (converted to an integer)
+             is greater than *given_value_string* (converted to an integer).
+    """
+    given_value = _try_convert_to_integer(given_value_string)
+
+    def comparator(value):
+        try:
+            return int(value) > given_value
+        except ValueError:
+            return False
+
+    return comparator
+
+
+def _compare_less_than(_key, given_value_string):
+    """
+    :return: a function which returns True if its parameter (converted to an integer)
+             is less than *given_value_string* (converted to an integer).
+    """
+    given_value = _try_convert_to_integer(given_value_string)
+
+    def comparator(value):
+        try:
+            return int(value) < given_value
+        except ValueError:
+            return False
+
+    return comparator
+
+
+def _parse_datetime(key, value):
+    if key == PolicyAction.LASTAUTH:
+        # Special case for last_auth: Legacy values are given in UTC time!
+        last_auth = parser.parse(value)
+        if not last_auth.tzinfo:
+            last_auth.replace(tzinfo=tzutc())
+        return last_auth
+    else:
+        # Other values are given in local time
+        return parse_legacy_time(value, return_date=True)
+
+
+def _try_convert_to_datetime(given_value_string):
+    try:
+        parsed = parser.parse(given_value_string, dayfirst=False)
+        if not parsed.tzinfo:
+            # If not timezone is given we assume the timestamp is given in local time
+            parsed = parsed.replace(tzinfo=tzlocal())
+        return parsed
+    except ValueError:
+        raise ClickException(f'Not a valid datetime format: {given_value_string}')
+
+
+def _compare_after(key, given_value_string):
+    """
+    :return: a function which returns True if its parameter (converted to a datetime) occurs after
+             *given_value_string* (converted to a datetime).
+    """
+    given_value_string = parse_legacy_time(given_value_string, return_date=True)
+
+    def comparator(value):
+        try:
+            return _parse_datetime(key, value) > given_value_string
+        except ValueError:
+            return False
+
+    return comparator
+
+
+def _compare_before(key, given_value_string):
+    """
+    :return: a function which returns True if its parameter (converted to a datetime) occurs before
+             *given_value_string* (converted to a datetime).
+    """
+    given_value_string = parse_legacy_time(given_value_string, return_date=True)
+
+    def comparator(value):
+        try:
+            return _parse_datetime(key, value) < given_value_string
+        except ValueError:
+            return False
+
+    return comparator
+
+
+def _compare_regex_or_equal(_key, given_regex):
+    def comparator(value):
+        if type(value) in (int, bool):
+            # If the value from the database is an integer, we compare "euqals integer"
+            given_value = _try_convert_to_integer(given_regex)
+            return given_value == value
+        else:
+            # if the value from the database is a string, we compare regex
+            return re.search(given_regex, value)
+
+    return comparator
+
+
+def build_tokenvalue_filter(key,
+                            tokeninfo_value,
+                            tokeninfo_value_greater_than,
+                            tokeninfo_value_less_than,
+                            tokeninfo_value_after,
+                            tokeninfo_value_before):
+    """
+    Build and return a token value filter, which is a list of comparator functions.
+    Each comparator function takes a tokeninfo value and returns True if the
+    user-defined criterion matches.
+    The filter matches a record if *all* comparator functions return True, i.e.
+    if the conjunction of all comparators returns True.
+
+    :param key: user-supplied --tokeninfo-key= value
+    :param tokeninfo_value: user-supplied --tokeninfo-value= value
+    :param tokeninfo_value_greater_than: user-supplied --tokeninfo-value-greater-than= value
+    :param tokeninfo_value_less_than: user-supplied --tokeninfo-value-less-than= value
+    :param tokeninfo_value_after: user-supplied --tokeninfo-value-after= value
+    :param tokeninfo_value_before: user-supplied --tokeninfo-value-before= value
+    :return: list of functions
+    """
+    tvfilter = []
+    if tokeninfo_value:
+        tvfilter.append(_compare_regex_or_equal(key, tokeninfo_value))
+    if tokeninfo_value_greater_than:
+        tvfilter.append(_compare_greater_than(key, tokeninfo_value_greater_than))
+    if tokeninfo_value_less_than:
+        tvfilter.append(_compare_less_than(key, tokeninfo_value_less_than))
+    if tokeninfo_value_after:
+        tvfilter.append(_compare_after(key, tokeninfo_value_after))
+    if tokeninfo_value_before:
+        tvfilter.append(_compare_before(key, tokeninfo_value_before))
+    return tvfilter
+
+
+def _get_tokenlist(last_auth, assigned, active, tokeninfo_key,
+                   tokeninfo_value_filter, tokenattribute, tokenattribute_filter,
+                   orphaned, tokentype, serial, description, chunksize, has_not_tokeninfo_key,
+                   has_tokeninfo_key, orphaned_on_error=False):
+    # assigned, active and orphaned are True, False or None, None does not filter
+    if chunksize is not None:
+        iterable = get_tokens_paginated_generator(tokentype=tokentype,
+                                                  active=active,
+                                                  assigned=assigned,
+                                                  psize=chunksize)
+    else:
+        iterable = [get_tokens(tokentype=tokentype,
+                               active=active,
+                               assigned=assigned)]
+    for tokenobj_list in iterable:
+        filtered_list = []
+        sys.stderr.write("++ Creating token object list.\n")
+        tok_count = 0
+        tok_found = 0
+        for token_obj in tokenobj_list:
+            sys.stderr.write(f'{tok_count} Tokens processed / {tok_found} Tokens found\r')
+            sys.stderr.flush()
+            tok_count += 1
+            if last_auth and token_obj.check_last_auth_newer(last_auth):
+                continue
+            if serial and not re.search(serial, token_obj.token.serial):
+                continue
+            if description and not re.search(description,
+                                             token_obj.token.description):
+                continue
+            if has_not_tokeninfo_key:
+                if has_not_tokeninfo_key in token_obj.get_tokeninfo():
+                    continue
+            if has_tokeninfo_key:
+                if has_tokeninfo_key not in token_obj.get_tokeninfo():
+                    continue
+            if tokeninfo_value_filter and tokeninfo_key:
+                value = token_obj.get_tokeninfo(tokeninfo_key)
+                # if the tokeninfo key is not even set, it does not match the filter
+                if value is None:
+                    continue
+                # suppose not all comparator functions return True
+                # => at least one comparator function returns False
+                # => at least one user-supplied criterion does not match
+                # => the token object does not match the user-supplied criteria
+                if not all(comparator(value) for comparator in tokeninfo_value_filter):
+                    continue
+            if tokenattribute_filter and tokenattribute:
+                value = token_obj.token.get(tokenattribute)
+                if value is None:
+                    continue
+                if not all(comparator(value) for comparator in tokenattribute_filter):
+                    continue
+            if orphaned is not None and token_obj.is_orphaned(orphaned_on_error) != orphaned:
+                continue
+
+            tok_found += 1
+            # if everything matched, we append the token object
+            filtered_list.append(token_obj)
+
+        sys.stderr.write(f'{tok_count} Tokens processed / {tok_found} Tokens found\r\n')
+        sys.stderr.write("++ Token object list created.\n")
+        sys.stderr.flush()
+        yield filtered_list
+
+
+def export_token_data(token_list, attributes=None):
+    """
+    Returns a list of tokens. Each token again is a simple list of data
+
+    :param token_list:
+    :param attributes: display additional user attributes
+    :return:
+    """
+    tokens = []
+    for token_obj in token_list:
+        token_data = [f"{token_obj.token.serial!s}",
+                      f"{token_obj.token.tokentype!s}"]
+        try:
+            user = token_obj.user
+            if user:
+                user_info = user.get_specific_info(["username", "givenname", "surname"])
+                token_data.append("{!s}".format(user_info.get("username", "")))
+                token_data.append("{!s}".format(user_info.get("givenname", "")))
+                token_data.append("{!s}".format(user_info.get("surname", "")))
+                token_data.append(f"{user.uid!s}")
+                token_data.append(f"{user.resolver!s}")
+                token_data.append(f"{user.realm!s}")
+
+            if attributes:
+                for att in attributes.split(","):
+                    token_data.append("{!s}".format(
+                        user.info.get(att, ""))
+                    )
+        except Exception:
+            sys.stderr.write(f"Failed to determine user for token {token_obj.token.serial!s}.\n")
+            token_data.append("**failed to resolve user**")
+        tokens.append(token_data)
+    return tokens
+
+
+def export_user_data(token_list, attributes=None):
+    """
+    Returns a list of users with the information how many tokens this user has assigned
+
+    :param token_list:
+    :param attributes: display additional user attributes
+    :return:
+    """
+    users = {}
+    for token_obj in token_list:
+        try:
+            user = token_obj.user
+        except Exception:
+            sys.stderr.write(f"Failed to determine user for token {token_obj.token.serial!s}.\n")
+        if user:
+            request_attributes = attributes.split(",") if attributes else []
+            request_attributes += ["username", "givenname", "surname"]
+            user_info = user.get_specific_info(request_attributes)
+            uid = "'{!s}','{!s}','{!s}','{!s}','{!s}','{!s}'".format(
+                user_info.get("username", ""),
+                user_info.get("givenname", ""),
+                user_info.get("surname", ""),
+                user.uid,
+                user.resolver,
+                user.realm
+            )
+            if attributes:
+                for att in attributes.split(","):
+                    uid += ",'{!s}'".format(
+                        user_info.get(att, "")
+                    )
+        else:
+            uid = "N/A" + ", " * 5
+
+        if uid in users.keys():
+            users[uid].append(token_obj.token.serial)
+        else:
+            users[uid] = [token_obj.token.serial]
+
+    return users
+
+
+@find_cli.command("find")
+@click.option('--set-description', help='set a new description')
+@click.option('--set-tokeninfo-key', help='set a new tokeninfo-key. Only a free-form key can be set, an entry '
+                                          'a token type maintains itself is written by the token and is skipped')
+@click.option('--set-tokeninfo-value', help='set a new tokeninfo-value')
+@click.option('--tokeninfo-value-before', metavar='DATETIME',
+              help='Interpret tokeninfo values as datetimes,'
+                   ' match only if they occur before the given ISO 8601 datetime')
+@click.option('--tokeninfo-value-after', metavar='DATETIME',
+              help='Interpret tokeninfo values as datetimes,'
+                   ' match only if they occur after the given ISO 8601 datetime')
+@click.option('--tokeninfo-value-greater-than', metavar='INTEGER',
+              help='Interpret tokeninfo values as integers and match only if they are '
+                   'greater than the given integer')
+@click.option('--tokeninfo-value-less-than', metavar='INTEGER',
+              help='Interpret tokeninfo values as integers and match only if they are '
+                   'smaller than the given integer')
+@click.option('--tokeninfo-value', metavar='REGEX|INTEGER', help='The tokeninfo value to match')
+@click.option('--has-not-tokeninfo-key', help='filters for tokens that have not given the specified tokeninfo-key')
+@click.option('--has-tokeninfo-key', help='filters for tokens that have given the specified tokeninfo-key.')
+@click.option('--tokeninfo-key', help='The tokeninfo key to match. ')
+@click.option('--tokenattribute-value-greater-than', metavar='INTEGER',
+              help="Match if the value of the token attribute is greater than the given value.")
+@click.option('--tokenattribute-value-less-than', metavar='INTEGER',
+              help="Match if the value of the token attribute is less than the given value.")
+@click.option('--tokenattribute-value', metavar='REGEX|INTEGER',
+              help='The value of the token attribute which should match.')
+@click.option('--tokenattribute', help='Match for a certain token attribute from the database.')
+@click.option('--tokentype', help='The tokentype to search.')
+@click.option('--serial', help='A regular expression on the serial')
+@click.option('--description', help='A regular expression on the description')
+@click.option('--attributes', help='Extends the "listuser" function to display additional user attributes')
+@click.option('--tokenrealms', help='A comma separated list of realms, to which the tokens should be assigned.')
+@click.option('--sum', 'sum_tokens', is_flag=True,
+              help='In case of the action "listuser", this switch specifies if'
+                   ' the output should only contain the number of tokens owned by the user.')
+@click.option('--action', help='Which action should be performed on the '
+                               'found tokens. {!s}. Exporting to PSKC only supports '
+                               'HOTP, TOTP and PW tokens!'.format("|".join(ALLOWED_ACTIONS)))
+@click.option('--csv', is_flag=True,
+              help='In case of a simple find, the output is written as CSV instead of the '
+                   'formatted output.')
+@click.option('--yaml', is_flag=True,
+              help='In case of a simple find, the output is written as YAML instead of the '
+                   'formatted output.')
+@click.option('--last_auth', help='Can be something like 10h, 7d, or 2y')
+@click.option('--assigned', type=click.BOOL, help='Whether the token is assigned to a user: true or false')
+@click.option('--active', type=click.BOOL, help='Whether the token is active: true or false')
+@click.option('--orphaned', type=click.BOOL, help='Whether the token is an orphaned token: true or false')
+@click.option('--orphaned-on-error', default=False, type=bool, show_default=True,
+              help='If orphaned is set, this specifies if a token should be listed as orphaned when there is an error.')
+@click.option('--b32', is_flag=True,
+              help='In case of exporting found tokens to CSV the seed is written base32 encoded instead of hex.')
+@click.option('--chunksize', default=None,
+              help='Read tokens from the database in smaller chunks to perform operations.')
+def findtokens(last_auth, assigned, active, tokeninfo_key, tokeninfo_value,
+               tokeninfo_value_greater_than, tokeninfo_value_less_than,
+               tokeninfo_value_after, tokeninfo_value_before,
+               orphaned, tokentype, serial, description, action, set_description,
+               set_tokeninfo_key, set_tokeninfo_value, sum_tokens, tokenrealms, csv,
+               chunksize, attributes, b32, has_not_tokeninfo_key, has_tokeninfo_key,
+               tokenattribute, tokenattribute_value, tokenattribute_value_greater_than,
+               tokenattribute_value_less_than, yaml, orphaned_on_error):
+    """
+    Finds all tokens which match the conditions.
+    """
+    tokenattributes = [col.key for col in Token.__table__.columns]
+    if tokenattribute and tokenattribute not in tokenattributes:
+        sys.stderr.write("Unknown token attribute. Allowed attributes are {!s}\n".format(
+            ", ".join(tokenattributes)
+        ))
+        sys.exit(1)
+    if action and action not in ALLOWED_ACTIONS:
+        sys.stderr.write("Unknown action. Allowed actions are {!s}\n".format(
+            ", ".join([f"'{x!s}'" for x in ALLOWED_ACTIONS])
+        ))
+        sys.exit(1)
+    if chunksize is not None:
+        chunksize = int(chunksize)
+    # filter for tokeninfo values
+    tvfilter = build_tokenvalue_filter(tokeninfo_key,
+                                       tokeninfo_value,
+                                       tokeninfo_value_greater_than,
+                                       tokeninfo_value_less_than,
+                                       tokeninfo_value_after,
+                                       tokeninfo_value_before)
+    # filter for token attribute
+    tafilter = build_tokenvalue_filter(tokenattribute,
+                                       tokenattribute_value,
+                                       tokenattribute_value_greater_than,
+                                       tokenattribute_value_less_than,
+                                       None, None)
+    generator = _get_tokenlist(last_auth, assigned, active,
+                               tokeninfo_key, tvfilter,
+                               tokenattribute, tafilter,
+                               orphaned, tokentype, serial,
+                               description, chunksize, has_not_tokeninfo_key,
+                               has_tokeninfo_key, orphaned_on_error)
+    if chunksize is not None:
+        sys.stderr.write(f"+ Reading tokens from database in chunks of {chunksize}...\n")
+    else:
+        sys.stderr.write("+ Reading tokens from database...\n")
+    for tlist in generator:
+        sys.stderr.write("+ Tokens read. Starting action.\n")
+        if not action:
+            if not csv:
+                print("Token serial\tTokeninfo")
+                print("=" * 42)
+                for token_obj in tlist:
+                    print(f"{token_obj.token.serial!s}\t({token_obj.token.tokentype!s})\n\t\t{token_obj.token.description!s}\n\t\t{token_obj.get_tokeninfo()!s}")
+            else:
+                for token_obj in tlist:
+                    print(f"'{token_obj.token.serial!s}','{token_obj.token.tokentype!s}','{token_obj.token.description!s}','{token_obj.get_tokeninfo()!s}'")
+
+        elif action == "listuser":
+            if not sum_tokens:
+                tokens = export_token_data(tlist, attributes)
+                for token in tokens:
+                    print(",".join([f"'{x!s}'" for x in token]))
+            else:
+                users = export_user_data(tlist, attributes)
+                for user, tokens in users.items():
+                    print(f"{user!s},{len(tokens)!s}")
+
+        elif action == "export":
+            if csv:
+                for tokenobj in tlist:
+                    if tokenobj.type.lower() not in ["totp", "hotp"]:
+                        continue
+                    token_dict = tokenobj._to_dict(b32=b32)
+                    owner = f"{tokenobj.user.login!s}@{tokenobj.user.realm!s}" if tokenobj.user else "n/a"
+                    if tokenobj.type.lower() == "totp":
+                        print("{!s}, {!s}, {!s}, {!s}, {!s}, {!s}".format(
+                            owner, token_dict.get("serial"),
+                            token_dict.get("otpkey"),
+                            token_dict.get("type"),
+                            token_dict.get("otplen"),
+                            token_dict.get("info_list", {}).get("timeStep")))
+                    else:
+                        print("{!s}, {!s}, {!s}, {!s}, {!s}".format(
+                            owner, token_dict.get("serial"),
+                            token_dict.get("otpkey"),
+                            token_dict.get("type"),
+                            token_dict.get("otplen")))
+            elif yaml:
+                token_list = []
+                for tokenobj in tlist:
+                    try:
+                        token_dict = tokenobj._to_dict(b32=b32)
+                        token_dict["owner"] = (f"{tokenobj.user.login!s}@{tokenobj.user.realm!s}"
+                                               if tokenobj.user else "n/a")
+                        token_list.append(token_dict)
+                    except Exception:
+                        sys.stderr.write("\nFailed to export token {!s}.\n".format(token_dict.get("serial")))
+                print(yaml_safe_dump(token_list))
+            else:
+                key, token_num, soup = export_pskc(tlist)
+                sys.stderr.write(f"\n{token_num!s} tokens exported.\n")
+                sys.stderr.write("\nThis is the AES encryption key of the token seeds.\n"
+                                 "You need this key to import the "
+                                 f"tokens again:\n\n\t{key!s}\n\n")
+                print(f"{soup!s}")
+        else:
+            for token_obj in tlist:
+                try:
+                    if action == "tokenrealms":
+                        trealms = [r.strip() for r in tokenrealms.split(",") if r]
+                        token_obj.set_realms(trealms)
+                        print(f"Setting realms of token {token_obj.token.serial!s} to {trealms!s}.")
+                    if action == "disable":
+                        enable_token(serial=token_obj.token.serial, enable=False)
+                        print(f"Disabling token {token_obj.token.serial!s}")
+                    elif action == "delete":
+                        remove_token(serial=token_obj.token.serial)
+                        print(f"Deleting token {token_obj.token.serial!s}")
+                    elif action == "unassign":
+                        unassign_token(serial=token_obj.token.serial)
+                        print(f"Unassigning token {token_obj.token.serial!s}")
+                    elif action == "mark":
+                        if set_description:
+                            print(f"Setting description for token {token_obj.token.serial!s}: {set_description!s}")
+                            token_obj.set_description(set_description)
+                            token_obj.save()
+                        if set_tokeninfo_value and set_tokeninfo_key:
+                            print(f"Setting tokeninfo for token {token_obj.token.serial!s}: "
+                                  f"{set_tokeninfo_key!s}={set_tokeninfo_value!s}")
+                            try:
+                                token_obj.add_tokeninfo(set_tokeninfo_key, set_tokeninfo_value)
+                                token_obj.save()
+                            except PolicyError as error:
+                                # An entry the token type maintains itself. Report it as skipped rather than
+                                # as a failure, and keep going through the remaining tokens.
+                                print(f"Skipped tokeninfo of token {token_obj.token.serial!s}: {error!s}")
+                except Exception as exx:
+                    print(f"Failed to process token {token_obj.token.serial}.")
+                    print(f"{exx}")

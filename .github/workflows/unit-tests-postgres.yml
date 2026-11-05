@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: (C) 2026 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: CC0-1.0
+#
+# Runs the full unit test suite against PostgreSQL for the oldest and newest
+# supported Python versions — enough to catch PostgreSQL dialect issues without
+# duplicating the full MariaDB matrix. Migration tests are excluded — they have
+# their own dedicated workflow (migration-tests.yml).
+#
+# The actual test steps live in the reusable unit-tests.yml workflow, shared
+# with the MariaDB run.
+
+name: Unit Tests PostgreSQL
+
+on:
+  pull_request:
+    paths:
+      - 'privacyidea/**.py'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - 'requirements.txt'
+      - 'tools/**'
+      - '.github/workflows/unit-tests-postgres.yml'
+      - '.github/workflows/unit-tests.yml'
+      - '.github/python-versions.env'
+
+permissions:
+  contents: read
+
+# Cancel any in-progress run for the same PR when a new commit is pushed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: PostgreSQL
+    permissions:
+      contents: read
+      checks: write
+    uses: ./.github/workflows/unit-tests.yml
+    with:
+      db-kind: postgres
+      driver-pip: psycopg2-binary
+      test-database-url: "postgresql+psycopg2://privacyidea:privacyidea@127.0.0.1:5432/privacyidea_test"

@@ -1,0 +1,185 @@
+import logging
+from datetime import datetime, UTC
+from dataclasses import dataclass
+from webauthn.helpers import bytes_to_base64url
+
+from privacyidea.lib.params import get_required_one_of, get_optional_one_of, get_required, get_optional
+from privacyidea.lib import fido2
+from privacyidea.lib.cache.redis import ChallengeDTO
+from privacyidea.lib.challenge import get_challenges, cancel_challenge
+from privacyidea.lib.config import get_from_config
+from privacyidea.models import Challenge
+from privacyidea.lib.crypto import geturandom
+from privacyidea.lib.error import ResourceNotFoundError, AuthError
+from privacyidea.lib.fido2.config import FIDO2ConfigOptions
+from privacyidea.lib.fido2.policy_action import FIDO2PolicyAction, PasskeyAction
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.tokenclass import TokenClass
+from privacyidea.lib.tokens.passkeytoken import PasskeyTokenClass
+from privacyidea.lib.tokens.webauthn import UserVerificationLevel
+
+log = logging.getLogger(__name__)
+
+# From the weakest to the strictest requirement
+USER_VERIFICATION_ORDER = (UserVerificationLevel.DISCOURAGED, UserVerificationLevel.PREFERRED,
+                           UserVerificationLevel.REQUIRED)
+
+
+def get_fido2_nonce() -> str:
+    """
+    Generate a random 32 byte nonce for fido2 challenges. The nonce is encoded in base64url.
+    """
+    return bytes_to_base64url(geturandom(32))
+
+
+def create_fido2_challenge(rp_id: str, user_verification: str = "preferred", transaction_id: str | None = None,
+                           serial: str | None = None, nonce: str | None = None) -> dict:
+    """
+    Returns a fido2 challenge. The challenge validity time is set to either WebauthnChallengeValidityTime,
+    DefaultChallengeValidityTime or 120s in that order of evaluation.
+    The user_verification parameter can be one of "required", "preferred" or "discouraged". If the value is not one of
+    these, "preferred" is used. user_verification is saved in the challenge data field.
+    If a serial is provided, the challenge is bound to the token with the serial.
+    This is the case when using the passkey_trigger_by_pin policy, where the passkey acts as a challenge-response token
+    that is triggered via the user and PIN. The challenge should then only be usable with the corresponding token.
+    By default, the challenge is not bound to a token, which is the general use-case of FIDO2, to allow usernameless
+    logins.
+    The returned dict has the format:
+        ::
+
+            {
+                "transaction_id": "12345678901234567890",
+                "challenge": <32 random bytes base64url encoded>,
+                "rpId": "example.com",
+                "message": "Please authenticate with your Passkey!",
+                "userVerification": "preferred"
+            }
+    """
+    if not nonce:
+        nonce = fido2.challenge.get_fido2_nonce()
+    message = PasskeyTokenClass.get_default_challenge_text_auth()
+    validity = int(get_from_config(FIDO2ConfigOptions.CHALLENGE_VALIDITY_TIME,
+                                   get_from_config('DefaultChallengeValidityTime', 120)))
+    if user_verification not in USER_VERIFICATION_ORDER:
+        log.warning(f"Invalid user_verification value {user_verification}. Using 'preferred' instead.")
+        user_verification = "preferred"
+
+    # Use the canonical policy-action constant as the key so verify_fido2_challenge can read it
+    # uniformly without knowing about the raw "user_verification" string.
+    data = {FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT: user_verification}
+
+    from privacyidea.lib.token import create_challenge
+    db_challenge = create_challenge(serial=serial or "", transaction_id=transaction_id,
+                                    challenge=nonce, data=data, validitytime=validity)
+    transaction_id = db_challenge.transaction_id
+    return {
+        "transaction_id": transaction_id,
+        "challenge": nonce,
+        "message": message,
+        "rpId": rp_id,
+        # "user_verification" is the browser-facing field name
+        "user_verification": user_verification
+    }
+
+
+@dataclass
+class FIDOVerificationResult:
+    success: int
+    challenge: "Challenge | ChallengeDTO"
+
+
+def has_unbound_challenge(transaction_id: str) -> bool:
+    """
+    Check whether the transaction has a challenge that is not bound to a token. Such a challenge comes from
+    /validate/initialize and starts a passkey login without a username.
+    """
+    return any(not challenge.serial for challenge in get_challenges(transaction_id=transaction_id))
+
+
+def verify_fido2_challenge(transaction_id: str, token: TokenClass, params: dict,
+                           minimum_user_verification: str | None = None) -> FIDOVerificationResult:
+    """
+    Verify the response for a fido2 challenge with the given token.
+    Params is required to have the keys:
+    - authenticatorData or authenticatordata
+    - clientDataJSON or clientdata
+    - signature or signaturedata
+    - userHandle or userhandle
+    - HTTP_ORIGIN
+
+    If no challenge is found for the transaction_id, a ResourceNotFoundError is raised.
+    If the challenge has timed out, an AuthError is raised.
+    If the challenge is bound to a token serial and the token serial does not match the input token, an AuthError
+    is raised.
+
+    The user verification requirement is taken from the challenge. If minimum_user_verification is given, the
+    stricter of the two values applies.
+    """
+    db_challenges = get_challenges(transaction_id=transaction_id)
+    if not db_challenges:
+        raise ResourceNotFoundError(f"Challenge with transaction_id {transaction_id} not found.")
+
+    challenge = next((db_challenge for db_challenge in db_challenges if
+                      (db_challenge.serial == token.get_serial() or not db_challenge.serial)),
+                     None)
+    if not challenge:
+        log.error(f"Challenge with transaction_id {transaction_id} is not meant for token {token.get_serial()}.")
+        raise AuthError(f"The challenge {transaction_id} is not meant for the token {token.get_serial()}.")
+
+    if not challenge.is_valid():
+        log.error(f"Challenge with transaction_id {transaction_id} has timed out.")
+        raise AuthError(f"The challenge {transaction_id} has timed out.")
+
+    # New challenges store the value under FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT.
+    # Challenges created by older code used the raw "user_verification" string instead.
+    # The translation happens here so token classes can always read the constant without a fallback.
+    data = challenge.get_data()
+    if not isinstance(data, dict):
+        log.error(f"Invalid challenge data for transaction_id {transaction_id}.")
+        raise AuthError(f"Invalid challenge data for transaction_id {transaction_id}.")
+    user_verification = (data.get(FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT)
+                         or data.get("user_verification"))
+    if user_verification not in USER_VERIFICATION_ORDER:
+        log.error(
+            f"Invalid user_verification value {user_verification!r} in challenge {transaction_id}."
+        )
+        raise AuthError(f"Invalid user_verification value in challenge {transaction_id}.")
+    if minimum_user_verification:
+        user_verification = max(user_verification, minimum_user_verification, key=USER_VERIFICATION_ORDER.index)
+
+    options = {
+        "challenge": challenge.challenge,
+        "authenticatorData": get_required_one_of(params, ["authenticatorData", "authenticatordata"]),
+        "clientDataJSON": get_required_one_of(params, ["clientDataJSON", "clientdata"]),
+        "signature": get_required_one_of(params, ["signature", "signaturedata"]),
+        "userHandle": get_optional_one_of(params, ["userHandle", "userhandle"]),
+        "HTTP_ORIGIN": get_required(params, "HTTP_ORIGIN"),
+        FIDO2PolicyAction.USER_VERIFICATION_REQUIREMENT: user_verification
+    }
+    # These parameters are required for compatibility with the old WebAuthnToken class
+    if token.type == "webauthn":
+        options.update({
+            "credential_id": get_required_one_of(params, ["credential_id", "credentialid"]),
+            # Authorization restrictions resolved by the webauthntoken_request and webauthntoken_authz prepolicies
+            FIDO2PolicyAction.REQ: get_optional(params, FIDO2PolicyAction.REQ),
+            FIDO2PolicyAction.AUTHENTICATOR_SELECTION_LIST: get_optional(
+                params, FIDO2PolicyAction.AUTHENTICATOR_SELECTION_LIST),
+        })
+    if token.type == "passkey":
+        # Passkey-only policy restrictions resolved by the fido2_auth prepolicy, forwarded here since this
+        # function builds its own curated options dict rather than passing params through unchanged.
+        options.update({
+            PasskeyAction.AllowedAuthenticatorDeviceTypes: get_optional(
+                params, PasskeyAction.AllowedAuthenticatorDeviceTypes),
+            PasskeyAction.EnforceUserHandle: get_optional(params, PasskeyAction.EnforceUserHandle),
+        })
+    options.update({"user": token.user})
+    ret = token.check_otp(None, options=options)
+    result = FIDOVerificationResult(ret, challenge)
+    # On success, remove all challenges with the transaction_id from both
+    # Redis (when active) and the DB.
+    if result.success > 0:
+        cancel_challenge(transaction_id)
+        # Update the last_auth token info
+        token.write_tokeninfo(PolicyAction.LASTAUTH, datetime.now(UTC).isoformat(timespec="seconds"))
+    return result

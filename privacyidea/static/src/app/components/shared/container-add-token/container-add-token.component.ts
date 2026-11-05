@@ -1,0 +1,92 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { NgClass } from "@angular/common";
+import { Component, inject, linkedSignal, output, WritableSignal } from "@angular/core";
+import { MatAutocomplete, MatAutocompleteTrigger } from "@angular/material/autocomplete";
+import { MatCheckbox } from "@angular/material/checkbox";
+import { MatOption } from "@angular/material/core";
+import { MatFormField, MatHint, MatLabel, MatSuffix } from "@angular/material/form-field";
+import { MatIcon } from "@angular/material/icon";
+import { MatInput } from "@angular/material/input";
+import { MatPaginator, PageEvent } from "@angular/material/paginator";
+import { ClearableInputComponent } from "@components/shared/clearable-input/clearable-input.component";
+import { AuthService, AuthServiceInterface } from "@services/auth/auth.service";
+import { ContainerService, ContainerServiceInterface } from "@services/container/container.service";
+import { TokenDetails, TokenService, TokenServiceInterface } from "@services/token/token.service";
+
+@Component({
+  selector: "app-container-add-token",
+  standalone: true,
+  imports: [
+    MatAutocomplete,
+    MatAutocompleteTrigger,
+    MatCheckbox,
+    MatFormField,
+    MatHint,
+    MatIcon,
+    MatInput,
+    MatLabel,
+    MatOption,
+    MatPaginator,
+    MatSuffix,
+    NgClass,
+    ClearableInputComponent
+  ],
+  templateUrl: "./container-add-token.component.html",
+  styleUrls: ["./container-add-token.component.scss"]
+})
+export class ContainerAddTokenComponent {
+  private readonly containerService: ContainerServiceInterface = inject(ContainerService);
+  protected readonly authService: AuthServiceInterface = inject(AuthService);
+  protected readonly tokenService: TokenServiceInterface = inject(TokenService);
+
+  addToken = output<TokenDetails>();
+
+  protected readonly showOnlyTokenInContainer = this.tokenService.showOnlyTokenInContainer;
+  protected readonly filterDraft = this.tokenService.filterDraft;
+  protected readonly pageIndex = this.tokenService.pageIndex;
+  protected readonly pageSize = this.tokenService.pageSize;
+  protected readonly total: WritableSignal<number> = linkedSignal({
+    source: this.tokenService.tokenResourceValue,
+    computation: (tokenResourceValue, previous) => tokenResourceValue?.count ?? previous?.value ?? 0
+  });
+  protected readonly tokenOptions: WritableSignal<TokenDetails[]> = linkedSignal({
+    source: this.tokenService.tokenResourceValue,
+    computation: (tokenResourceValue, previous) => tokenResourceValue?.tokens ?? previous?.value ?? []
+  });
+
+  onPageEvent(event: PageEvent) {
+    this.tokenService.eventPageSize.set(event.pageSize);
+    this.tokenService.pageIndex.set(event.pageIndex);
+  }
+
+  clearFilter() {
+    this.tokenService.clearFilter();
+    this.applyCompatibleTokenTypesFilter();
+  }
+
+  applyCompatibleTokenTypesFilter() {
+    const compatibleTokenTypes = this.containerService.supportedTokenTypes();
+    this.tokenService.updateFilter((filter) =>
+      compatibleTokenTypes.length > 0
+        ? filter.updateHiddenEntry("type_list", compatibleTokenTypes.join(","))
+        : filter.removeHiddenKey("type_list")
+    );
+  }
+}

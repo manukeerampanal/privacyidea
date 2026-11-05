@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  privacyIDEA is a fork of LinOTP
 #  May 08, 2014 Cornelius Kölbel
 #  License:  AGPLv3
@@ -26,16 +24,15 @@
 #
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#  
+#
 """
   Description:  HOTP basic functions
 """
-  
+
 import hmac
 import logging
 import struct
 import binascii
-import six
 
 from hashlib import sha1
 
@@ -47,7 +44,7 @@ from privacyidea.lib.crypto import safe_compare
 log = logging.getLogger(__name__)
 
 
-class HmacOtp(object):
+class HmacOtp:
 
     def __init__(self, secObj=None, counter=0, digits=6, hashfunc=sha1):
         self.secretObj = secObj
@@ -87,12 +84,12 @@ class HmacOtp(object):
         return dig
 
     def truncate(self, digest):
-        offset = six.indexbytes(digest, -1) & 0x0f
+        offset = digest[-1] & 0x0f
 
-        binary = (six.indexbytes(digest, (offset + 0)) & 0x7f) << 24
-        binary |= (six.indexbytes(digest, (offset + 1)) & 0xff) << 16
-        binary |= (six.indexbytes(digest, (offset + 2)) & 0xff) << 8
-        binary |= (six.indexbytes(digest, (offset + 3)) & 0xff)
+        binary = (digest[offset + 0] & 0x7f) << 24
+        binary |= (digest[offset + 1] & 0xff) << 16
+        binary |= (digest[offset + 2] & 0xff) << 8
+        binary |= (digest[offset + 3] & 0xff)
 
         return binary % (10 ** self.digits)
 
@@ -125,7 +122,7 @@ class HmacOtp(object):
             sotp = (self.digits - len(otp)) * "0" + otp
         else:
             sotp = hexlify_and_unicode(hmac)
-            
+
         if inc_counter:
             self.counter = counter + 1
         return sotp
@@ -150,7 +147,7 @@ class HmacOtp(object):
             start = 0 if (start < 0) else start
             end = self.counter + (window)
 
-        log.debug("OTP range counter: {0!r} - {1!r}".format(start, end))
+        log.debug(f"OTP range counter: {start!r} - {end!r}")
         for c in range(start, end):
             otpval = self.generate(c)
             #log.debug("calculating counter {0!r}".format(c))

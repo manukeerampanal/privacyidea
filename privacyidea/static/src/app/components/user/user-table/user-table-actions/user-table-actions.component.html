@@ -1,0 +1,81 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div
+  appOverflowNav
+  overflowNavIcon="menu"
+  overflowNavBadgeIcon="build"
+  class="actions-div margin-bottom-16">
+  <mat-form-field
+    class="input-width-l"
+    subscriptSizing="dynamic">
+    <mat-label i18n="@@user.selectRealm">Select Realm</mat-label>
+    <mat-select
+      (selectionChange)="userService.selectedUserRealm.set($event.value)"
+      [value]="userService.selectedUserRealm()">
+      @for (option of realmService.realmOptions(); track option) {
+        <mat-option [value]="option">{{ option }}</mat-option>
+      }
+    </mat-select>
+  </mat-form-field>
+
+  @if (showCreateUser() && authService.actionAllowed("adduser") && anyEditableResolver()) {
+    <button
+      (click)="navigateToCreateUser()"
+      class="action-button-primary button-width-m"
+      mat-stroked-button>
+      <span class="icon-badge">
+        <mat-icon class="padding-right-3">person</mat-icon>
+        <mat-icon class="icon-badge-overlay icon-badge-bold">add</mat-icon>
+      </span>
+      <span i18n="@@common.createUser">Create User</span>
+    </button>
+  }
+</div>
+
+<!-- Same actions as menu items, for the compact trigger shown next to the filter once the table is
+     scrolled and this component's own row is hidden. -->
+<mat-menu #actionsMenu="matMenu">
+  <button
+    [matMenuTriggerFor]="realmMenu"
+    mat-menu-item>
+    <mat-icon>public</mat-icon>
+    <span i18n="@@user.selectRealm">Select Realm</span>
+  </button>
+  @if (showCreateUser() && authService.actionAllowed("adduser") && anyEditableResolver()) {
+    <button
+      (click)="navigateToCreateUser()"
+      mat-menu-item>
+      <mat-icon>person_add</mat-icon>
+      <span i18n="@@common.createUser">Create User</span>
+    </button>
+  }
+</mat-menu>
+
+<mat-menu #realmMenu="matMenu">
+  @for (option of realmService.realmOptions(); track option) {
+    <button
+      (click)="userService.selectedUserRealm.set(option)"
+      mat-menu-item>
+      <mat-icon>{{
+        option === userService.selectedUserRealm() ? "radio_button_checked" : "radio_button_unchecked"
+      }}</mat-icon>
+      <span>{{ option }}</span>
+    </button>
+  }
+</mat-menu>

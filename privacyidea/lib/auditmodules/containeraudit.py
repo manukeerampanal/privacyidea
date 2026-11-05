@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2019-11-07 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             initial code for writing audit information to a file
 #
@@ -18,9 +16,9 @@
 #
 #
 __doc__ = """The Container Audit Module allows to write audit information to several different
-audit modules at the same time. E.g. it can write audit information to the SQL Audit Module and to the 
+audit modules at the same time. E.g. it can write audit information to the SQL Audit Module and to the
 Logger Audit Module. This way audit information can be saved in the SQL database and at the same time
-be passed to a file or external services via the Python logging facility. 
+be passed to a file or external services via the Python logging facility.
 
 The Container Audit Module is configured like this:
 
@@ -33,6 +31,8 @@ You also have to provide the configuration parameters for the referenced audit m
 """
 
 import logging
+from datetime import timedelta
+
 from privacyidea.lib.auditmodules.base import (Audit as AuditBase)
 from privacyidea.lib.utils import get_module_class
 
@@ -47,7 +47,7 @@ class Audit(AuditBase):
     """
 
     def __init__(self, config=None, startdate=None):
-        super(Audit, self).__init__(config, startdate)
+        super().__init__(config, startdate)
         self.name = "containeraudit"
         write_conf = self.config.get('PI_AUDIT_CONTAINER_WRITE')
         read_conf = self.config.get('PI_AUDIT_CONTAINER_READ')
@@ -56,7 +56,7 @@ class Audit(AuditBase):
                               for audit_module in write_conf]
         self.read_module = get_module_class(read_conf, "Audit", "log")(config, startdate)
         if not self.read_module.is_readable:
-            log.warning(u"The specified PI_AUDIT_CONTAINER_READ {0!s} is not readable.".format(self.read_module))
+            log.warning(f"The specified PI_AUDIT_CONTAINER_READ {self.read_module!s} is not readable.")
 
     @property
     def has_data(self):
@@ -76,19 +76,19 @@ class Audit(AuditBase):
         for module in self.write_modules:
             module.add_to_log(param, add_with_comma)
 
-    def add_policy(self, policyname):
+    def add_policy(self, policy_names: set | list | str):
         """
         Call the add_policy method for all writeable modules
         """
         for module in self.write_modules:
-            module.add_policy(policyname)
+            module.add_policy(policy_names)
 
-    def search(self, search_dict, page_size=15, page=1, sortorder="asc",
-               timelimit=None):
+    def search(self, search_dict: dict, admin_params: dict | None = None, page_size: int = 15, page: int = 1,
+               sortorder: str = "asc", timelimit: timedelta | None = None):
         """
         Call the search method for the one readable module
         """
-        return self.read_module.search(search_dict, page_size=page_size, page=page,
+        return self.read_module.search(search_dict, admin_params=admin_params, page_size=page_size, page=page,
                                        sortorder=sortorder, timelimit=timelimit)
 
     def get_count(self, search_dict, timedelta=None, success=None):
@@ -97,18 +97,20 @@ class Audit(AuditBase):
         """
         return self.read_module.get_count(search_dict, timedelta=timedelta, success=success)
 
-    def csv_generator(self, param=None, user=None, timelimit=None):
+    def csv_generator(self, param: dict | None = None, admin_params: dict | None = None, user=None,
+                      timelimit: timedelta | None = None):
         """
         Call the csv_generator method for the one readable module
         """
-        return self.read_module.csv_generator(param=param, user=user,
-                                              timelimit=timelimit)
+        return self.read_module.csv_generator(param=param, admin_params=admin_params, user=user, timelimit=timelimit)
 
-    def get_total(self, param, AND=True, display_error=True, timelimit=None):
+    def get_total(self, param: dict, admin_params: dict | None = None, AND: bool = True, display_error: bool = True,
+                  timelimit: timedelta | None = None) -> int:
         """
         Call the total method for the one readable module
         """
-        return self.read_module.get_total(param, AND=AND, display_error=display_error, timelimit=timelimit)
+        return self.read_module.get_total(param, admin_params=admin_params, AND=AND, display_error=display_error,
+                                          timelimit=timelimit)
 
     def finalize_log(self):
         """

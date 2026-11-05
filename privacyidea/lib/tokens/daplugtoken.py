@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  privacyIDEA
 #  Aug 12, 2014 Cornelius Kölbel
 #  License:  AGPLv3
@@ -36,17 +34,18 @@ This code is tested in tests/test_lib_tokens_daplug
 """
 
 import binascii
+import logging
+
 from privacyidea.lib.tokens.hotptoken import HotpTokenClass
 from privacyidea.lib.log import log_with
 from privacyidea.lib.config import get_prepend_pin
 from privacyidea.lib.decorators import check_token_locked
 from privacyidea.lib.utils import to_bytes, to_unicode
 from privacyidea.lib import _
-from privacyidea.lib.policy import SCOPE, ACTION, GROUP
-optional = True
-required = False
+from privacyidea.lib.policy import SCOPE, GROUP
+from privacyidea.lib.policies.actions import PolicyAction
 
-import logging
+
 log = logging.getLogger(__name__)
 
 MAPPING = {"b": "0",
@@ -93,8 +92,10 @@ class DaplugTokenClass(HotpTokenClass):
     """
     daplug token class implementation
     """
-    # If the token is enrollable via multichallenge
-    is_multichallenge_enrollable = False
+
+    @classmethod
+    def is_multichallenge_enrollable(cls):
+        return False
 
     @staticmethod
     def get_class_type():
@@ -125,12 +126,12 @@ class DaplugTokenClass(HotpTokenClass):
                                 "the HOTP algorithm"),
                'policy': {
                    SCOPE.ENROLL: {
-                       ACTION.MAXTOKENUSER: {
+                       PolicyAction.MAXTOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of daplug tokens assigned."),
                            'group': GROUP.TOKEN
                        },
-                       ACTION.MAXACTIVETOKENUSER: {
+                       PolicyAction.MAXACTIVETOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of active daplug tokens assigned."),
                            'group': GROUP.TOKEN
@@ -154,7 +155,7 @@ class DaplugTokenClass(HotpTokenClass):
         :type aToken:  orm object
         """
         HotpTokenClass.__init__(self, a_token)
-        self.set_type(u"daplug")
+        self.set_type("daplug")
         self.hKeyRequired = True
         return
 
@@ -220,7 +221,6 @@ class DaplugTokenClass(HotpTokenClass):
         # convert the response
         rdict = {'type': self.get_class_type(),
                  'otp': {}}
-        otp_dict = {}
         for k, v in res[2].get('otp').items():
             rdict['otp'][k] = _digi2daplug(v)
 
@@ -247,7 +247,6 @@ class DaplugTokenClass(HotpTokenClass):
         return res
 
     def split_pin_pass(self, passw, user=None, options=None):
-        res = 0
         try:
             otplen = int(self.token.otplen)
         except ValueError:  # pragma: no cover
@@ -256,7 +255,7 @@ class DaplugTokenClass(HotpTokenClass):
         # For splitting the value we use 12 characters.
         # For internal calculation we use 6 digits.
         otplen *= 2
-        
+
         if get_prepend_pin():
             pin = passw[0:-otplen]
             otpval = passw[-otplen:]
@@ -264,4 +263,4 @@ class DaplugTokenClass(HotpTokenClass):
             pin = passw[otplen:]
             otpval = passw[0:otplen]
 
-        return res, pin, otpval
+        return len(passw) >= otplen, pin, otpval

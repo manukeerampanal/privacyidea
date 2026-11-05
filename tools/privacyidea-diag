@@ -30,6 +30,18 @@
 # CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
+#
+# SPDX-FileCopyrightText: (C) 2018 NetKnights GmbH <https://netknights.it>
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+if [[ $(id -u) != 0 ]]; then
+	echo "Script must be run as root user"
+	exit 1
+fi
+
+# The diagnostics file contains configuration and logs, only root may read it
+umask 077
 
 PICFG="/etc/privacyidea/pi.cfg"
 
@@ -43,8 +55,14 @@ if [[ ! -r $PICFG ]];then
 fi
 
 OS=$(grep "^ID=" /etc/os-release | sed -e 's/^ID=//g' | tr -d '"')
+OS_LIKE=$(grep "^ID_LIKE=" /etc/os-release | sed -e 's/^ID_LIKE=//g' | tr -d '"')
+# Rebuilds of RHEL (Rocky Linux, AlmaLinux, ...) are handled like RHEL
+if [[ "${OS}" != "centos" && " ${OS_LIKE} " == *" rhel "* ]]; then
+	OS="rhel"
+fi
 diag_info=$(mktemp -d -t pi_diag_XXXXXXXXXX)
-tempfile="${diag_info}/privacyidea.config"
+tempfile="${diag_info}/system.config"
+pi_config="${diag_info}/privacyidea.config"
 timestamp=$(date +"%y-%m-%d")
 diag_file="/tmp/${timestamp}_$(basename "$diag_info").tar.gz"
 
@@ -58,6 +76,10 @@ esac
 
 log() {
 	echo "$1" >> "$tempfile"
+}
+
+log_pi_config() {
+	echo "$1" >> "$pi_config"
 }
 
 call_pi_manage() {
@@ -77,29 +99,141 @@ get_os() {
 	cat /etc/*-release >> "$tempfile"
 }
 
+pi_python() {
+	# The interpreter of pi-manage has the Python version privacyIDEA needs
+	local pi_manage interpreter
+	pi_manage=$(command -v pi-manage) && interpreter=$(head -n 1 "$pi_manage" | sed -e 's/^#!//')
+	case "$interpreter" in
+		*python*) echo "$interpreter" ;;
+		*) echo python3 ;;
+	esac
+}
+
+censor_pi_cfg() {
+	# Print the statements of the pi.cfg file given as first argument without comments.
+	# Assignments to names that look like secrets are censored. Of URIs and URLs only the
+	# scheme is kept, so we see if e.g. pymysql, mysql or any other dialect is used.
+	# shellcheck disable=SC2046
+	$(pi_python) - "$1" <<'EOF'
+import ast
+import re
+import sys
+from typing import Optional
+
+SECRET_NAME = re.compile(r"SECRET|PASSWORD|PASSWD|PEPPER|CREDENTIAL|_KEY$|_URI$|_URL$|_OPTIONS$|EXTRA_PARAMS$")
+URL_NAME = re.compile(r"_URI$|_URL$")
+URL_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
+PUBLIC_NAMES = {"PI_BASE_URL"}
+
+
+def is_secret(name: str) -> bool:
+    return name not in PUBLIC_NAMES and bool(SECRET_NAME.search(name))
+
+
+def assigned_names(statement: ast.stmt) -> list:
+    return [node.id for node in ast.walk(statement) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)]
+
+
+def url_scheme(value: ast.expr) -> Optional[str]:
+    for node in ast.walk(value):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            scheme_match = URL_SCHEME.match(node.value)
+            return scheme_match.group(1) if scheme_match else None
+    return None
+
+
+def censor_statement(statement: ast.stmt, source: str) -> str:
+    names = assigned_names(statement)
+    if not any(is_secret(name) for name in names):
+        return ast.get_source_segment(source, statement)
+    if isinstance(statement, ast.Assign) and len(names) == 1 and URL_NAME.search(names[0]):
+        scheme = url_scheme(statement.value)
+        if scheme:
+            return f"{names[0]} = '{scheme}:<censored>'"
+    return "\n".join(f"{name} = <censored>" for name in names)
+
+
+def main(config_file_name: str) -> None:
+    with open(config_file_name) as config_file:
+        source = config_file.read()
+    try:
+        module = ast.parse(source)
+    except SyntaxError:
+        print(f"{config_file_name} could not be parsed and is not included.")
+        return
+    for statement in module.body:
+        print(censor_statement(statement, source))
+
+
+main(sys.argv[1])
+EOF
+}
+
+censor_json() {
+	# Read a configuration export from stdin and replace the string values of keys that look like
+	# secrets. JSON objects inside string values, e.g. HTTP headers, are censored as well.
+	local program
+	program=$(cat <<'EOF'
+import json
+import re
+import sys
+from typing import Any
+
+SECRET_KEY = re.compile(r"secret|passw|bindpw|authorization|credential|token$|api[-_]?key|private[-_]?key|motppin|"
+                        r"access[-_]?code", re.IGNORECASE)
+CENSORED = "__CENSORED__"
+
+
+def censor(value: Any, secret: bool = False) -> Any:
+    if isinstance(value, dict):
+        return {key: censor(item, bool(SECRET_KEY.search(str(key)))) for key, item in value.items()}
+    if isinstance(value, list):
+        return [censor(item, secret) for item in value]
+    if isinstance(value, str) and value:
+        if secret:
+            return CENSORED
+        if value.lstrip().startswith("{"):
+            try:
+                nested_value = json.loads(value)
+            except ValueError:
+                return value
+            if isinstance(nested_value, dict):
+                return json.dumps(censor(nested_value))
+    return value
+
+
+try:
+    exported = json.load(sys.stdin)
+except ValueError:
+    print("The export could not be parsed and is not included.")
+else:
+    print(json.dumps(censor(exported), indent=2))
+EOF
+)
+	# shellcheck disable=SC2046
+	$(pi_python) -c "$program"
+}
+
 get_pi_cfg() {
-	log
-	log "SECTION: pi.cfg file"
-	log "===================="
-	grep -v -e 'SECRET_KEY\|PI_PEPPER\|SQLALCHEMY_DATABASE_URI' "$PICFG" >> "$tempfile"
-	# only write the driver part of the URI to the logfile.
-	# So we see if eg. pymysql, mysql or any other dialect is used.
-	grep ^SQLALCHEMY_DATABASE_URI "$PICFG" | cut -d':' -f 1 >> "$tempfile"
+	log_pi_config
+	log_pi_config "SECTION: pi.cfg file (without comments, secrets censored)"
+	log_pi_config "========================================================="
+	censor_pi_cfg "$PICFG" >> "$pi_config"
 }
 
 current_db_revision() {
-	log
-	log "SECTION: current_db_revision"
-	log "============================"
-	call_pi_manage db current -d /opt/privacyidea/lib/privacyidea/migrations/ >> "$tempfile"
+	log_pi_config
+	log_pi_config "SECTION: current_db_revision"
+	log_pi_config "============================"
+	call_pi_manage db current -v >> "$pi_config"
 }
 
 pi_versions() {
-	log
-	log "SECTION: privacyIDEA Versions"
-	log "============================="
-	log "Installed packages"
-	log "------------------"
+	log_pi_config
+	log_pi_config "SECTION: privacyIDEA Versions"
+	log_pi_config "============================="
+	log_pi_config "Installed packages"
+	log_pi_config "------------------"
 	FileName=$(mktemp)
 	if [[ "${OS}" == "centos" || "${OS}" == "rhel" ]]; then
 		# In case it is CentOS/RHEL
@@ -109,32 +243,43 @@ pi_versions() {
 		dpkg -l | sort >> "$FileName";
 	fi
 	# save all installed packages
-	cat "$FileName" >> "$tempfile"
+	cat "$FileName" >> "$pi_config"
 	rm -f "$FileName"
-	log
-	log "Python packages in /opt/privacyidea:"
-	log "===================================="
+	log_pi_config
+	log_pi_config "Python packages in /opt/privacyidea:"
+	log_pi_config "===================================="
 	if [[ -x  /opt/privacyidea/bin/pip ]]; then
-		/opt/privacyidea/bin/pip freeze >> "$tempfile"
+		/opt/privacyidea/bin/pip freeze >> "$pi_config"
 	fi
 }
 
 pi_config() {
-	log
-	log "SECTION: privacyIDEA Configuration"
-	log "=================================="
-	log "Resolvers"
-	log "---------"
-	call_pi_manage resolver list -v >> "$tempfile"
-	log "Realms"
-	log "------"
-	call_pi_manage realm list >> "$tempfile"
-	log "Events"
-	log "------"
-	call_pi_manage event e_export >> "$tempfile"
-	log "Policies"
-	log "--------"
-	call_pi_manage policy p_export >> "$tempfile"
+	log_pi_config
+	log_pi_config "SECTION: privacyIDEA Configuration"
+	log_pi_config "=================================="
+	log_pi_config "Resolvers"
+	log_pi_config "---------"
+	call_pi_manage config export -t resolver -f json --censor | censor_json >> "$pi_config"
+	log_pi_config "Realms"
+	log_pi_config "------"
+	call_pi_manage config realm list >> "$pi_config"
+	log_pi_config "Events"
+	log_pi_config "------"
+	call_pi_manage config export -t event -f json | censor_json >> "$pi_config"
+	log_pi_config "Policies"
+	log_pi_config "--------"
+	call_pi_manage config export -t policy -f json | censor_json >> "$pi_config"
+}
+
+server_config() {
+	# Extract configurations for smtp, privacyIDEA and RADIUS server
+	server_config=$(call_pi_manage config export -t smtpserver -t privacyideaserver -t radiusserver -f json --censor |
+		censor_json)
+
+	log_pi_config
+	log_pi_config "SECTION: SMTP|privacyIDEA|RADIUS Server Configuration"
+	log_pi_config "====================================================="
+	log_pi_config "$server_config"
 }
 
 FreeRADIUS_config() {
@@ -174,7 +319,7 @@ system_status() {
 centos_auditlog() {
 	if [[ "$(getenforce)" == "Enforcing" ]]; then
 		log
-		log "SECTION: centOS Auditlog"
+		log "SECTION: SELinux denials"
 		log "========================"
 		grep "denied" /var/log/audit/audit.log  >> "$tempfile"
 	fi
@@ -182,58 +327,87 @@ centos_auditlog() {
 
 apache_log() {
 	if [[ "${OS}" == "centos" || "${OS}" == "rhel" ]]; then
-		log
-		log "SECTION: httpd SSL_error_log"
-		log "============================"
-		tail -100 /var/log/httpd/ssl_error_log  >> "$tempfile"
-		log
-		log "SECTION: httpd Access_log"
-		log "========================="
-		tail -100 /var/log/httpd/ssl_access_log  >> "$tempfile"
-		log
-		log "SECTION: apache configuration"
-		log "============================="
-		tail -n +1 /etc/httpd/conf/httpd.conf /etc/httpd/conf.d/privacyidea.conf >>  "$tempfile"
+		if [ -f /var/log/httpd/ssl_error_log ] && [ -f /var/log/httpd/ssl_access_log ]; then
+			log
+			log "SECTION: httpd SSL_error_log"
+			log "============================"
+			tail -100 /var/log/httpd/ssl_error_log  >> "$tempfile"
+			log
+			log "SECTION: httpd SSL_access_log"
+			log "============================"
+			tail -100 /var/log/httpd/ssl_access_log  >> "$tempfile"
+		fi
+		if [ -f /etc/httpd/conf/httpd.conf ] && [ -f /etc/httpd/conf.d/privacyidea.conf ]; then
+			log
+			log "SECTION: apache configuration"
+			log "============================="
+			tail -n +1 /etc/httpd/conf/httpd.conf /etc/httpd/conf.d/privacyidea.conf >>  "$tempfile"
+		fi
 	elif [[ "${OS}" == "ubuntu" || "${OS}" == "debian" ]]; then
+		if [ -f /var/log/apache2/error.log ] && [ -f /var/log/apache2/ssl_access.log ]; then
+			log
+			log "SECTION: apache2 error_log"
+			log "=========================="
+			tail -100 /var/log/apache2/error.log >> "$tempfile"
+			log
+			log "SECTION: apache2 SSL_access_log"
+			log "==============================="
+			tail -100 /var/log/apache2/ssl_access.log >> "$tempfile"
+		fi
+		if [ -f /etc/apache2/apache2.conf ] && [ -d /etc/apache2/sites-enabled ]; then
+			log
+			log "SECTION: apache configuration"
+			log "============================="
+			tail -n +1 /etc/apache2/apache2.conf /etc/apache2/sites-enabled/* >> "$tempfile"
+		fi
+	fi
+}
+
+ngnix_log(){
+	# Check if NGNIX logs exist
+	if [ -f /var/log/nginx/error.log ] && [ -f /var/log/nginx/access.log ]; then
 		log
-		log "SECTION: apache2 error_log"
-		log "=========================="
-		tail -100 /var/log/apache2/error.log >> "$tempfile"
+		log "SECTION: NGNIX-ERROR.LOG"
+		log "========================"
+		tail -n 100 /var/log/nginx/error.log >> "$tempfile"
 		log
-		log "SECTION: apache2 SSL_access_log"
-		log "==============================="
-		tail -100 /var/log/apache2/ssl_access.log >> "$tempfile"
-		log
-		log "SECTION: apache configuration"
-		log "============================="
-		tail -n +1 /etc/apache2/apache2.conf /etc/apache2/sites-enabled/* >> "$tempfile"
+		log "SECTION: NGNIX-ACCESS.LOG"
+		log "========================"
+		tail -n 100 /var/log/nginx/access.log >> "$tempfile"
 	fi
 }
 
 pi_logfile() {
 	R=$( grep "^PI_LOGFILE" "$PICFG" | cut -d "=" -f2 | tr -d "\t \'\"" )
-	[ -f ${R} ] && cp ${R} "${diag_info}/privacyidea.logfile" || echo "Could not read logfile ${R}" >> "$tempfile"
+	[[ -f ${R} ]] && cp ${R} "${diag_info}/privacyidea.logfile" || echo "Could not read logfile ${R}" >> "${diag_info}/privacyidea.logfile"
 }
 
 pi_auditlog() {
 	call_pi_manage audit dump -f - -t 2d >> "${diag_info}/privacyidea.auditlog"
 }
 
-
 get_os
 get_pi_cfg
 current_db_revision
 pi_versions
 pi_config
+server_config
 FreeRADIUS_config
 system_status
-if [[ "${OS}" == "centos" ]]; then
+if [[ "${OS}" == "centos" || "${OS}" == "rhel" ]]; then
 	centos_auditlog
 fi
 apache_log
+ngnix_log
 pi_logfile
 pi_auditlog
 
-tar -zcf "$diag_file" -C /tmp "$(basename "$diag_info")"
-
-upload_info
+# mktemp honours TMPDIR, so the collected data is packed from where it actually is. It is only removed once the
+# archive exists.
+if tar -zcf "$diag_file" -C "$(dirname "$diag_info")" "$(basename "$diag_info")"; then
+	rm -rf "$diag_info"
+	upload_info
+else
+	echo "Could not create $diag_file, the collected data is kept in $diag_info." >&2
+	exit 1
+fi

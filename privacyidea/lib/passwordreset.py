@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2022-06-06 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Fix recovery link
 #  2015-01-06 Cornelius Kölbel <cornelius@privacyidea.org>
@@ -19,19 +17,21 @@
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 #
-from privacyidea.models import PasswordReset
+import logging
+from datetime import datetime, UTC
+
+from sqlalchemy import select, delete
+
+from privacyidea.lib.config import get_from_config
 from privacyidea.lib.crypto import (hash_with_pepper, verify_with_pepper,
                                     generate_password)
-import logging
+from privacyidea.lib.error import UserError, PrivacyIDEAError, ConfigAdminError
 from privacyidea.lib.log import log_with
-from privacyidea.lib.error import UserError, privacyIDEAError, ConfigAdminError
-from privacyidea.lib.smtpserver import send_email_identifier
-from privacyidea.lib.config import get_from_config
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.policy import SCOPE, Match
 from privacyidea.lib.resolver import get_resolver_list
-from privacyidea.lib.policy import ACTION, SCOPE, Match
-from sqlalchemy import and_
-from datetime import datetime
-
+from privacyidea.lib.smtpserver import send_email_identifier
+from privacyidea.models import PasswordReset, db
 
 __doc__ = """
 This is the library for creating a recovery code for password reset.
@@ -45,7 +45,7 @@ This module is tested in tests/test_lib_passwordreset.py
 
 log = logging.getLogger(__name__)
 
-BODY = u"""Someone requested to reset the password within privacyIDEA.
+BODY = """Someone requested to reset the password within privacyIDEA.
 
 To reset your user password please visit the link
 
@@ -65,39 +65,41 @@ def create_recoverycode(user, email=None, expiration_seconds=3600,
     :param recoverycode: Only used for testing purpose
     :return: bool
     """
-    base_url = base_url.strip("recover")
-    base_url += "#!"
+    # Validate everything before persisting a recovery code, so a rejected
+    # request never leaves a PasswordReset row behind.
+    if not user:
+        raise UserError("User required for recovery token.")
+    user_email = user.get_specific_info(["email"]).get("email")
+    if not user_email:
+        raise UserError("The user has no email address on file. "
+                        "Cannot send a password recovery code.")
+    if email and email.lower() != user_email.lower():
+        raise UserError("The email does not match the users email.")
+    identifier = get_from_config("recovery.identifier")
+    if not identifier:
+        raise ConfigAdminError("Missing configuration "
+                               "recovery.identifier.")
+
+    # ``base_url`` is expected to be a trusted base URL (see
+    # privacyidea.lib.framework.get_base_url); append the Web UI hashbang route
+    # that consumes the recovery code.
+    base_url = base_url.rstrip("/") + "/#!"
     recoverycode = recoverycode or generate_password(size=24)
     hash_code = hash_with_pepper(recoverycode)
-    # send this recoverycode
-    #
     pwreset = PasswordReset(hash_code, username=user.login,
                             realm=user.realm,
                             expiration_seconds=expiration_seconds)
     pwreset.save()
 
-    res = False
-    if not user:
-        raise UserError("User required for recovery token.")
-    user_email = user.info.get("email")
-    if email and email.lower() != user_email.lower():
-        raise UserError("The email does not match the users email.")
-
-    identifier = get_from_config("recovery.identifier")
-    if identifier:
-        # send email
-        r = send_email_identifier(identifier, user_email,
-                                  "Your password reset",
-                                  BODY.format(base_url,
-                                              user.login, user.realm,
-                                              recoverycode))
-        if not r:
-            raise privacyIDEAError("Failed to send email. {0!s}".format(r))
-    else:
-        raise ConfigAdminError("Missing configuration "
-                               "recovery.identifier.")
-    res = True
-    return res
+    # send this recoverycode
+    r = send_email_identifier(identifier, user_email,
+                              "Your password reset",
+                              BODY.format(base_url,
+                                          user.login, user.realm,
+                                          recoverycode))
+    if not r:
+        raise PrivacyIDEAError(f"Failed to send email. {r!s}")
+    return True
 
 
 @log_with(log)
@@ -113,21 +115,21 @@ def check_recoverycode(user, recoverycode):
     """
     recoverycode_valid = False
     # delete old entries
-    r = PasswordReset.query.filter(and_(PasswordReset.expiration <
-                                      datetime.now())).delete()
-    log.debug("{0!s} old password recoverycodes deleted.".format(r))
-    sql_query = PasswordReset.query.filter(and_(PasswordReset.username ==
-                                            user.login,
-                                                PasswordReset.realm
-                                                == user.realm))
-    for pwr in sql_query:
+    delete_expired_stmt = delete(PasswordReset).where(
+        PasswordReset.expiration < datetime.now(UTC).replace(tzinfo=None))
+    delete_result = db.session.execute(delete_expired_stmt)
+    log.debug(f"{delete_result.rowcount!s} old password recoverycodes deleted.")
+    stmt = select(PasswordReset).where(PasswordReset.username == user.login, PasswordReset.realm == user.realm)
+    pw_resets = db.session.scalars(stmt).all()
+    for pwr in pw_resets:
         if verify_with_pepper(pwr.recoverycode, recoverycode):
             recoverycode_valid = True
-            log.debug(u"Found valid recoverycode for user {0!r}".format(user))
+            log.debug(f"Found valid recoverycode for user {user!r}")
             # Delete the recovery code, so that it can only be used once!
             r = pwr.delete()
-            log.debug("{0!s} used password recoverycode deleted.".format(r))
+            log.debug(f"{r!s} used password recoverycode deleted.")
 
+    db.session.commit()
     return recoverycode_valid
 
 
@@ -142,8 +144,8 @@ def is_password_reset(g):
     :return: True or False
     """
     rlist = get_resolver_list(editable=True)
-    log.debug("Number of editable resolvers: {0!s}".format(len(rlist)))
+    log.debug(f"Number of editable resolvers: {len(rlist)!s}")
     pwreset = Match.generic(g, scope=SCOPE.USER,
-                            action=ACTION.PASSWORDRESET).allowed(write_to_audit_log=False)
-    log.debug("Password reset allowed via policies: {0!s}".format(pwreset))
+                            action=PolicyAction.PASSWORDRESET).allowed(write_to_audit_log=False)
+    log.debug(f"Password reset allowed via policies: {pwreset!s}")
     return bool(rlist and pwreset)

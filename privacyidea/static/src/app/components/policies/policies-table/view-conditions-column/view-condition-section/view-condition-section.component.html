@@ -1,0 +1,13 @@
+<div class="conditions-grid-container">
+  <span class="conditions-label">{{ displayLabel() }}</span>
+  <div class="conditions-chips-container">
+    @for (value of values(); track value) {
+      <div [innerHTML]="value | highlight: highlightTerms()"></div>
+    }
+    @if (marker()) {
+      <div class="marker-chip">
+        {{ marker() }}
+      </div>
+    }
+  </div>
+</div>

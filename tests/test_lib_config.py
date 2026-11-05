@@ -3,8 +3,9 @@ This test file tests the lib.config
 
 The lib.config only depends on the database model.
 """
-from privacyidea.models import Config, PRIVACYIDEA_TIMESTAMP, save_config_timestamp, db
-from .base import MyTestCase
+import importlib
+from unittest import mock
+
 from privacyidea.lib.config import (get_resolver_list,
                                     get_resolver_classes,
                                     get_resolver_class_dict,
@@ -22,18 +23,21 @@ from privacyidea.lib.config import (get_resolver_list,
                                     get_machine_resolver_class_dict,
                                     get_privacyidea_node, get_privacyidea_nodes,
                                     this, get_config_object, invalidate_config_object,
-                                    get_multichallenge_enrollable_tokentypes)
+                                    get_multichallenge_enrollable_types,
+                                    get_email_validators,
+                                    check_node_uuid_exists)
 from privacyidea.lib.resolvers.PasswdIdResolver import IdResolver as PWResolver
 from privacyidea.lib.tokens.hotptoken import HotpTokenClass
 from privacyidea.lib.tokens.totptoken import TotpTokenClass
-from flask import current_app
-import importlib
+from privacyidea.models import Config, save_config_timestamp, db, NodeName
+from .base import MyTestCase
 
 
 class ConfigTestCase(MyTestCase):
     """
     Test the config on the database level
     """
+
     def test_00_get_config(self):
         # set the config
         set_privacyidea_config(key="Hallo", value="What?", typ="string",
@@ -55,7 +59,7 @@ class ConfigTestCase(MyTestCase):
         # delete privacyidea config
         delete_privacyidea_config("Hallo")
         conf = get_from_config("Hallo")
-        self.assertFalse(conf == "What?", conf)
+        self.assertNotEqual("What?", conf)
 
         # set more values to create a timestamp and overwrite
         set_privacyidea_config(key="k1", value="v1")
@@ -73,6 +77,9 @@ class ConfigTestCase(MyTestCase):
         self.assertTrue("privacyidea.lib.resolvers.LDAPIdResolver" in r, r)
         self.assertTrue("privacyidea.lib.resolvers.SCIMIdResolver" in r, r)
         self.assertTrue("privacyidea.lib.resolvers.SQLIdResolver" in r, r)
+        self.assertTrue("privacyidea.lib.resolvers.HTTPResolver" in r, r)
+        self.assertTrue("privacyidea.lib.resolvers.EntraIDResolver" in r, r)
+        self.assertTrue("privacyidea.lib.resolvers.KeycloakResolver" in r, r)
 
         # check modules
         mlist = get_resolver_module_list()
@@ -97,7 +104,7 @@ class ConfigTestCase(MyTestCase):
         self.assertTrue('privacyidea.lib.resolvers.PasswdIdResolver'
                         '.IdResolver' in types, types)
         self.assertTrue(types.get('privacyidea.lib.resolvers.PasswdIdResolver'
-                        '.IdResolver') == "passwdresolver", types)
+                                  '.IdResolver') == "passwdresolver", types)
 
         # With calling 'get_resolver_classes()' the resolver types will also be cached
         self.assertTrue("pi_resolver_types" in this.config, this.config)
@@ -116,9 +123,9 @@ class ConfigTestCase(MyTestCase):
         module = importlib.import_module(mod_name)
         self.assertTrue(module in mlist, mlist)
 
-#        r = get_resolver_classes()
-#        self.assertTrue(UserResolver in r, r)
-#        self.assertTrue(PWResolver in r, r)
+        #        r = get_resolver_classes()
+        #        self.assertTrue(UserResolver in r, r)
+        #        self.assertTrue(PWResolver in r, r)
 
         # get_token_class_dict
         (classes, types) = get_token_class_dict()
@@ -224,11 +231,22 @@ class ConfigTestCase(MyTestCase):
         self.assertEqual(a, None)
 
     def test_07_node_names(self):
+        # if there is no node in the nodename table, the check fails
+        self.assertFalse(check_node_uuid_exists("8e4272a9-9037-40df-8aa3-976e4a04b5a9"))
+
+        node1 = NodeName(id="8e4272a9-9037-40df-8aa3-976e4a04b5a9", name="Node1")
+        node2 = NodeName(id="d1d7fde6-330f-4c12-88f3-58a1752594bf", name="Node2")
+        db.session.add_all([node1, node2])
+
+        self.assertTrue(check_node_uuid_exists("8e4272a9-9037-40df-8aa3-976e4a04b5a9"))
+
         node = get_privacyidea_node()
         self.assertEqual(node, "Node1")
         nodes = get_privacyidea_nodes()
-        self.assertTrue("Node1" in nodes)
-        self.assertTrue("Node2" in nodes)
+        self.assertIn({"uuid": "8e4272a9-9037-40df-8aa3-976e4a04b5a9", "name": "Node1"}, nodes, nodes)
+        self.assertIn({"uuid": "d1d7fde6-330f-4c12-88f3-58a1752594bf", "name": "Node2"}, nodes, nodes)
+        db.session.delete(node1)
+        db.session.delete(node2)
 
     def test_08_config_object(self):
         obj1 = get_config_object()
@@ -250,7 +268,7 @@ class ConfigTestCase(MyTestCase):
         # Ensure we have a config object
         get_config_object()
         # Add a config option *without invalidating the config*
-        db.session.add(Config(Key=u"some_key", Value=u"some_value"))
+        db.session.add(Config(Key="some_key", Value="some_value"))
         save_config_timestamp(False)
         db.session.commit()
         # The request-local config does not know about the new config option
@@ -261,12 +279,88 @@ class ConfigTestCase(MyTestCase):
         self.assertEqual(get_from_config("some_key", "default"), "some_value")
 
     def test_10_enrollable_tokentypes(self):
-        ttypes = get_multichallenge_enrollable_tokentypes()
-        self.assertIn("hotp", ttypes)
-        self.assertIn("totp", ttypes)
-        self.assertIn("sms", ttypes)
-        self.assertIn("email", ttypes)
-        self.assertIn("push", ttypes)
-        self.assertNotIn("tan", ttypes)
-        self.assertNotIn("daplug", ttypes)
-        self.assertNotIn("paper", ttypes)
+        # Execute the function twice to ensure the cache works
+        for i in range(2):
+            ttypes = get_multichallenge_enrollable_types()
+            self.assertIn("hotp", ttypes)
+            self.assertIn("totp", ttypes)
+            self.assertIn("sms", ttypes)
+            self.assertIn("email", ttypes)
+            self.assertIn("push", ttypes)
+            self.assertNotIn("tan", ttypes)
+            self.assertNotIn("daplug", ttypes)
+            self.assertNotIn("paper", ttypes)
+            self.assertIn("smartphone", ttypes)
+            self.assertNotIn("generic", ttypes)
+            self.assertNotIn("yubikey", ttypes)
+
+    def test_11_get_email_validators(self):
+        ev = get_email_validators()
+        self.assertEqual(['tests.testdata.gmailvalidator',
+                          'privacyidea.lib.utils.emailvalidation'], list(ev.keys()))
+        validate_email = get_email_validators().get("privacyidea.lib.utils.emailvalidation")
+        self.assertTrue(validate_email("valid@email.com"))
+        self.assertFalse(validate_email("invalid@email.k"))
+
+    def test_12_export_import_censor_password(self):
+        from privacyidea.lib.config import (export_config, import_config,
+                                            set_privacyidea_config, get_from_config,
+                                            delete_privacyidea_config)
+        from privacyidea.lib.crypto import CENSORED
+        set_privacyidea_config("ExpSecret", "topsecret", typ="password")
+        # a censored export replaces the value of password-type entries
+        censored = export_config(censor=True)
+        self.assertEqual(censored["ExpSecret"]["Value"], CENSORED)
+        # importing a censored entry keeps the stored secret unchanged (skip)
+        import_config({"ExpSecret": {"Value": CENSORED, "Type": "password"}})
+        self.assertEqual(get_from_config("ExpSecret"), "topsecret")
+        delete_privacyidea_config("ExpSecret")
+
+    def test_12b_export_import_password_roundtrip(self):
+        from privacyidea.lib.config import export_config, import_config
+        from privacyidea.lib.crypto import decryptPassword
+        set_privacyidea_config("ExpSecret", "topsecret", typ="password")
+        # The export carries the decrypted value, which the import encrypts with the key of the instance
+        exported = export_config(name="ExpSecret")
+        self.assertEqual("topsecret", exported["ExpSecret"]["Value"])
+        self.assertEqual("password", exported["ExpSecret"]["Type"])
+
+        import_config(exported)
+        self.assertEqual("topsecret", get_from_config("ExpSecret"))
+        stored = db.session.query(Config).filter_by(Key="ExpSecret").one()
+        self.assertEqual("topsecret", decryptPassword(stored.Value))
+        delete_privacyidea_config("ExpSecret")
+
+    def test_12c_export_undecryptable_password_censored(self):
+        from privacyidea.lib.config import export_config
+        from privacyidea.lib.crypto import CENSORED, FAILED_TO_DECRYPT_PASSWORD
+        set_privacyidea_config("ExpSecret", "topsecret", typ="password")
+        # A value that can not be decrypted is exported censored, so that an import does not store the error text
+        with mock.patch("privacyidea.lib.config.decryptPassword", return_value=FAILED_TO_DECRYPT_PASSWORD):
+            exported = export_config(name="ExpSecret")
+        self.assertEqual(CENSORED, exported["ExpSecret"]["Value"])
+        delete_privacyidea_config("ExpSecret")
+
+    def test_13_update_password_entry_without_type(self):
+        from privacyidea.lib.crypto import decryptPassword
+        set_privacyidea_config("SecretToUpdate", "first", typ="password")
+        # The update names no type, so the entry keeps the password type it already has and the
+        # new value is stored the same way the first one was.
+        set_privacyidea_config("SecretToUpdate", "second")
+
+        stored = db.session.query(Config).filter_by(Key="SecretToUpdate").one()
+        self.assertEqual("password", stored.Type)
+        self.assertNotEqual("second", stored.Value)
+        self.assertEqual("second", decryptPassword(stored.Value))
+        self.assertEqual("second", get_from_config("SecretToUpdate"))
+        delete_privacyidea_config("SecretToUpdate")
+
+    def test_14_update_entry_without_type_keeps_plain_type(self):
+        # The type fallback carries over whatever type is there, so a public entry stays plain.
+        set_privacyidea_config("PlainToUpdate", "first", typ="public")
+        set_privacyidea_config("PlainToUpdate", "second")
+
+        stored = db.session.query(Config).filter_by(Key="PlainToUpdate").one()
+        self.assertEqual("public", stored.Type)
+        self.assertEqual("second", stored.Value)
+        delete_privacyidea_config("PlainToUpdate")

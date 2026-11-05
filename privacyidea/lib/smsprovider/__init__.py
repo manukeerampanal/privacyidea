@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #    privacyIDEA is a fork of LinOTP
 #    May 28, 2014 Cornelius Kölbel
 #    E-mail: info@privacyidea.org
@@ -25,11 +23,11 @@
 
 """
 SMSProvider is the base class for submitting SMS.
-It provides 3 different implementations:
+Implementations include:
 
  * HTTP: submitting SMS via an HTTP gateway of an SMS provider
  * SMTP: submitting SMS via an SMTP gateway of an SMS provider
- * Sipgate: submitting SMS via Sipgate service
+ * SMPP: submitting SMS via an SMPP gateway of an SMS provider
 """
 
 __license__ = "GNU AGPLv3"

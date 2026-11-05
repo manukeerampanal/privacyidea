@@ -1,0 +1,72 @@
+<!--
+ (c) NetKnights GmbH 2025,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div class="flex-column">
+  <div class="flex-row gap-16">
+    <mat-form-field class="input-width-s">
+      <mat-label i18n="@@token.separator">Separator</mat-label>
+      <input
+        [formField]="separatorForm"
+        class="separator-input"
+        matInput
+        placeholder="|" />
+      <mat-error i18n="@@token.separatorRequired">Separator is <strong>required</strong></mat-error>
+    </mat-form-field>
+    <span
+      class="margin-top-16"
+      i18n="@@token.separatorUsed"
+      >The separator that is used to separate the passwords of the different tokens.</span
+    >
+  </div>
+  <h4 i18n="@@token.requiredRealms">Required Realms</h4>
+  <span
+    class="required-realms-hint"
+    i18n="@@token.hereYouSelect"
+    >Here you can select how many tokens of which realm are required to perform a successful authentication.</span
+  >
+  <div class="flex-row gap-16">
+    <mat-form-field class="input-width-l">
+      <mat-label i18n="@@common.selectRealms">Select Realms</mat-label>
+      <mat-select
+        [value]="requiredTokensOfRealms()"
+        (selectionChange)="requiredTokensOfRealms.set($event.value)"
+        multiple
+        required>
+        @for (realm of realmOptions(); track realm) {
+          <div class="required-realms-div">
+            <mat-option
+              [value]="realm"
+              class="required-realms-option">
+              <span>{{ realm }}</span>
+            </mat-option>
+            <input
+              [value]="getTokenCount(realm)"
+              (change)="setTokenCount(realm, +$event.target['value'])"
+              class="required-realms-input"
+              i18n-placeholder="@@common.tokens"
+              max="9"
+              min="1"
+              placeholder="Tokens"
+              type="number" />
+          </div>
+        }
+      </mat-select>
+      <mat-error i18n="@@token.leastOneRealm">At least one realm is <strong>required</strong></mat-error>
+    </mat-form-field>
+  </div>
+</div>

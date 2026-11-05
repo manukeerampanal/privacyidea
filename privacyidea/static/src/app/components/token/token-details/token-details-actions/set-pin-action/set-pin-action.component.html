@@ -1,0 +1,71 @@
+<!--
+ (c) NetKnights GmbH 2025,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<div class="set-pin-panel">
+  <ng-content select="[panelTitle]"></ng-content>
+  @if (authService.actionAllowed("setpin")) {
+    <div class="set-pin-fields">
+      <input
+        class="hidden-input"
+        type="text" />
+      <input
+        class="hidden-input"
+        type="password" />
+      <mat-form-field
+        class="input-width-m"
+        subscriptSizing="dynamic">
+        <mat-label i18n="@@common.pin">PIN</mat-label>
+        <input
+          [value]="setPinValue()"
+          (input)="setPinValue.set($any($event.target).value)"
+          [type]="'password'"
+          matInput />
+      </mat-form-field>
+      <mat-form-field
+        class="input-width-m"
+        subscriptSizing="dynamic">
+        <mat-label i18n="@@common.repeatPin">Repeat PIN</mat-label>
+        <input
+          [value]="repeatPinValue()"
+          (input)="repeatPinValue.set($any($event.target).value)"
+          [type]="'password'"
+          matInput />
+      </mat-form-field>
+    </div>
+  }
+  <div class="set-pin-buttons">
+    @if (authService.actionAllowed("setpin")) {
+      <button
+        (click)="setPin()"
+        class="action-button-secondary button-width-l"
+        mat-stroked-button>
+        <mat-icon>password</mat-icon>
+        <span i18n="@@common.setPin">Set PIN</span>
+      </button>
+    }
+    @if (authService.actionsAllowed(["setrandompin", "otp_pin_set_random"])) {
+      <button
+        (click)="setRandomPin()"
+        class="action-button-secondary button-width-l"
+        mat-stroked-button>
+        <mat-icon>casino</mat-icon>
+        <span i18n="@@token.randomPin">Random PIN</span>
+      </button>
+    }
+  </div>
+</div>

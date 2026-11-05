@@ -1,18 +1,15 @@
-# -*- coding: utf-8 -*-
-
 """
 This file tests:
 
 lib/eventhandler/logging.py
 """
-from mock import mock
+from unittest import mock
 from datetime import datetime
 from werkzeug.test import EnvironBuilder
-from flask import Request
+from flask import Request, Response
 from testfixtures import log_capture
 
 from privacyidea.lib.token import init_token
-from privacyidea.app import PiResponseClass as Response
 from privacyidea.lib.eventhandler.logginghandler import LoggingEventHandler
 from privacyidea.lib.user import User
 from .base import MyTestCase, FakeFlaskG, FakeAudit
@@ -35,7 +32,8 @@ class LoggingTestCase(MyTestCase):
         env = EnvironBuilder(method='POST', headers={}, path='/auth').get_environ()
         req = Request(env)
         req.all_data = {}
-        resp = Response(response="""{"result": {"value": true}}""")
+        resp = Response(response="""{"result": {"value": true}}""",
+                        mimetype='application/json')
         options = {
             "g": g,
             "request": req,
@@ -60,7 +58,8 @@ class LoggingTestCase(MyTestCase):
         req = Request(env)
         req.all_data = {}
         req.User = User("cornelius", self.realm1)
-        resp = Response(response="""{"result": {"value": true}}""")
+        resp = Response(response="""{"result": {"value": true}}""",
+                        mimetype="application/json")
         options = {
             "g": g,
             "request": req,
@@ -90,7 +89,8 @@ class LoggingTestCase(MyTestCase):
         req = Request(env)
         req.all_data = {}
         req.User = User("cornelius", self.realm1)
-        resp = Response(response="""{"result": {"value": true}}""")
+        resp = Response(response="""{"result": {"value": true}}""",
+                        mimetype="application/json")
         options = {
             "g": g,
             "request": req,
@@ -113,8 +113,9 @@ class LoggingTestCase(MyTestCase):
     @log_capture()
     def test_05_loggingevent_tags(self, capture):
         class UserAgentMock:
-            string = "hello world"
-            browser = "browser"
+            # Werkzeug does not parse the user agent, the name is taken from the string
+            string = "privacyidea-keycloak/1.2.3"
+            browser = None
 
         # simple logging event with all tags
         self.setUp_sqlite_resolver_realm('testuser.sqlite', 'sqliterealm')
@@ -122,25 +123,29 @@ class LoggingTestCase(MyTestCase):
                           'surname', 'givenname', 'username', 'userrealm',
                           'tokentype', 'time', 'date', 'client_ip',
                           'ua_browser', 'ua_string']
-        tok = init_token({"serial": "testserial", "type": "spass",
-                          "pin": "pin"}, user=User("cornelius", "sqliterealm"))
+        init_token({"serial": "testserial", "type": "spass",
+                    "pin": "pin"}, user=User("cornelius", "sqliterealm"))
         g = FakeFlaskG()
         g.audit_object = FakeAudit()
         g.logged_in_user = {"username": "admin", "role": "admin",
                             "realm": "super"}
+        # The {url} tag is built from the trusted PI_BASE_URL, not the request Host header.
+        self.app.config["PI_BASE_URL"] = "https://pi.example.com"
+        self.addCleanup(self.app.config.pop, "PI_BASE_URL", None)
         env = EnvironBuilder(method='POST', headers={}, path='/auth').get_environ()
         req = Request(env)
         req.user_agent = UserAgentMock()
         req.all_data = {'serial': 'testserial'}
         req.User = User("cornelius", 'sqliterealm')
-        resp = Response(response="""{"result": {"value": true}}""")
+        resp = Response(response="""{"result": {"value": true}}""",
+                        mimetype="application/json")
         options = {
             "g": g,
             "request": req,
             "response": resp,
             "handler_def": {
                 'options': {
-                    'message': ' '.join(['{0!s}={{{0!s}}}'.format(x) for x in available_tags])
+                    'message': ' '.join([f'{x!s}={{{x!s}}}' for x in available_tags])
                 }
             }
         }
@@ -153,9 +158,10 @@ class LoggingTestCase(MyTestCase):
             self.assertTrue(res)
             capture.check_present(
                 ('pi-eventlogger', 'INFO',
-                 u'admin=admin realm=super action=/auth serial=testserial '
-                 u'url=http://localhost/ user=Cornelius surname=Kölbel '
-                 u'givenname=None username=cornelius userrealm=sqliterealm '
-                 u'tokentype=spass time=05:06:08 date=2018-03-04 '
-                 u'client_ip=None ua_browser=browser ua_string=hello world')
+                 'admin=admin realm=super action=/auth serial=testserial '
+                 'url=https://pi.example.com user=Cornelius surname=Kölbel '
+                 'givenname=Cornelius username=cornelius userrealm=sqliterealm '
+                 'tokentype=spass time=05:06:08 date=2018-03-04 '
+                 'client_ip= ua_browser=privacyidea-keycloak '
+                 'ua_string=privacyidea-keycloak/1.2.3')
             )

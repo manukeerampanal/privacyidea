@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 #  privacyIDEA is a fork of LinOTP
 #
 #  2018-12-14 Cornelius Kölbel <cornelius.koelbel@netknights.it>
@@ -43,31 +42,32 @@ Its only dependencies are to the database model.py and to the
 config.py, so this can be tested standalone without realms, tokens and
 webservice!
 """
-
+import copy
+import json
 import logging
+from typing import Any
 
-from .log import log_with
-from .config import (get_resolver_types, get_resolver_classes, get_config_object)
-from privacyidea.lib.usercache import delete_user_cache
+from sqlalchemy import func, delete, select
+
+from privacyidea.lib.cache.user import invalidate_resolver
 from privacyidea.lib.framework import get_request_local_store
-from ..models import (Resolver,
-                      ResolverConfig)
-from ..api.lib.utils import required
-from ..api.lib.utils import getParam
-from .error import ConfigAdminError
-from sqlalchemy import func
-from .crypto import encryptPassword
+from privacyidea.lib.usercache import delete_user_cache
 from privacyidea.lib.utils import (sanity_name_check, get_data_from_params,
                                    is_true)
 from privacyidea.lib.utils.export import (register_import, register_export)
-import copy
+from .config import (get_resolver_types, get_resolver_classes, get_config_object)
+from .crypto import encryptPassword, CENSORED
+from .error import ConfigAdminError
+from .log import log_with
+from privacyidea.lib.params import get_required
+from ..models import (Resolver,
+                      ResolverConfig, save_config_timestamp, db)
 
-CENSORED = "__CENSORED__"
 log = logging.getLogger(__name__)
 
 
 # Hide the keyswords BINDPW and Password in params
-@log_with(log, hide_args_keywords={0: ["BINDPW", "Password"]})
+@log_with(log)
 def save_resolver(params):
     """
     create a new resolver from request parameters
@@ -88,15 +88,15 @@ def save_resolver(params):
     """
     # before we create the resolver in the database, we need to check
     # for the name and type thing...
-    resolvername = getParam(params, 'resolver', required)
-    resolvertype = getParam(params, 'type', required)
+    resolvername = get_required(params, 'resolver')
+    resolvertype = get_required(params, 'type')
     update_resolver = False
     # check the name
     sanity_name_check(resolvername)
     # check the type
     resolvertypes = get_resolver_types()
     if resolvertype not in resolvertypes:
-        raise Exception("resolver type : {0!s} not in {1!s}".format(resolvertype, str(resolvertypes)))
+        raise Exception(f"resolver type : {resolvertype!s} not in {str(resolvertypes)!s}")
 
     # check the name
     resolvers = get_resolver_list(filter_resolver_name=resolvername)
@@ -107,7 +107,7 @@ def save_resolver(params):
             update_resolver = True
         else:
             raise Exception("resolver with similar name and other type already "
-                            "exists: %s" % r_name)
+                            f"exists: {r_name}")
 
     # create a dictionary for the ResolverConfig
     resolver_config = get_resolver_config_description(resolvertype)
@@ -118,35 +118,103 @@ def save_resolver(params):
                                              resolvername)
 
     # Everything passed. So lets actually create the resolver in the DB
+    resolver = None
     if update_resolver:
-        resolver_id = Resolver.query.filter(func.lower(Resolver.name) ==
-                                  resolvername.lower()).first().id
+        resolver_stmt = select(Resolver).where(func.lower(Resolver.name) == resolvername.lower())
+        resolver = db.session.scalar(resolver_stmt)
+    if resolver is not None:
+        resolver_id = resolver.id
     else:
+        # Either this is a new resolver, or the cached configuration reported it
+        # as existing while it is no longer in the database (e.g. a stale config
+        # object after a delete). In both cases we (re-)create it.
         resolver = Resolver(params.get("resolver"),
                             params.get("type"))
-        resolver_id = resolver.save()
+        db.session.add(resolver)
+        db.session.flush()
+        resolver_id = resolver.id
     # create the config
     for key, value in data.items():
+        if not value and not isinstance(value, bool):
+            # If the value is empty, we do not store it. But we check if an old entry already exists and delete it.
+            old_config = delete(ResolverConfig).filter_by(resolver_id=resolver_id, Key=key)
+            db.session.execute(old_config)
+            continue
         if types.get(key) == "password":
             if value == CENSORED:
-                continue
+                stored_stmt = select(ResolverConfig).filter_by(resolver_id=resolver_id, Key=key)
+                stored_config = db.session.scalar(stored_stmt)
+                if not stored_config or stored_config.Type == "password":
+                    # Keep the stored secret
+                    continue
+                # Stored in plain text before the resolver class declared the entry a password: encrypt it now
+                value = encryptPassword(stored_config.Value)
             else:
                 value = encryptPassword(value)
+        elif types.get(key) == "dict_with_password":
+            resolver_data_types = resolver_config.get(resolvertype, {}).get("config")
+            if not isinstance(value, dict):
+                log.warning("Config entry %s is not a dict. Cannot be stored.", key)
+                continue
+            for (dict_key, dict_value) in value.items():
+                if resolver_data_types.get(f"{key}.{dict_key}") == "password":
+                    if dict_value == CENSORED:
+                        # Fetch the old value from the database to not delete the password from the config
+                        dict_stmt = select(ResolverConfig).filter_by(resolver_id=resolver_id, Key=key)
+                        old_dict_serialized = db.session.scalar(dict_stmt)
+                        if old_dict_serialized:
+                            old_dict = json.loads(old_dict_serialized.Value)
+                            old_entry = old_dict.get(dict_key)
+                            if old_entry:
+                                value[dict_key] = old_entry  # It is already encrypted
+                    else:
+                        value[dict_key] = encryptPassword(dict_value)
 
-        ResolverConfig(resolver_id=resolver_id,
-                       Key=key,
-                       Value=value,
-                       Type=types.get(key, ""),
-                       Description=desc.get(key, "")).save()
+        if isinstance(value, dict):
+            value = json.dumps(value)
+
+        existing_config_stmt = select(ResolverConfig).filter(ResolverConfig.resolver_id == resolver_id,
+                                                             ResolverConfig.Key == key)
+        existing_config = db.session.execute(existing_config_stmt).scalar_one_or_none()
+        if existing_config:
+            # Update existing entry
+            existing_config.Value = value
+            existing_config.Type = types.get(key, "")
+            existing_config.Description = desc.get(key, "")
+        else:
+            config = ResolverConfig(resolver_id=resolver_id,
+                                    Key=key,
+                                    Value=value,
+                                    Type=types.get(key, ""),
+                                    Description=desc.get(key, ""))
+            db.session.add(config)
 
     # Remove corresponding entries from the user cache
     delete_user_cache(resolver=resolvername)
+    save_config_timestamp()
+    db.session.commit()
+
+    # Only now that the new configuration is committed and the timestamp says so.
+    # Dropping the shared entries earlier leaves a window in which another worker
+    # is still serving the previous configuration, misses the cache, and fills it
+    # again from what it is still holding - and those entries would then outlive
+    # the change by a full TTL.
+    if not invalidate_resolver(resolvername):
+        # Redis could not be asked, so entries cached under the previous configuration may still
+        # be served until they expire. Nothing here can undo that, but an operator whose change
+        # did not take effect at once has to be able to find out why.
+        log.warning(f"The cached user entries of the resolver {resolvername!r} could not be "
+                    f"dropped. Entries from the previous configuration may be served until they expire.")
+
+    # Resolver TLS endpoints may have changed - drop cached cert health.
+    from privacyidea.lib.health import invalidate_certificate_cache
+    invalidate_certificate_cache()
 
     return resolver_id
 
 
 @log_with(log, log_exit=False)
-#@cache.memoize(10)
+# @cache.memoize(10)
 def get_resolver_list(filter_resolver_type=None,
                       filter_resolver_name=None,
                       editable=None,
@@ -200,7 +268,15 @@ def get_resolver_list(filter_resolver_type=None,
     if censor:
         for reso_name, reso in resolvers.items():
             for censor_key in reso.get("censor_keys", []):
-                reso["data"][censor_key] = CENSORED
+                if censor_key in reso["data"]:
+                    reso["data"][censor_key] = CENSORED
+                else:
+                    # it might be a sub key
+                    data = reso["data"]
+                    keys = censor_key.split('.')
+                    for key in keys[:-1]:
+                        data = data[key]
+                    data[keys[-1]] = CENSORED
 
     return resolvers
 
@@ -218,15 +294,19 @@ def delete_resolver(resolvername):
     """
     ret = -1
 
-    reso = Resolver.query.filter_by(name=resolvername).first()
-    if reso:
-        if reso.realm_list:
+    select_stmt = select(Resolver).where(Resolver.name == resolvername)
+    resolver = db.session.execute(select_stmt).scalar_one_or_none()
+    if resolver:
+        if resolver.realm_list:
             # The resolver is still contained in a realm! We must not delete it
-            realmname = reso.realm_list[0].realm.name
-            raise ConfigAdminError("The resolver %r is still contained in "
-                                   "realm %r." % (resolvername, realmname))
-        reso.delete()
-        ret = reso.id
+            realmname = resolver.realm_list[0].realm.name
+            raise ConfigAdminError(f"The resolver {resolvername!r} is still contained in "
+                                   f"realm {realmname!r}.")
+
+        db.session.delete(resolver)
+        save_config_timestamp()
+        db.session.commit()
+        ret = resolver.id
     # Delete resolver object from cache
     store = get_request_local_store()
     if 'resolver_objects' in store:
@@ -235,12 +315,21 @@ def delete_resolver(resolvername):
 
     # Remove corresponding entries from the user cache
     delete_user_cache(resolver=resolvername)
+    if not invalidate_resolver(resolvername):
+        # Redis could not be asked, so entries cached for a resolver that no longer exists may
+        # still be served until they expire: until then a deleted user store can still resolve.
+        log.warning(f"The cached user entries of the deleted resolver {resolvername!r} could not "
+                    f"be dropped. Its users may still resolve until the entries expire.")
+
+    # Resolver TLS endpoints may have changed - drop cached cert health.
+    from privacyidea.lib.health import invalidate_certificate_cache
+    invalidate_certificate_cache()
 
     return ret
 
 
 @log_with(log, log_exit=False)
-#@cache.memoize(10)
+# @cache.memoize(10)
 def get_resolver_config(resolvername):
     """
     return the complete config of a given resolver from the database
@@ -254,7 +343,7 @@ def get_resolver_config(resolvername):
 
 
 @log_with(log)
-#@cache.memoize(10)
+# @cache.memoize(10)
 def get_resolver_config_description(resolver_type):
     """
     get the configuration description of a resolver
@@ -279,7 +368,7 @@ def get_resolver_config_description(resolver_type):
     return descriptor
 
 
-#@cache.memoize(10)
+# @cache.memoize(10)
 def get_resolver_class(resolver_type):
     """
     return the class object for a resolver type
@@ -296,11 +385,11 @@ def get_resolver_class(resolver_type):
     return ret
 
 
-#@cache.memoize(10)
+# @cache.memoize(10)
 def get_resolver_type(resolvername):
     """
     return the type of a resolvername
-    
+
     :param resolvername: THe name of the resolver
     :return: The type of the resolver
     :rtype: string
@@ -311,7 +400,7 @@ def get_resolver_type(resolvername):
 
 
 @log_with(log)
-#@cache.memoize(10)
+# @cache.memoize(10)
 def get_resolver_object(resolvername):
     """
     Return the cached resolver object for the given resolver name (stored in the request context).
@@ -326,7 +415,7 @@ def get_resolver_object(resolvername):
     r_obj_class = get_resolver_class(r_type)
 
     if r_obj_class is None:
-        log.error("Can not find resolver with name {0!s} ".format(resolvername))
+        log.error(f"Can not find resolver with name {resolvername!s} ")
         return None
     else:
         store = get_request_local_store()
@@ -339,7 +428,42 @@ def get_resolver_object(resolvername):
             if r_obj is not None:
                 resolver_config = get_resolver_config(resolvername)
                 r_obj.loadConfig(resolver_config)
+                r_obj.name = resolvername
         return resolver_objects[resolvername]
+
+
+def _replace_censored_values(params: dict[str, Any], old_config: dict[str, Any]):
+    """
+    Helper to replace censored values in params with the values from old_config.
+    """
+    for key in old_config.get("censor_keys", []):
+        # Censored keys can be nested e.g. client_certificate.private_key_password
+        layers = key.split('.')
+        last_layer = params
+        for nested_key in layers[:-1]:
+            if not isinstance(last_layer, dict):
+                # seems to be a wrong config, we cannot replace the censored value. So we continue with the next one
+                break
+            last_layer = last_layer.get(nested_key, {})
+        if not isinstance(last_layer, dict):
+            continue
+        value = last_layer.get(layers[-1])
+        if value == CENSORED:
+            # Overwrite with the value from the database
+            old_value = old_config.get("data", {})
+            valid_value = True
+            for layer_key in layers:
+                if not isinstance(old_value, dict):
+                    # we can not read the correct old value from the database
+                    log.debug(
+                        "Failed to replace censored value for %s, because no uncensored value exists in the database.",
+                        key)
+                    valid_value = False
+                    break
+                old_value = old_value.get(layer_key, {})
+            if valid_value:
+                last_layer[layers[-1]] = old_value
+
 
 @log_with(log)
 def pretestresolver(resolvertype, params):
@@ -357,10 +481,7 @@ def pretestresolver(resolvertype, params):
     if params.get("resolver"):
         old_config_list = get_resolver_list(filter_resolver_name=params.get("resolver")) or {}
         old_config = old_config_list.get(params.get("resolver")) or {}
-        for key in old_config.get("censor_keys", []):
-            if params.get(key) == CENSORED:
-                # Overwrite with the value from the database
-                params[key] = old_config.get("data").get(key)
+        _replace_censored_values(params, old_config)
 
     # determine the class by the given type
     r_obj_class = get_resolver_class(resolvertype)
@@ -381,7 +502,12 @@ def import_resolver(data, name=None):
     #  given data. We could use "pretestresolver() / testconnection()" (which
     #  doesn't check the input) or "loadConfig()" (which also doesn't check the
     #  parameter, at least for LDAP/SQL-resolver).
-    log.debug('Import resolver config: {0!s}'.format(data))
+    log.debug(f'Import resolver config: {data!s}')
+
+    # Check for old style export type where resolvers were given as a list
+    if isinstance(data, list):
+        data = {x.get("resolvername"): x for x in data}
+
     for res_name, res_data in data.items():
         if name and name != res_name:
             continue
@@ -394,5 +520,5 @@ def import_resolver(data, name=None):
         rid = save_resolver(res_data)
         # TODO: we have no information if a new resolver was created or an
         #  existing resolver updated. We would need to enhance "save_resolver()".
-        log.info('Import of resolver "{0!s}" finished,'
-                 ' id: {1!s}'.format(res_data['resolver'], rid))
+        log.info('Import of resolver "{!s}" finished,'
+                 ' id: {!s}'.format(res_data['resolver'], rid))

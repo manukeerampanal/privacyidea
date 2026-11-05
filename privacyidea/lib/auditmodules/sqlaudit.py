@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# (c) NetKnights GmbH 2025,  https://netknights.it
 #
 #  2016-04-08 Cornelius Kölbel <cornelius@privacyidea.org>
 #             Avoid consecutive if statements
@@ -20,74 +20,190 @@
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
+# SPDX-FileCopyrightText: 2025 Paul Lettich <paul.lettich@netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
-__doc__ = """The SQL Audit Module is used to write audit entries to an SQL
+"""The SQL Audit Module is used to write audit entries to an SQL
 database.
-The SQL Audit Module is configured like this:
+The SQL Audit Module is configured like this::
 
     PI_AUDIT_MODULE = "privacyidea.lib.auditmodules.sqlaudit"
     PI_AUDIT_KEY_PRIVATE = "tests/testdata/private.pem"
     PI_AUDIT_KEY_PUBLIC = "tests/testdata/public.pem"
     PI_AUDIT_SERVERNAME = "your choice"
 
-    Optional:
+Optional::
+
     PI_AUDIT_SQL_URI = "sqlite://"
-    PI_AUDIT_SQL_TRUNCATE = True | False
     PI_AUDIT_SQL_COLUMN_LENGTH = {"user": 60, "info": 10 ...}
 
 If the PI_AUDIT_SQL_URI is omitted the Audit data is written to the
 token database.
 """
 
-import logging
-from collections import OrderedDict
-from privacyidea.lib.auditmodules.base import (Audit as AuditBase, Paginate)
-from privacyidea.lib.crypto import Sign
-from privacyidea.lib.pooling import get_engine
-from privacyidea.lib.utils import censor_connect_string
-from privacyidea.lib.lifecycle import register_finalizer
-from privacyidea.lib.utils import truncate_comma_list, is_true
-from sqlalchemy import MetaData, cast, String
-from sqlalchemy import asc, desc, and_, or_
-from sqlalchemy.sql import expression
-from sqlalchemy.ext.compiler import compiles
+import csv
 import datetime
+import inspect
+import io
+import logging
+import re
 import traceback
-from six import string_types
-from privacyidea.models import audit_column_length as column_length
-from privacyidea.models import Audit as LogEntry
+from collections import OrderedDict
+
+from sqlalchemy import asc, desc, and_, false, or_, func, select, delete, text
+from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy import create_engine
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy.sql.expression import FunctionElement
+
+from privacyidea.config import ConfigKey
+from privacyidea.lib.auditmodules.base import Audit as AuditBase, Paginate
+from privacyidea.lib.crypto import get_sign_object
+from privacyidea.lib.lifecycle import register_finalizer
+from privacyidea.lib.pooling import get_engine, engines_are_shared
+from privacyidea.lib.framework import is_request_context
+from privacyidea.lib.utils import censor_connect_string
+from privacyidea.lib.utils import (is_true, convert_wildcard_to_sql_like, SQL_LIKE_ESCAPE)
+from privacyidea.models import Audit as LogEntry
+from privacyidea.models.audit import AUDIT_TABLE_NAME
+from privacyidea.models import audit_column_length as column_length
 
 log = logging.getLogger(__name__)
 
-metadata = MetaData()
+# Characters that make a spreadsheet application read a cell as a formula rather than as text.
+# "|" starts a DDE reference, which is the same class of thing.
+_CELL_TEXT_PREFIXES = ("=", "+", "-", "@", "|", "\t", "\r")
+
+# A plain number, so that a negative value keeps its sign instead of being marked as text. Not
+# float(), which also accepts "-inf" and the underscore separators of "-1_0".
+_NUMBER = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?")
+
+# Entries read from the database per round while streaming the CSV export. Every round costs one
+# query for the entries and one for their neighbouring ids, so this trades queries against the
+# memory a round holds.
+_CSV_EXPORT_CHUNK_SIZE = 500
+
+# How many ids are asked for in a single IN list. Oracle accepts at most 1000 elements, and a
+# batch of entries asks for two neighbours each.
+_ID_LOOKUP_SLICE_SIZE = 500
+
+
+def _csv_cell(value: object) -> str:
+    """
+    Render one audit value for the CSV export.
+
+    A cell starting with one of ``= + - @`` is read as a formula by spreadsheet applications
+    instead of as the text it is, so such a value is prefixed with an apostrophe, which is the
+    conventional way of marking a cell as text. Values that are simply numbers are left alone,
+    so the numeric columns stay numeric.
+
+    :param value: The value of one audit column
+    :return: The value as it should appear in the CSV cell
+    """
+    text = str(value)
+    # Leading whitespace is trimmed by spreadsheet applications before they decide whether the
+    # cell is a formula, so it is trimmed here before the check as well.
+    if text.lstrip().startswith(_CELL_TEXT_PREFIXES):
+        if not _NUMBER.fullmatch(text.strip()):
+            return f"'{text}"
+    return text
+
+
+def _pool_accepts_pool_size(connect_string, engine_kwargs):
+    """
+    Check whether the connection pool that ``create_engine()`` will use for this
+    connect string takes a ``pool_size``.
+
+    ``NullPool`` and ``StaticPool`` do not, and they can be requested for any database
+    through the ``poolclass`` engine option, so the database type alone does not answer
+    this. Passing ``pool_size`` to a pool that does not know it is a ``TypeError``.
+
+    :param connect_string: The connect string the engine will be created with
+    :param engine_kwargs: The keyword arguments for ``create_engine()``
+    :return: True if the pool takes a pool_size
+    """
+    pool_class = engine_kwargs.get("poolclass")
+    if pool_class is None:
+        url = make_url(connect_string)
+        pool_class = url.get_dialect().get_pool_class(url)
+    return "pool_size" in inspect.signature(pool_class).parameters
 
 
 # Define function to convert SQL DateTime objects to an ISO-format string
-# By using <https://docs.sqlalchemy.org/en/13/core/compiler.html> we can
+# By using <https://docs.sqlalchemy.org/en/14/core/compiler.html> we can
 # differentiate between different dialects.
-class to_isodate(expression.FunctionElement):
+class to_isodate(FunctionElement):
     name = 'to_isodate'
+    inherit_cache = True
 
 
 @compiles(to_isodate, 'oracle')
 @compiles(to_isodate, 'postgresql')
-def fn_to_isodate(element, compiler, **kw):
-    return "to_char(%s, 'IYYY-MM-DD HH24:MI:SS')" % compiler.process(element.clauses, **kw)
+def fn_to_isodate_oracle_pg(element, compiler, **kw):
+    # YYYY is the calendar year. IYYY would be the year of the ISO week, which is a different one for up to three
+    # days around New Year.
+    return f"to_char({compiler.process(element.clauses, **kw)}, 'YYYY-MM-DD HH24:MI:SS')"
 
 
 @compiles(to_isodate, 'sqlite')
-def fn_to_isodate(element, compiler, **kw):
+def fn_to_isodate_sqlite(element, compiler, **kw):
     # sqlite does not have a DateTime type, they are already in ISO format
-    return "%s" % compiler.process(element.clauses, **kw)
+    return f"{compiler.process(element.clauses, **kw)}"
 
 
 @compiles(to_isodate)
-def fn_to_isodate(element, compiler, **kw):
-    # The four percent signs are necessary for two format substitutions
-    return "date_format(%s, '%%%%Y-%%%%m-%%%%d %%%%H:%%%%i:%%%%s')" % compiler.process(
-        element.clauses, **kw)
+def fn_to_isodate_default(element, compiler, **kw):
+    # %% escapes a literal % past the DBAPI driver's pyformat paramstyle.
+    return "date_format({}, '%%Y-%%m-%%d %%H:%%i:%%s')".format(compiler.process(
+        element.clauses, **kw))
+
+
+def _now():
+    """
+    Returns the current local date and time.
+    This function is required to be able to mock datetime.now() in tests.
+    """
+    return datetime.datetime.now()
+
+
+# The audit table is introspected once per process and database: an Audit object is created
+# for every request, and the schema does not change underneath a running process.
+_live_column_length = {}
+
+
+def get_live_column_length(engine) -> dict:
+    """
+    Return the length of every length-restricted column of the audit table as it really is
+    in the database, so that values can be shortened to what the table accepts rather than
+    to what the model declares. The result is cached per database.
+
+    An unreachable database or a missing audit table yields an empty mapping, in which case
+    the model and the configuration decide alone. Such a result is not cached, so that a
+    database that was unreachable once is read again on the next request instead of leaving
+    the process with the assumption that the table looks like the model for good.
+
+    :param engine: the SQLAlchemy engine of the audit database
+    :return: a dict mapping column name to its length
+    """
+    cache_key = str(engine.url)
+    if cache_key not in _live_column_length:
+        lengths = {}
+        try:
+            for column in sqlalchemy_inspect(engine).get_columns(AUDIT_TABLE_NAME):
+                # A type without a length, e.g. TEXT, holds a value of any length. It is
+                # reported as None so that nothing is cut for such a column.
+                lengths[column.get("name")] = getattr(column.get("type"), "length", None)
+        except Exception as exx:  # noqa: BLE001 - the table may not exist yet
+            # The values are sized to the model instead, which is what the table has unless
+            # somebody changed it. A database that has narrower columns rejects the entries,
+            # so this needs to be visible.
+            log.warning(f"Could not read the columns of the table {AUDIT_TABLE_NAME}, audit "
+                        f"entries are sized to the model instead: {exx!r}")
+            return {}
+        _live_column_length[cache_key] = lengths
+    return _live_column_length[cache_key]
 
 
 class Audit(AuditBase):
@@ -114,7 +230,6 @@ class Audit(AuditBase):
 
     * ``PI_AUDIT_POOL_SIZE``
     * ``PI_AUDIT_POOL_RECYCLE``
-    * ``PI_AUDIT_SQL_TRUNCATE``
     * ``PI_AUDIT_NO_SIGN``
     * ``PI_CHECK_OLD_SIGNATURES``
 
@@ -127,24 +242,38 @@ class Audit(AuditBase):
     is_readable = True
 
     def __init__(self, config=None, startdate=None):
-        super(Audit, self).__init__(config, startdate)
+        super().__init__(config, startdate)
         self.name = "sqlaudit"
-        self.sign_data = not self.config.get("PI_AUDIT_NO_SIGN")
+        self.sign_data = not self.config.get(ConfigKey.AUDIT_NO_SIGN)
         self.sign_object = None
-        self.verify_old_sig = self.config.get('PI_CHECK_OLD_SIGNATURES')
+        self.verify_old_sig = self.config.get(ConfigKey.CHECK_OLD_SIGNATURES)
+        # Disable the costly checking of private RSA keys when loading them.
+        self.check_private_key = not self.config.get(ConfigKey.AUDIT_NO_PRIVATE_KEY_CHECK, False)
         if self.sign_data:
-            self.read_keys(self.config.get("PI_AUDIT_KEY_PUBLIC"),
-                           self.config.get("PI_AUDIT_KEY_PRIVATE"))
-            self.sign_object = Sign(self.private, self.public)
+            public_key_file = self.config.get(ConfigKey.AUDIT_KEY_PUBLIC)
+            if not public_key_file:
+                # The module would still sign, but every entry it reads back would verify as
+                # FAIL, which is indistinguishable from a tampered log. A missing key file is
+                # a configuration error and has to be visible as one.
+                raise TypeError(f"{ConfigKey.AUDIT_KEY_PUBLIC} must name a file containing the "
+                                "public key to verify audit entries with.")
+            self.sign_object = get_sign_object(self.config.get(ConfigKey.AUDIT_KEY_PRIVATE),
+                                               public_key_file,
+                                               check_private_key=self.check_private_key)
         # Read column_length from the config file
-        config_column_length = self.config.get("PI_AUDIT_SQL_COLUMN_LENGTH", {})
+        config_column_length = self.config.get(ConfigKey.AUDIT_SQL_COLUMN_LENGTH, {})
         # fill the missing parts with the default from the models
         self.custom_column_length = {k: (v if k not in config_column_length else config_column_length[k])
                                      for k, v in column_length.items()}
+        # Filled on first use from the columns the audit table really has
+        self._effective_column_length = None
         # We can use "sqlaudit" as the key because the SQLAudit connection
         # string is fixed for a running privacyIDEA instance.
         # In other words, we will not run into any problems with changing connect strings.
         self.engine = get_engine(self.name, self._create_engine)
+        # A shared engine is still in use elsewhere when this request ends, so only an engine
+        # this object has to itself may have its connections closed on teardown.
+        self._owns_engine = not engines_are_shared()
         # create a configured "Session" class. ``scoped_session`` is not
         # necessary because we do not share session objects among threads.
         # We use it anyway as a safety measure.
@@ -152,8 +281,16 @@ class Audit(AuditBase):
         self.session = Session()
         # Ensure that the connection gets returned to the pool when the request has
         # been handled. This may close an already-closed session, but this is not a problem.
-        register_finalizer(self._finalize_session)
+        # Outside a request (pi-manage, a cron job, a background thread) nothing tears the
+        # application context down, so a finalizer registered there would never run and would
+        # only keep this object - and with it an open database connection - alive for the
+        # lifetime of the process.
+        if is_request_context():
+            register_finalizer(self._finalize_session)
         self.session._model_changes = {}
+        # Lazily determined by _get_id_stride(), cached per instance since a single
+        # instance serves an entire request (e.g. one page of audit entries).
+        self._id_stride = None
 
     def _create_engine(self):
         """
@@ -161,68 +298,127 @@ class Audit(AuditBase):
         """
         # an Engine, which the Session will use for connection
         # resources
-        connect_string = self.config.get("PI_AUDIT_SQL_URI", self.config.get(
-            "SQLALCHEMY_DATABASE_URI"))
-        log.debug("using the connect string {0!s}".format(censor_connect_string(connect_string)))
+        connect_string = self.config.get(ConfigKey.AUDIT_SQL_URI, self.config.get(
+            ConfigKey.SQLALCHEMY_DATABASE_URI))
+        log.debug(f"using the connect string {censor_connect_string(connect_string)!s}")
         # if no specific audit engine options are given, use the default from
         # SQLALCHEMY_ENGINE_OPTIONS or none
-        sqa_options = self.config.get("PI_AUDIT_SQL_OPTIONS",
-                                      self.config.get('SQLALCHEMY_ENGINE_OPTIONS', {}))
-        log.debug("Using Audit SQLAlchemy engine options: {0!s}".format(sqa_options))
-        try:
-            pool_size = self.config.get("PI_AUDIT_POOL_SIZE", 20)
-            engine = create_engine(
-                connect_string,
-                pool_size=pool_size,
-                pool_recycle=self.config.get("PI_AUDIT_POOL_RECYCLE", 600),
-                **sqa_options)
-            log.debug("Using SQL pool size of {}".format(pool_size))
-        except TypeError:
-            # SQLite does not support pool_size
-            engine = create_engine(connect_string, **sqa_options)
-            log.debug("Using no SQL pool_size.")
-        return engine
+        sqa_options = self.config.get(ConfigKey.AUDIT_SQL_OPTIONS,
+                                      self.config.get(ConfigKey.SQLALCHEMY_ENGINE_OPTIONS, {}))
+        log.debug(f"Using Audit SQLAlchemy engine options: {sqa_options!s}")
+        # The engine options are merged over the pool defaults instead of being passed
+        # alongside them, because a key present in both would raise a TypeError about
+        # duplicate keyword arguments and take the whole pool configuration down with it.
+        # The merge comes first, since the poolclass may be configured here as well.
+        engine_kwargs = {"pool_recycle": self.config.get(ConfigKey.AUDIT_POOL_RECYCLE, 600)}
+        engine_kwargs.update(sqa_options)
+        if _pool_accepts_pool_size(connect_string, engine_kwargs):
+            engine_kwargs.setdefault("pool_size", self.config.get(ConfigKey.AUDIT_POOL_SIZE, 20))
+            log.debug(f"Using SQL pool size of {engine_kwargs['pool_size']}")
+        else:
+            log.debug("The configured connection pool takes no pool size, using none.")
+        return create_engine(connect_string, **engine_kwargs)
 
     def _finalize_session(self):
         """ Close current session and dispose connections of db engine"""
         self.session.close()
-        self.engine.dispose()
+        if self._owns_engine:
+            self.engine.dispose()
+
+    @property
+    def column_length(self) -> dict:
+        """
+        The length every value has to fit into, which is the configured length of a column
+        capped by the length the column really has in the database. A database whose audit
+        table has not been migrated yet rejects a longer value and the entry would be lost,
+        so the actual table always wins over the configuration.
+        """
+        if self._effective_column_length is None:
+            live_length = get_live_column_length(self.engine)
+            effective = {}
+            for key, length in self.custom_column_length.items():
+                if key not in live_length:
+                    # The column is unknown, e.g. because the table could not be read
+                    effective[key] = length
+                elif live_length[key] is None:
+                    # The column holds a value of any length, so nothing has to be cut
+                    continue
+                else:
+                    effective[key] = min(length, live_length[key])
+            self._effective_column_length = effective
+        return self._effective_column_length
 
     def _truncate_data(self):
         """
-        Truncate self.audit_data according to the self.custom_column_length.
+        Shorten every value of self.audit_data to the length the table can hold.
+
         :return: None
         """
-        for column, l in self.custom_column_length.items():
+        # This is the only place values are shortened, and it runs right before the entry
+        # is written: until then ``audit_data`` is shared request state that event handlers
+        # read the whole value from, and ``finalize_log`` has just joined list values into
+        # one comma separated string, which is what actually has to fit the column.
+        for column in self.column_length:
             if column in self.audit_data:
-                data = self.audit_data[column]
-                if isinstance(data, string_types):
-                    if column == "policies":
-                        # The policies column is shortened per comma entry
-                        data = truncate_comma_list(data, l)
-                    else:
-                        data = data[:l]
-                self.audit_data[column] = data
+                self.audit_data[column] = self.fit_to_store(column, self.audit_data[column])
 
     @staticmethod
-    def _create_filter(param, timelimit=None):
+    def _create_filter(param: dict, admin_params: dict | None = None,
+                       timelimit: datetime.timedelta | None = None):
         """
         create a filter condition for the logentry
+
+        :param param: Filter parameters that are concatenated with a logical AND
+        :param admin_params: Optional admin parameters containing the admin name, admin realm and a list of realms the
+            admin is allowed to see, such as ::
+
+                {"admin": "admin_name",
+                 "admin_realm": "realm_of_the_admin",
+                 "allowed_audit_realms": ["realm1", "realm2"]}
+
+        :param timelimit: Only audit entries newer than this timedelta
         """
         conditions = []
         param = param or {}
+
+        # For admins, only get audit entries of their allowed realms and their own realm
+        filter_realm = None
+        if admin_params:
+            admin = admin_params.get("admin")
+            admin_realm = admin_params.get("admin_realm")
+            # A list, also an empty one, limits the admin to these realms: empty means their policies grant no realm
+            # at all, not that nothing is restricted.
+            allowed_audit_realms = admin_params.get("allowed_audit_realms")
+            if allowed_audit_realms is not None:
+                # search condition
+                realm_conditions = []
+                for realm in allowed_audit_realms:
+                    realm_conditions.append(LogEntry.realm == realm)
+                # If the admin is limited to some realms, we need to additionally filter for their own audit entries
+                if admin and admin_realm:
+                    realm_conditions.append(and_(LogEntry.administrator == admin, LogEntry.realm == admin_realm))
+                elif admin:
+                    realm_conditions.append(LogEntry.administrator == admin)
+                filter_realm = or_(*realm_conditions) if realm_conditions else false()
+
         for search_key in param.keys():
             search_value = param.get(search_key)
             if search_key == "allowed_audit_realm":
-                # Add each realm in the allowed_audit_realm list to the
-                # search condition
+                # Add each realm in the allowed_audit_realm list to the search condition
                 realm_conditions = []
                 for realm in search_value:
                     realm_conditions.append(LogEntry.realm == realm)
                 filter_realm = or_(*realm_conditions)
                 conditions.append(filter_realm)
-            # We do not search if the search value only consists of '*'
-            elif search_value.strip() != '' and search_value.strip('*') != '':
+            # Any other filter value is compared as a string. Coerce non-string
+            # scalars so a meaningful filter is never silently dropped, which would
+            # widen the audit result set. An empty value or a bare '*' wildcard means
+            # "no filter" for this key.
+            elif search_value is not None:
+                if not isinstance(search_value, str):
+                    search_value = str(search_value)
+                if search_value.strip() == '' or search_value.strip('*') == '':
+                    continue
                 try:
                     if search_key == "success":
                         # "success" is the only integer.
@@ -230,30 +426,48 @@ class Audit(AuditBase):
                         conditions.append(getattr(LogEntry, search_key) ==
                                           int(is_true(search_value)))
                     else:
-                        # All other keys are compared as strings
-                        column = getattr(LogEntry, search_key)
+                        # All other keys are compared as strings. Only '*' is a wildcard; literal '%' and '_' are
+                        # matched literally. A leading '!' negates the condition.
+                        raw_column = getattr(LogEntry, search_key)
+                        column = raw_column
                         if search_key in ["date", "startdate"]:
                             # but we cast a column with a DateTime type to an
                             # ISO-format string first
                             column = to_isodate(column)
-                        search_value = search_value.replace('*', '%')
-                        if '%' in search_value:
-                            conditions.append(column.like(search_value))
+                        negate = search_value.startswith("!")
+                        if negate:
+                            search_value = search_value[1:]
+                        if "*" in search_value:
+                            pattern = convert_wildcard_to_sql_like(search_value)
+                            if negate:
+                                conditions.append(or_(raw_column.is_(None),
+                                                      column.notlike(pattern, escape=SQL_LIKE_ESCAPE)))
+                            else:
+                                conditions.append(column.like(pattern, escape=SQL_LIKE_ESCAPE))
                         else:
-                            conditions.append(column == search_value)
+                            if negate:
+                                conditions.append(or_(raw_column.is_(None), column != search_value))
+                            else:
+                                conditions.append(column == search_value)
                 except Exception as exx:
                     # The search_key was no search key but some
                     # bullshit stuff in the param
-                    log.debug("Not a valid searchkey: {0!s}".format(exx))
+                    log.debug(f"Not a valid searchkey: {exx!s}")
 
         if timelimit:
             conditions.append(LogEntry.date >= datetime.datetime.now() -
                               timelimit)
         # Combine them with or to a BooleanClauseList
-        filter_condition = and_(*conditions)
+        if conditions:
+            filter_condition = and_(*conditions)
+        else:
+            filter_condition = and_(True, *conditions)
+        if filter_realm is not None:
+            filter_condition = and_(filter_condition, filter_realm)
         return filter_condition
 
-    def get_total(self, param, AND=True, display_error=True, timelimit=None):
+    def get_total(self, param: dict, admin_params: dict | None = None, AND: bool = True, display_error: bool = True,
+                  timelimit: datetime.timedelta | None = None) -> int:
         """
         This method returns the total number of audit entries
         in the audit store
@@ -261,12 +475,10 @@ class Audit(AuditBase):
         count = 0
         # if param contains search filters, we build the search filter
         # to only return the number of those entries
-        filter_condition = self._create_filter(param, timelimit=timelimit)
+        filter_condition = self._create_filter(param, admin_params, timelimit=timelimit)
 
         try:
-            count = self.session.query(LogEntry.id) \
-                .filter(filter_condition) \
-                .count()
+            count = self.session.query(LogEntry.id).filter(filter_condition).count()
         finally:
             self.session.close()
         return count
@@ -277,22 +489,29 @@ class Audit(AuditBase):
         It should hash the data and do a hash chain and sign the data
         """
         try:
-            self.audit_data["policies"] = ",".join(self.audit_data.get("policies", []))
-            if self.config.get("PI_AUDIT_SQL_TRUNCATE"):
-                self._truncate_data()
+            for entry, value in self.audit_data.items():
+                if isinstance(value, list):
+                    self.audit_data[entry] = ",".join(value)
+            # A value that does not fit into its column makes the database reject the whole
+            # entry, which would lose it. Shortening is therefore not optional.
+            self._truncate_data()
             if "tokentype" in self.audit_data:
                 log.warning("We have a wrong 'tokentype' key. This should not happen. Fix it!. "
-                            "Error occurs in action: {0!r}.".format(self.audit_data.get("action")))
-                if not "token_type" in self.audit_data:
+                            "Error occurs in action: {!r}.".format(self.audit_data.get("action")))
+                if "token_type" not in self.audit_data:
                     self.audit_data["token_type"] = self.audit_data.get("tokentype")
+            end_date = _now()
             if self.audit_data.get("startdate"):
-                duration = datetime.datetime.now() - self.audit_data.get("startdate")
+                duration = end_date - self.audit_data.get("startdate")
             else:
                 duration = None
             le = LogEntry(action=self.audit_data.get("action"),
                           success=int(self.audit_data.get("success", 0)),
+                          authentication=self.audit_data.get("authentication"),
                           serial=self.audit_data.get("serial"),
                           token_type=self.audit_data.get("token_type"),
+                          container_serial=self.audit_data.get("container_serial"),
+                          container_type=self.audit_data.get("container_type"),
                           user=self.audit_data.get("user"),
                           realm=self.audit_data.get("realm"),
                           resolver=self.audit_data.get("resolver"),
@@ -301,11 +520,14 @@ class Audit(AuditBase):
                           info=self.audit_data.get("info"),
                           privacyidea_server=self.audit_data.get("privacyidea_server"),
                           client=self.audit_data.get("client", ""),
+                          user_agent=self.audit_data.get("user_agent"),
+                          user_agent_version=self.audit_data.get("user_agent_version"),
                           loglevel=self.audit_data.get("log_level"),
                           clearance_level=self.audit_data.get("clearance_level"),
                           policies=self.audit_data.get("policies"),
                           startdate=self.audit_data.get("startdate"),
                           duration=duration,
+                          date=end_date,
                           thread_id=self.audit_data.get("thread_id")
                           )
             self.session.add(le)
@@ -320,9 +542,9 @@ class Audit(AuditBase):
         except Exception as exx:  # pragma: no cover
             # in case of a Unicode Error in _log_to_string() we won't have
             # a signature, but the log entry is available
-            log.error("exception {0!r}".format(exx))
-            log.error("DATA: {0!s}".format(self.audit_data))
-            log.debug("{0!s}".format(traceback.format_exc()))
+            log.error(f"exception {exx!r}")
+            log.error(f"DATA: {self.audit_data!s}")
+            log.debug(f"{traceback.format_exc()!s}")
             self.session.rollback()
 
         finally:
@@ -330,32 +552,90 @@ class Audit(AuditBase):
             # clear the audit data
             self.audit_data = {}
 
-    def _check_missing(self, audit_id):
+    def _get_id_stride(self):
+        """
+        Determine the step between the ids of two consecutively written audit log
+        entries.
+
+        This is normally 1. However, a Galera cluster with ``wsrep_auto_increment_control``
+        enabled (the default) raises ``auto_increment_increment`` to the cluster size and
+        gives each node its own offset, so that concurrently writing nodes cannot generate
+        the same id. Entries written through a single node then land ``auto_increment_increment``
+        ids apart instead of 1 apart, even though nothing was deleted.
+
+        This is a heuristic, not a guarantee: it assumes one node is the steady writer for
+        a given offset (true for a single-writer setup in front of Galera), and it reflects
+        the increment at the time this instance was created, not at the time older entries
+        were written, so a cluster resize can make the stride wrong for entries predating it.
+
+        :rtype: int
+        """
+        if self._id_stride is None:
+            self._id_stride = 1
+            if self.engine.dialect.name in ("mysql", "mariadb"):
+                try:
+                    row = self.session.execute(
+                        text("SHOW VARIABLES LIKE 'auto_increment_increment'")).fetchone()
+                    if row:
+                        self._id_stride = max(1, int(row[1]))
+                except Exception as exx:  # pragma: no cover
+                    log.debug(f"Could not determine auto_increment_increment: {exx!r}")
+                    self.session.rollback()
+        return self._id_stride
+
+    def _existing_neighbour_ids(self, audit_ids: list[int]) -> set[int]:
+        """
+        Return those ids neighbouring the given entries that exist in the audit log.
+
+        This answers :func:`_check_missing` for a whole batch of entries with a couple of
+        queries instead of one query per entry, which is what makes it usable for a listing
+        or an export rather than for a single entry.
+
+        :param audit_ids: The ids of the entries whose neighbours are of interest
+        :return: The subset of the neighbouring ids that exist
+        """
+        stride = self._get_id_stride()
+        wanted = set()
+        for audit_id in audit_ids:
+            wanted.update((int(audit_id) - stride, int(audit_id) + stride))
+        found = set()
+        wanted = sorted(wanted)
+        # Ask in slices: the number of elements an IN list accepts is limited on some databases
+        # (1000 on Oracle), and a batch may be larger than that.
+        for start in range(0, len(wanted), _ID_LOOKUP_SLICE_SIZE):
+            stmt = select(LogEntry.id).where(LogEntry.id.in_(wanted[start:start + _ID_LOOKUP_SLICE_SIZE]))
+            found.update(self.session.scalars(stmt).all())
+        return found
+
+    def _check_missing(self, audit_id: int, existing_neighbour_ids: set[int] | None = None) -> bool:
         """
         Check if the audit log contains the entries before and after
         the given id.
-        
+
         TODO: We can not check at the moment if the first or the last entries
               were deleted. If we want to do this, we need to store some signed
               meta information:
               1. Which one was the first entry. (use initialize_log)
               2. Which one was the last entry.
+
+        :param existing_neighbour_ids: The result of :func:`_existing_neighbour_ids` for a batch
+            of entries this one belongs to. When given, the neighbours are looked up in that set
+            instead of with a query of this entry's own.
         """
         res = False
         try:
-            id_bef = self.session.query(LogEntry.id
-                                        ).filter(LogEntry.id ==
-                                                 int(audit_id) - 1).count()
-            id_aft = self.session.query(LogEntry.id
-                                        ).filter(LogEntry.id ==
-                                                 int(audit_id) + 1).count()
+            stride = self._get_id_stride()
+            neighbour_ids = (int(audit_id) - stride, int(audit_id) + stride)
+            if existing_neighbour_ids is not None:
+                return all(neighbour_id in existing_neighbour_ids for neighbour_id in neighbour_ids)
+            found = self.session.query(LogEntry.id).filter(LogEntry.id.in_(neighbour_ids)).count()
             # We may not do a commit!
             # self.session.commit()
-            if id_bef and id_aft:
+            if found == len(neighbour_ids):
                 res = True
         except Exception as exx:  # pragma: no cover
-            log.error("exception {0!r}".format(exx))
-            log.debug("{0!s}".format(traceback.format_exc()))
+            log.error(f"exception {exx!r}")
+            log.debug(f"{traceback.format_exc()!s}")
             # self.session.rollback()
         finally:
             # self.session.close()
@@ -368,7 +648,7 @@ class Audit(AuditBase):
         """
         This function creates a string from the logentry so
         that this string can be signed.
-        
+
         Note: Not all elements of the LogEntry are used to generate the
         string (the Signature is not!), otherwise we could have used pickle
 
@@ -377,27 +657,18 @@ class Audit(AuditBase):
         :rtype str
         """
         # TODO: Add thread_id. We really should add a versioning to identify which audit data is signed.
-        s = u"id=%s,date=%s,action=%s,succ=%s,serial=%s,t=%s,u=%s,r=%s,adm=%s," \
-            u"ad=%s,i=%s,ps=%s,c=%s,l=%s,cl=%s" % (le.id,
-                                                   le.date,
-                                                   le.action,
-                                                   le.success,
-                                                   le.serial,
-                                                   le.token_type,
-                                                   le.user,
-                                                   le.realm,
-                                                   le.administrator,
-                                                   le.action_detail,
-                                                   le.info,
-                                                   le.privacyidea_server,
-                                                   le.client,
-                                                   le.loglevel,
-                                                   le.clearance_level)
+        s = f"id={le.id},date={le.date},action={le.action},succ={le.success},serial={le.serial}," \
+            f"t={le.token_type},u={le.user},r={le.realm},adm={le.administrator},ad={le.action_detail}," \
+            f"i={le.info},ps={le.privacyidea_server},c={le.client},l={le.loglevel},cl={le.clearance_level}"
         # If we have the new log entries, we also add them for signing and verification.
         if le.startdate:
-            s += ",{0!s}".format(le.startdate)
+            s += f",{le.startdate!s}"
         if le.duration:
-            s += ",{0!s}".format(le.duration)
+            s += f",{le.duration!s}"
+        if le.container_serial:
+            s += f",c_serial={le.container_serial}"
+        if le.container_type:
+            s += f",ct={le.container_type}"
         return s
 
     @staticmethod
@@ -423,27 +694,80 @@ class Audit(AuditBase):
                     'log_level': LogEntry.loglevel,
                     'policies': LogEntry.policies,
                     'clearance_level': LogEntry.clearance_level,
-                    'thread_id': LogEntry.thread_id}
+                    'thread_id': LogEntry.thread_id,
+                    'container_serial': LogEntry.container_serial,
+                    'container_type': LogEntry.container_type}
         return sortname.get(key)
 
-    def csv_generator(self, param=None, user=None, timelimit=None):
+    def csv_generator(self, param: dict | None = None, admin_params: dict | None = None, user=None,
+                      timelimit: datetime.timedelta | None = None):
         """
         Returns the audit log as csv file.
 
         :param timelimit: Limit the number of dumped entries by time
-        :type timelimit: datetime.timedelta
         :param param: The request parameters
-        :type param: dict
+        :param admin_params: Optional admin parameters containing the admin name, admin realm and a list of realms the
+            admin is allowed to see, such as ::
+
+                {"admin": "admin_name",
+                 "admin_realm": "realm_of_the_admin",
+                 "allowed_audit_realms": ["realm1", "realm2"]}
+
         :param user: The user, who issued the request
         :return: None. It yields results as a generator
         """
-        filter_condition = self._create_filter(param,
-                                               timelimit=timelimit)
-        logentries = self.session.query(LogEntry).filter(filter_condition).order_by(LogEntry.date).all()
+        filter_condition = self._create_filter(param, admin_params=admin_params, timelimit=timelimit)
 
-        for le in logentries:
-            audit_dict = self.audit_entry_to_dict(le)
-            yield u",".join([u"'{0!s}'".format(x) for x in audit_dict.values()]) + u"\n"
+        # The rows are written through the csv module so that a value containing a comma, a quote
+        # or a line break is quoted and escaped the way every CSV reader expects, instead of being
+        # wrapped in literal single quotes that the value itself can contain. The line terminator
+        # stays "\n", which is what this export has always emitted.
+        row_buffer = io.StringIO()
+        writer = csv.writer(row_buffer, lineterminator="\n")
+
+        # The entries are read in rounds of _CSV_EXPORT_CHUNK_SIZE rather than all at once. The
+        # endpoint streams the response, so reading everything first would hold the whole audit
+        # log in memory and send nothing until the last entry had been read - on an audit log of
+        # any size that is the difference between an export that starts immediately and one that
+        # appears to hang. Each round asks for the entries after the last one already written,
+        # which is a range scan on the indexed date column, and no cursor stays open while the
+        # neighbour ids of the round are looked up, which is what a server-side cursor would not
+        # survive on every dialect.
+        # An upper bound taken before the first round, so the export is a snapshot of the log as
+        # it was when it started. Without it every round would also pick up the entries written
+        # while the export runs - every request writes one - and on a server that produces them
+        # faster than the client reads, the export would never reach an empty round.
+        last_entry_id = self.session.execute(
+            select(func.max(LogEntry.id)).where(filter_condition)).scalar()
+        if last_entry_id is None:
+            return
+        filter_condition = and_(filter_condition, LogEntry.id <= last_entry_id)
+
+        last_date = None
+        last_id = None
+        while True:
+            stmt = select(LogEntry).where(filter_condition)
+            if last_date is not None:
+                # The date is not unique, so the id breaks the tie and makes the order total.
+                # Written out rather than as a row-value comparison, which Oracle does not have.
+                stmt = stmt.where(or_(LogEntry.date > last_date,
+                                      and_(LogEntry.date == last_date, LogEntry.id > last_id)))
+            stmt = stmt.order_by(LogEntry.date, LogEntry.id).limit(_CSV_EXPORT_CHUNK_SIZE)
+            entries = self.session.scalars(stmt).all()
+            if not entries:
+                break
+            last_date = entries[-1].date
+            last_id = entries[-1].id
+            existing_neighbour_ids = self._existing_neighbour_ids([entry.id for entry in entries])
+            for entry in entries:
+                audit_dict = self.audit_entry_to_dict(entry, existing_neighbour_ids)
+                writer.writerow([_csv_cell(value) for value in audit_dict.values()])
+                yield row_buffer.getvalue()
+                row_buffer.seek(0)
+                row_buffer.truncate(0)
+                # Detach the entry, so that the session does not accumulate every entry of the
+                # export and undo the point of reading it in rounds.
+                self.session.expunge(entry)
 
     def get_count(self, search_dict, timedelta=None, success=None):
         # create filter condition
@@ -456,31 +780,43 @@ class Audit(AuditBase):
             conditions.append(LogEntry.date >= datetime.datetime.now() -
                               timedelta)
 
-        filter_condition = and_(*conditions)
+        if conditions:
+            filter_condition = and_(*conditions)
+        else:
+            filter_condition = and_(True, *conditions)
         log_count = self.session.query(LogEntry).filter(filter_condition).count()
 
         return log_count
 
-    def search(self, search_dict, page_size=15, page=1, sortorder="asc",
-               timelimit=None):
+    def search(self, search_dict: dict, admin_params: dict | None = None, page_size: int = 15, page: int = 1,
+               sortorder: str = "asc", timelimit: datetime.timedelta | None = None):
         """
         This function returns the audit log as a Pagination object.
 
-        :param timelimit: Only audit entries newer than this timedelta will
-            be searched
-        :type timelimit: timedelta
+        :param search_dict: Filter parameters that are concatenated with a logical AND
+        :param admin_params: Optional admin parameters containing the admin name, admin realm and a list of realms the
+            admin is allowed to see, such as ::
+
+                {"admin": "admin_name",
+                 "admin_realm": "realm_of_the_admin",
+                 "allowed_audit_realms": ["realm1", "realm2"]}
+
+        :param page_size: Number of entries per page
+        :param page: The page number
+        :param sortorder: "asc" - ascending or "desc" - descending
+        :param timelimit: Only audit entries newer than this timedelta will be searched
         """
-        page = int(page)
-        page_size = int(page_size)
+        page = page
+        page_size = page_size
         paging_object = Paginate()
         paging_object.page = page
-        paging_object.total = self.get_total(search_dict, timelimit=timelimit)
+        paging_object.total = self.get_total(search_dict, admin_params=admin_params, timelimit=timelimit)
         if page > 1:
             paging_object.prev = page - 1
         if paging_object.total > (page_size * page):
             paging_object.next = page + 1
 
-        auditIter = self.search_query(search_dict, page_size=page_size,
+        auditIter = self.search_query(search_dict, admin_params=admin_params, page_size=page_size,
                                       page=page, sortorder=sortorder,
                                       timelimit=timelimit)
         while True:
@@ -489,7 +825,7 @@ class Audit(AuditBase):
                 # Fill the list
                 paging_object.auditdata.append(self.audit_entry_to_dict(le))
             except StopIteration as _e:
-                log.debug("Interation stopped.")
+                log.debug("Iteration stopped.")
                 break
             except UnicodeDecodeError as _e:
                 # Unfortunately if one of the audit entries fails, the whole
@@ -498,42 +834,52 @@ class Audit(AuditBase):
                 #  or some meaningful error for the user.
                 log.warning('Could not read audit log entry! '
                             'Possible database encoding mismatch.')
-                log.debug("{0!s}".format(traceback.format_exc()))
+                log.debug(f"{traceback.format_exc()!s}")
 
         return paging_object
 
-    def search_query(self, search_dict, page_size=15, page=1, sortorder="asc",
-                     sortname="number", timelimit=None):
+    def search_query(self, search_dict: dict, admin_params: dict | None = None, page_size: int = 15, page: int = 1,
+                     sortorder: str = "asc", sortname: str = "number", timelimit: datetime.timedelta | None = None):
         """
         This function returns the audit log as an iterator on the result
 
+        :param search_dict: Filter parameters that are concatenated with a logical AND
+        :param admin_params: Optional admin parameters containing the admin name, admin realm and a list of realms the
+            admin is allowed to see, such as ::
+
+                {"admin": "admin_name",
+                 "admin_realm": "realm_of_the_admin",
+                 "allowed_audit_realms": ["realm1", "realm2"]}
+
+        :param page_size: Number of entries per page
+        :param page: The page number
+        :param sortorder: "asc" - ascending or "desc" - descending
+        :param sortname: The column name to sort after. E.g. "number", "date", "user", ...
         :param timelimit: Only audit entries newer than this timedelta will
             be searched
         :type timelimit: timedelta
         """
         logentries = None
         try:
-            limit = int(page_size)
-            offset = (int(page) - 1) * limit
+            limit = page_size
+            offset = (page - 1) * limit
 
             # create filter condition
-            filter_condition = self._create_filter(search_dict,
-                                                   timelimit=timelimit)
+            filter_condition = self._create_filter(search_dict, admin_params, timelimit=timelimit)
+            stmt = select(LogEntry).where(filter_condition)
 
             if sortorder == "desc":
-                logentries = self.session.query(LogEntry).filter(
-                    filter_condition).order_by(
-                    desc(self._get_logentry_attribute("number"))).limit(
-                    limit).offset(offset)
+                stmt = stmt.order_by(
+                    desc(self._get_logentry_attribute("number")))
             else:
-                logentries = self.session.query(LogEntry).filter(
-                    filter_condition).order_by(
-                    asc(self._get_logentry_attribute("number"))).limit(
-                    limit).offset(offset)
+                stmt = stmt.order_by(
+                    asc(self._get_logentry_attribute("number")))
+            stmt = stmt.limit(limit).offset(offset)
+            logentries = self.session.scalars(stmt).all()
 
         except Exception as exx:  # pragma: no cover
-            log.error("exception {0!r}".format(exx))
-            log.debug("{0!s}".format(traceback.format_exc()))
+            log.error(f"exception {exx!r}")
+            log.debug(f"{traceback.format_exc()!s}")
             self.session.rollback()
         finally:
             self.session.close()
@@ -549,10 +895,12 @@ class Audit(AuditBase):
         This is only used for test cases!
         :return:
         """
-        self.session.query(LogEntry).delete()
+        stmt = delete(LogEntry)
+        self.session.execute(stmt)
         self.session.commit()
 
-    def audit_entry_to_dict(self, audit_entry):
+    def audit_entry_to_dict(self, audit_entry: LogEntry,
+                            existing_neighbour_ids: set[int] | None = None) -> OrderedDict:
         sig = None
         if self.sign_data:
             try:
@@ -564,9 +912,9 @@ class Audit(AuditBase):
                 #  audit_entry, we will get issues when packing the response.
                 log.warning('Could not verify log entry! We get invalid values '
                             'from the database, please check the encoding.')
-                log.debug('{0!s}'.format(traceback.format_exc()))
+                log.debug(f'{traceback.format_exc()!s}')
 
-        is_not_missing = self._check_missing(int(audit_entry.id))
+        is_not_missing = self._check_missing(int(audit_entry.id), existing_neighbour_ids)
         # is_not_missing = True
         audit_dict = OrderedDict()
         audit_dict['number'] = audit_entry.id
@@ -574,9 +922,12 @@ class Audit(AuditBase):
         audit_dict['sig_check'] = "OK" if sig else "FAIL"
         audit_dict['missing_line'] = "OK" if is_not_missing else "FAIL"
         audit_dict['action'] = audit_entry.action
+        audit_dict['authentication'] = audit_entry.authentication
         audit_dict['success'] = audit_entry.success
         audit_dict['serial'] = audit_entry.serial
         audit_dict['token_type'] = audit_entry.token_type
+        audit_dict['container_serial'] = audit_entry.container_serial
+        audit_dict['container_type'] = audit_entry.container_type
         audit_dict['user'] = audit_entry.user
         audit_dict['realm'] = audit_entry.realm
         audit_dict['resolver'] = audit_entry.resolver
@@ -586,6 +937,8 @@ class Audit(AuditBase):
         audit_dict['privacyidea_server'] = audit_entry.privacyidea_server
         audit_dict['policies'] = audit_entry.policies
         audit_dict['client'] = audit_entry.client
+        audit_dict['user_agent'] = audit_entry.user_agent
+        audit_dict['user_agent_version'] = audit_entry.user_agent_version
         audit_dict['log_level'] = audit_entry.loglevel
         audit_dict['clearance_level'] = audit_entry.clearance_level
         audit_dict['startdate'] = audit_entry.startdate.isoformat() if audit_entry.startdate else None

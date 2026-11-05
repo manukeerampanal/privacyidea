@@ -11,7 +11,8 @@ This way privacyIDEA can change the data sent back to the client, depending
 on certain conditions.
 
 All actions take a JSON pointer, which looks like a path variable like
-``/result/value``.
+``/result/value``. The JSON pointer can have at most three levels, like
+``/detail/googleurl/img``. A longer pointer is ignored (a warning is logged).
 
 Possible Actions
 ~~~~~~~~~~~~~~~~
@@ -27,7 +28,7 @@ This action simply deletes the given JSON pointer from the response.
 
 **Example**
 
-You can use this to delete ``/detail/googleurl``, ``/detail/oathurl`` and ``/detail/otpkey``
+You can use this to delete ``/detail/googleurl`` and ``/detail/otpkey``
 in a ``/token/init`` event to hide the created QR code from the helpdesk admin.
 This way the QR code could be used internally, but could be hidden from
 the administrator.

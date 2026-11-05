@@ -1,6 +1,5 @@
-# -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: (C) 2025 NetKnights GmbH <https://netknights.it>
 #
-#  privacyIDEA
 #  Aug 12, 2014 Cornelius Kölbel
 #  License:  AGPLv3
 #  contact:  http://www.privacyidea.org
@@ -13,6 +12,8 @@
 #
 #  2015-05-15 Adapt during migration to flask
 #             Cornelius Kölbel <cornelius@privacyidea.org>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # This code is free software; you can redistribute it and/or
 # modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
@@ -34,29 +35,33 @@ The code is tested in test_lib_tokens_certificate.py.
 """
 
 import logging
-
-from privacyidea.lib.utils import to_unicode, b64encode_and_unicode, to_byte_string
-from privacyidea.lib.tokenclass import TokenClass, ROLLOUTSTATE
-from privacyidea.lib.log import log_with
-from privacyidea.api.lib.utils import getParam
-from privacyidea.lib.caconnector import get_caconnector_object, get_caconnector_list
-from privacyidea.lib.user import get_user_from_param
-from privacyidea.lib.utils import determine_logged_in_userparams
-from OpenSSL import crypto
-from cryptography.x509 import load_pem_x509_certificate, load_pem_x509_csr
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.asymmetric import padding
-from privacyidea.lib.decorators import check_token_locked
-from privacyidea.lib import _
-from privacyidea.lib.policy import SCOPE, ACTION as BASE_ACTION, GROUP, Match
-from privacyidea.lib.error import privacyIDEAError, CSRError, CSRPending
+import pathlib
+import secrets
 import traceback
 
-optional = True
-required = False
+from cryptography import x509
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.serialization import pkcs12, BestAvailableEncryption
+from cryptography.x509 import (load_pem_x509_certificate, load_pem_x509_csr,
+                               Certificate)
+
+from privacyidea.lib import _
+from privacyidea.lib.caconnector import get_caconnector_object, get_caconnector_list
+from privacyidea.lib.decorators import check_token_locked
+from privacyidea.lib.error import PrivacyIDEAError, CSRError, CSRPending, CAError
+from privacyidea.lib.log import log_with
+from privacyidea.lib.params import get_optional, get_required
+from privacyidea.lib.policies.actions import PolicyAction as BASE_ACTION
+from privacyidea.lib.policy import SCOPE, GROUP, Match
+from privacyidea.lib.tokenclass import TokenClass
+from privacyidea.lib.tokenrolloutstate import RolloutState
+from privacyidea.lib.user import get_user_from_param
+from privacyidea.lib.utils import b64encode_and_unicode, to_byte_string
+from privacyidea.lib.utils import determine_logged_in_userparams
 
 log = logging.getLogger(__name__)
-
 
 DEFAULT_CA_PATH = ["/etc/privacyidea/trusted_attestation_ca"]
 # This is the key of the tokeninfo, where the request Id of a pending certificate is stored
@@ -67,41 +72,43 @@ class ACTION(BASE_ACTION):
     __doc__ = """This is the list of special certificate actions."""
     TRUSTED_CA_PATH = "certificate_trusted_Attestation_CA_path"
     REQUIRE_ATTESTATION = "certificate_require_attestation"
-    CA_CONNECTOR = "ca_connector"
+    CA_CONNECTOR = "certificate_ca_connector"
     CERTIFICATE_TEMPLATE = "certificate_template"
     CERTIFICATE_REQUEST_SUBJECT_COMPONENT = "certificate_request_subject_component"
 
 
-class REQUIRE_ACTIONS(object):
+class REQUIRE_ACTIONS:
     IGNORE = "ignore"
     VERIFY = "verify"
     REQUIRE_AND_VERIFY = "require_and_verify"
 
 
-def verify_certificate_path(certificate, trusted_ca_paths):
+def verify_certificate_path(certificate: Certificate, trusted_ca_paths: list):
     """
     Verify a certificate against the list of directories each containing files with
     a certificate chain.
 
-    :param certificate: The PEM certificate to verify
+    :param certificate: The certificate to verify
+    :type certificate: cryptography.x509.Certificate
     :param trusted_ca_paths: A list of directories
-    :return: True or False
+    :type trusted_ca_paths: list
+    :return: True if the certificate can be verified against the ca chains
+    :rtype: bool
     """
-    from os import listdir
-    from os.path import isfile, join, isdir
 
     for capath in trusted_ca_paths:
-        if isdir(capath):
-            chainfiles = [join(capath, f) for f in listdir(capath) if isfile(join(capath, f))]
+        p = pathlib.Path(capath)
+        if p.is_dir():
+            chainfiles = [f for f in p.iterdir() if f.is_file()]
             for chainfile in chainfiles:
                 chain = parse_chainfile(chainfile)
                 try:
-                    verify_certificate(to_byte_string(certificate), chain)
+                    verify_certificate(certificate, chain)
                     return True
-                except Exception as exx:
-                    log.debug(u"Can not verify attestation certificate against chain {0!s}.".format(chain))
+                except InvalidSignature:
+                    log.info(f"Can not verify attestation certificate against chain in {chainfile}")
         else:
-            log.warning("The configured attestation CA directory does not exist.")
+            log.warning(f"The configured attestation CA directory {p} does not exist.")
     return False
 
 
@@ -132,38 +139,36 @@ def parse_chainfile(chainfile):
     return cacerts
 
 
-def verify_certificate(certificate, chain):
+def verify_certificate(certificate: Certificate, chain: list):
     """
     Verify a certificate against the certificate chain, which can be of any length
 
     The certificate chain starts with the root certificate and contains further
     intermediate certificates
 
-    :param certificate: The certificate
-    :type certificate: PEM encoded string
+    :param certificate: The certificate in PEM encoded format
+    :type certificate: cryptography.x509.Certificate
     :param chain: A list of PEM encoded certificates
     :type chain: list
     :return: raises an exception
     """
+    if not chain:
+        raise PrivacyIDEAError("Can not verify certificate against an empty chain.")  # pragma: no cover
     # first reverse the list, since it can be popped better
     chain = list(reversed(chain))
-    if not chain:
-        raise privacyIDEAError("Can not verify certificate against an empty chain.")
-    certificate = load_pem_x509_certificate(to_byte_string(certificate), default_backend())
-    chain = [load_pem_x509_certificate(to_byte_string(c), default_backend()) for c in chain]
+    chain = [load_pem_x509_certificate(c.encode()) for c in chain]
     # verify chain
+    signer = chain.pop()
     while chain:
-        signer = chain.pop()
-        if chain:
-            # There is another element in the list, so we check the intermediate:
-            signee = chain.pop()
-            signer.public_key().verify(
-                signee.signature,
-                signee.tbs_certificate_bytes,
-                padding.PKCS1v15(),
-                signee.signature_hash_algorithm
-            )
-            signer = signee
+        # There is another element in the list, so we check the intermediate:
+        signee = chain.pop()
+        signer.public_key().verify(
+            signee.signature,
+            signee.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            signee.signature_hash_algorithm
+        )
+        signer = signee
 
     # This was the last certificate in the chain, so we check the certificate
     signer.public_key().verify(
@@ -179,31 +184,33 @@ class CertificateTokenClass(TokenClass):
     Token to implement an X509 certificate.
     The certificate can be enrolled by sending a CSR to the server or the
     keypair is created by the server. If the server creates the keypair,
-    the user can download a PKCS12 file.
-    The OTP PIN is used as passphrase for the PKCS12 file.
+    the user can download an encrypted PKCS12 container file.
+    The OTP PIN is used as passphrase for the PKCS12 file. If no PIN is set for
+    the token, a random password will be generated and returned in the init
+    details.
 
     privacyIDEA is capable of working with different CA connectors.
 
-    Valid parameters are *request* or *certificate*, both PEM encoded.
-    If you pass a *request* you also need to pass the *ca* that should be
-    used to sign the request. Passing a *certificate* just uploads the
-    certificate to a new token object.
+    Valid parameters are ``request`` or ``certificate``, both PEM encoded.
+    If you pass a ``request`` or ``genkey=1`` you also need to pass the ``ca``
+    that should be used to sign the request. Passing a ``certificate`` just
+    uploads the certificate to a new token object.
 
     A certificate token can be created by an administrative task with the
-    token/init api like this:
+    :http:post:`/token/init` api like this:
 
       **Example Initialization Request**:
 
         .. sourcecode:: http
 
-           POST /auth HTTP/1.1
+           POST /token/init HTTP/1.1
            Host: example.com
            Accept: application/json
 
            type=certificate
            user=cornelius
            realm=realm1
-           request=<PEM encoded request>
+           request=<PEM encoded certificate request>
            attestation=<PEM encoded attestation certificate>
            ca=<name of the ca connector>
 
@@ -213,14 +220,14 @@ class CertificateTokenClass(TokenClass):
 
         .. sourcecode:: http
 
-           POST /auth HTTP/1.1
+           POST /token/init HTTP/1.1
            Host: example.com
            Accept: application/json
 
            type=certificate
            user=cornelius
            realm=realm1
-           generate=1
+           genkey=1
            ca=<name of the ca connector>
 
       **Example response**:
@@ -231,30 +238,32 @@ class CertificateTokenClass(TokenClass):
                Content-Type: application/json
 
                {
-                  "detail": {
-                    "certificate": "...PEM..."
-                  },
-                  "id": 1,
-                  "jsonrpc": "2.0",
-                  "result": {
-                    "status": true,
-                    "value": true
-                  },
-                  "version": "privacyIDEA unknown"
-                }
+                 "detail": {
+                   "certificate": "...PEM...",
+                   "serial": "CRT...."
+                 },
+                 "id": 1,
+                 "jsonrpc": "2.0",
+                 "result": {
+                   "status": true,
+                   "value": true
+                 },
+               }
 
     """
     using_pin = False
     hKeyRequired = False
 
+    owned_tokeninfo_keys = frozenset({"CA", "certificate", "pkcs12", "pkcs12_password", "privatekey", REQUEST_ID})
+
     def __init__(self, aToken):
         TokenClass.__init__(self, aToken)
-        self.set_type(u"certificate")
+        self.set_type("certificate")
         self.otp_len = 0
         try:
             self._update_rollout_state()
         except Exception as e:
-            log.warning("Failed to check for pending update. {0!s}".format(e))
+            log.warning(f"Failed to check for pending update. {e!s}")
 
     @staticmethod
     def get_class_type():
@@ -283,7 +292,7 @@ class CertificateTokenClass(TokenClass):
                                 'Token.'),
                'init': {},
                'config': {},
-               'user':  ['enroll'],
+               'user': ['enroll'],
                # This tokentype is enrollable in the UI for...
                'ui_enroll': ["admin", "user"],
                'policy': {
@@ -391,7 +400,7 @@ class CertificateTokenClass(TokenClass):
         :return: the status of the rollout
         """
         status = -1
-        if self.rollout_state == ROLLOUTSTATE.PENDING:
+        if self.rollout_state == RolloutState.PENDING:
             request_id = self.get_tokeninfo(REQUEST_ID)
             ca = self.get_tokeninfo("CA")
             if ca and request_id:
@@ -399,137 +408,167 @@ class CertificateTokenClass(TokenClass):
                 cacon = get_caconnector_object(ca)
                 status = cacon.get_cr_status(request_id)
                 # TODO: Later we need to make the status CA dependent. Different CAs could return
-                # different codes. So each CA Connector needs a mapper for its specific codes.
+                #  different codes. So each CA Connector needs a mapper for its specific codes.
                 if status in [3, 4]:  # issued or "issued out of band"
-                    log.info("The certificate {0!s} has been issued by the CA.".format(self.token.serial))
+                    log.info(f"The certificate {self.token.serial!s} has been issued by the CA.")
                     certificate = cacon.get_issued_certificate(request_id)
                     # Update the rollout state
-                    self.token.rollout_state = ROLLOUTSTATE.ENROLLED
-                    self.add_tokeninfo("certificate", certificate)
+                    self.token.rollout_state = RolloutState.ENROLLED
+                    self.write_tokeninfo("certificate", certificate)
                 elif status == 2:  # denied
-                    log.warning("The certificate {0!s} has been denied by the CA.".format(self.token.serial))
-                    self.token.rollout_state = ROLLOUTSTATE.DENIED
+                    log.warning(f"The certificate {self.token.serial!s} has been denied by the CA.")
+                    self.token.rollout_state = RolloutState.DENIED
                     self.token.save()
                 else:
-                    log.info("The certificate {0!s} is still pending.".format(self.token.serial))
+                    log.info(f"The certificate {self.token.serial!s} is still pending.")
             else:
-                log.warning("The certificate token in rollout_state pending, but either the CA ({0!s}) "
-                            "or the requestId ({1!s}) is missing.".format(ca, request_id))
+                log.warning(f"The certificate token in rollout_state pending, but either the CA ({ca!s}) "
+                            f"or the requestId ({request_id!s}) is missing.")
         return status
 
     def update(self, param):
         """
         This method is called during the initialization process.
+
         :param param: parameters from the token init
         :type param: dict
         :return: None
         """
-        TokenClass.update(self, param)
+        # Remove genkey and otpkey from params to avoid generating an otpkey
+        token_params = {k: v for k, v in param.items() if k not in ["genkey", "otpkey"]}
+        TokenClass.update(self, token_params)
 
-        request = getParam(param, "request", optional)
-        spkac = getParam(param, "spkac", optional)
-        certificate = getParam(param, "certificate", optional)
-        generate = getParam(param, "genkey", optional)
-        template_name = getParam(param, "template", optional)
-        subject_components = getParam(param, "subject_components", optional=optional, default=[])
+        request = get_optional(param, "request")
+        certificate = get_optional(param, "certificate")
+        generate = get_optional(param, "genkey")
+        template_name = get_optional(param, "template")
+        subject_components = get_optional(param, "subject_components", default=[])
+
+        if "pin" in param:
+            self.set_pin(param.get("pin"))
+
         request_id = None
+        ca_connector = None
         if request or generate:
             # If we do not upload a user certificate, then we need a CA do
             # sign the uploaded request or generated certificate.
-            ca = getParam(param, "ca", required)
-            self.add_tokeninfo("CA", ca)
-            cacon = get_caconnector_object(ca)
+            ca = get_required(param, "ca")
+            self.write_tokeninfo("CA", ca)
+            ca_connector = get_caconnector_object(ca)
         if request:
-            if not spkac:
-                # We only do the whole attestation checking in case we have no SPKAC
-                request_csr = load_pem_x509_csr(to_byte_string(request), default_backend())
-                if not request_csr.is_signature_valid:
-                    raise privacyIDEAError("request has invalid signature.")
-                # If a request is sent, we can have an attestation certificate
-                attestation = getParam(param, "attestation", optional)
-                verify_attestation = getParam(param, "verify_attestation", optional)
-                if attestation:
-                    request_numbers = request_csr.public_key().public_numbers()
-                    attestation_cert = load_pem_x509_certificate(to_byte_string(attestation), default_backend())
-                    attestation_numbers = attestation_cert.public_key().public_numbers()
-                    if request_numbers != attestation_numbers:
-                        log.warning("certificate request does not match attestation certificate.")
-                        raise privacyIDEAError("certificate request does not match attestation certificate.")
+            request = request.replace("\n", "")
+            if not request.startswith("-----BEGIN CERTIFICATE REQUEST-----"):
+                request = "-----BEGIN CERTIFICATE REQUEST-----" + request
+            if not request.endswith("-----END CERTIFICATE REQUEST-----"):
+                request = request + "-----END CERTIFICATE REQUEST-----"
+            request_csr = load_pem_x509_csr(to_byte_string(request))
+            # Restore the request string with newlines
+            request = request_csr.public_bytes(encoding=serialization.Encoding.PEM).decode('utf-8')
+            if not request_csr.is_signature_valid:
+                raise PrivacyIDEAError("request has invalid signature.")
+            # If a request is sent, we can have an attestation certificate
+            attestation = get_optional(param, "attestation")
+            verify_attestation = get_optional(param, "verify_attestation")
+            if attestation:
+                request_numbers = request_csr.public_key().public_numbers()
+                attestation_cert = load_pem_x509_certificate(to_byte_string(attestation))
+                attestation_numbers = attestation_cert.public_key().public_numbers()
+                if request_numbers != attestation_numbers:
+                    log.warning("certificate request does not match attestation certificate.")
+                    raise PrivacyIDEAError("certificate request does not match attestation certificate.")
 
-                    try:
-                        verified = verify_certificate_path(attestation,
-                                                           param.get(ACTION.TRUSTED_CA_PATH))
-                    except Exception as exx:
-                        # We could have file system errors during verification.
-                        log.debug("{0!s}".format(traceback.format_exc()))
-                        verified = False
+                try:
+                    verified = verify_certificate_path(attestation_cert,
+                                                       param.get(ACTION.TRUSTED_CA_PATH))
+                except Exception as e:
+                    # We could have file system errors during verification.
+                    log.debug(f"An error occurred while verifying the certificate path: {e}")
+                    log.debug(f"{traceback.format_exc()!s}")
+                    verified = False
 
-                    if not verified:
-                        log.warning("Failed to verify certificate chain of attestation certificate.")
-                        if verify_attestation:
-                            raise privacyIDEAError("Failed to verify certificate chain of attestation certificate.")
+                if not verified:
+                    log.warning("Failed to verify certificate chain of attestation certificate.")
+                    if verify_attestation:
+                        raise PrivacyIDEAError("Failed to verify certificate chain of attestation certificate.")
 
             # During the initialization process, we need to create the certificate
-            request_id, x509object = cacon.sign_request(request,
-                                                        options={"spkac": spkac,
-                                                                 "template": template_name})
-            certificate = crypto.dump_certificate(crypto.FILETYPE_PEM,
-                                                  x509object)
+            # TODO: We should check for a pending CSR from the MSCA connector
+            request_id, certificate = ca_connector.sign_request(request, options={"template": template_name})
         elif generate:
             """
-            Create the certificate on behalf of another user. Now we need to create 
+            Create the certificate on behalf of another user. Now we need to create
             * the key pair,
             * the request
             * and the certificate
             We need the user for whom the certificate should be created
             """
-            user = get_user_from_param(param, optionalOrRequired=required)
-            keysize = getParam(param, "keysize", optional, 2048)
-            key = crypto.PKey()
-            key.generate_key(crypto.TYPE_RSA, keysize)
-            req = crypto.X509Req()
-            req.get_subject().CN = user.login
-            # Add components to subject
+            user = get_user_from_param(param, optional_or_required=False)  # user is required
+            keysize = get_optional(param, "keysize", 2048)
+            # The key size should be at least 2048
+            if keysize < 2048:
+                log.info("Adjusting Key size to 2048 bits for improved security.")
+                keysize = 2048
+            key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=keysize)
+            # Provide various details about who we are.
+            subject_name = [x509.NameAttribute(x509.NameOID.COMMON_NAME, user.login)]
             if subject_components:
-                if "email" in subject_components and user.info.get("email"):
-                    req.get_subject().emailAddress = user.info.get("email")
+                # TODO: Add Country, Organization. Maybe from templates?
+                """
+                req.get_subject().countryName = 'xxx'
+                req.get_subject().stateOrProvinceName = 'xxx'
+                req.get_subject().localityName = 'xxx'
+                req.get_subject().organizationName = 'xxx'
+                """
+                user_email = user.get_specific_info(["email"]).get("email")
+                if "email" in subject_components and user_email:
+                    subject_name.append(
+                        x509.NameAttribute(x509.NameOID.EMAIL_ADDRESS, user_email)
+                    )
                 if "realm" in subject_components:
-                    req.get_subject().organizationalUnitName = user.realm
-            # TODO: Add Country, Organization
-            """
-            req.get_subject().countryName = 'xxx'
-            req.get_subject().stateOrProvinceName = 'xxx'
-            req.get_subject().localityName = 'xxx'
-            req.get_subject().organizationName = 'xxx'
-            """
-            req.set_pubkey(key)
-            r = req.sign(key, "sha256")
-            csr = to_unicode(crypto.dump_certificate_request(crypto.FILETYPE_PEM, req))
+                    subject_name.append(
+                        x509.NameAttribute(x509.NameOID.ORGANIZATIONAL_UNIT_NAME, user.realm)
+                    )
+            req = x509.CertificateSigningRequestBuilder().subject_name(x509.Name(subject_name))
+            # Sign the CSR with our private key.
+            req = req.sign(key, hashes.SHA256())
+
+            csr = req.public_bytes(serialization.Encoding.PEM).decode()
+            key_pem = key.private_bytes(serialization.Encoding.PEM,
+                                        serialization.PrivateFormat.PKCS8,
+                                        serialization.NoEncryption()).decode()
+
             try:
-                request_id, x509object = cacon.sign_request(csr, options={"template": template_name})
-                certificate = crypto.dump_certificate(crypto.FILETYPE_PEM, x509object)
-            except CSRError:
-                # Mark the token as broken
-                self.token.rollout_state = ROLLOUTSTATE.FAILED
-                # Reraise the error
-                raise CSRError()
+                request_id, certificate = ca_connector.sign_request(
+                    csr,
+                    options={"template": template_name})
+
             except CSRPending as e:
-                self.token.rollout_state = ROLLOUTSTATE.PENDING
+                self.token.rollout_state = RolloutState.PENDING
                 if hasattr(e, "requestId"):
                     request_id = e.requestId
-            finally:
-                # Save the private key to the encrypted key field of the token
-                s = crypto.dump_privatekey(crypto.FILETYPE_PEM, key)
-                self.add_tokeninfo("privatekey", s, value_type="password")
+            except (CSRError, CAError):
+                # Mark the token as broken
+                self.token.rollout_state = RolloutState.FAILED
+                # Reraise the error
+                raise
 
-        if "pin" in param:
-            self.set_pin(param.get("pin"), encrypt=True)
+            # We create the pkcs12 container here and save it in the token info
+            # and add it to the init details. If the rollout state is pending, there
+            # will be no certificate in the container, just the private key.
+            pkcs12_password, pkcs12_container = self._create_pkcs12_bin(certificate, key_pem)
+            pkcs12_container_encoded = b64encode_and_unicode(pkcs12_container)
+            self.write_tokeninfo("pkcs12", pkcs12_container_encoded)
+            self.add_init_details("pkcs12", pkcs12_container_encoded)
+            if pkcs12_password:
+                self.add_init_details("pkcs12_password", pkcs12_password)
 
         if certificate:
-            self.add_tokeninfo("certificate", certificate)
+            self.write_tokeninfo("certificate", certificate)
 
         if request_id:
-            self.add_tokeninfo(REQUEST_ID, request_id)
+            self.write_tokeninfo(REQUEST_ID, request_id)
 
     @log_with(log)
     def get_init_detail(self, params=None, user=None):
@@ -538,58 +577,67 @@ class CertificateTokenClass(TokenClass):
         PKCS12 file, if the private key exists.
         """
         response_detail = TokenClass.get_init_detail(self, params, user)
-        params = params or {}
         certificate = self.get_tokeninfo("certificate")
         response_detail["certificate"] = certificate
         response_detail["rollout_state"] = self.token.rollout_state
-        privatekey = self.get_tokeninfo("privatekey")
-        # If there is a private key, we dump a PKCS12
-        if privatekey:
-            try:
-                response_detail["pkcs12"] = b64encode_and_unicode(self._create_pkcs12_bin())
-            except Exception:
-                log.warning("Can not create PKCS12 for token {0!s}.".format(self.token.serial))
-
+        # Remove the "otpkey" from the response, it is unused for certificate tokens
+        if "otpkey" in response_detail:
+            del response_detail["otpkey"]
         return response_detail
 
-    def _create_pkcs12_bin(self):
+    def _create_pkcs12_bin(self, certificate: str = None, privatekey: str = None) -> tuple[str, bytes]:
         """
         Helper function to create an encrypted pkcs12 binary for download
 
         :return: PKCS12 binary
         """
-        certificate = self.get_tokeninfo("certificate")
-        privatekey = self.get_tokeninfo("privatekey")
-        pkcs12 = crypto.PKCS12()
-        pkcs12.set_certificate(crypto.load_certificate(
-            crypto.FILETYPE_PEM, certificate))
-        pkcs12.set_privatekey(crypto.load_privatekey(crypto.FILETYPE_PEM,
-                                                     privatekey))
-        # TODO define a random passphrase and hand it to the user
-        passphrase = self.token.get_pin()
-        if passphrase == -1:
-            passphrase = ""
-        pkcs12_bin = pkcs12.export(passphrase=passphrase.encode('utf8'))
-        return pkcs12_bin
+        if not certificate:
+            certificate = self.get_tokeninfo("certificate")
+        if not privatekey:
+            privatekey = self.get_tokeninfo("privatekey")
 
-    def get_as_dict(self):
+        cert = None
+        if certificate:
+            cert = load_pem_x509_certificate(certificate.encode())
+        key = serialization.load_pem_private_key(privatekey.encode(), None)
+        # Get the token PIN. If it exists we use it as the password for the
+        # encrypted pkcs12 container. Otherwise, we create a random password.
+        token_pin = self.token.get_pin()
+        if token_pin == -1:
+            passphrase = secrets.token_urlsafe(12)
+        else:
+            passphrase = token_pin
+        # See https://cryptography.io/en/latest/hazmat/primitives/asymmetric/serialization/#cryptography.hazmat.primitives.serialization.pkcs12.serialize_key_and_certificates
+        # for more details on PKCS12 export
+        p12 = pkcs12.serialize_key_and_certificates(
+            b"certificatetoken", key, cert, None,
+            BestAvailableEncryption(passphrase.encode()))
+        # If we used the token PIN to encrypt the pkcs12 container, we do not
+        # return it to the caller
+        if token_pin != -1:
+            passphrase = None
+        return passphrase, p12
+
+    def get_as_dict(self) -> dict:
         """
         This returns the token data as a dictionary.
         It is used to display the token list at /token/list.
 
         The certificate token can add the PKCS12 file if it exists
 
-        :return: The token data as dict
+        :return: The token data as dictionary
         :rtype: dict
         """
         # first get the database values as dict
         token_dict = self.token.get()
 
-        if "privatekey" in token_dict.get("info"):
-            try:
-                token_dict["info"]["pkcs12"] = b64encode_and_unicode(self._create_pkcs12_bin())
-            except Exception:
-                log.warning("Can not create PKCS12 for token {0!s}.".format(self.token.serial))
+        if "pkcs12_password" in token_dict["info"]:
+            # We need to use the get_tokeninfo function to decrypt the password
+            token_dict["info"]["pkcs12_password"] = self.get_tokeninfo("pkcs12_password")
+
+        # Remove the private key from the response
+        if "privatekey" in token_dict["info"]:
+            del token_dict["info"]["privatekey"]
 
         return token_dict
 
@@ -601,13 +649,12 @@ class CertificateTokenClass(TokenClass):
         passphrase for the PKCS12 file.
 
         :param pin: the pin to be set for the token
-        :type pin: basestring
-        :param encrypt: If set to True, the pin is stored encrypted and
-                        can be retrieved from the database again
+        :type pin: str
+        :param encrypt: ignored
         :type encrypt: bool
         """
-        storeHashed = False
-        self.token.set_pin(pin, storeHashed)
+        store_hashed = False
+        self.token.set_pin(pin, store_hashed)
 
     def revoke(self):
         """
@@ -621,19 +668,17 @@ class CertificateTokenClass(TokenClass):
         # determine the CA and its connector.
         ti = self.get_tokeninfo()
         ca_specifier = ti.get("CA")
-        log.debug("Revoking certificate {0!s} on CA {1!s}.".format(
-            self.token.serial, ca_specifier))
+        log.debug(f"Revoking certificate {self.token.serial!s} on CA {ca_specifier!s}.")
         certificate_pem = ti.get("certificate")
 
         # call CAConnector.revoke_cert()
         ca_obj = get_caconnector_object(ca_specifier)
         revoked = ca_obj.revoke_cert(certificate_pem,
                                      request_id=ti.get(REQUEST_ID))
-        log.info("Certificate {0!s} revoked on CA {1!s}.".format(revoked,
-                                                                 ca_specifier))
+        log.info(f"Certificate {revoked!s} revoked on CA {ca_specifier!s}.")
 
         # call CAConnector.create_crl()
         crl = ca_obj.create_crl()
-        log.info("CRL {0!s} created.".format(crl))
+        log.info(f"CRL {crl!s} created.")
 
         return revoked

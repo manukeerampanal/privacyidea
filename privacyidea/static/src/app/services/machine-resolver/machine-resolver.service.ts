@@ -1,0 +1,202 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+
+import { HttpClient, httpResource, HttpResourceRef } from "@angular/common/http";
+import { computed, effect, inject, Injectable, Signal } from "@angular/core";
+import { PiResponse } from "@app/app.component";
+import { environment } from "@env/environment";
+import { AuthService, AuthServiceInterface } from "@services/auth/auth.service";
+import { ContentService, ContentServiceInterface } from "@services/content/content.service";
+import { NotificationService, NotificationServiceInterface } from "@services/notification/notification.service";
+import { lastValueFrom } from "rxjs";
+
+export type MachineResolvers = Record<string, MachineResolver>;
+
+export interface MachineResolverData {
+  resolver: string;
+  type: string;
+}
+
+export interface MachineResolver {
+  resolvername: string;
+  type: string;
+  data: MachineResolverData;
+}
+
+export interface HostsMachineResolverData extends MachineResolverData {
+  filename?: string;
+  type: "hosts";
+}
+
+export interface HostsMachineResolver extends MachineResolver {
+  type: "hosts";
+  data: HostsMachineResolverData;
+}
+
+export interface LdapMachineResolverData extends MachineResolverData {
+  type: "ldap";
+  AUTHTYPE?: string;
+  TLS_VERIFY?: boolean;
+  START_TLS?: boolean;
+  LDAPURI?: string;
+  TLS_CA_FILE?: string;
+  LDAPBASE?: string;
+  BINDDN?: string;
+  BINDPW?: string;
+  TIMEOUT?: string;
+  SIZELIMIT?: string;
+  SEARCHFILTER?: string;
+  IDATTRIBUTE?: string;
+  IPATTRIBUTE?: string;
+  HOSTNAMEATTRIBUTE?: string;
+  NOREFERRALS?: "True" | "False";
+}
+
+export interface LdapMachineResolver extends MachineResolver {
+  type: "ldap";
+  data: LdapMachineResolverData;
+}
+
+export interface MachineResolverServiceInterface {
+  readonly allMachineResolverTypes: string[];
+  readonly machineResolvers: Signal<MachineResolver[]>;
+  readonly machineResolverResource: HttpResourceRef<PiResponse<MachineResolvers> | undefined>;
+
+  postMachineResolver(resolver: MachineResolver): Promise<void>;
+
+  postTestMachineResolver(resolver: MachineResolver): Promise<void>;
+
+  deleteMachineResolver(name: string): Promise<void>;
+}
+
+@Injectable()
+export class MachineResolverService implements MachineResolverServiceInterface {
+  readonly allMachineResolverTypes: string[] = ["hosts", "ldap"];
+  private readonly authService: AuthServiceInterface = inject(AuthService);
+  private readonly contentService: ContentServiceInterface = inject(ContentService);
+  private readonly notificationService: NotificationServiceInterface = inject(NotificationService);
+  private readonly http = inject(HttpClient);
+
+  readonly machineResolverBaseUrl = environment.proxyUrl + "/machineresolver/";
+
+  constructor() {
+    effect(() => {
+      this.notificationService.handleResourceError(this.machineResolverResource.error(), "machine resolvers");
+    });
+  }
+
+  readonly machineResolverResource = httpResource<PiResponse<MachineResolvers>>(() => {
+    if (!this.contentService.onMachineResolver()) {
+      return undefined;
+    }
+    if (!this.authService.actionAllowed("mresolverread")) {
+      this.notificationService.error(
+        $localize`:@@machineResolver.youAreNotAllowedTo:You are not allowed to read Machine Resolvers.`
+      );
+      return undefined;
+    }
+    return {
+      url: `${this.machineResolverBaseUrl}`,
+      method: "GET",
+      headers: this.authService.getHeaders()
+    };
+  });
+
+  readonly machineResolvers = computed<MachineResolver[]>(() => {
+    if (!this.machineResolverResource.hasValue()) {
+      return [];
+    }
+    const res = this.machineResolverResource.value();
+    return res?.result?.value ? Object.values(res.result.value) : [];
+  });
+
+  async postMachineResolver(resolver: MachineResolver): Promise<void> {
+    if (!this.authService.actionAllowed("mresolverwrite")) {
+      this.notificationService.error(
+        $localize`:@@machineResolver.youAreNotAllowedTo2:You are not allowed to update Machine Resolvers.`
+      );
+      throw new Error("not-allowed");
+    }
+    const url = `${this.machineResolverBaseUrl}${encodeURIComponent(resolver.resolvername)}`;
+    const request = this.http.post<PiResponse<number>>(url, resolver.data, { headers: this.authService.getHeaders() });
+
+    return lastValueFrom(request)
+      .then(() => {
+        this.notificationService.success(
+          $localize`:@@machineResolver.successfullyUpdatedMachineresolver:Successfully updated machineResolver.`
+        );
+        this.machineResolverResource.reload();
+      })
+      .catch((error) => {
+        console.warn("Failed to update machineResolver:", error);
+        const message = error.error?.result?.error?.message || "";
+        this.notificationService.error(
+          $localize`:@@machineResolver.failedToUpdateMachineresolver:Failed to update machineResolver. ${message}:MESSAGE:`
+        );
+        throw new Error("post-failed");
+      });
+  }
+
+  async postTestMachineResolver(resolver: MachineResolver): Promise<void> {
+    if (!this.authService.actionAllowed("mresolverwrite")) {
+      this.notificationService.error(
+        $localize`:@@machineResolver.youAreNotAllowedTo2:You are not allowed to update Machine Resolvers.`
+      );
+      throw new Error("not-allowed");
+    }
+    const url = `${this.machineResolverBaseUrl}test`;
+    const request = this.http.post<PiResponse<boolean>>(url, resolver.data, { headers: this.authService.getHeaders() });
+    return lastValueFrom(request)
+      .then(() => undefined)
+      .catch((error) => {
+        const message = error.error?.result?.error?.message || "";
+        this.notificationService.error(
+          $localize`:@@machineResolver.failedToUpdateMachineresolver:Failed to update machineResolver. ${message}:MESSAGE:`
+        );
+        throw new Error("post-failed");
+      });
+  }
+
+  async deleteMachineResolver(name: string): Promise<void> {
+    if (!this.authService.actionAllowed("mresolverdelete")) {
+      this.notificationService.error(
+        $localize`:@@machineResolver.youAreNotAllowedTo4:You are not allowed to delete Machine Resolvers.`
+      );
+      throw new Error("not-allowed");
+    }
+    const request = this.http.delete<PiResponse<number>>(`${this.machineResolverBaseUrl}${encodeURIComponent(name)}`, {
+      headers: this.authService.getHeaders()
+    });
+    return lastValueFrom(request)
+      .then(() => {
+        this.notificationService.success(
+          $localize`:@@machineResolver.successfullyDeletedMachineresolverName:Successfully deleted machineResolver: ${name}:NAME:.`
+        );
+        this.machineResolverResource.reload();
+      })
+      .catch((error) => {
+        console.warn("Failed to delete machineResolver:", error);
+        const message = error.error?.result?.error?.message || "";
+        this.notificationService.error(
+          $localize`:@@machineResolver.failedToDeleteMachineresolver:Failed to delete machineResolver. ${message}:MESSAGE:`
+        );
+        throw new Error("delete-failed");
+      });
+  }
+}

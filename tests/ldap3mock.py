@@ -1,4 +1,5 @@
-# -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: 2024 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """
 2020-09-07 Cornelius Kölbel <cornelius.koelbel@netknights.it>
            Add exception
@@ -37,31 +38,34 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-
-from __future__ import (
-    absolute_import, division, unicode_literals
-)
+import datetime
+import os
 
 from passlib.hash import ldap_salted_sha1
 from ast import literal_eval
 import uuid
 from ldap3.utils.conv import escape_bytes
 import ldap3
+from unittest.mock import Mock
 import re
 import pyparsing
 
 from .smtpmock import get_wrapped
 
 from collections import namedtuple
-
-try:
-    from collections import Sequence, Sized
-except ImportError:
-    from collections.abc import Sequence, Sized
+from collections.abc import Sequence, Sized
 
 from privacyidea.lib.utils import to_bytes, to_unicode
 
-DIRECTORY = "tests/testdata/tmp_directory"
+# Each pytest-xdist worker gets its own scratch file, otherwise concurrent
+# writes to tmp_directory from parallel workers silently clobber each other's
+# mock LDAP state — producing spurious LDAP auth failures in tests that rely
+# on the mock being stable across ``_on_Connection`` reloads. See the
+# ``setLDAPDirectory`` / ``_on_Connection._load_data`` round trip below.
+DIRECTORY = "tests/testdata/tmp_directory" + (
+    "_" + os.environ["PYTEST_XDIST_WORKER"]
+    if os.environ.get("PYTEST_XDIST_WORKER") else ""
+)
 
 Call = namedtuple('Call', ['request', 'response'])
 
@@ -73,7 +77,7 @@ def wrapper%(signature)s:
 
 
 def _convert_objectGUID(item):
-    item = uuid.UUID("{{{0!s}}}".format(item)).bytes_le
+    item = uuid.UUID(f"{{{item!s}}}").bytes_le
     item = escape_bytes(item)
     return item
 
@@ -98,11 +102,11 @@ class CallList(Sequence, Sized):
         self._calls = []
 
 
-class Connection(object):
+class Connection:
 
-    class Extend(object):
+    class Extend:
 
-        class Standard(object):
+        class Standard:
 
             def __init__(self, connection):
                 self.connection = connection
@@ -127,18 +131,24 @@ class Connection(object):
 
     def __init__(self, directory=None):
         if directory is None:
-                directory = []
+            directory = []
         import copy
         self.directory = copy.deepcopy(directory)
         self.bound = False
         self.start_tls_called = False
         self.extend = self.Extend(self)
+        self.usage = Mock(**{"elapsed_time": datetime.timedelta(microseconds=500)})
 
         self.operation = {
-                    "!" : self._search_not,
-                    "&" : self._search_and,
-                    "|" : self._search_or,
-            }
+                    "!": self._search_not,
+                    "&": self._search_and,
+                    "|": self._search_or}
+        self.result = {'dn': '',
+                       'referrals': None,
+                       'description': 'success',
+                       'result': 0,
+                       'message': '',
+                       'type': 'addResponse'}
 
     def set_directory(self, directory):
         self.directory = directory
@@ -155,33 +165,23 @@ class Connection(object):
 
     def start_tls(self, read_server_info=True):
         self.start_tls_called = True
+        return True
 
     def add(self, dn, object_class=None, attributes=None):
-
-        self.result = { 'dn' : '',
-                        'referrals' : None,
-                        'description' : 'success',
-                        'result' : 0,
-                        'message' : '',
-                        'type' : 'addResponse'}
-
         # Check to see if the user exists in the directory
         try:
-            index = self._find_user(dn)
+            self._find_user(dn)
         except StopIteration:
             # If we get here the user doesn't exist so continue
-            # Create a entry object for the new user
-            entry = {}
-            entry['dn'] = dn
-            entry['attributes'] = attributes
-            if object_class != None:
-                entry['attributes'].update( {'objectClass': object_class} )
+            # to create an entry object for the new user
+            entry = {'dn': dn, 'attributes': attributes}
+            if object_class is not None:
+                entry['attributes'].update( {'objectClass': object_class})
         else:
             # User already exists
             self.result["description"] = "failure"
             self.result["result"] = 68
-            self.result["message"] = \
-                    "Error entryAlreadyExists for {0}".format(dn)
+            self.result["message"] = f"Error entryAlreadyExists for {dn}"
             return False
 
         # Add the user entry to the directory
@@ -195,12 +195,12 @@ class Connection(object):
 
     def delete(self, dn, controls=None):
 
-        self.result = { 'dn' : '',
-                        'referrals' : None,
-                        'description' : 'success',
-                        'result' : 0,
-                        'message' : '',
-                        'type' : 'addResponse'}
+        self.result = {'dn': '',
+                       'referrals': None,
+                       'description': 'success',
+                       'result': 0,
+                       'message': '',
+                       'type': 'addResponse'}
 
         # Check to see if the user exists in the directory
         try:
@@ -209,7 +209,7 @@ class Connection(object):
             # If we get here the user doesn't exist so continue
             self.result["description"] = "failure"
             self.result["result"] = 32
-            self.result["message"] = "Error no such object: {0}".format(dn)
+            self.result["message"] = f"Error no such object: {dn}"
             return False
 
         # Delete the entry object for the user
@@ -237,7 +237,7 @@ class Connection(object):
             # If we get here the user doesn't exist so continue
             self.result["description"] = "failure"
             self.result["result"] = 32
-            self.result["message"] = "Error no such object: {0!s}".format(dn)
+            self.result["message"] = f"Error no such object: {dn!s}"
             return False
 
         # extract the hash we are interested in
@@ -252,7 +252,7 @@ class Connection(object):
             else:
                 self.result["result"] = 2
                 self.result["message"] = "Error bad/missing/not implemented" \
-                    "modify operation: %s" % k[1]
+                    f"modify operation: {k[1]}"
 
         # Place the attributes back into the directory hash
         self.directory[index]["attributes"] = entry
@@ -332,7 +332,7 @@ class Connection(object):
             match_using_regex = True
             #regex = check_escape(value)
             regex = value.replace('*', '.*')
-            regex = "^{0}$".format(regex)
+            regex = f"^{regex}$"
 
         for entry in candidates:
             dn = to_unicode(entry.get("dn"))
@@ -371,8 +371,8 @@ class Connection(object):
                     if isinstance(values_from_directory, bytes):
                         values_from_directory = values_from_directory.decode(
                             "utf-8")
-                    elif type(values_from_directory) == int:
-                        values_from_directory = u"{0!s}".format(values_from_directory)
+                    elif isinstance(values_from_directory, int):
+                        values_from_directory = f"{values_from_directory!s}"
                     if value == values_from_directory:
                         entry["type"] = "searchResEntry"
                         matches.append(entry)
@@ -388,7 +388,7 @@ class Connection(object):
             match_using_regex = True
             #regex = check_escape(value)
             regex = value.replace('*', '.*')
-            regex = "^{0}$".format(regex)
+            regex = f"^{regex}$"
 
         for entry in candidates:
             found = False
@@ -431,7 +431,7 @@ class Connection(object):
 
     @staticmethod
     def _parse_filter():
-        op = pyparsing.oneOf('! & |')
+        op = pyparsing.one_of('! & |')
         lpar  = pyparsing.Literal('(').suppress()
         rpar  = pyparsing.Literal(')').suppress()
 
@@ -442,7 +442,7 @@ class Connection(object):
         #   numbers, upper/lower case letters, astrisk, at symbol, minus, full
         #   stop, backslash or a space
         v = pyparsing.Word(pyparsing.alphanums + "-*@.\\ äöü")
-        rel = pyparsing.oneOf("= ~= >= <=")
+        rel = pyparsing.one_of("= ~= >= <=")
 
         expr = pyparsing.Forward()
         atom = pyparsing.Group(lpar + op + expr + rpar) \
@@ -457,7 +457,7 @@ class Connection(object):
         deDuped = list()
         for entry in results:
             dn = entry.get("dn")
-            if not dn in found:
+            if dn not in found:
                 found[dn] = 1
                 deDuped.append(entry)
 
@@ -640,13 +640,12 @@ class Connection(object):
         try:
             if isinstance(search_filter, bytes):
                 # We need to convert to unicode otherwise pyparsing will not
-                # find the u"ö"
+                # find the "ö"
                 search_filter = to_unicode(search_filter)
             expr = Connection._parse_filter()
-            s_filter = expr.parseString(search_filter).asList()[0]
-        except pyparsing.ParseBaseException as exx:
-            # Just for debugging purposes
-            s = "{!s}".format(exx)
+            s_filter = expr.parse_string(search_filter).as_list()[0]
+        except pyparsing.ParseBaseException:
+            pass
 
         for item in s_filter:
             if item[0] in self.operation:
@@ -660,7 +659,7 @@ class Connection(object):
         return True
 
 
-class Ldap3Mock(object):
+class Ldap3Mock:
 
     def __init__(self):
         self._calls = CallList()
@@ -680,7 +679,7 @@ class Ldap3Mock(object):
                 with open(DIRECTORY, 'w+') as f:
                     f.write(str(directory))
                     self.directory = directory
-            except OSError as e:
+            except OSError:
                 raise
 
     def set_exception(self, exc=True):
@@ -688,10 +687,10 @@ class Ldap3Mock(object):
 
     def _load_data(self, directory):
         try:
-            with open(directory, 'r') as f:
+            with open(directory) as f:
                 data = f.read()
                 return literal_eval(data)
-        except OSError as e:
+        except OSError:
             raise
 
     @property
@@ -718,7 +717,8 @@ class Ldap3Mock(object):
     def _on_Connection(self, server, user, password,
                        auto_bind=None, client_strategy=None,
                        authentication=None, check_names=None,
-                       auto_referrals=None, receive_timeout=None):
+                       auto_referrals=None, receive_timeout=None,
+                       collect_usage=None):
         """
         We need to create a Connection object with
         methods:
@@ -755,7 +755,7 @@ class Ldap3Mock(object):
         return self.con_obj
 
     def start(self):
-        import mock
+        from unittest import mock
 
         def unbound_on_Server(host, port,
                               use_ssl,

@@ -1,0 +1,157 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { ComponentType } from "@angular/cdk/overlay";
+import { EnvironmentInjector, inject, Injectable } from "@angular/core";
+import { MatDialog, MatDialogConfig, MatDialogRef } from "@angular/material/dialog";
+import { AbstractDialogComponent } from "@components/shared/dialog/abstract-dialog/abstract-dialog.component";
+import { SimpleConfirmationDialogComponent } from "@components/shared/dialog/confirmation-dialog/confirmation-dialog.component";
+import { lastValueFrom, take } from "rxjs";
+
+export interface DialogServiceInterface {
+  closeDialog<D, R>(ref: MatDialogRef<AbstractDialogComponent<D, R>, R>, result?: R): boolean;
+
+  openDialog<D, R>(args: {
+    component: ComponentType<AbstractDialogComponent<D, R>>;
+    data?: D;
+    configOverride?: Partial<MatDialogConfig<D>>;
+  }): MatDialogRef<AbstractDialogComponent<D, R>, R>;
+
+  openDialogAsync<D, R>(args: {
+    component: ComponentType<AbstractDialogComponent<D, R>>;
+    data?: D;
+    configOverride?: Partial<MatDialogConfig<D>>;
+  }): Promise<R | undefined>;
+
+  closeLatestDialog(): void;
+
+  closeAllDialogs(): void;
+
+  isAnyDialogOpen(): boolean;
+
+  isDialogOpen(ref: MatDialogRef<AbstractDialogComponent>): boolean;
+
+  confirm(args: { title: string; message: string; confirmButtonText: string }): Promise<boolean>;
+
+  confirmDelete(args: { title: string; items: string[]; itemType: string }): Promise<boolean>;
+}
+
+@Injectable({ providedIn: "root" })
+export class DialogService implements DialogServiceInterface {
+  private readonly dialog = inject(MatDialog);
+  private readonly injector = inject(EnvironmentInjector);
+  public openDialogs = new Set<MatDialogRef<AbstractDialogComponent>>();
+
+  /**
+   * @param ref The MatDialogRef of the dialog to be closed.
+   * @param result The optional return value of the dialog.
+   * @returns true if the dialog was found and closed.
+   */
+  closeDialog<D, R>(ref: MatDialogRef<AbstractDialogComponent<D, R>, R>, result?: R): boolean {
+    if (this.openDialogs.has(ref)) {
+      ref.close(result);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Opens a dialog.
+   * @param T - The type of the payload data in MatDialogConfig.data.
+   * @param R - The type of the return value when the dialog is closed.
+   */
+  openDialog<D, R>(args: {
+    component: ComponentType<AbstractDialogComponent<D, R>>;
+    data?: D;
+    configOverride?: Partial<MatDialogConfig<D>>;
+  }): MatDialogRef<AbstractDialogComponent<D, R>, R> {
+    const { component, data, configOverride } = args;
+    const config: MatDialogConfig<D> = {
+      disableClose: false,
+      hasBackdrop: true,
+      injector: this.injector,
+      data,
+      ...configOverride
+    };
+    const dialogRef = this.dialog.open(component, config) as MatDialogRef<AbstractDialogComponent<D, R>, R>;
+    this.openDialogs.add(dialogRef);
+    dialogRef
+      .afterClosed()
+      .pipe(take(1))
+      .subscribe(() => {
+        this.openDialogs.delete(dialogRef);
+      });
+
+    return dialogRef;
+  }
+
+  async openDialogAsync<D, R>(args: {
+    component: ComponentType<AbstractDialogComponent<D, R>>;
+    data?: D;
+    configOverride?: Partial<MatDialogConfig<D>>;
+  }): Promise<R | undefined> {
+    const dialogRef = this.openDialog(args);
+    return lastValueFrom(dialogRef.afterClosed());
+  }
+
+  closeLatestDialog(): void {
+    const latestRef = Array.from(this.openDialogs).pop();
+    if (latestRef) {
+      latestRef.close();
+    }
+  }
+
+  closeAllDialogs(): void {
+    this.dialog.closeAll();
+    this.openDialogs.clear();
+  }
+
+  isAnyDialogOpen(): boolean {
+    return this.dialog.openDialogs.length > 0;
+  }
+
+  isDialogOpen(ref: MatDialogRef<AbstractDialogComponent>): boolean {
+    return this.openDialogs.has(ref);
+  }
+
+  async confirm(args: { title: string; message: string; confirmButtonText: string }): Promise<boolean> {
+    const dialogRef = this.openDialog({
+      component: SimpleConfirmationDialogComponent,
+      data: {
+        title: args.title,
+        confirmAction: { type: "confirm", label: args.confirmButtonText, value: true },
+        items: [args.message],
+        itemType: ""
+      }
+    });
+    return lastValueFrom(dialogRef.afterClosed()).then((result) => result === true);
+  }
+
+  async confirmDelete(args: { title: string; items: string[]; itemType: string }): Promise<boolean> {
+    const dialogRef = this.openDialog({
+      component: SimpleConfirmationDialogComponent,
+      data: {
+        title: args.title,
+        items: args.items,
+        itemType: args.itemType,
+        confirmAction: { type: "destruct", label: $localize`:@@common.delete:Delete`, value: true }
+      }
+    });
+    return lastValueFrom(dialogRef.afterClosed()).then((result) => result === true);
+  }
+}

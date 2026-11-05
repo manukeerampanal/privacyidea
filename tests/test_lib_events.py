@@ -1,49 +1,64 @@
-# -*- coding: utf-8 -*-
-
 """
 This file contains the event handlers tests. It tests:
 
 lib/eventhandler/usernotification.py (one event handler module)
 lib/event.py (the decorator)
 """
-import responses
+import json
 import os
-import mock
+from collections import OrderedDict
+from datetime import datetime, timedelta, UTC
 
-from mock import patch, MagicMock
-from privacyidea.lib.eventhandler.customuserattributeshandler import (CustomUserAttributesHandler,
-                                                                      ACTION_TYPE as CUAH_ACTION_TYPE)
-from privacyidea.lib.eventhandler.customuserattributeshandler import USER_TYPE
-from privacyidea.lib.eventhandler.webhookeventhandler import ACTION_TYPE, WebHookHandler, CONTENT_TYPE
-from privacyidea.lib.eventhandler.usernotification import UserNotificationEventHandler
-from .base import MyTestCase, FakeFlaskG, FakeAudit
-from privacyidea.lib.config import get_config_object
-from privacyidea.lib.eventhandler.tokenhandler import (TokenEventHandler,
-                                                       ACTION_TYPE, VALIDITY)
-from privacyidea.lib.eventhandler.scripthandler import ScriptEventHandler, SCRIPT_WAIT
-from privacyidea.lib.eventhandler.counterhandler import CounterEventHandler
-from privacyidea.lib.eventhandler.responsemangler import ResponseManglerEventHandler
-from privacyidea.models import EventCounter
-from privacyidea.lib.eventhandler.federationhandler import FederationEventHandler
-from privacyidea.lib.eventhandler.requestmangler import RequestManglerEventHandler
-from privacyidea.lib.eventhandler.base import BaseEventHandler, CONDITION
-from privacyidea.lib.counter import increase as counter_increase
-from flask import Request
+from unittest import mock
+import requests.exceptions
+import responses
+from dateutil.parser import parse as parse_date_string
+from dateutil.tz import tzlocal
+from flask import Request, Response
+from unittest.mock import patch
+from sqlalchemy import select
+from testfixtures import log_capture
 from werkzeug.test import EnvironBuilder
+
+from privacyidea.lib.audit import getAudit
+from privacyidea.lib.config import get_config_object
+from privacyidea.lib.container import (init_container, find_container_by_serial, get_all_containers,
+                                       delete_container_by_serial, add_token_to_container, create_endpoint_url)
+from privacyidea.lib.containers.container_info import TokenContainerInfoData, PI_INTERNAL
+from privacyidea.lib.counter import increase as counter_increase
+from privacyidea.lib.error import ResourceNotFoundError, ConfigAdminError
 from privacyidea.lib.event import (delete_event, set_event,
                                    EventConfiguration, get_handler_object,
                                    enable_event)
+from privacyidea.lib.eventhandler.base import BaseEventHandler, CONDITION
+from privacyidea.lib.eventhandler.containerhandler import (ContainerEventHandler, ACTION_TYPE as C_ACTION_TYPE)
+from privacyidea.lib.eventhandler.counterhandler import CounterEventHandler
+from privacyidea.lib.eventhandler.customuserattributeshandler import (CustomUserAttributesHandler,
+                                                                      ACTION_TYPE as CUAH_ACTION_TYPE,
+                                                                      USER_TYPE)
+from privacyidea.lib.eventhandler.federationhandler import FederationEventHandler
+from privacyidea.lib.eventhandler.requestmangler import RequestManglerEventHandler
+from privacyidea.lib.eventhandler.responsemangler import ResponseManglerEventHandler
+from privacyidea.lib.eventhandler.scripthandler import ScriptEventHandler, SCRIPT_WAIT
+from privacyidea.lib.eventhandler.tokenhandler import (TokenEventHandler,
+                                                       ACTION_TYPE, VALIDITY)
+from privacyidea.lib.eventhandler.usernotification import UserNotificationEventHandler
+from privacyidea.lib.eventhandler.webhookeventhandler import (ActionType as WHEH_ACTION_TYPE,
+                                                              WebHookHandler,
+                                                              ContentType,
+                                                              DB_CONTENT_TYPE_MAP)
+from privacyidea.lib.machine import list_token_machines
+from privacyidea.lib.realm import get_default_realm
 from privacyidea.lib.token import (init_token, remove_token, get_realms_of_token, get_tokens,
-                                   add_tokeninfo)
-from privacyidea.lib.tokenclass import DATE_FORMAT
+                                   get_one_token, unassign_token, get_tokens_paginate)
+from privacyidea.lib.tokenclass import DATE_FORMAT, ChallengeSession
 from privacyidea.lib.user import User
-from privacyidea.lib.error import ResourceNotFoundError
 from privacyidea.lib.utils import is_true
-from datetime import datetime, timedelta
-from dateutil.parser import parse as parse_date_string
-from dateutil.tz import tzlocal
-from privacyidea.app import PiResponseClass as Response
-from collections import OrderedDict
+from privacyidea.models import Challenge
+from privacyidea.models import EventCounter, TokenOwner
+from privacyidea.models import db, EventHandler
+from .base import MyTestCase, FakeFlaskG, FakeAudit
+from .test_lib_tokencontainer import MockSmartphone
 
 
 class EventHandlerLibTestCase(MyTestCase):
@@ -53,6 +68,21 @@ class EventHandlerLibTestCase(MyTestCase):
                         conditions={"bla": "yes"},
                         options={"emailconfig": "themis"})
         self.assertEqual(eid, 1)
+        event_1 = db.session.scalars(select(EventHandler).where(EventHandler.id == eid)).one_or_none()
+        self.assertEqual("token_init", event_1.event)
+        self.assertEqual("UserNotification", event_1.handlermodule)
+        self.assertEqual("sendmail", event_1.action)
+        # Defaults
+        self.assertEqual(0, event_1.ordering)
+        self.assertTrue(event_1.active)
+        self.assertEqual("post", event_1.position)
+        self.assertEqual("", event_1.condition)
+        self.assertFalse(event_1.abort_on_error)
+        # Relationships
+        self.assertEqual("emailconfig", event_1.options[0].Key)
+        self.assertEqual("themis", event_1.options[0].Value)
+        self.assertEqual("bla", event_1.conditions[0].Key)
+        self.assertEqual("yes", event_1.conditions[0].Value)
 
         # create a new event!
         r = set_event("name2", ["token_init", "token_assign"],
@@ -72,6 +102,26 @@ class EventHandlerLibTestCase(MyTestCase):
                                "always": "immer"},
                       id=eid)
         self.assertEqual(r, eid)
+        event_1 = db.session.scalars(select(EventHandler).where(EventHandler.id == eid)).one_or_none()
+        self.assertEqual("token_init, token_assign", event_1.event)
+        self.assertEqual(0, len(event_1.conditions.all()))
+        self.assertSetEqual({"emailconfig", "always"}, {option.Key for option in event_1.options})
+        for opt in event_1.options:
+            if opt.Key == "emailconfig":
+                self.assertEqual("themis", opt.Value)
+            if opt.Key == "always":
+                self.assertEqual("immer", opt.Value)
+
+        # Update the name of the first event (regression test for #5591)
+        r = set_event("renamed_event", "token_init, token_assign",
+                      "UserNotification", "sendmail",
+                      conditions={},
+                      options={"emailconfig": "themis",
+                               "always": "immer"},
+                      id=eid)
+        self.assertEqual(r, eid)
+        event_1 = db.session.scalars(select(EventHandler).where(EventHandler.id == eid)).one_or_none()
+        self.assertEqual("renamed_event", event_1.name)
 
         # check that the config timestamp has been updated
         self.assertGreater(get_config_object().timestamp, current_timestamp)
@@ -111,7 +161,7 @@ class EventHandlerLibTestCase(MyTestCase):
         # If eventid is None, then the whole list is returned
         r = event_config.get_event(None)
         self.assertEqual(r, event_config.events)
-        # return a destinct eventid
+        # return a distinct eventid
         r = event_config.get_event(events[0].get("id"))
         self.assertEqual(r[0].get("id"), events[0].get("id"))
         self.assertEqual(r[0].get("position"), "post")
@@ -124,6 +174,34 @@ class EventHandlerLibTestCase(MyTestCase):
         self.assertTrue(r)
         event_config = EventConfiguration()
         self.assertEqual(len(event_config.events), 0)
+
+    def test_01b_update_keeps_options_when_omitted(self):
+        # Regression test: reordering an event handler (an update that does not
+        # supply options/conditions) must not wipe the stored options and
+        # conditions. See the "change order in the overview deletes actions" bug.
+        eid = set_event("keepme", "token_init", "UserNotification", "sendmail",
+                        conditions={"bla": "yes"},
+                        options={"emailconfig": "themis"})
+        # Update only the ordering, omit options and conditions (options=None,
+        # conditions=None means "keep the stored values")
+        set_event("keepme", "token_init", "UserNotification", "sendmail",
+                  id=eid, ordering=5)
+        event = db.session.scalars(select(EventHandler).where(EventHandler.id == eid)).one_or_none()
+        self.assertEqual(5, event.ordering)
+        # options and conditions are still there
+        self.assertEqual("emailconfig", event.options[0].Key)
+        self.assertEqual("themis", event.options[0].Value)
+        self.assertEqual("bla", event.conditions[0].Key)
+        self.assertEqual("yes", event.conditions[0].Value)
+
+        # An explicit empty dict clears the options/conditions
+        set_event("keepme", "token_init", "UserNotification", "sendmail",
+                  id=eid, options={}, conditions={})
+        event = db.session.scalars(select(EventHandler).where(EventHandler.id == eid)).one_or_none()
+        self.assertEqual(0, len(event.options.all()))
+        self.assertEqual(0, len(event.conditions.all()))
+
+        delete_event(eid)
 
     def test_02_get_handler_object(self):
         h_obj = get_handler_object("UserNotification")
@@ -138,8 +216,75 @@ class EventHandlerLibTestCase(MyTestCase):
         h_obj = get_handler_object("Federation")
         self.assertEqual(type(h_obj), FederationEventHandler)
 
+        h_obj = get_handler_object("Container")
+        self.assertEqual(type(h_obj), ContainerEventHandler)
+
+    def test_03_abort_on_error(self):
+        def stored(event_id):
+            return db.session.scalars(select(EventHandler).where(EventHandler.id == event_id)).one_or_none()
+
+        # A handler whose result the request consumes is created as aborting, the others are best-effort
+        federation_id = set_event("federation", "token_init", "Federation", "forward")
+        notification_id = set_event("notification", "token_init", "UserNotification", "sendmail")
+        self.assertTrue(stored(federation_id).abort_on_error)
+        self.assertFalse(stored(notification_id).abort_on_error)
+
+        # An update that does not mention abort_on_error keeps the stored value
+        set_event("federation", "token_init", "Federation", "forward", id=federation_id, ordering=2)
+        self.assertTrue(stored(federation_id).abort_on_error)
+
+        # The stored value can be changed in both directions
+        set_event("federation", "token_init", "Federation", "forward", id=federation_id, abort_on_error=False)
+        self.assertFalse(stored(federation_id).abort_on_error)
+        set_event("notification", "token_init", "UserNotification", "sendmail", id=notification_id,
+                  abort_on_error=True)
+        self.assertTrue(stored(notification_id).abort_on_error)
+
+        # The handler definition passed to the event handlers carries the value
+        event_config = EventConfiguration()
+        handler_definitions = {d.get("id"): d for d in event_config.get_handled_events("token_init")}
+        self.assertFalse(handler_definitions[federation_id].get("abort_on_error"))
+        self.assertTrue(handler_definitions[notification_id].get("abort_on_error"))
+
+        delete_event(federation_id)
+        delete_event(notification_id)
+
 
 class BaseEventHandlerTestCase(MyTestCase):
+
+    @classmethod
+    def setup_request(cls, req_data: dict = {}, all_data: dict = None, user: User = None, resp_data: str = None,
+                      resp_content_type: str = None, handler_def: dict = {}):
+        # Prepare a fake request
+        builder = EnvironBuilder(method='POST',
+                                 data=req_data,
+                                 headers={})
+        env = builder.get_environ()
+        req = Request(env)
+        if all_data:
+            req.all_data = all_data
+        if user:
+            req.User = user
+
+        # fake response
+        resp = Response()
+        if resp_data:
+            resp.data = resp_data
+        else:
+            resp.data = """{"result": {"value": false}}"""
+        if resp_content_type:
+            resp.content_type = resp_content_type
+
+        # fake g
+        fake_g = FakeFlaskG()
+        fake_g.audit_object = getAudit(cls.app.config)
+
+        # options for the event handler
+        options = {"g": fake_g,
+                   "handler_def": handler_def,
+                   "request": req,
+                   "response": resp}
+        return options
 
     def test_01_basefunctions(self):
         actions = BaseEventHandler().actions
@@ -173,26 +318,13 @@ class BaseEventHandlerTestCase(MyTestCase):
         self.assertEqual(tok.type, "pw")
 
         uhandler = BaseEventHandler()
-        builder = EnvironBuilder(method='POST',
-                                 data={'user': "cornelius@realm1",
-                                       "pass": "wrongvalue"},
-                                 headers={})
-        env = builder.get_environ()
-        req = Request(env)
-        # This is a kind of authentication request
-        req.all_data = {"user": "cornelius@realm1",
-                        "pass": "wrongvalue"}
-        req.User = User("cornelius", "realm1")
-        resp = Response()
-        resp.data = """{"result": {"value": false}}"""
+        req_data = {'user': "cornelius@realm1", "pass": "wrongvalue"}
+        user = User("cornelius", "realm1")
+        handler_def = {"conditions": {CONDITION.TOKENTYPE: "pw"}}
+        options = self.setup_request(req_data=req_data, all_data=req_data, user=user, handler_def=handler_def)
+
         # Do checking
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.TOKENTYPE: "pw"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        r = uhandler.check_condition(options)
         # The only token of the user is of type "pw".
         self.assertEqual(r, True)
 
@@ -208,105 +340,51 @@ class BaseEventHandlerTestCase(MyTestCase):
                          user=user)
         self.assertEqual(tok.type, "pw")
         uhandler = BaseEventHandler()
-        builder = EnvironBuilder(method='POST',
-                                 data={'user': "cornelius@realm1",
-                                       "pass": "wrongvalue"},
-                                 headers={})
-        env = builder.get_environ()
-        req = Request(env)
-        # This is a kind of authentication request
-        req.all_data = {"user": "cornelius@realm1",
-                        "pass": "wrongvalue"}
-        req.User = User("cornelius", "realm1")
-        resp = Response()
-        resp.data = """{"result": {"value": false}}"""
+        req_data = {'user': "cornelius@realm1", "pass": "wrongvalue"}
+        user = User("cornelius", "realm1")
+        handler_def = {"conditions": {CONDITION.COUNT_AUTH: "<100"}}
+        options = self.setup_request(req_data=req_data, all_data=req_data, user=user, handler_def=handler_def)
 
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.COUNT_AUTH: "<100"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        r = uhandler.check_condition(options)
         self.assertEqual(r, True)
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.COUNT_AUTH: ">100"}},
-             "request": req,
-             "response": resp
-             }
-        )
+
+        options["handler_def"] = {"conditions": {CONDITION.COUNT_AUTH: ">100"}}
+        r = uhandler.check_condition(options)
         self.assertFalse(r)
 
         # Set the count_auth and count_auth_success
-        add_tokeninfo(serial, "count_auth", 100)
-        add_tokeninfo(serial, "count_auth_success", 50)
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.COUNT_AUTH: ">99"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        token_object = get_one_token(serial=serial)
+        token_object.set_count_auth(100)
+        token_object.set_count_auth_success(50)
+        options["handler_def"] = {"conditions": {CONDITION.COUNT_AUTH: ">99"}}
+        r = uhandler.check_condition(options)
         self.assertTrue(r)
 
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.COUNT_AUTH_SUCCESS:
-                                                ">45"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.COUNT_AUTH_SUCCESS: ">45"}}
+        r = uhandler.check_condition(options)
         self.assertTrue(r)
 
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.COUNT_AUTH_FAIL:
-                                                ">45"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.COUNT_AUTH_FAIL: ">45"}}
+        r = uhandler.check_condition(options)
         self.assertTrue(r)
 
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.COUNT_AUTH_FAIL:
-                                                "<45"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.COUNT_AUTH_FAIL: "<45"}}
+        r = uhandler.check_condition(options)
         self.assertFalse(r)
 
         # check for failcounter
         tok.set_failcount(8)
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.FAILCOUNTER: "<9"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        db.session.commit()
+        options["handler_def"] = {"conditions": {CONDITION.FAILCOUNTER: "<9"}}
+        r = uhandler.check_condition(options)
         self.assertTrue(r)
 
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.FAILCOUNTER: ">9"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.FAILCOUNTER: ">9"}}
+        r = uhandler.check_condition(options)
         self.assertFalse(r)
 
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.FAILCOUNTER: "=8"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.FAILCOUNTER: "=8"}}
+        r = uhandler.check_condition(options)
         self.assertTrue(r)
 
         remove_token(serial)
@@ -322,127 +400,61 @@ class BaseEventHandlerTestCase(MyTestCase):
                          user=user)
         self.assertEqual(tok.type, "pw")
         uhandler = BaseEventHandler()
-        builder = EnvironBuilder(method='POST',
-                                 data={'user': "cornelius@realm1",
-                                       "pass": "secret"},
-                                 headers={})
-        env = builder.get_environ()
-        req = Request(env)
-        # This is a kind of authentication request
-        req.all_data = {"user": "cornelius@realm1",
-                        "pass": "secret"}
-        req.User = User("cornelius", "realm1")
-        resp = Response()
-        resp.data = """{"result": {"value": true}}"""
+        req_data = {'user': "cornelius@realm1", "pass": "secret"}
+        user = User("cornelius", "realm1")
+        resp_data = """{"result": {"value": true}}"""
+        options = self.setup_request(req_data=req_data, all_data=req_data, user=user, resp_data=resp_data)
 
         tok.add_tokeninfo("myValue", "99")
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.TOKENINFO:
-                                                "myValue<100"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.TOKENINFO: "myValue<100"}}
+        r = uhandler.check_condition(options)
         self.assertEqual(r, True)
 
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.TOKENINFO:
-                                                "myValue<98"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.TOKENINFO: "myValue<98"}}
+        r = uhandler.check_condition(options)
         self.assertEqual(r, False)
 
         tok.add_tokeninfo("myValue", "Hallo")
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.TOKENINFO:
-                                                "myValue== Hallo"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.TOKENINFO: "myValue==Hallo"}}
+        r = uhandler.check_condition(options)
         self.assertEqual(r, True)
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.TOKENINFO:
-                                                "myValue==hallo"}},
-             "request": req,
-             "response": resp
-             }
-        )
+
+        options["handler_def"] = {"conditions": {CONDITION.TOKENINFO: "myValue==hallo"}}
+        r = uhandler.check_condition(options)
         self.assertEqual(r, False)
 
-        # The beginning of the year 2017 in smaller than now
+        # The beginning of the year 2017 is smaller than now
         tok.add_tokeninfo("myDate", "2017-01-01T10:00+0200")
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.TOKENINFO:
-                                                "myDate < {now}"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.TOKENINFO: "myDate < {now}"}}
+        r = uhandler.check_condition(options)
         self.assertTrue(r)
 
         # myDate is one hour in the future
-        tok.add_tokeninfo("myDate",
-                          (datetime.now(tzlocal())
-                           + timedelta(hours=1)
-                           ).strftime(DATE_FORMAT))
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.TOKENINFO:
-                                                "myDate > {now}-2h"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        tok.add_tokeninfo("myDate", (datetime.now(tzlocal()) + timedelta(hours=1)).strftime(DATE_FORMAT))
+        options["handler_def"] = {"conditions": {CONDITION.TOKENINFO: "myDate > {now}-2h"}}
+        r = uhandler.check_condition(options)
         self.assertTrue(r)
         remove_token(serial)
 
     def test_05_detail_messages_condition(self):
         self.setUp_user_realms()
         uhandler = BaseEventHandler()
-        builder = EnvironBuilder(method='POST',
-                                 data={'user': "cornelius@realm1",
-                                       "pass": "secret"},
-                                 headers={})
-        env = builder.get_environ()
-        req = Request(env)
-        # This is a kind of authentication request
-        req.all_data = {"user": "cornelius@realm1",
-                        "pass": "secret"}
-        req.User = User("cornelius", "realm1")
+        req_data = {'user': "cornelius@realm1", "pass": "secret"}
+        user = User("cornelius", "realm1")
+        resp_data = """{"result": {"value": true, "status": true},
+                    "detail": {"message": "something very special happened"}
+                    }
+                    """
+        resp_content_type = "application/json"
+        options = self.setup_request(req_data=req_data, all_data=req_data, user=user, resp_data=resp_data,
+                                     resp_content_type=resp_content_type)
 
-        # Check DETAIL_MESSAGE
-        resp = Response()
-        resp.data = """{"result": {"value": true, "status": true},
-        "detail": {"message": "something very special happened"}
-        }
-        """
-
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.DETAIL_MESSAGE:
-                                                "special"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.DETAIL_MESSAGE: "special"}}
+        r = uhandler.check_condition(options)
         self.assertEqual(r, True)
 
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.DETAIL_MESSAGE:
-                                                "^special"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.DETAIL_MESSAGE: "^special"}}
+        r = uhandler.check_condition(options)
         self.assertEqual(r, False)
 
         # Check DETAIL_MESSAGE to evaluate to False if it does not exist
@@ -451,15 +463,9 @@ class BaseEventHandlerTestCase(MyTestCase):
                 "detail": {"options": "Nothing"}
                 }
                 """
-
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.DETAIL_MESSAGE:
-                                                "special"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["response"] = resp
+        options["handler_def"] = {"conditions": {CONDITION.DETAIL_MESSAGE: "special"}}
+        r = uhandler.check_condition(options)
         self.assertEqual(r, False)
 
         # Check DETAIL_ERROR_MESSAGE
@@ -468,65 +474,36 @@ class BaseEventHandlerTestCase(MyTestCase):
             "detail": {"error": {"message": "user does not exist"}}
             }
             """
-
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.DETAIL_ERROR_MESSAGE:
-                                                "does not exist$"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        resp.content_type = "application/json"
+        options["response"] = resp
+        options["handler_def"] = {"conditions": {CONDITION.DETAIL_ERROR_MESSAGE: "does not exist$"}}
+        r = uhandler.check_condition(options)
         self.assertEqual(r, True)
 
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.DETAIL_ERROR_MESSAGE:
-                                                "^does not exist"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.DETAIL_ERROR_MESSAGE: "^does not exist"}}
+        r = uhandler.check_condition(options)
         self.assertEqual(r, False)
 
     def test_06_check_for_client_ip(self):
         uhandler = BaseEventHandler()
-        builder = EnvironBuilder(method='POST',
-                                 data={'user': "cornelius@realm1",
-                                       "pass": "secret"},
-                                 headers={})
-        g = FakeFlaskG()
-        g.client_ip = "10.0.0.1"
-        env = builder.get_environ()
-        req = Request(env)
-        # This is a kind of authentication request
-        req.all_data = {"user": "cornelius@realm1",
-                        "pass": "secret"}
-        req.User = User("cornelius", "realm1")
+        req_data = {'user': "cornelius@realm1", "pass": "secret"}
+        user = User("cornelius", "realm1")
+        resp_data = """{"result": {"value": true, "status": true},
+                        "detail": {"message": "something very special happened"}
+                        }
+                        """
+        resp_content_type = "application/json"
+        options = self.setup_request(req_data=req_data, all_data=req_data, user=user, resp_data=resp_data,
+                                     resp_content_type=resp_content_type)
 
-        # Check DETAIL_MESSAGE
-        resp = Response()
-        resp.data = """{"result": {"value": true, "status": true},
-                "detail": {"message": "something very special happened"}
-                }
-                """
+        options["g"].client_ip = "10.0.0.1"
 
-        r = uhandler.check_condition(
-            {"g": g,
-             "handler_def": {"conditions": {CONDITION.CLIENT_IP: "10.0.0.0/24"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.CLIENT_IP: "10.0.0.0/24"}}
+        r = uhandler.check_condition(options)
         self.assertTrue(r)
 
-        r = uhandler.check_condition(
-            {"g": g,
-             "handler_def": {"conditions": {CONDITION.CLIENT_IP: "10.0.0.0/24, !10.0.0.1"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.CLIENT_IP: "10.0.0.0/24, !10.0.0.1"}}
+        r = uhandler.check_condition(options)
         self.assertFalse(r)
 
     def test_07_check_rollout_state(self):
@@ -543,36 +520,20 @@ class BaseEventHandlerTestCase(MyTestCase):
 
         uhandler = BaseEventHandler()
         # Prepare a fake request
-        builder = EnvironBuilder(method='POST',
-                                 data={'user': "cornelius@realm1",
-                                       "pass": "wrongvalue"},
-                                 headers={})
-        env = builder.get_environ()
-        req = Request(env)
-        req.all_data = {"user": "cornelius@realm1",
-                        "pass": "wrongvalue"}
-        req.User = user
-        resp = Response()
-        resp.data = """{"result": {"value": false}}"""
+        req_data = {'user': "cornelius@realm1", "pass": "wrongvalue"}
+        resp_data = """{"result": {"value": false}}"""
+        resp_content_type = "application/json"
+        options = self.setup_request(req_data=req_data, all_data=req_data, user=user, resp_data=resp_data,
+                                     resp_content_type=resp_content_type)
 
         # Check if the condition matches
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.ROLLOUT_STATE: "fakestate"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.ROLLOUT_STATE: "fakestate"}}
+        r = uhandler.check_condition(options)
         self.assertTrue(r)
 
         # Check if the condition does not match
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.ROLLOUT_STATE: "otherstate"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.ROLLOUT_STATE: "otherstate"}}
+        r = uhandler.check_condition(options)
         self.assertFalse(r)
 
         remove_token(serial)
@@ -583,69 +544,882 @@ class BaseEventHandlerTestCase(MyTestCase):
             counter_increase("myCounter")
 
         uhandler = BaseEventHandler()
-        builder = EnvironBuilder(method='POST',
-                                 data={'user': "cornelius@realm1",
-                                       "pass": "secret"},
-                                 headers={})
-        env = builder.get_environ()
-        req = Request(env)
-        # This is a kind of authentication request
-        req.all_data = {"user": "cornelius@realm1",
-                        "pass": "secret"}
-        req.User = User("cornelius", "realm1")
-        resp = Response()
-        resp.data = """{"result": {"value": true}}"""
+        req_data = {'user': "cornelius@realm1", "pass": "secret"}
+        user = User("cornelius", "realm1")
+        resp_data = """{"result": {"value": true}}"""
+        resp_content_type = "application/json"
+        options = self.setup_request(req_data=req_data, all_data=req_data, user=user, resp_data=resp_data,
+                                     resp_content_type=resp_content_type)
 
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.COUNTER:
-                                                "myCounter<4"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.COUNTER: "myCounter<4"}}
+        r = uhandler.check_condition(options)
         self.assertFalse(r)
 
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.COUNTER:
-                                                "myCounter==4"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.COUNTER: "myCounter==4"}}
+        r = uhandler.check_condition(options)
         self.assertTrue(r)
 
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.COUNTER:
-                                                "myCounter>3"}},
-             "request": req,
-             "response": resp
-             }
-        )
+        options["handler_def"] = {"conditions": {CONDITION.COUNTER: "myCounter>3"}}
+        r = uhandler.check_condition(options)
         self.assertTrue(r)
 
         # If we have a nonexisting counter this should be treated as zero
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.COUNTER:
-                                                "myNonExistingCounter>3"}},
+        options["handler_def"] = {"conditions": {CONDITION.COUNTER: "myNonExistingCounter>3"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        options["handler_def"] = {"conditions": {CONDITION.COUNTER: "myNonExistingCounter<3"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+    def test_09_check_conditions_realm_and_resolver_value(self):
+        # prepare
+        # setup realms
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+
+        serial = "pw01"
+        user = User("cornelius", "realm1")
+        remove_token(user=user)
+        tok = init_token({"serial": serial,
+                          "type": "pw", "otppin": "test", "otpkey": "secret"},
+                         user=user)
+        self.assertEqual(tok.type, "pw")
+
+        uhandler = BaseEventHandler()
+
+        # Checking values of the conditions
+        realm_value = uhandler.conditions.get("realm").get("value")
+        resolver_value = uhandler.conditions.get("resolver").get("value")
+        self.assertEqual([{'name': 'realm1'}, {'name': 'realm2'}], realm_value, realm_value)
+        self.assertEqual([{'name': 'resolver1'}], resolver_value, resolver_value)
+
+        req_data = {'user': "cornelius@realm1",
+                    "pass": "wrongvalue"}
+        resp_data = """{"result": {"value": false}}"""
+        options = self.setup_request(req_data=req_data, all_data=req_data, user=user, resp_data=resp_data)
+
+        options["handler_def"] = {"conditions": {CONDITION.REALM: "realm1"}}
+        r = uhandler.check_condition(options)
+        # Works if the realm is correct
+        self.assertEqual(r, True)
+
+        options["handler_def"] = {"conditions": {CONDITION.REALM: "realm3"}}
+        r = uhandler.check_condition(options)
+        # False if the realm is incorrect
+        self.assertEqual(r, False)
+
+        options["handler_def"] = {"conditions": {CONDITION.RESOLVER: "resolver1"}}
+        r = uhandler.check_condition(options)
+        # Works if the resolver is correct
+        self.assertEqual(r, True)
+
+        options["handler_def"] = {"conditions": {CONDITION.REALM: "resolver3"}}
+        r = uhandler.check_condition(options)
+        # False if the resolver is incorrect
+        self.assertEqual(r, False)
+
+        remove_token(serial)
+
+    def test_10_check_challenge_session(self):
+        self.setUp_user_realms()
+        serial = "rs01"
+        user = User("cornelius", "realm1")
+        remove_token(user=user)
+        tid = "1234567"
+        # Prepare the token
+        init_token({"serial": serial,
+                    "type": "pw", "otppin": "test", "otpkey": "secret"},
+                   user=user)
+        # Prepare a challenge
+        chal = Challenge(serial=serial, session=ChallengeSession.DECLINED, transaction_id=tid)
+        chal.save()
+        # One token with one declined challenge
+        uhandler = BaseEventHandler()
+        # Prepare a fake request
+        req_data = {'user': "cornelius@realm1", "pass": "wrongvalue", "transaction_id": tid}
+        resp_data = """{"result": {"value": false}}"""
+        options = self.setup_request(req_data=req_data, all_data=req_data, user=user, resp_data=resp_data)
+
+        # Check if the condition matches
+        options["handler_def"] = {"conditions": {CONDITION.CHALLENGE_SESSION: ChallengeSession.DECLINED}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        # Check if the condition does not match
+        options["handler_def"] = {"conditions": {CONDITION.CHALLENGE_SESSION: ChallengeSession.ENROLLMENT}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # We have two declined challenges, add a 2nd one.
+        chal = Challenge(serial=serial, session=ChallengeSession.DECLINED, transaction_id=tid)
+        chal.save()
+        # Check if the condition matches
+        options["handler_def"] = {"conditions": {CONDITION.CHALLENGE_SESSION: ChallengeSession.DECLINED}}
+        r = uhandler.check_condition(options)
+        # We will receive a False and a log.warning
+        self.assertFalse(r)
+
+        remove_token(serial)
+
+    def test_11_check_challenge_expired(self):
+        self.setUp_user_realms()
+        serial = "rs01"
+        user = User("cornelius", "realm1")
+        remove_token(user=user)
+        tid = "1234567"
+        # Prepare the token
+        init_token({"serial": serial,
+                    "type": "pw", "otppin": "test", "otpkey": "secret"},
+                   user=user)
+        # Prepare a challenge, that is not yet expired
+        chal = Challenge(serial=serial, transaction_id=tid)
+        chal.save()
+        # One token with one declined challenge
+        uhandler = BaseEventHandler()
+        # Prepare a fake request
+        req_data = {'user': "cornelius@realm1", "pass": "wrongvalue", "transaction_id": tid}
+        resp_data = """{"result": {"value": false}}"""
+        options = self.setup_request(req_data=req_data, all_data=req_data, user=user, resp_data=resp_data)
+
+        # Check if the condition matches
+        options["handler_def"] = {"conditions": {CONDITION.CHALLENGE_EXPIRED: "false"}}
+        r = uhandler.check_condition(options)
+        # Right, the challenge has not yet expired.
+        self.assertTrue(r)
+
+        # Check if the condition does not match, so we have an expired challenge
+        chal.delete()
+        chal = Challenge(serial=serial, transaction_id=tid, validitytime=-120)
+        chal.save()
+
+        options["handler_def"] = {"conditions": {CONDITION.CHALLENGE_EXPIRED: "True"}}
+        r = uhandler.check_condition(options)
+        # Right, the challenge has expired.
+        self.assertTrue(r)
+
+        remove_token(serial)
+
+    def test_12_check_token_is_in_container(self):
+        # Prepare the container and token
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        token_serial = "SPASS01"
+        init_token({"serial": "SPASS01", "type": "spass"})
+
+        uhandler = BaseEventHandler()
+
+        # Prepare a fake request
+        all_data = {"serial": token_serial}
+        resp_data = """{"result": {"value": false}}"""
+        options = self.setup_request(all_data=all_data, resp_data=resp_data)
+
+        # Token is not in a container
+        # Check if the condition matches
+        options['handler_def'] = {"conditions": {CONDITION.TOKEN_IS_IN_CONTAINER: "False"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        # Check if the condition does not match
+        options['handler_def'] = {"conditions": {CONDITION.TOKEN_IS_IN_CONTAINER: "True"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # Token is in a container
+        add_token_to_container(container_serial, token_serial)
+        # Check if the condition matches
+        options['handler_def'] = {"conditions": {CONDITION.TOKEN_IS_IN_CONTAINER: "True"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        # Check if the condition does not match
+        options['handler_def'] = {"conditions": {CONDITION.TOKEN_IS_IN_CONTAINER: "False"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # Clean up
+        delete_container_by_serial(container_serial)
+        remove_token(token_serial)
+
+    def test_13_check_container_state(self):
+        # Prepare the container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+        container.set_states(["disabled", "lost"])
+
+        uhandler = BaseEventHandler()
+        # Prepare a fake request
+        all_data = {"container_serial": container_serial}
+        resp_data = """{"result": {"value": true}}"""
+        options = self.setup_request(all_data=all_data, resp_data=resp_data)
+
+        # Check if the condition matches
+        options['handler_def'] = {"conditions": {CONDITION.CONTAINER_STATE: "disabled"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        # Check if the condition does not match
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_STATE: "active"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # ------------- Check condition container_single_state --------------
+        # Check if the condition does not match due to multiple states
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_EXACT_STATE: "disabled"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # Check if the condition does not match due to wrong state
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_EXACT_STATE: "lost,active"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # Check if the condition match
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_EXACT_STATE: "disabled,lost"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        container.delete()
+
+    def test_14_check_container_has_owner(self):
+        # create user
+        self.setUp_user_realms()
+        test_user = User(login="cornelius",
+                         realm=self.realm1)
+
+        # init container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+        container.add_user(test_user)
+
+        # event handler
+        uhandler = BaseEventHandler()
+
+        # Prepare a fake request
+        all_data = {"container_serial": container_serial}
+        res_data = """{"result": {"value": false}}"""
+        options = self.setup_request(all_data=all_data, user=test_user, resp_data=res_data)
+
+        # Check if the condition matches
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_HAS_OWNER: "True"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        # Check if the condition does not match
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_HAS_OWNER: "False"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # Unassign user
+        container.remove_user(test_user)
+
+        # Check if the condition matches
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_HAS_OWNER: "False"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        # Check if the condition does not match
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_HAS_OWNER: "True"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        container.delete()
+
+    def test_15_check_container_type(self):
+        # Init container
+        container_serial = init_container({"type": "smartphone"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+
+        # event handler
+        uhandler = BaseEventHandler()
+
+        # Prepare a fake request
+        all_data = {"container_serial": container_serial}
+        resp_data = """{"result": {"value": false}}"""
+        options = self.setup_request(all_data=all_data, resp_data=resp_data)
+
+        # Check if the condition matches
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_TYPE: "smartphone"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        # Check if the condition does not match
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_TYPE: "generic"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        container.delete()
+
+    def test_16_check_container_has_token(self):
+        # Init container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+
+        # Init token
+        token_serial = "SPASS01"
+        init_token({"serial": token_serial, "type": "spass"})
+
+        uhandler = BaseEventHandler()
+
+        # Prepare a fake request
+        all_data = {"container_serial": container_serial}
+        resp_data = """{"result": {"value": false}}"""
+        options = self.setup_request(all_data=all_data, resp_data=resp_data)
+
+        # Container has no token
+        # Check if the condition matches
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        # Check if the condition does not match
+        options['handler_def'] = {"conditions": {CONDITION.CONTAINER_HAS_TOKEN: "True"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # Container has a token
+        add_token_to_container(container_serial, token_serial)
+        # Check if the condition matches
+        options['handler_def'] = {"conditions": {CONDITION.CONTAINER_HAS_TOKEN: "True"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        # Check if the condition does not match
+        options['handler_def'] = {"conditions": {CONDITION.CONTAINER_HAS_TOKEN: "False"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # Clean up
+        delete_container_by_serial(container_serial)
+        remove_token(token_serial)
+
+    def test_17_user_token_number(self):
+        self.setUp_user_realms()
+        user = User("cornelius", "realm1")
+
+        options = self.setup_request(req_data={'user': "cornelius@realm1", "pass": "wrongvalue"},
+                                     all_data={"user": "cornelius@realm1", "pass": "wrongvalue"},
+                                     user=user,
+                                     resp_data="""{"result": {"value": false}}""",
+                                     handler_def={"conditions": {CONDITION.USER_TOKEN_NUMBER: "<1"}})
+
+        event_handler = BaseEventHandler()
+        r = event_handler.check_condition(options)
+        self.assertTrue(r)
+        init_token({"serial": "pw01", "type": "pw", "otppin": "test", "otpkey": "secret"}, user=user)
+        options["handler_def"] = {"conditions": {CONDITION.USER_TOKEN_NUMBER: "<1"}}
+        r = event_handler.check_condition(options)
+        self.assertFalse(r)
+
+    def test_18_compare_condition_no_int(self):
+        self.setUp_user_realms()
+
+        builder = EnvironBuilder(method='POST',
+                                 data={'user': "cornelius@realm1",
+                                       "pass": "wrongvalue"},
+                                 headers={})
+        env = builder.get_environ()
+        req = Request(env)
+        req.all_data = {"user": "cornelius@realm1",
+                        "pass": "wrongvalue"}
+        req.User = User("cornelius", "realm1")
+        resp = Response()
+        resp.data = """{"result": {"value": false}}"""
+
+        fake_g = FakeFlaskG()
+        fake_g.audit_object = getAudit(self.app.config)
+
+        event_handler = BaseEventHandler()
+        # If the condition is not an integer, the error when converting is caught and false is returned
+        r = event_handler.check_condition(
+            {"g": fake_g,
+             "handler_def": {"conditions": {CONDITION.USER_TOKEN_NUMBER: ">notaninteger"}},
              "request": req,
              "response": resp
              }
         )
         self.assertFalse(r)
 
-        r = uhandler.check_condition(
-            {"g": {},
-             "handler_def": {"conditions": {CONDITION.COUNTER:
-                                                "myNonExistingCounter<3"}},
-             "request": req,
-             "response": resp
-             }
-        )
+    def test_19_check_container_realm(self):
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+        # Init container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+
+        # setup fake request
+        all_data = {'container_serial': container_serial}
+        options = self.setup_request(all_data=all_data)
+
+        event_handler = BaseEventHandler()
+
+        # Container in no realm: condition shall match
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_REALM: "realm1"}}
+        r = event_handler.check_condition(options)
         self.assertTrue(r)
+
+        # Add container to realm2: condition shall not match
+        container.set_realms([self.realm2])
+        r = event_handler.check_condition(options)
+        self.assertFalse(r)
+
+        # Condition for realm 2 shall match the container
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_REALM: "realm2"}}
+        r = event_handler.check_condition(options)
+        self.assertTrue(r)
+
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_REALM: "realm1,realm2"}}
+        r = event_handler.check_condition(options)
+        self.assertTrue(r)
+
+        # Clean up
+        container.delete()
+
+    def test_20_check_container_resolver(self):
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+        # Init container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+        user = User("hans", self.realm1, self.resolvername1)
+
+        # setup fake request
+        all_data = {'container_serial': container_serial}
+        options = self.setup_request(all_data=all_data)
+
+        event_handler = BaseEventHandler()
+
+        # Container has no user: condition shall match
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_RESOLVER: self.resolvername2}}
+        r = event_handler.check_condition(options)
+        self.assertTrue(r)
+
+        # Add user to container: condition shall not match
+        container.add_user(user)
+        r = event_handler.check_condition(options)
+        self.assertFalse(r)
+
+        # Condition for resolver 1 shall match the container
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_RESOLVER: self.resolvername1}}
+        r = event_handler.check_condition(options)
+        self.assertTrue(r)
+
+        options["handler_def"] = {
+            "conditions": {CONDITION.CONTAINER_RESOLVER: f"{self.resolvername1},{self.resolvername2}"}}
+        r = event_handler.check_condition(options)
+        self.assertTrue(r)
+
+        # Clean up
+        container.delete()
+
+    def test_19_check_container_info(self):
+        # Init container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+
+        # setup fake request
+        all_data = {'container_serial': container_serial}
+        options = self.setup_request(all_data=all_data)
+
+        event_handler = BaseEventHandler()
+
+        # --- Equality ---
+        # Condition not match: no info
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_INFO: "registration_state == registered"}}
+        r = event_handler.check_condition(options)
+        self.assertFalse(r)
+
+        # Condition not match: wrong info value
+        container.set_container_info([TokenContainerInfoData("registration_state", "client_wait")])
+        r = event_handler.check_condition(options)
+        self.assertFalse(r)
+
+        # Condition match
+        container.set_container_info([TokenContainerInfoData("registration_state", "registered")])
+        r = event_handler.check_condition(options)
+        self.assertTrue(r)
+
+        # --- Smaller ---
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_INFO: "challenge_ttl < 5"}}
+
+        # Condition not match: no info
+        r = event_handler.check_condition(options)
+        self.assertFalse(r)
+
+        # Condition not match: value is greater
+        container.set_container_info([TokenContainerInfoData("challenge_ttl", "10")])
+        r = event_handler.check_condition(options)
+        self.assertFalse(r)
+
+        # Condition match
+        container.set_container_info([TokenContainerInfoData("challenge_ttl", "3")])
+        r = event_handler.check_condition(options)
+        self.assertTrue(r)
+
+        # --- Greater ---
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_INFO: "challenge_ttl > 5"}}
+
+        # condition not match: no info
+        container.delete_container_info("challenge_ttl", keep_internal=False)
+        r = event_handler.check_condition(options)
+        self.assertFalse(r)
+
+        # condition not match: value is smaller
+        container.set_container_info([TokenContainerInfoData("challenge_ttl", "3")])
+        r = event_handler.check_condition(options)
+        self.assertFalse(r)
+
+        # condition match
+        container.set_container_info([TokenContainerInfoData("challenge_ttl", "10")])
+        r = event_handler.check_condition(options)
+        self.assertTrue(r)
+
+        # Clean up
+        container.delete()
+
+    def test_20_check_last_authentication(self):
+        # Init container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+
+        # setup fake request
+        all_data = {'container_serial': container_serial}
+        options = self.setup_request(all_data=all_data)
+
+        event_handler = BaseEventHandler()
+
+        # last auth not set: condition shall not match
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_LAST_AUTH: "1d"}}
+        r = event_handler.check_condition(options)
+        self.assertFalse(r)
+
+        # set last auth to 2 days ago: condition shall not match
+        container._db_container.last_seen = datetime.now(UTC) - timedelta(days=2)
+        container._db_container.save()
+        r = event_handler.check_condition(options)
+        self.assertFalse(r)
+
+        # set last auth to now: condition shall match
+        container.update_last_authentication()
+        r = event_handler.check_condition(options)
+        self.assertTrue(r)
+
+    def test_22_check_last_synchronization(self):
+        # Init container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+
+        # setup fake request
+        all_data = {'container_serial': container_serial}
+        options = self.setup_request(all_data=all_data)
+
+        event_handler = BaseEventHandler()
+
+        # last sync not set: condition shall not match
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_LAST_SYNC: "1y"}}
+        r = event_handler.check_condition(options)
+        self.assertFalse(r)
+
+        # set last auth to 1 year ago: condition shall not match
+        container._db_container.last_updated = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=365)
+        container._db_container.save()
+        r = event_handler.check_condition(options)
+        self.assertFalse(r)
+
+        # set last auth to now: condition shall match
+        container.update_last_synchronization()
+        r = event_handler.check_condition(options)
+        self.assertTrue(r)
+
+    def test_23_check_container_challenge_expired(self):
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        # Prepare a challenge, that is not yet expired
+        chal = Challenge(serial=container_serial, validitytime=120)
+        chal.save()
+
+        uhandler = BaseEventHandler()
+        # Prepare a fake request
+        req_data = {'container_serial': container_serial}
+        resp_data = """{"result": {"value": true}}"""
+        options = self.setup_request(all_data=req_data, resp_data=resp_data)
+
+        # Check if the condition matches
+        options["handler_def"] = {"conditions": {CONDITION.CHALLENGE_EXPIRED: "false"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        # Check if the condition does not match, so we have an expired challenge
+        chal.delete()
+        chal = Challenge(serial=container_serial, validitytime=0)
+        chal.save()
+
+        options["handler_def"] = {"conditions": {CONDITION.CHALLENGE_EXPIRED: "True"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        delete_container_by_serial(container_serial)
+
+    def test_24_invalid_container_serial(self):
+        # event handler
+        uhandler = BaseEventHandler()
+
+        # Prepare a fake request
+        all_data = {"container_serial": "random_serial"}
+        resp_data = """{"result": {"value": false}}"""
+        options = self.setup_request(all_data=all_data, resp_data=resp_data)
+
+        # The condition matches as the container is not found, hence the condition is not checked
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_TYPE: "smartphone"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        # Try to get container from invalid token serial
+        all_data = {"serial": "random_serial"}
+        resp_data = """{"result": {"value": false}}"""
+        options = self.setup_request(all_data=all_data, resp_data=resp_data)
+        options["handler_def"] = {"conditions": {CONDITION.CONTAINER_TYPE: "smartphone"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+    def test_25_check_token_locked(self):
+        token = init_token({"type": "hotp", "genkey": True})
+
+        # event handler
+        uhandler = BaseEventHandler()
+
+        # Prepare a fake request
+        all_data = {"serial": token.get_serial()}
+        resp_data = """{"result": {"value": false}}"""
+        options = self.setup_request(all_data=all_data, resp_data=resp_data)
+
+        # Token is not locked
+        options["handler_def"] = {"conditions": {CONDITION.TOKEN_LOCKED: "False"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+        options["handler_def"] = {"conditions": {CONDITION.TOKEN_LOCKED: "True"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # Token is locked
+        token.set_maxfail(1)
+        token.inc_failcount()
+        options["handler_def"] = {"conditions": {CONDITION.TOKEN_LOCKED: "False"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+        options["handler_def"] = {"conditions": {CONDITION.TOKEN_LOCKED: "True"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        token.delete_token()
+
+    def test_26_check_user_container_number(self):
+        self.setUp_user_realms()
+        hans = User("hans", self.realm1)
+        container_serial = init_container({"type": "generic", "user": hans.login, "realm": hans.realm})[
+            "container_serial"]
+
+        # event handler
+        uhandler = BaseEventHandler()
+
+        # Prepare a fake request
+        all_data = {"type": "hotp"}  # just set any data to ensure request.all_data is set
+        resp_data = """{"result": {"value": false}}"""
+        options = self.setup_request(all_data=all_data, resp_data=resp_data, user=hans)
+
+        # Condition is true
+        options["handler_def"] = {"conditions": {CONDITION.USER_CONTAINER_NUMBER: "==1"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+        options["handler_def"] = {"conditions": {CONDITION.USER_CONTAINER_NUMBER: "<2"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+        options["handler_def"] = {"conditions": {CONDITION.USER_CONTAINER_NUMBER: ">0"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        # Condition is false
+        options["handler_def"] = {"conditions": {CONDITION.USER_CONTAINER_NUMBER: "!=1"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+        options["handler_def"] = {"conditions": {CONDITION.USER_CONTAINER_NUMBER: ">2"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+        options["handler_def"] = {"conditions": {CONDITION.USER_CONTAINER_NUMBER: "<1"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        delete_container_by_serial(container_serial)
+
+    def test_27_token_has_owner(self):
+        token = init_token({"type": "hotp", "genkey": True})
+
+        # event handler
+        uhandler = BaseEventHandler()
+
+        # Prepare a fake request
+        all_data = {"serial": token.get_serial()}
+        resp_data = """{"result": {"value": false}}"""
+        options = self.setup_request(all_data=all_data, resp_data=resp_data)
+
+        # Token has no owner
+        options["handler_def"] = {"conditions": {CONDITION.TOKEN_HAS_OWNER: "False"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+        options["handler_def"] = {"conditions": {CONDITION.TOKEN_HAS_OWNER: "True"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # Token has owner
+        self.setUp_user_realms()
+        user = User("hans", self.realm1)
+        token.add_user(user)
+        options["handler_def"] = {"conditions": {CONDITION.TOKEN_HAS_OWNER: "False"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+        options["handler_def"] = {"conditions": {CONDITION.TOKEN_HAS_OWNER: "True"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        token.delete_token()
+
+    def test_28_token_is_orphaned(self):
+        token = init_token({"type": "hotp", "genkey": True})
+
+        # event handler
+        uhandler = BaseEventHandler()
+
+        # Prepare a fake request
+        all_data = {"serial": token.get_serial()}
+        resp_data = """{"result": {"value": false}}"""
+        options = self.setup_request(all_data=all_data, resp_data=resp_data)
+
+        # Token is not orphaned
+        options["handler_def"] = {"conditions": {CONDITION.TOKEN_IS_ORPHANED: "False"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+        options["handler_def"] = {"conditions": {CONDITION.TOKEN_IS_ORPHANED: "True"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # Token is orphaned
+        self.setUp_user_realms()
+        TokenOwner(token_id=token.token.id, user_id="123", resolver=self.resolvername1, realmname=self.realm1).save()
+        options["handler_def"] = {"conditions": {CONDITION.TOKEN_IS_ORPHANED: "False"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+        options["handler_def"] = {"conditions": {CONDITION.TOKEN_IS_ORPHANED: "True"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        token.delete_token()
+
+    def test_29_check_condition_sets_context(self):
+        self.setUp_user_realms()
+        user = User("hans", self.realm1)
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        options = self.setup_request(all_data={"serial": "SPASS01", "container_serial": container_serial}, user=user,
+                                     handler_def={"conditions": {}})
+
+        event_handler = BaseEventHandler()
+        self.assertTrue(event_handler.check_condition(options))
+        self.assertIn("context", options)
+        context = options["context"]
+        self.assertListEqual(["SPASS01"], context.token_serials)
+        self.assertEqual(user, context.user)
+        self.assertEqual(container_serial, context.container.serial)
+
+        delete_container_by_serial(container_serial)
+
+    def test_30_user_info_condition(self):
+        self.setUp_user_realms()
+        serial = "pw01"
+        user = User("cornelius", "realm1")
+        remove_token(user=user)
+        tok = init_token({"serial": serial,
+                          "type": "pw", "otppin": "test",
+                          "otpkey": "secret"},
+                         user=user)
+        self.assertEqual(tok.type, "pw")
+        uhandler = BaseEventHandler()
+        req_data = {'user': "cornelius@realm1", "pass": "secret"}
+        resp_data = """{"result": {"value": true}}"""
+        options = self.setup_request(req_data=req_data, all_data=req_data, user=user, resp_data=resp_data)
+
+        # Verify the user info is what we expect from the passwd resolver
+        info = user.info
+        self.assertEqual("Cornelius", info.get("givenname"))
+        self.assertEqual("user@localhost.localdomain", info.get("email"))
+
+        # Test string equality: givenname matches
+        options["handler_def"] = {"conditions": {CONDITION.USER_INFO: "givenname == Cornelius"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        # Test string equality: givenname does not match
+        options["handler_def"] = {"conditions": {CONDITION.USER_INFO: "givenname == NotCornelius"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # Test email string equality
+        options["handler_def"] = {"conditions": {CONDITION.USER_INFO: "email == user@localhost.localdomain"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        # Test email string inequality
+        options["handler_def"] = {"conditions": {CONDITION.USER_INFO: "email == other@example.com"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # Test non-existent key returns False
+        options["handler_def"] = {"conditions": {CONDITION.USER_INFO: "nonexistent == somevalue"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # Test numeric comparison with userid (1000 for cornelius)
+        options["handler_def"] = {"conditions": {CONDITION.USER_INFO: "userid < 1001"}}
+        r = uhandler.check_condition(options)
+        self.assertTrue(r)
+
+        options["handler_def"] = {"conditions": {CONDITION.USER_INFO: "userid > 1001"}}
+        r = uhandler.check_condition(options)
+        self.assertFalse(r)
+
+        # Test {now} replacement and time offset in user info condition.
+        # We mock get_specific_info to return a date value and verify that
+        # {now} is correctly replaced and compared.
+        future_date = (datetime.now(tzlocal()) + timedelta(days=10)).strftime(DATE_FORMAT)
+        past_date = (datetime.now(tzlocal()) - timedelta(days=10)).strftime(DATE_FORMAT)
+
+        # A user info field set to a future date should be > {now}
+        with mock.patch.object(user, 'get_specific_info', return_value={"expiration": future_date}):
+            options["handler_def"] = {"conditions": {CONDITION.USER_INFO: "expiration > {now}"}}
+            r = uhandler.check_condition(options)
+            self.assertTrue(r)
+
+        # A user info field set to a past date should be < {now}
+        with mock.patch.object(user, 'get_specific_info', return_value={"expiration": past_date}):
+            options["handler_def"] = {"conditions": {CONDITION.USER_INFO: "expiration < {now}"}}
+            r = uhandler.check_condition(options)
+            self.assertTrue(r)
+
+        # Test {now} with a time offset: past_date should be < {now}-5d (now minus 5 days)
+        # past_date is 10 days ago, {now}-5d is 5 days ago, so past_date < {now}-5d
+        with mock.patch.object(user, 'get_specific_info', return_value={"expiration": past_date}):
+            options["handler_def"] = {"conditions": {CONDITION.USER_INFO: "expiration < {now}-5d"}}
+            r = uhandler.check_condition(options)
+            self.assertTrue(r)
+
+        # future_date should NOT be < {now}+5d ... actually future_date is +10d, {now}+5d is +5d
+        # so future_date > {now}+5d should be True
+        with mock.patch.object(user, 'get_specific_info', return_value={"expiration": future_date}):
+            options["handler_def"] = {"conditions": {CONDITION.USER_INFO: "expiration > {now}+5d"}}
+            r = uhandler.check_condition(options)
+            self.assertTrue(r)
+
+        # future_date (+10d) should NOT be > {now}+15d
+        with mock.patch.object(user, 'get_specific_info', return_value={"expiration": future_date}):
+            options["handler_def"] = {"conditions": {CONDITION.USER_INFO: "expiration > {now}+15d"}}
+            r = uhandler.check_condition(options)
+            self.assertFalse(r)
+
+        remove_token(serial)
 
 
 class CounterEventTestCase(MyTestCase):
@@ -672,11 +1446,7 @@ class CounterEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {
-                       "options": {
-                           "counter_name": "hallo_counter"}
-                   }
-                   }
+                   "handler_def": {"options": {"counter_name": "hallo_counter"}}}
 
         t_handler = CounterEventHandler()
         res = t_handler.do("increase_counter", options=options)
@@ -705,6 +1475,13 @@ class CounterEventTestCase(MyTestCase):
 
 class ScriptEventTestCase(MyTestCase):
 
+    def test_00_instantiate(self):
+        # Default script directory path. Should be unavailable
+        del self.app.config['PI_SCRIPT_HANDLER_DIRECTORY']
+        sh = ScriptEventHandler()
+        with self.assertRaises(ConfigAdminError):
+            _actions = sh.actions
+
     def test_01_runscript(self):
         g = FakeFlaskG()
         audit_object = FakeAudit()
@@ -729,23 +1506,25 @@ class ScriptEventTestCase(MyTestCase):
         resp = Response()
         resp.data = """{"result": {"value": true}}"""
 
-        options = {"g": g,
-                   "request": req,
-                   "response": resp,
-                   "handler_def": {
-                       "options": {
-                           "user": "1",
-                           "realm": "1",
-                           "serial": "1",
-                           "logged_in_user": "1",
-                           "logged_in_role": "1"}
-                   }
-                   }
+        options = {
+            "g": g,
+            "request": req,
+            "response": resp,
+            "handler_def": {
+                "options": {
+                    "user": "1",
+                    "realm": "1",
+                    "serial": "1",
+                    "logged_in_user": "1",
+                    "logged_in_role": "1"}
+            }
+        }
 
         script_name = "ls.sh"
         d = os.getcwd()
-        d = "{0!s}/tests/testdata/scripts/".format(d)
-        t_handler = ScriptEventHandler(script_directory=d)
+        d = f"{d!s}/tests/testdata/scripts/"
+        self.app.config['PI_SCRIPT_HANDLER_DIRECTORY'] = d
+        t_handler = ScriptEventHandler()
         res = t_handler.do(script_name, options=options)
         self.assertTrue(res)
 
@@ -789,8 +1568,9 @@ class ScriptEventTestCase(MyTestCase):
 
         script_name = "fail.sh"
         d = os.getcwd()
-        d = "{0!s}/tests/testdata/scripts/".format(d)
-        t_handler = ScriptEventHandler(script_directory=d)
+        d = f"{d!s}/tests/testdata/scripts/"
+        self.app.config['PI_SCRIPT_HANDLER_DIRECTORY'] = d
+        t_handler = ScriptEventHandler()
         self.assertRaises(Exception, t_handler.do, script_name, options=options)
 
     def test_03_sync_to_db(self):
@@ -824,8 +1604,9 @@ class ScriptEventTestCase(MyTestCase):
 
         script_name = "ls.sh"
         d = os.getcwd()
-        d = "{0!s}/tests/testdata/scripts/".format(d)
-        t_handler = ScriptEventHandler(script_directory=d)
+        d = f"{d!s}/tests/testdata/scripts/"
+        self.app.config['PI_SCRIPT_HANDLER_DIRECTORY'] = d
+        t_handler = ScriptEventHandler()
         # first check that the db session is not synced by default
         with mock.patch('privacyidea.lib.eventhandler.scripthandler.db') as mdb:
             res = t_handler.do(script_name, options=options)
@@ -1038,7 +1819,7 @@ class FederationEventTestCase(MyTestCase):
         # A token init request
         builder = EnvironBuilder(method='POST',
                                  data={"genkey": "1", "type": "totp"},
-                                 headers={"Authorization": "myAuthToken"})
+                                 headers=[("Authorization", "myAuthToken")])
         env = builder.get_environ()
         env["REMOTE_ADDR"] = "10.0.0.1"
         g.client_ip = env["REMOTE_ADDR"]
@@ -1049,21 +1830,21 @@ class FederationEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options":
-                                       {"forward_authorization_token": True,
-                                        "privacyIDEA": "remotePI"}
-                                   }
+                   "handler_def": {"options": {
+                       "forward_authorization_token": True,
+                       "privacyIDEA": "remotePI"}
+                   }
                    }
         f_handler = FederationEventHandler()
         from privacyidea.lib.eventhandler.federationhandler import ACTION_TYPE
         from privacyidea.lib.privacyideaserver import add_privacyideaserver
         responses.add(responses.POST, "https://remote/token/init",
-                      body="""{"jsonrpc": "2.0", 
-                               "detail": {"googleurl": 
-                                              {"value": "otpauth://totp/TOTP0019C11A?secret=5IUZZICQQI7CFA6VZA4HO6L52RA4ZIVC&period=30&digits=6&issuer=privacyIDEA", 
-                                               "description": "URL for google Authenticator", 
+                      body="""{"jsonrpc": "2.0",
+                               "detail": {"googleurl":
+                                              {"value": "otpauth://totp/TOTP0019C11A?secret=5IUZZICQQI7CFA6VZA4HO6L52RA4ZIVC&period=30&digits=6&issuer=privacyIDEA",
+                                               "description": "URL for google Authenticator",
                                                "img": "data:image/png;base64,YII="},
-                               "threadid": 140161650956032}, 
+                               "threadid": 140161650956032},
                                "versionnumber": "2.20.1",
                                "version": "privacyIDEA 2.20.1",
                                "result": {"status": true,
@@ -1091,7 +1872,6 @@ class RequestManglerTestCase(MyTestCase):
         self.assertEqual(set(pos), {"post", "pre"})
 
         g = FakeFlaskG()
-        audit_object = FakeAudit()
         builder = EnvironBuilder(method='POST',
                                  data={'serial': "SPASS01"},
                                  headers={})
@@ -1131,7 +1911,6 @@ class RequestManglerTestCase(MyTestCase):
 
     def test_02_set_parameter(self):
         g = FakeFlaskG()
-        audit_object = FakeAudit()
         builder = EnvironBuilder(method='POST',
                                  data={'serial': "SPASS01"},
                                  headers={})
@@ -1227,6 +2006,7 @@ class RequestManglerTestCase(MyTestCase):
         r_handler = RequestManglerEventHandler()
         res = r_handler.do("set", options=options)
         self.assertTrue(res)
+        # todo this is pointless, req.all_data.get("user") is not used anywhere, but req.User...
         self.assertEqual("givenname.surname@newcompany.com", req.all_data.get("user"))
 
         # The request does not contain the match_parameter, thus the
@@ -1268,6 +2048,127 @@ class RequestManglerTestCase(MyTestCase):
         # The user was not modified, since the number of tags did not match
         self.assertEqual("givenname.surname@company.com", req.all_data.get("user"))
 
+    def test_03_reset_user(self):
+        """
+        If a param concerning the user is mangled and reset_user is enabled, the user that is appended to the request
+        is reset.
+        """
+        g = FakeFlaskG()
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "SPASS01"},
+                                 headers={})
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.User = User("cornelius", self.realm1)
+        req.all_data = {"serial": "SPASS01", "type": "spass", "user": "cornelius", "realm": self.realm1}
+        resp = Response()
+
+        options = {
+            "g": g,
+            "request": req,
+            "response": resp,
+            "handler_def":
+                {
+                    "options":
+                        {
+                            "parameter": "user",
+                            "match_parameter": "user",
+                            "value": "hans",
+                            "match_pattern": "cornelius",
+                            "reset_user": True
+                        }
+                }
+        }
+        r_handler = RequestManglerEventHandler()
+        res = r_handler.do("set", options=options)
+        self.assertTrue(res)
+        self.assertTrue(hasattr(req, "User"))
+        self.assertEqual(req.User.login, "hans")
+        self.assertEqual(req.User.realm, self.realm1)
+
+    def test_04_reset_user_disabled(self):
+        """
+        If a param concerning the user is mangled and reset_user is enabled, the user that is appended to the request
+        is reset.
+        """
+        g = FakeFlaskG()
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "SPASS01"},
+                                 headers={})
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.User = User("cornelius", self.realm1)
+        req.all_data = {"serial": "SPASS01", "type": "spass", "user": "cornelius", "realm": self.realm1}
+        resp = Response()
+
+        options = {
+            "g": g,
+            "request": req,
+            "response": resp,
+            "handler_def":
+                {
+                    "options":
+                        {
+                            "parameter": "user",
+                            "match_parameter": "user",
+                            "value": "hans",
+                            "match_pattern": "cornelius",
+                            "reset_user": "False"
+                        }
+                }
+        }
+        r_handler = RequestManglerEventHandler()
+        res = r_handler.do("set", options=options)
+        self.assertTrue(res)
+        self.assertTrue(hasattr(req, "User"))
+        self.assertEqual(req.User.login, "cornelius")
+        self.assertEqual(req.User.realm, self.realm1)
+
+    @staticmethod
+    def _set(request_data: dict, handler_options: dict) -> Request:
+        """Run the set action on a request carrying *request_data* and return the request."""
+        req = Request(EnvironBuilder(method='POST').get_environ())
+        req.User = User()
+        req.all_data = dict(request_data)
+        options = {"g": FakeFlaskG(), "request": req, "response": Response(),
+                   "handler_def": {"options": handler_options}}
+        RequestManglerEventHandler().do("set", options=options)
+        return req
+
+    def test_05_reset_user_with_a_fixed_value(self):
+        # Setting a user parameter to a fixed value resets the user just like a value built from a match.
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+        req = self._set({"user": "cornelius", "realm": self.realm1},
+                        {"parameter": "realm", "value": self.realm2, "reset_user": True})
+        self.assertEqual(self.realm2, req.all_data["realm"])
+        self.assertEqual(User("cornelius", self.realm2), req.User)
+
+    def test_06_reset_user_reads_the_parameters_like_a_request(self):
+        self.setUp_user_realms()
+        self.setUp_user_realm2()
+        # A login name with the name of a realm is split.
+        req = self._set({"user": "hans"},
+                        {"parameter": "user", "value": f"cornelius@{self.realm2}", "reset_user": True})
+        self.assertEqual(User("cornelius", self.realm2), req.User)
+        # The realm parameter takes precedence over the realm in the login name.
+        req = self._set({"user": "hans", "realm": self.realm1},
+                        {"parameter": "user", "value": f"cornelius@{self.realm2}", "reset_user": True})
+        self.assertEqual(User("cornelius", self.realm1), req.User)
+        # Without any realm, the user is looked up in the default realm.
+        req = self._set({"user": "hans"}, {"parameter": "user", "value": "cornelius", "reset_user": True})
+        self.assertEqual(User("cornelius", get_default_realm()), req.User)
+        # /auth names the user in the username parameter.
+        req = self._set({"username": "hans", "realm": self.realm2},
+                        {"parameter": "username", "value": "cornelius", "reset_user": True})
+        self.assertEqual(User("cornelius", self.realm2), req.User)
+
 
 class ResponseManglerTestCase(MyTestCase):
 
@@ -1280,7 +2181,6 @@ class ResponseManglerTestCase(MyTestCase):
         self.assertEqual(set(pos), {"post"})
 
         g = FakeFlaskG()
-        audit_object = FakeAudit()
         builder = EnvironBuilder(method='POST',
                                  data={'serial': "SPASS01"},
                                  headers={})
@@ -1388,7 +2288,6 @@ class ResponseManglerTestCase(MyTestCase):
 
     def test_02_set_response(self):
         g = FakeFlaskG()
-        audit_object = FakeAudit()
         builder = EnvironBuilder(method='POST',
                                  data={'serial': "SPASS01"},
                                  headers={})
@@ -1497,12 +2396,595 @@ class ResponseManglerTestCase(MyTestCase):
         self.assertEqual(resp.json["comp1"]["comp2"], "notint")
 
 
+class ContainerEventTestCase(MyTestCase):
+
+    @classmethod
+    def register_smartphone(cls, smartphone):
+        # Register smartphone
+        server_url = "https://pi.com"
+        scope = create_endpoint_url(server_url, "container/register/finalize")
+        init_result = smartphone.init_registration(server_url, scope, registration_ttl=100, ssl_verify="True",
+                                                   params={})
+        smartphone.update_container_info(
+            [TokenContainerInfoData(key="server_url", value=server_url, info_type=PI_INTERNAL)])
+        mock_smph = MockSmartphone()
+        params = mock_smph.register_finalize(init_result["nonce"],
+                                             init_result["time_stamp"],
+                                             scope,
+                                             smartphone.serial)
+
+        smartphone.finalize_registration(params)
+        return mock_smph
+
+    def setup_request(self, container_serial=None):
+        g = FakeFlaskG()
+        audit_object = FakeAudit()
+
+        g.logged_in_user = {"username": "admin",
+                            "role": "admin",
+                            "realm": ""}
+        g.audit_object = audit_object
+
+        builder = EnvironBuilder(method='POST',
+                                 headers={})
+
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.all_data = {}
+        if container_serial:
+            req.all_data = {"container_serial": container_serial}
+        resp = Response()
+        resp.data = """{"result": {"value": true}}"""
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {"options": {}}}
+
+        return options
+
+    def test_00_missing_container_serial(self):
+        options = self.setup_request()
+        c_handler = ContainerEventHandler()
+        actions = c_handler.actions
+
+        for action in actions:
+            # All actions should fail if no container serial is provided
+            if action == C_ACTION_TYPE.INIT:
+                # except for creating a container
+                continue
+            res = c_handler.do(action, options=options)
+            self.assertFalse(res)
+
+    def test_01_init_container(self):
+        # check actions
+        actions = ContainerEventHandler().actions
+        self.assertTrue("create" in actions, actions)
+
+        # check positions
+        pos = ContainerEventHandler().allowed_positions
+        self.assertEqual(set(pos), {"post", "pre"}, pos)
+
+        # Setup the request
+        options = self.setup_request()
+        self.setUp_user_realms()
+        user_obj = User("cornelius", self.realm1)
+        options['request'].User = user_obj
+        options["handler_def"]["options"] = {"type": "smartphone", "user": False, "token": False}
+
+        c_handler = ContainerEventHandler()
+
+        # Init container only with type
+        res = c_handler.do(C_ACTION_TYPE.INIT, options=options)
+        self.assertTrue(res)
+        # Check if the container was created
+        containers = get_all_containers(ctype="smartphone")['containers']
+        self.assertTrue(len(containers) == 1)
+
+        # Init container with type and user
+        options["handler_def"]["options"] = {"type": "yubikey", "user": True}
+        res = c_handler.do(C_ACTION_TYPE.INIT, options=options)
+        self.assertTrue(res)
+        # Check if the container was created
+        containers = get_all_containers(ctype="yubikey")['containers']
+        self.assertTrue(len(containers) == 1)
+        # Check if the user is set
+        owners = containers[0].get_users()
+        self.assertIn(user_obj, owners)
+        containers[0].delete()
+
+        # Init container with type and user, but no user is provided
+        options['request'].User = None
+        res = c_handler.do(C_ACTION_TYPE.INIT, options=options)
+        self.assertTrue(res)
+        # Check if the container was created
+        containers = get_all_containers(ctype="yubikey")['containers']
+        self.assertTrue(len(containers) == 1)
+        # Check that no user is set
+        owners = containers[0].get_users()
+        self.assertEqual(0, len(owners))
+
+        # Init container with type and token
+        token_serial = "SPASS01"
+        token = init_token({"serial": token_serial, "type": "spass"})
+        options['request'].all_data['serial'] = token_serial
+        options["handler_def"]["options"] = {"type": "generic", "token": True}
+        res = c_handler.do(C_ACTION_TYPE.INIT, options=options)
+        self.assertTrue(res)
+
+        # Check if the container was created
+        containers = get_all_containers(ctype="generic")['containers']
+        self.assertTrue(len(containers) == 1)
+
+        # Check if the token was assigned
+        token_serials = [token.get_serial() for token in containers[0].get_tokens()]
+        self.assertIn(token_serial, token_serials)
+
+        # Check that user is not assigned
+        owners = containers[0].get_users()
+        self.assertNotIn(user_obj, owners)
+
+        # Init container without type:
+        options["handler_def"]["options"] = {}
+        res = c_handler.do(C_ACTION_TYPE.INIT, options=options)
+        self.assertFalse(res)
+
+        # Check that no new container is created
+        containers = get_all_containers()['containers']
+        self.assertEqual(3, len(containers))
+
+        # Clean up
+        for container in containers:
+            container.delete()
+        token.delete_token()
+
+        # Init container with tokens, but no token is provided
+        options = self.setup_request()
+        options["handler_def"]["options"] = {"type": "generic", "token": True}
+        res = c_handler.do(C_ACTION_TYPE.INIT, options=options)
+        self.assertTrue(res)
+        # Check that container is created without tokens
+        containers = get_all_containers()['containers']
+        self.assertEqual(1, len(containers))
+        self.assertEqual(0, len(containers[0].get_tokens()))
+
+    def test_02_delete_container(self):
+        # create container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+
+        # Setup request
+        options = self.setup_request(container_serial=container_serial)
+        user_obj = User("cornelius", self.realm1)
+        options['request'].User = user_obj
+
+        c_handler = ContainerEventHandler()
+
+        # Delete container
+        res = c_handler.do(C_ACTION_TYPE.DELETE, options=options)
+        self.assertTrue(res)
+
+        # check that the container does not exist
+        containers = get_all_containers(serial=container_serial)['containers']
+        self.assertTrue(len(containers) == 0)
+
+        # Delete non-existing container
+        options['request'].all_data = {"container_serial": "doesnotexist"}
+
+        res = c_handler.do(C_ACTION_TYPE.DELETE, options=options)
+        self.assertFalse(res)
+
+    def test_03_assign_and_unassign_container(self):
+        # create container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+        # create user
+        self.setUp_user_realms()
+        test_user = User(login='cornelius', realm=self.realm1)
+        # create token with user
+        token_serial = "SPASS01"
+        token = init_token({"serial": token_serial, "type": "spass"}, user=test_user)
+        container.add_token(token)
+
+        # Setup request
+        options = self.setup_request()
+        options['request'].all_data = {"serial": token_serial}
+        options['request'].User = User()
+
+        c_handler = ContainerEventHandler()
+
+        # Assign user from token to its container
+        res = c_handler.do(C_ACTION_TYPE.ASSIGN, options=options)
+        self.assertTrue(res)
+
+        # check that user is owner of container
+        container_owner = container.get_users()[0]
+        self.assertEqual(container_owner, test_user)
+
+        # Unassign all users from container
+        res = c_handler.do(C_ACTION_TYPE.UNASSIGN, options=options)
+        self.assertTrue(res)
+
+        # check that no container owner exists
+        container_owners = container.get_users()
+        self.assertTrue(len(container_owners) == 0)
+
+        # Use token without user
+        options = self.setup_request()
+        options['request'].all_data = {"serial": token_serial}
+        unassign_token(token_serial)
+        res = c_handler.do(C_ACTION_TYPE.ASSIGN, options=options)
+        self.assertFalse(res)
+
+        # check that no user is owner of container
+        container_owners = container.get_users()
+        self.assertEqual(len(container_owners), 0)
+
+        # Unassign all users from container
+        res = c_handler.do(C_ACTION_TYPE.UNASSIGN, options=options)
+        self.assertFalse(res)
+
+        # Clean up
+        container.delete()
+        token.delete_token()
+
+    def test_04_set_states(self):
+        # create container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+
+        # Setup request
+        options = self.setup_request(container_serial=container_serial)
+        options['handler_def']["options"] = {"disabled": True, "lost": True}
+
+        c_handler = ContainerEventHandler()
+
+        # Set container to disabled and lost
+        res = c_handler.do(C_ACTION_TYPE.SET_STATES, options=options)
+        self.assertTrue(res)
+
+        # Check the state of the container
+        states = container.get_states()
+        self.assertEqual(len(states), 2)
+        self.assertTrue("disabled" in states)
+        self.assertTrue("lost" in states)
+
+        # Set container to active
+        options["handler_def"]["options"] = {"active": True}
+        res = c_handler.do(C_ACTION_TYPE.SET_STATES, options=options)
+        self.assertTrue(res)
+
+        # Check that active is the only state of the container
+        states = container.get_states()
+        self.assertEqual(len(states), 1)
+        self.assertTrue("active" in states)
+        self.assertFalse("lost" in states)
+
+        # Set empty states
+        options["handler_def"]["options"] = {}
+        res = c_handler.do(C_ACTION_TYPE.SET_STATES, options=options)
+        self.assertFalse(res)
+
+        # Check the state of the container
+        states = container.get_states()
+        self.assertEqual(len(states), 1)
+        self.assertTrue("active" in states)
+
+        # Set non-existing state
+        options["handler_def"]["options"] = {"wrong_state": True}
+        res = c_handler.do(C_ACTION_TYPE.SET_STATES, options=options)
+        self.assertFalse(res)
+
+        # Check the state of the container
+        states = container.get_states()
+        self.assertEqual(len(states), 1)
+        self.assertTrue("active" in states)
+
+        # Clean up
+        container.delete()
+
+    def test_05_add_states(self):
+        # create container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+        initial_states = container.get_states()
+
+        # Setup request
+        options = self.setup_request(container_serial=container_serial)
+        options['handler_def']["options"] = {"lost": True}
+
+        c_handler = ContainerEventHandler()
+
+        # Add state lost
+        res = c_handler.do(C_ACTION_TYPE.ADD_STATES, options=options)
+        self.assertTrue(res)
+
+        # Check the states of the container
+        states = container.get_states()
+        self.assertEqual(len(states), len(initial_states) + 1)
+        self.assertTrue(initial_states[0] in states)
+        self.assertTrue("lost" in states)
+
+        # Add empty state
+        options["handler_def"]["options"] = {}
+        res = c_handler.do(C_ACTION_TYPE.ADD_STATES, options=options)
+        self.assertFalse(res)
+
+        # Check the state of the container
+        states = container.get_states()
+        self.assertEqual(len(states), len(initial_states) + 1)
+        self.assertTrue(initial_states[0] in states)
+        self.assertTrue("lost" in states)
+
+        # Add non-existing state
+        options["handler_def"]["options"] = {"wrong_state": True}
+        res = c_handler.do(C_ACTION_TYPE.ADD_STATES, options=options)
+        self.assertFalse(res)
+
+        # Check the state of the container
+        states = container.get_states()
+        self.assertEqual(len(states), len(initial_states) + 1)
+        self.assertTrue(initial_states[0] in states)
+        self.assertTrue("lost" in states)
+
+        # Clean up
+        container.delete()
+
+    def test_06_set_description(self):
+        # create container
+        initial_description = "Initial description"
+        container_serial = init_container({"type": "generic", "description": initial_description})["container_serial"]
+        container = find_container_by_serial(container_serial)
+
+        # Setup request and options
+        options = self.setup_request(container_serial=container_serial)
+        new_description = "New description"
+        options['handler_def']["options"] = {"description": new_description}
+
+        c_handler = ContainerEventHandler()
+
+        # Set new description
+        res = c_handler.do(C_ACTION_TYPE.SET_DESCRIPTION, options=options)
+        self.assertTrue(res)
+
+        # Check description
+        description = container.description
+        self.assertEqual(description, new_description)
+
+        # Set new description without description parameter
+        options["handler_def"]["options"] = {}
+        res = c_handler.do(C_ACTION_TYPE.SET_DESCRIPTION, options=options)
+        self.assertFalse(res)
+
+        # Check description
+        description = container.description
+        self.assertEqual(description, new_description)
+
+        # Clean up
+        container.delete()
+
+    def test_07_remove_tokens(self):
+        # create container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+
+        # create token
+        token_serial_01 = "SPASS01"
+        token_01 = init_token({"serial": token_serial_01, "type": "spass"})
+        token_serial_02 = "SPASS02"
+        token_02 = init_token({"serial": token_serial_02, "type": "spass"})
+        container.add_token(token_01)
+        container.add_token(token_02)
+
+        # Setup request and options
+        options = self.setup_request(container_serial=container_serial)
+        new_description = "New description"
+        options['handler_def']["options"] = {"description": new_description}
+
+        c_handler = ContainerEventHandler()
+
+        # Remove all tokens
+        res = c_handler.do(C_ACTION_TYPE.REMOVE_TOKENS, options=options)
+        self.assertTrue(res)
+
+        # check that no tokens are assigned to the container
+        container = find_container_by_serial(container_serial)
+        tokens = container.get_tokens()
+        self.assertEqual(0, len(tokens))
+
+        # Remove all tokens for container without tokens
+        res = c_handler.do(C_ACTION_TYPE.REMOVE_TOKENS, options=options)
+        self.assertTrue(res)
+
+        # Clean up
+        container.delete()
+        token_01.delete_token()
+        token_02.delete_token()
+
+    def test_08_set_add_del_container_info(self):
+        # create container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+
+        # Setup request and options
+        options = self.setup_request(container_serial=container_serial)
+        key = "info_key"
+        value = "info_value"
+        options['handler_def']["options"] = {"key": key, "value": value}
+
+        c_handler = ContainerEventHandler()
+
+        # Set container info
+        res = c_handler.do(C_ACTION_TYPE.SET_CONTAINER_INFO, options=options)
+        self.assertTrue(res)
+
+        # check that the info is set
+        container = find_container_by_serial(container_serial)
+        infos = {container_info.key: container_info.value for container_info in container.get_container_info()}
+        self.assertIn(key, infos)
+        self.assertEqual(infos[key], value)
+
+        # Set another info
+        new_key = "info_key_new"
+        new_value = "info_value_new"
+        options['handler_def']["options"] = {"key": new_key, "value": new_value}
+        res = c_handler.do(C_ACTION_TYPE.SET_CONTAINER_INFO, options=options)
+        self.assertTrue(res)
+
+        # check that the info is set and the old one deleted
+        container = find_container_by_serial(container_serial)
+        infos = {container_info.key: container_info.value for container_info in container.get_container_info()}
+        self.assertIn(new_key, infos)
+        self.assertEqual(infos[new_key], new_value)
+        self.assertNotIn(key, infos)
+
+        # add container info
+        added_key = "info_key_add"
+        added_value = "info_value_add"
+        options['handler_def']["options"] = {"key": added_key, "value": added_value}
+        res = c_handler.do(C_ACTION_TYPE.ADD_CONTAINER_INFO, options=options)
+        self.assertTrue(res)
+
+        # check that the info is added and the old ones still exists
+        container = find_container_by_serial(container_serial)
+        infos = {container_info.key: container_info.value for container_info in container.get_container_info()}
+        self.assertIn(added_key, infos)
+        self.assertEqual(infos[added_key], added_value)
+        self.assertIn(new_key, infos)
+        self.assertEqual(infos[new_key], new_value)
+
+        # delete container info
+        options['handler_def']["options"] = {}
+        res = c_handler.do(C_ACTION_TYPE.DELETE_CONTAINER_INFO, options=options)
+        self.assertTrue(res)
+
+        # check that all infos are deleted (except for internals)
+        infos = {container_info.key: container_info.value for container_info in container.get_container_info()}
+        self.assertEqual(1, len(infos))
+        self.assertIn("creation_date", infos)
+
+        # Clean up
+        container.delete()
+
+    def test_09_enable_disable_all_tokens(self):
+        # create container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+
+        # create tokens
+        token_serial_01 = "SPASS01"
+        token_01 = init_token({"serial": token_serial_01, "type": "spass"})
+        token_serial_02 = "SPASS02"
+        token_02 = init_token({"serial": token_serial_02, "type": "spass"})
+
+        # Setup request and options
+        options = self.setup_request(container_serial=container_serial)
+        c_handler = ContainerEventHandler()
+
+        # Disable all tokens if container does not have any token
+        res = c_handler.do(C_ACTION_TYPE.DISABLE_TOKENS, options=options)
+        self.assertTrue(res)
+
+        # Enable all tokens if container does not have any token
+        res = c_handler.do(C_ACTION_TYPE.ENABLE_TOKENS, options=options)
+        self.assertTrue(res)
+
+        # Add tokens to container
+        container.add_token(token_01)
+        container.add_token(token_02)
+
+        # Disable all tokens
+        res = c_handler.do(C_ACTION_TYPE.DISABLE_TOKENS, options=options)
+        self.assertTrue(res)
+
+        # Check that both tokens are disabled
+        self.assertFalse(token_01.is_active())
+        self.assertFalse(token_02.is_active())
+
+        # Enable all tokens
+        res = c_handler.do(C_ACTION_TYPE.ENABLE_TOKENS, options=options)
+        self.assertTrue(res)
+
+        # Check that both tokens are enabled
+        self.assertTrue(token_01.is_active())
+        self.assertTrue(token_02.is_active())
+
+        # clean up
+        container.delete()
+        token_01.delete_token()
+        token_02.delete_token()
+
+    def test_11_description_and_info_tags(self):
+        # The description and the container info values support the tags of the
+        # notification handlers, including {now} with an offset
+        self.setUp_user_realms()
+        container_serial = init_container({"type": "generic",
+                                           "user": "cornelius",
+                                           "realm": self.realm1})["container_serial"]
+        options = self.setup_request(container_serial=container_serial)
+        c_handler = ContainerEventHandler()
+
+        options["handler_def"]["options"] = {
+            "description": "{username}@{userrealm} on {container_serial} at {now}+5d"}
+        self.assertTrue(c_handler.do(C_ACTION_TYPE.SET_DESCRIPTION, options=options))
+        description = find_container_by_serial(container_serial).description
+        self.assertTrue(
+            description.startswith(f"cornelius@{self.realm1} on {container_serial} at 20"),
+            description)
+
+        # The same tags are available in the value of the container info
+        options["handler_def"]["options"] = {"key": "seen_from", "value": "{client_ip}"}
+        self.assertTrue(c_handler.do(C_ACTION_TYPE.SET_CONTAINER_INFO, options=options))
+        container = find_container_by_serial(container_serial)
+        infos = {info.key: info.value for info in container.get_container_info()}
+        self.assertEqual("10.0.0.1", infos.get("seen_from"))
+
+        options["handler_def"]["options"] = {"key": "added", "value": "{now}"}
+        self.assertTrue(c_handler.do(C_ACTION_TYPE.ADD_CONTAINER_INFO, options=options))
+        container = find_container_by_serial(container_serial)
+        infos = {info.key: info.value for info in container.get_container_info()}
+        self.assertIn(str(datetime.now().year), infos.get("added", ""))
+        self.assertEqual("10.0.0.1", infos.get("seen_from"))
+
+        # A value that can not be formatted is written as it was entered
+        options["handler_def"]["options"] = {"key": "raw", "value": "{now}+2h {does_not_exist}"}
+        self.assertTrue(c_handler.do(C_ACTION_TYPE.ADD_CONTAINER_INFO, options=options))
+        container = find_container_by_serial(container_serial)
+        infos = {info.key: info.value for info in container.get_container_info()}
+        self.assertEqual("{now}+2h {does_not_exist}", infos.get("raw"))
+
+        container.delete()
+
+    def test_10_unregister(self):
+        # create container
+        smartphone_serial = init_container({"type": "smartphone"})["container_serial"]
+        smartphone = find_container_by_serial(smartphone_serial)
+
+        # Register smartphone
+        self.register_smartphone(smartphone)
+
+        # Setup request and options
+        options = self.setup_request(container_serial=smartphone_serial)
+        c_handler = ContainerEventHandler()
+
+        # unregister success
+        res = c_handler.do(C_ACTION_TYPE.UNREGISTER, options=options)
+        self.assertTrue(res)
+        self.assertIsNone(smartphone.get_container_info_dict().get("registration_state"))
+
+        # unregister for not registered container
+        res = c_handler.do(C_ACTION_TYPE.UNREGISTER, options=options)
+        self.assertTrue(res)
+        self.assertIsNone(smartphone.get_container_info_dict().get("registration_state"))
+
+
 class TokenEventTestCase(MyTestCase):
 
     def test_01_set_tokenrealm(self):
         # check actions
         actions = TokenEventHandler().actions
         self.assertTrue("set tokeninfo" in actions, actions)
+        self.assertTrue("increase tokeninfo" in actions, actions)
 
         # check positions
         pos = TokenEventHandler().allowed_positions
@@ -1536,16 +3018,17 @@ class TokenEventTestCase(MyTestCase):
         resp = Response()
         resp.data = """{"result": {"value": true}}"""
 
-        # Now the initiailized token will be set in realm2
+        # Now the initialized token will be set in realm2
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options":
-                                       {"realm": "realm2"}
-                                   }
+                   "handler_def": {"options": {"realm": "realm2"}, "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
+        context = options.get("context")
+        self.assertListEqual(["SPASS01"], context.token_serials)
         res = t_handler.do(ACTION_TYPE.SET_TOKENREALM, options=options)
         self.assertTrue(res)
 
@@ -1583,14 +3066,62 @@ class TokenEventTestCase(MyTestCase):
         resp = Response()
         resp.data = """{"result": {"value": true}}"""
 
-        # Now the initiailized token will be set in realm2
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {}
+                   "handler_def": {"conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
+        context = options.get("context")
+        self.assertListEqual(["SPASS01"], context.token_serials)
+        res = t_handler.do(ACTION_TYPE.DELETE, options=options)
+        self.assertTrue(res)
+
+        # Check if the token does not exist anymore
+        s = get_tokens(serial="SPASS01")
+        self.assertFalse(s)
+
+    def test_02_delete_user_token(self):
+        # setup realms
+        self.setUp_user_realms()
+
+        user = User("hans", self.realm1)
+        init_token({"serial": "SPASS01", "type": "spass"}, user=user)
+
+        g = FakeFlaskG()
+        audit_object = FakeAudit()
+
+        g.logged_in_user = {"username": user.login,
+                            "role": "user",
+                            "realm": user.realm}
+        g.audit_object = audit_object
+
+        builder = EnvironBuilder(method='POST',
+                                 data={'user': user.login, "realm": user.realm},
+                                 headers={})
+
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.all_data = {'user': user.login, "realm": user.realm}
+        req.User = user
+        resp = Response()
+        resp.data = """{"result": {"value": true}}"""
+
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {"conditions": {}}
+                   }
+
+        t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
+        context = options.get("context")
+        self.assertListEqual(["SPASS01"], context.token_serials)
         res = t_handler.do(ACTION_TYPE.DELETE, options=options)
         self.assertTrue(res)
 
@@ -1626,23 +3157,31 @@ class TokenEventTestCase(MyTestCase):
         resp = Response()
         resp.data = """{"result": {"value": true}}"""
 
-        # Now the initiailized token will be set in realm2
-        options = {"g": g,
-                   "request": req,
-                   "response": resp,
-                   "handler_def": {}
-                   }
+        def get_options():
+            return {"g": g,
+                    "request": req,
+                    "response": resp,
+                    "handler_def": {"conditions": {}}
+                    }
 
         t_handler = TokenEventHandler()
+        options = get_options()
+        self.assertTrue(t_handler.check_condition(options))
+        context = options.get("context")
+        self.assertListEqual(["SPASS01"], context.token_serials)
         res = t_handler.do(ACTION_TYPE.DISABLE, options=options)
         self.assertTrue(res)
-        # Check if the token does not exist anymore
+        # Check if the token is disabled
         t = get_tokens(serial="SPASS01")
         self.assertFalse(t[0].is_active())
 
+        options = get_options()
+        self.assertTrue(t_handler.check_condition(options))
+        context = options.get("context")
+        self.assertListEqual(["SPASS01"], context.token_serials)
         res = t_handler.do(ACTION_TYPE.ENABLE, options=options)
         self.assertTrue(res)
-        # Check if the token does not exist anymore
+        # Check if the token is enabled
         t = get_tokens(serial="SPASS01")
         self.assertTrue(t[0].is_active())
 
@@ -1680,14 +3219,16 @@ class TokenEventTestCase(MyTestCase):
         resp = Response()
         resp.data = """{"result": {"value": true}}"""
 
-        # Now the initialized token will be set in realm2
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {}
+                   "handler_def": {"conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
+        context = options.get("context")
+        self.assertListEqual(["SPASS01"], context.token_serials)
         res = t_handler.do(ACTION_TYPE.UNASSIGN, options=options)
         self.assertTrue(res)
         # Check if the token was unassigned
@@ -1729,12 +3270,15 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options":
-                                       {"tokentype": "paper",
-                                        "user": "1"}}
+                   "handler_def": {"options": {"tokentype": "paper", "user": "1"},
+                                   "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
+        context = options.get("context")
+        self.assertListEqual(["SPASS01"], context.token_serials)
+        self.assertEqual(user_obj, context.user)
         res = t_handler.do(ACTION_TYPE.INIT, options=options)
         self.assertTrue(res)
         # Check if the token was created and assigned
@@ -1747,12 +3291,13 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options":
-                                       {"tokentype": "sms",
-                                        "user": "1"}}
+                   "handler_def": {"options": {"tokentype": "sms", "user": "1"}, "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
+        context = options.get("context")
+        self.assertEqual(user_obj, context.user)
         res = t_handler.do(ACTION_TYPE.INIT, options=options)
         self.assertTrue(res)
         # Check if the token was created and assigned
@@ -1766,13 +3311,12 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options":
-                                       {"tokentype": "sms",
-                                        "user": "1",
-                                        "sms_identifier": "mySMSGateway"}}
+                   "handler_def": {"options": {"tokentype": "sms", "user": "1", "sms_identifier": "mySMSGateway"},
+                                   "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.INIT, options=options)
         self.assertTrue(res)
         # Check if the token was created and assigned
@@ -1787,12 +3331,11 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options":
-                                       {"tokentype": "email",
-                                        "user": "1"}}
+                   "handler_def": {"options": {"tokentype": "email", "user": "1"}, "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.INIT, options=options)
         self.assertTrue(res)
         # Check if the token was created and assigned
@@ -1806,13 +3349,12 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options":
-                                       {"tokentype": "email",
-                                        "user": "1",
-                                        "smtp_identifier": "myServer"}}
+                   "handler_def": {"options": {"tokentype": "email", "user": "1", "smtp_identifier": "myServer"},
+                                   "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.INIT, options=options)
         self.assertTrue(res)
         # Check if the token was created and assigned
@@ -1827,13 +3369,12 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options":
-                                       {"tokentype": "motp",
-                                        "user": "1",
-                                        "motppin": "1234"}}
+                   "handler_def": {"options": {"tokentype": "motp", "user": "1", "motppin": "1234"},
+                                   "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.INIT, options=options)
         self.assertTrue(res)
         # Check if the token was created and assigned
@@ -1846,13 +3387,12 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options":
-                                       {"tokentype": "sms",
-                                        "user": "1",
-                                        "dynamic_phone": "1"}}
+                   "handler_def": {"options": {"tokentype": "sms", "user": "1", "dynamic_phone": "1"},
+                                   "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.INIT, options=options)
         self.assertTrue(res)
         # Check if the token was created and assigned
@@ -1866,13 +3406,14 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options":
-                                       {"tokentype": "email",
-                                        "user": "1",
-                                        "dynamic_email": "1"}}
+                   "handler_def": {"options": {"tokentype": "email",
+                                               "user": "1",
+                                               "dynamic_email": "1"},
+                                   "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.INIT, options=options)
         self.assertTrue(res)
         # Check if the token was created and assigned
@@ -1888,12 +3429,11 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options":
-                                       {"tokentype": "email",
-                                        "user": "1"}}
+                   "handler_def": {"options": {"tokentype": "email", "user": "1"}, "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.INIT, options=options)
         self.assertTrue(res)
         # Check if the token was created and assigned
@@ -1908,21 +3448,106 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options":
-                                       {"tokentype": "totp",
-                                        "user": "1",
-                                        "additional_params": "{'totp.hashlib': 'sha256'}"}}
+                   "handler_def": {"options": {"tokentype": "totp",
+                                               "user": "1",
+                                               "additional_params": "{'totp.hashlib': 'sha256'}"},
+                                   "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.INIT, options=options)
         self.assertTrue(res)
         # Check if the token was created and assigned
         t = get_tokens(tokentype="totp")[0]
-        self.assertTrue(t)
         self.assertEqual(t.user, user_obj)
         self.assertEqual(t.get_tokeninfo("totp.hashlib"), "sha256")
         remove_token(t.token.serial)
+
+        # Enroll a totp token with additional params but no user assignment
+        req.User = user_obj
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {"options": {"tokentype": "totp",
+                                               "additional_params": "{'totp.hashlib': 'sha256'}"},
+                                   "conditions": {}}
+                   }
+
+        t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
+        res = t_handler.do(ACTION_TYPE.INIT, options=options)
+        self.assertTrue(res)
+        # Check if the token was created with additional parameter
+        t = get_tokens(tokentype="totp")[0]
+        self.assertEqual(t.get_tokeninfo("totp.hashlib"), "sha256", t)
+        # Check that the token is not assigned to a user
+        self.assertFalse(t.user)
+        remove_token(t.token.serial)
+
+        # Check error handling, wrong token type
+        options["handler_def"]["options"] = {
+            "tokentype": "wrong-token-type"
+        }
+        t_handler = TokenEventHandler()
+        res = t_handler.do(ACTION_TYPE.INIT, options=options)
+        self.assertFalse(res)
+        # Check error handling, broken yaml
+        options["handler_def"] = {
+            "options": {
+                "additional_params": "a:1, b:2"
+            }}
+        t_handler = TokenEventHandler()
+        res = t_handler.do(ACTION_TYPE.INIT, options=options)
+        self.assertFalse(res)
+
+        # Enroll token and assign to container
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {"options": {"tokentype": "spass",
+                                               "user": False,
+                                               "container": True},
+                                   "conditions": {}}
+                   }
+        options['request'].all_data = {"container_serial": container_serial}
+
+        # With container serial
+        self.assertTrue(t_handler.check_condition(options))
+        res = t_handler.do(ACTION_TYPE.INIT, options=options)
+        self.assertTrue(res)
+
+        # Check if the token was created and added to the container
+        tokens = get_tokens_paginate(tokentype="spass")
+        self.assertEqual(1, tokens['count'])
+        self.assertEqual(tokens["tokens"][0]["container_serial"], container_serial)
+
+        # Clean up
+        remove_token(tokens["tokens"][0]["serial"])
+        delete_container_by_serial(container_serial)
+
+        # Enroll token and assign to container without a container serial
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {"options": {"tokentype": "spass",
+                                               "user": False,
+                                               "container": True},
+                                   "conditions": {}}
+                   }
+        options['request'].all_data = {}
+        self.assertTrue(t_handler.check_condition(options))
+        res = t_handler.do(ACTION_TYPE.INIT, options=options)
+        self.assertTrue(res)
+
+        # Check if the token was created and no container added
+        tokens = get_tokens_paginate(tokentype="spass")
+        self.assertEqual(1, tokens['count'])
+        self.assertIn(tokens["tokens"][0]["container_serial"], ['', None])
+
+        # Clean up
+        remove_token(tokens["tokens"][0]["serial"])
 
     def test_06_set_description(self):
         # setup realms
@@ -1956,16 +3581,14 @@ class TokenEventTestCase(MyTestCase):
         resp = Response()
         resp.data = """{"result": {"value": true}}"""
 
-        # Now the initialized token will be set in realm2
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options": {
-                       "description": "New Description"
-                   }}
+                   "handler_def": {"options": {"description": "New Description"}, "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.SET_DESCRIPTION, options=options)
         self.assertTrue(res)
         # Check if the token was unassigned
@@ -1976,12 +3599,11 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options": {
-                       "description": "valid for {now}+5d you know"
-                   }}
+                   "handler_def": {"options": {"description": "valid for {now}+5d you know"}, "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.SET_DESCRIPTION, options=options)
         self.assertTrue(res)
         # Check if the token was unassigned
@@ -2028,11 +3650,13 @@ class TokenEventTestCase(MyTestCase):
                    "request": req,
                    "response": resp,
                    "handler_def": {"options": {VALIDITY.START: "+10m",
-                                               VALIDITY.END: "+10d"}
+                                               VALIDITY.END: "+10d"},
+                                   "conditions": {}
                                    }
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.SET_VALIDITY, options=options)
         self.assertTrue(res)
         # Check if the token has the correct validity period
@@ -2083,11 +3707,11 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options": {"count window": "123"}
-                                   }
+                   "handler_def": {"options": {"count window": "123"}, "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.SET_COUNTWINDOW, options=options)
         self.assertTrue(res)
         # Check if the token has the correct sync window
@@ -2134,11 +3758,13 @@ class TokenEventTestCase(MyTestCase):
                    "request": req,
                    "response": resp,
                    "handler_def": {"options": {"key": "timeWindow",
-                                               "value": "33000"}
+                                               "value": "33000"},
+                                   "conditions": {}
                                    }
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.SET_TOKENINFO, options=options)
         self.assertTrue(res)
         # Check if the token has the correct sync window
@@ -2151,12 +3777,13 @@ class TokenEventTestCase(MyTestCase):
                    "request": req,
                    "response": resp,
                    "handler_def": {"options": {"key": "pastText",
-                                               "value": "it was {"
-                                                        "current_time}-12h..."}
+                                               "value": "it was {current_time}-12h..."},
+                                   "conditions": {}
                                    }
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.SET_TOKENINFO, options=options)
         self.assertTrue(res)
         # Check if the token has the correct sync window
@@ -2170,10 +3797,10 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options": {"key": "SomeNonExistingKey"}
-                                   }
+                   "handler_def": {"options": {"key": "SomeNonExistingKey"}, "conditions": {}}
                    }
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.DELETE_TOKENINFO, options=options)
         self.assertTrue(res)
         # Check if the token info was deleted
@@ -2185,16 +3812,51 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options": {"key": "pastText"}
-                                   }
+                   "handler_def": {"options": {"key": "pastText"}, "conditions": {}}
                    }
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.DELETE_TOKENINFO, options=options)
         self.assertTrue(res)
         # Check if the token info was deleted
         t = get_tokens(serial="SPASS01")
         tw = t[0].get_tokeninfo("pastText", "key not found")
         self.assertEqual(tw, "key not found")
+
+        # Test 'increase tokeninfo'. Set a tokeninfo to 17.
+        tokeninfo_key = "pushMitigation"
+        t[0].add_tokeninfo(tokeninfo_key, "17")
+        ti = t[0].get_tokeninfo(tokeninfo_key)
+        self.assertEqual("17", ti)
+        # Now we run an event handler, that increases the tokeninfo by 3
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {"options": {"key": tokeninfo_key,
+                                               "increment": "3"},
+                                   "conditions": {}
+                                   }
+                   }
+        self.assertTrue(t_handler.check_condition(options))
+        res = t_handler.do(ACTION_TYPE.INCREASE_TOKENINFO, options=options)
+        self.assertTrue(res)
+        ti = t[0].get_tokeninfo(tokeninfo_key)
+        self.assertEqual("20", ti)
+
+        # Now, decrease the tokeninfo
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {"options": {"key": tokeninfo_key,
+                                               "increment": "-10"},
+                                   "conditions": {}
+                                   }
+                   }
+        self.assertTrue(t_handler.check_condition(options))
+        res = t_handler.do(ACTION_TYPE.INCREASE_TOKENINFO, options=options)
+        self.assertTrue(res)
+        ti = t[0].get_tokeninfo(tokeninfo_key)
+        self.assertEqual("10", ti)
 
         remove_token("SPASS01")
 
@@ -2234,10 +3896,11 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options": {"fail counter": "7"}}
+                   "handler_def": {"options": {"fail counter": "7"}, "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.SET_FAILCOUNTER, options=options)
         self.assertTrue(res)
         # Check if the token has the correct fail counter
@@ -2253,6 +3916,7 @@ class TokenEventTestCase(MyTestCase):
             options["handler_def"] = {"options": {"change fail counter": diff}}
             res = t_handler.do(ACTION_TYPE.CHANGE_FAILCOUNTER, options=options)
             self.assertTrue(res)
+            db.session.commit()
             # Check if the token has the correct fail counter
             t = get_tokens(serial="SPASS01")
             tw = t[0].get_failcount()
@@ -2296,10 +3960,11 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options": {"length": "8"}}
+                   "handler_def": {"options": {"length": "8"}, "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.SET_RANDOM_PIN, options=options)
         self.assertTrue(res)
         # Check, if we have a pin
@@ -2349,11 +4014,11 @@ class TokenEventTestCase(MyTestCase):
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options": {"max failcount": "123"}
-                                   }
+                   "handler_def": {"options": {"max failcount": "123"}, "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.SET_MAXFAIL, options=options)
         self.assertTrue(res)
         # Check if the token has the correct sync window
@@ -2367,7 +4032,7 @@ class TokenEventTestCase(MyTestCase):
         # setup realms
         self.setUp_user_realms()
         # create a tokengroup
-        from privacyidea.lib.tokengroup import set_tokengroup, delete_tokengroup
+        from privacyidea.lib.tokengroup import set_tokengroup
         set_tokengroup("group1")
 
         init_token({"serial": "SPASS01", "type": "spass"},
@@ -2398,22 +4063,22 @@ class TokenEventTestCase(MyTestCase):
         resp = Response()
         resp.data = """{"result": {"value": true}}"""
 
-        # The count window of the token will be set to 123
+        # The tokengroup of the token will be set to "group1"
         options = {"g": g,
                    "request": req,
                    "response": resp,
-                   "handler_def": {"options": {"tokengroup": "group1"}
-                                   }
+                   "handler_def": {"options": {"tokengroup": "group1"}, "conditions": {}}
                    }
 
         t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
         res = t_handler.do(ACTION_TYPE.ADD_TOKENGROUP, options=options)
         self.assertTrue(res)
         # Check if the token as the group assigned
         tok = get_tokens(serial="SPASS01")[0]
         self.assertEqual(1, len(tok.token.tokengroup_list))
         tg = tok.token.tokengroup_list[0]
-        self.assertEqual(tg.tokengroup.name, "group1")
+        self.assertEqual(tg.name, "group1")
 
         # now remove the tokengroup
         t_handler = TokenEventHandler()
@@ -2424,6 +4089,239 @@ class TokenEventTestCase(MyTestCase):
         self.assertEqual(0, len(tok.token.tokengroup_list))
 
         remove_token("SPASS01")
+
+    def test_14_attach_token(self):
+        # create token
+        init_token({"serial": "offHOTP", "genkey": 1})
+
+        g = FakeFlaskG()
+        audit_object = FakeAudit()
+        audit_object.audit_data["serial"] = "SPASS01"
+
+        g.logged_in_user = {"username": "admin",
+                            "role": "admin",
+                            "realm": ""}
+        g.audit_object = audit_object
+
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "SPASS01"},
+                                 headers={})
+
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.all_data = {"serial": "offHOTP", "type": "hotp"}
+        resp = Response()
+        resp.data = """{"result": {"value": true}}"""
+
+        # The application of the token will be set to "offline"
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {
+                       "options": {
+                           "application": "offline",
+                           "count": "12"},
+                       "conditions": {}}
+                   }
+
+        t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
+        res = t_handler.do("attach application", options=options)
+        self.assertTrue(res)
+
+        # check if the options were set.
+        token_obj = list_token_machines(serial="offHOTP")[0]
+        self.assertEqual(token_obj.get("application"), "offline")
+        self.assertEqual(token_obj.get("hostname"), "any host")
+        self.assertEqual(token_obj.get("machine_id"), "any machine")
+
+    @log_capture()
+    def test_15_missing_serial(self, capture):
+        # setup realms
+        self.setUp_user_realms()
+
+        init_token({"serial": "SPASS01", "type": "spass"})
+
+        g = FakeFlaskG()
+        audit_object = FakeAudit()
+
+        g.logged_in_user = {"username": "admin",
+                            "role": "admin",
+                            "realm": ""}
+        g.audit_object = audit_object
+
+        builder = EnvironBuilder(method='POST',
+                                 headers={})
+
+        env = builder.get_environ()
+        req = Request(env)
+        req.all_data = {}
+        resp = Response()
+        resp.data = """{"result": {"value": true}}"""
+
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {"conditions": {}}
+                   }
+
+        t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
+        res = t_handler.do(ACTION_TYPE.DELETE, options=options)
+        self.assertFalse(res)
+        capture.check_present(
+            ("privacyidea.lib.eventhandler.tokenhandler", "INFO",
+             "No token serials found for token event handling action 'delete'.")
+        )
+        remove_token(serial="SPASS01")
+
+    @log_capture()
+    def test_16_unknown_action(self, capture):
+        # setup realms
+        self.setUp_user_realms()
+        init_token({"serial": "SPASS01", "type": "spass"})
+        g = FakeFlaskG()
+        audit_object = FakeAudit()
+        g.logged_in_user = {"username": "admin",
+                            "role": "admin",
+                            "realm": ""}
+        g.audit_object = audit_object
+        builder = EnvironBuilder(method='POST',
+                                 headers={})
+        env = builder.get_environ()
+        req = Request(env)
+        req.all_data = {"serial": "SPASS01"}
+        resp = Response()
+        resp.data = """{"result": {"value": true}}"""
+
+        options = {"g": g,
+                   "request": req,
+                   "response": resp,
+                   "handler_def": {}
+                   }
+
+        t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
+        res = t_handler.do("unknown_tokenhandler_action", options=options)
+        self.assertFalse(res)
+        capture.check_present(
+            ("privacyidea.lib.eventhandler.tokenhandler", "WARNING",
+             "Action 'unknown_tokenhandler_action' is not supported by the token handler.")
+        )
+        remove_token(serial="SPASS01")
+
+    def test_17_set_description_and_tokeninfo_tags(self):
+        # The tags of "set description" and "set tokeninfo" are built with
+        # create_tag_dict(): {username} and {userrealm} describe the token owner,
+        # {admin} and {realm} the acting administrator.
+        self.setUp_user_realms()
+        init_token({"serial": "SPASS03", "type": "spass"},
+                   User("cornelius", self.realm1))
+        g = FakeFlaskG()
+        g.logged_in_user = {"username": "admin", "role": "admin", "realm": "super"}
+        builder = EnvironBuilder(method='POST',
+                                 headers={"User-Agent": "privacyidea-keycloak/1.2.3"})
+        env = builder.get_environ()
+        env["REMOTE_ADDR"] = "10.0.0.7"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.all_data = {"serial": "SPASS03"}
+        req.User = User("cornelius", self.realm1)
+        resp = Response()
+        resp.data = """{"result": {"value": true}}"""
+
+        # The owner tags describe the token owner, the admin tags the administrator
+        options = {"g": g, "request": req, "response": resp,
+                   "handler_def": {"options": {
+                       "key": "who",
+                       "value": "{username}@{userrealm} by {admin}@{realm} "
+                                "ip={client_ip} serial={serial} type={tokentype}"},
+                       "conditions": {}}}
+        t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
+        self.assertTrue(t_handler.do(ACTION_TYPE.SET_TOKENINFO, options=options))
+        who = get_tokens(serial="SPASS03")[0].get_tokeninfo("who")
+        self.assertEqual(f"cornelius@{self.realm1} by admin@super "
+                         f"ip=10.0.0.7 serial=SPASS03 type=spass", who)
+
+        # The description supports the same tags, including {now} with an offset.
+        # {ua_browser} is the name of the client application, not the werkzeug
+        # user agent object, which has no browser and renders as "None".
+        options["handler_def"]["options"] = {
+            "description": "{username} {now}+5d {ua_browser}"}
+        self.assertTrue(t_handler.check_condition(options))
+        self.assertTrue(t_handler.do(ACTION_TYPE.SET_DESCRIPTION, options=options))
+        desc = get_tokens(serial="SPASS03")[0].token.description
+        self.assertTrue(desc.startswith("cornelius 20"), desc)
+        self.assertTrue(desc.endswith(" privacyidea-keycloak"), desc)
+        self.assertNotIn("{now}", desc)
+        self.assertNotIn("None", desc)
+
+        # The complete user agent stays available as {ua_string}
+        options["handler_def"]["options"] = {"key": "client", "value": "{ua_string}"}
+        self.assertTrue(t_handler.check_condition(options))
+        self.assertTrue(t_handler.do(ACTION_TYPE.SET_TOKENINFO, options=options))
+        self.assertEqual("privacyidea-keycloak/1.2.3",
+                         get_tokens(serial="SPASS03")[0].get_tokeninfo("client"))
+
+        # An unknown tag must not fail the event handling, the text is kept as the
+        # administrator entered it, including a time offset
+        options["handler_def"]["options"] = {"description": "{now}+5d {does_not_exist}"}
+        self.assertTrue(t_handler.check_condition(options))
+        self.assertTrue(t_handler.do(ACTION_TYPE.SET_DESCRIPTION, options=options))
+        self.assertEqual("{now}+5d {does_not_exist}",
+                         get_tokens(serial="SPASS03")[0].token.description)
+
+        # Without a user in the request, the owner is determined from the serial
+        req.User = User()
+        options["handler_def"]["options"] = {"key": "who2", "value": "{username}@{userrealm}"}
+        self.assertTrue(t_handler.check_condition(options))
+        self.assertTrue(t_handler.do(ACTION_TYPE.SET_TOKENINFO, options=options))
+        self.assertEqual(f"cornelius@{self.realm1}",
+                         get_tokens(serial="SPASS03")[0].get_tokeninfo("who2"))
+
+        remove_token(serial="SPASS03")
+
+    def test_18_tags_describe_the_handled_token(self):
+        # When the handler acts on several tokens, the tags of each token describe
+        # that token and its owner
+        self.setUp_user_realms()
+        init_token({"serial": "SPASS04", "type": "spass"},
+                   User("cornelius", self.realm1))
+        init_token({"serial": "SPASS05", "type": "spass"},
+                   User("shadow", self.realm1))
+        g = FakeFlaskG()
+        g.logged_in_user = {"username": "admin", "role": "admin", "realm": "super"}
+        g.audit_object = FakeAudit()
+        builder = EnvironBuilder(method='POST', headers={})
+        env = builder.get_environ()
+        env["REMOTE_ADDR"] = "10.0.0.8"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.all_data = {"serial": "SPASS04,SPASS05"}
+        req.User = User()
+        resp = Response()
+        resp.data = """{"result": {"value": true}}"""
+
+        options = {"g": g, "request": req, "response": resp,
+                   "handler_def": {"options": {"key": "owner",
+                                               "value": "{username} {serial}"},
+                                   "conditions": {}}}
+        t_handler = TokenEventHandler()
+        self.assertTrue(t_handler.check_condition(options))
+        self.assertListEqual(["SPASS04", "SPASS05"], options["context"].token_serials)
+        self.assertTrue(t_handler.do(ACTION_TYPE.SET_TOKENINFO, options=options))
+
+        self.assertEqual("cornelius SPASS04",
+                         get_tokens(serial="SPASS04")[0].get_tokeninfo("owner"))
+        self.assertEqual("shadow SPASS05",
+                         get_tokens(serial="SPASS05")[0].get_tokeninfo("owner"))
+
+        remove_token(serial="SPASS04")
+        remove_token(serial="SPASS05")
 
 
 class CustomUserAttributesTestCase(MyTestCase):
@@ -2583,258 +4481,235 @@ class CustomUserAttributesTestCase(MyTestCase):
         self.assertIn('test', a, user)
         self.assertEqual('new', a.get('test'), user)
 
+    def test_06_set_attribute_with_tags(self):
+        # The attribute value supports tags like {now}, {current_time} (with
+        # offsets), {client_ip} and {serial}
+        self.setUp_user_realms()
+        init_token({"serial": "SPASS02", "type": "spass"},
+                   User("cornelius", self.realm1))
+        g = FakeFlaskG()
+        g.audit_object = FakeAudit()
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "SPASS02"},
+                                 headers={})
+        env = builder.get_environ()
+        env["REMOTE_ADDR"] = "10.0.0.5"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+        req.all_data = {"serial": "SPASS02"}
+        req.User = User("cornelius", self.realm1)
+
+        # {now} with an offset must be replaced by a timestamp, not stored literally
+        options = {"g": g,
+                   "request": req,
+                   "handler_def": {"options": {"attrkey": "last_login",
+                                               "attrvalue": "{now}+2h from {client_ip} ({serial})",
+                                               "user": USER_TYPE.TOKENOWNER}}}
+        t_handler = CustomUserAttributesHandler()
+        res = t_handler.do(CUAH_ACTION_TYPE.SET_CUSTOM_USER_ATTRIBUTES, options=options)
+        self.assertTrue(res)
+
+        value = req.User.attributes.get("last_login")
+        self.assertNotIn("{now}", value, value)
+        self.assertNotIn("{client_ip}", value, value)
+        self.assertIn("from 10.0.0.5", value, value)
+        self.assertIn("(SPASS02)", value, value)
+        # The rendered value must contain the current year of the timestamp
+        self.assertIn(str(datetime.now().year), value, value)
+
+        # An unknown tag must not fail the handler, the value is kept as the
+        # administrator entered it, including a time offset
+        options["handler_def"]["options"]["attrvalue"] = "{now}+2h {does_not_exist}"
+        res = t_handler.do(CUAH_ACTION_TYPE.SET_CUSTOM_USER_ATTRIBUTES, options=options)
+        self.assertTrue(res)
+        self.assertEqual("{now}+2h {does_not_exist}", req.User.attributes.get("last_login"))
+
+        # {serial} is taken from the response if the request does not carry one
+        req.all_data = {}
+        resp = Response(mimetype="application/json",
+                        response="""{"detail": {"serial": "SPASS02"},
+                                    "result": {"status": true, "value": true}}""",
+                        content_type="application/json")
+        options["response"] = resp
+        options["handler_def"]["options"]["attrvalue"] = "token {serial}"
+        res = t_handler.do(CUAH_ACTION_TYPE.SET_CUSTOM_USER_ATTRIBUTES, options=options)
+        self.assertTrue(res)
+        self.assertEqual("token SPASS02", req.User.attributes.get("last_login"))
+
+        # Without any token in the event, {serial} is empty and the tokens of the
+        # user are not enumerated
+        init_token({"serial": "SPASS02B", "type": "spass"},
+                   User("cornelius", self.realm1))
+        del options["response"]
+        options["handler_def"]["options"]["attrvalue"] = "token '{serial}'"
+        res = t_handler.do(CUAH_ACTION_TYPE.SET_CUSTOM_USER_ATTRIBUTES, options=options)
+        self.assertTrue(res)
+        self.assertEqual("token ''", req.User.attributes.get("last_login"))
+        remove_token(serial="SPASS02B")
+
+        # The user tags describe the user the attribute is written for. With the
+        # logged-in user, they do not depend on a user in the request.
+        req.User = User()
+        g.logged_in_user = {"username": "cornelius", "realm": self.realm1, "role": "user"}
+        options["handler_def"]["options"] = {"attrkey": "last_login",
+                                             "attrvalue": "{username}@{userrealm}",
+                                             "user": USER_TYPE.LOGGED_IN_USER}
+        res = t_handler.do(CUAH_ACTION_TYPE.SET_CUSTOM_USER_ATTRIBUTES, options=options)
+        self.assertTrue(res)
+        user = User("cornelius", self.realm1)
+        self.assertEqual(f"cornelius@{self.realm1}", user.attributes.get("last_login"))
+
+        remove_token(serial="SPASS02")
+
 
 class WebhookTestCase(MyTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.setUp_user_realms()
+
+    # ── helpers ──────────────────────────────────────────────────────
+
+    def _make_g(self, username='hans', realm=None):
+        """Return a FakeFlaskG pre-populated with a logged_in_user."""
+        g = FakeFlaskG()
+        g.logged_in_user = {'username': username,
+                            'realm': realm or self.realm1}
+        return g
+
+    def _make_options(self, g, url='http://test.com',
+                      content_type=ContentType.JSON, data='',
+                      replace=None, request=None):
+        """Build the *options* dict expected by WebHookHandler.do()."""
+        handler_opts = {"URL": url, "content_type": content_type, "data": data}
+        if replace is not None:
+            handler_opts["replace"] = replace
+        opts = {"g": g, "handler_def": {"options": handler_opts}}
+        if request is not None:
+            opts["request"] = request
+        return opts
+
+    def _do_webhook(self, options, action=WHEH_ACTION_TYPE.POST_WEBHOOK):
+        """Execute the webhook handler and return (result, handler)."""
+        handler = WebHookHandler()
+        return handler.do(action, options=options), handler
+
+    def _posted_json(self, mock_post):
+        """Return the parsed JSON body from the most recent ``requests.post`` call."""
+        return json.loads(mock_post.call_args.kwargs["data"])
 
     @patch('requests.post')
     def test_01_send_webhook(self, mock_post):
         with mock.patch("logging.Logger.info") as mock_log:
             mock_post.return_value.status_code = 200
             mock_post.return_value.json.return_value = 'response'
-            # Setup realm and user
-            self.setUp_user_realms()
 
-            user = User("hans", self.realm1)
-            g = FakeFlaskG()
-            g.logged_in_user = {'username': 'hans',
-                                'realm': self.realm1}
+            g = self._make_g()
 
-            t_handler = WebHookHandler()
-            options = {"g": g,
-                       "handler_def": {
-                           "options": {"URL":
-                                           'http://test.com',
-                                       "content_type":
-                                           CONTENT_TYPE.URLENCODED,
-                                       "data":
-                                           'This is a test'
-                                       }
-                       }
-                       }
-            res = t_handler.do("post_webhook", options=options)
+            # URLENCODED
+            opts = self._make_options(g, url='https://test.com',
+                                      content_type=ContentType.URLENCODED,
+                                      data='This is a test')
+            res, _ = self._do_webhook(opts)
             self.assertTrue(res)
-            text = 'A webhook is send to {0!r} with the text: {1!r}'.format(
-                'http://test.com', 'This is a test')
+            text = "A webhook is called at 'https://test.com' with data: 'This is a test'"
             mock_log.assert_any_call(text)
             mock_log.assert_called_with(200)
 
-            options = {"g": g,
-                       "handler_def": {
-                           "options": {"URL":
-                                           'http://test.com',
-                                       "content_type":
-                                           CONTENT_TYPE.JSON,
-                                       "data":
-                                           'This is a test'
-                                       }
-                       }
-                       }
-            res = t_handler.do("post_webhook", options=options)
+            # JSON (no replace → raw string is fine even though it's not valid JSON)
+            opts = self._make_options(g, url='https://test.com',
+                                      content_type=ContentType.JSON,
+                                      data='This is a test')
+            res, _ = self._do_webhook(opts)
             self.assertTrue(res)
-            text = 'A webhook is send to {0!r} with the text: {1!r}'.format(
-                'http://test.com', 'This is a test')
             mock_log.assert_any_call(text)
             mock_log.assert_called_with(200)
-
-    def test_02_actions_and_positions(self):
-        positions = WebHookHandler().allowed_positions
-        self.assertEqual(positions, ["post", "pre"])
-        actions = WebHookHandler().actions
-        self.assertEqual(actions, {'post_webhook': {
-            "URL": {
-                "type": "str",
-                "required": True,
-                "description": ("The URL the WebHook is posted to")
-            },
-            "content_type": {
-                "type": "str",
-                "required": True,
-                "description": ("The encoding that is sent to the WebHook, for example json"),
-                "value": [
-                    CONTENT_TYPE.JSON,
-                    CONTENT_TYPE.URLENCODED]
-            },
-            "replace": {
-                "type": "bool",
-                "required": True,
-                "description": ("You can replace placeholder like {logged_in_user}")
-            },
-            "data": {
-                "type": "str",
-                "required": True,
-                "description": ('The data posted in the WebHook')
-            }
-        }})
 
     def test_03_wrong_action_type(self):
         with mock.patch("logging.Logger.warning") as mock_log:
-            # Setup realm and user
-            self.setUp_user_realms()
-
-            user = User("hans", self.realm1)
-            g = FakeFlaskG()
-            g.logged_in_user = {'username': 'hans',
-                                'realm': self.realm1}
-
-            t_handler = WebHookHandler()
-            options = {"g": g,
-                       "handler_def": {
-                           "options": {"URL":
-                                           'http://test.com',
-                                       "content_type":
-                                           CONTENT_TYPE.URLENCODED,
-                                       "data":
-                                           'This is a test'
-                                       }
-                       }
-                       }
-            res = t_handler.do("False_Type", options=options)
+            g = self._make_g()
+            opts = self._make_options(g, url='https://test.com',
+                                      content_type=ContentType.URLENCODED,
+                                      data='This is a test')
+            res, _ = self._do_webhook(opts, action="False_Type")
             self.assertFalse(res)
-            text = 'Unknown action value: False_Type'
-            mock_log.assert_any_call(text)
+            mock_log.assert_any_call('Unknown action value: False_Type')
 
     def test_04_wrong_content_type(self):
         with mock.patch("logging.Logger.warning") as mock_log:
-            # Setup realm and user
-            self.setUp_user_realms()
-
-            user = User("hans", self.realm1)
-            g = FakeFlaskG()
-            g.logged_in_user = {'username': 'hans',
-                                'realm': self.realm1}
-
-            t_handler = WebHookHandler()
-            options = {"g": g,
-                       "handler_def": {
-                           "options": {"URL":
-                                           'http://test.com',
-                                       "content_type":
-                                           'False_Type',
-                                       "data":
-                                           'This is a test'
-                                       }
-                       }
-                       }
-            res = t_handler.do("post_webhook", options=options)
+            g = self._make_g()
+            opts = self._make_options(g, url='https://test.com',
+                                      content_type='False_Type',
+                                      data='This is a test')
+            res, _ = self._do_webhook(opts)
             self.assertFalse(res)
-            text = 'Unknown content type value: False_Type'
-            mock_log.assert_any_call(text)
+            mock_log.assert_any_call('Unknown content type value: False_Type')
 
-    def test_05_wrong_url(self):
-        # Setup realm and user
-        self.setUp_user_realms()
-
-        user = User("hans", self.realm1)
-        g = FakeFlaskG()
-        g.logged_in_user = {'username': 'hans',
-                            'realm': self.realm1}
-
-        t_handler = WebHookHandler()
-        options = {"g": g,
-                   "handler_def": {
-                       "options": {"URL":
-                                       'http://xyz.blablba',
-                                   "content_type":
-                                       CONTENT_TYPE.JSON,
-                                   "data":
-                                       'This is a test'
-                                   }
-                   }
-                   }
-        res = t_handler.do("post_webhook", options=options)
+    @patch('requests.post')
+    def test_05_wrong_url(self, mock_post):
+        mock_post.side_effect = requests.exceptions.ConnectionError()
+        g = self._make_g()
+        opts = self._make_options(g, url='https://xyz.blablba',
+                                  content_type=ContentType.JSON,
+                                  data='This is a test')
+        res, _ = self._do_webhook(opts)
         self.assertFalse(res)
 
     @patch('requests.post')
-    def test_06_replace_function(self, mock_post):
+    def test_06_replace_function_json(self, mock_post):
         with mock.patch("logging.Logger.info") as mock_log:
             mock_post.return_value.status_code = 200
-            mock_post.return_value.json.return_value = 'response'
-            # Setup realm and user
-            self.setUp_user_realms()
 
-            user = User("hans", self.realm1)
-            g = FakeFlaskG()
-            g.logged_in_user = {'username': 'hans',
-                                'realm': self.realm1}
-
-            t_handler = WebHookHandler()
-            options = {"g": g,
-                       "handler_def": {
-                           "options": {"URL":
-                                           'http://test.com',
-                                       "content_type":
-                                           CONTENT_TYPE.URLENCODED,
-                                       "replace":
-                                           True,
-                                       "data":
-                                           'This is {logged_in_user} from realm {realm}'
-                                       }
-                       }
-                       }
-            res = t_handler.do("post_webhook", options=options)
+            g = self._make_g()
+            data = '{"{realm}": {"{realm}": {"{realm}": "This is {logged_in_user} from realm {realm}"}}}'
+            opts = self._make_options(g, data=data, replace=True)
+            res, _ = self._do_webhook(opts)
             self.assertTrue(res)
-            text = 'A webhook is send to {0!r} with the text: {1!r}'.format(
-                'http://test.com', 'This is hans from realm realm1')
-            mock_log.assert_any_call(text)
+            expected_body = '{"realm1": {"realm1": {"realm1": "This is hans from realm realm1"}}}'
+            mock_log.assert_any_call(
+                f"A webhook is called at 'http://test.com' with data: '{expected_body}'")
             mock_log.assert_called_with(200)
 
     @patch('requests.post')
-    def test_07_replace_function_error(self, mock_post):
+    def test_07_replace_function_urlencoded(self, mock_post):
+        with mock.patch("logging.Logger.info") as mock_log:
+            mock_post.return_value.status_code = 200
+
+            g = self._make_g()
+            opts = self._make_options(g, url='https://test.com',
+                                      content_type=ContentType.URLENCODED,
+                                      data='This is {logged_in_user} from realm {realm}',
+                                      replace=True)
+            res, _ = self._do_webhook(opts)
+            self.assertTrue(res)
+            mock_log.assert_any_call(
+                "A webhook is called at 'https://test.com' "
+                "with data: 'This is hans from realm realm1'")
+            mock_log.assert_called_with(200)
+
+    @patch('requests.post')
+    def test_08_replace_function_error(self, mock_post):
         with mock.patch("logging.Logger.warning") as mock_log:
             with mock.patch("logging.Logger.info") as mock_info:
                 mock_post.return_value.status_code = 200
-                mock_post.return_value.json.return_value = 'response'
 
-                # Setup realm and user
-                self.setUp_user_realms()
-
-                init_token({"serial": "SPASS01", "type": "spass"},
-                           User("cornelius", self.realm1))
-                g = FakeFlaskG()
-                builder = EnvironBuilder(method='POST',
-                                         data={'serial': "SPASS01"},
-                                         headers={})
-
-                env = builder.get_environ()
-                env["REMOTE_ADDR"] = "10.0.0.1"
-                g.client_ip = env["REMOTE_ADDR"]
-                req = Request(env)
-                req.all_data = {"serial": "SPASS01"}
-                req.User = User("cornelius", self.realm1)
-
-                t_handler = WebHookHandler()
-                options = {"g": g,
-                           "request": req,
-                           "handler_def": {
-                               "options": {"URL":
-                                               'http://test.com',
-                                           "content_type":
-                                               CONTENT_TYPE.JSON,
-                                           "replace":
-                                               True,
-                                           "data":
-                                               '{{token_serial} {token_owner} {user_realm}}'
-                                           }
-                           }
-                           }
-                res = t_handler.do("post_webhook", options=options)
+                g = self._make_g(username='cornelius')
+                data = '{"{token_serial}": "{token_owner} {unknown_tag}"}'
+                opts = self._make_options(g, data=data, replace=True)
+                res, _ = self._do_webhook(opts)
                 self.assertTrue(res)
-                mock_log.assert_any_call("Unable to replace placeholder: (Single '}' encountered in format string)!"
-                                         " Please check the webhooks data option.")
-                text = 'A webhook is send to {0!r} with the text: {1!r}'.format(
-                    'http://test.com', '{{token_serial} {token_owner} {user_realm}}')
-                mock_info.assert_any_call(text)
+                mock_log.assert_any_call(
+                    "Unable to replace placeholder: ('unknown_tag')!"
+                    " Please check the webhooks data option.")
+                mock_info.assert_any_call(
+                    f"A webhook is called at 'http://test.com' with data: '{data}'")
                 mock_info.assert_called_with(200)
 
     @patch('requests.post')
-    def test_08_replace_function_typo(self, mock_post):
+    def test_09_replace_function_typo(self, mock_post):
         with mock.patch("logging.Logger.warning") as mock_log:
             with mock.patch("logging.Logger.info") as mock_info:
                 mock_post.return_value.status_code = 200
-                mock_post.return_value.json.return_value = 'response'
-
-                # Setup realm and user
-                self.setUp_user_realms()
 
                 init_token({"serial": "SPASS01", "type": "spass"},
                            User("cornelius", self.realm1))
@@ -2842,7 +4717,6 @@ class WebhookTestCase(MyTestCase):
                 builder = EnvironBuilder(method='POST',
                                          data={'serial': "SPASS01"},
                                          headers={})
-
                 env = builder.get_environ()
                 env["REMOTE_ADDR"] = "10.0.0.1"
                 g.client_ip = env["REMOTE_ADDR"]
@@ -2850,26 +4724,160 @@ class WebhookTestCase(MyTestCase):
                 req.all_data = {"serial": "SPASS01"}
                 req.User = User("cornelius", self.realm1)
 
-                t_handler = WebHookHandler()
-                options = {"g": g,
-                           "request": req,
-                           "handler_def": {
-                               "options": {"URL":
-                                               'http://test.com',
-                                           "content_type":
-                                               CONTENT_TYPE.JSON,
-                                           "replace":
-                                               True,
-                                           "data":
-                                               'The token serial is {token_seril}'
-                                           }
-                           }
-                           }
-                res = t_handler.do("post_webhook", options=options)
+                data = '{"text": "The token serial is {token_seril}"}'
+                opts = self._make_options(g, data=data, replace=True, request=req)
+                res, _ = self._do_webhook(opts)
                 self.assertTrue(res)
-                mock_log.assert_any_call("Unable to replace placeholder: ('token_seril')!"
-                                         " Please check the webhooks data option.")
-                text = 'A webhook is send to {0!r} with the text: {1!r}'.format(
-                    'http://test.com', 'The token serial is {token_seril}')
-                mock_info.assert_any_call(text)
+                mock_log.assert_any_call(
+                    "Unable to replace placeholder: ('token_seril')!"
+                    " Please check the webhooks data option.")
+                mock_info.assert_any_call(
+                    f"A webhook is called at 'http://test.com' with data: '{data}'")
                 mock_info.assert_called_with(200)
+
+    @patch('requests.post')
+    def test_10_content_type_header_is_set_correctly(self, mock_post):
+        mock_post.return_value.status_code = 200
+        g = self._make_g()
+
+        for ct in (ContentType.JSON, ContentType.URLENCODED):
+            with self.subTest(content_type=ct):
+                data = '{"key": "value"}' if ct == ContentType.JSON else "key=value"
+                opts = self._make_options(g, url='https://test.com',
+                                          content_type=ct, data=data)
+                self._do_webhook(opts)
+                _, kwargs = mock_post.call_args
+                self.assertEqual(kwargs["headers"]["Content-Type"], ct)
+
+    def test_11_db_content_type_map_covers_old_and_new_values(self):
+        self.assertEqual(DB_CONTENT_TYPE_MAP["json"], ContentType.JSON)
+        self.assertEqual(DB_CONTENT_TYPE_MAP["urlencoded"], ContentType.URLENCODED)
+        self.assertEqual(DB_CONTENT_TYPE_MAP[ContentType.JSON], ContentType.JSON)
+        self.assertEqual(DB_CONTENT_TYPE_MAP[ContentType.URLENCODED], ContentType.URLENCODED)
+        self.assertIsNone(DB_CONTENT_TYPE_MAP.get("unknown_type"))
+
+    @patch('requests.post')
+    def test_12_legacy_db_values_are_accepted_and_mapped_to_correct_header(self, mock_post):
+        mock_post.return_value.status_code = 200
+        g = self._make_g()
+
+        for legacy, expected in [("json", ContentType.JSON),
+                                 ("urlencoded", ContentType.URLENCODED)]:
+            with self.subTest(legacy_value=legacy):
+                data = '{"key": "value"}' if legacy == "json" else "key=value"
+                opts = self._make_options(g, url='https://test.com',
+                                          content_type=legacy, data=data)
+                res, _ = self._do_webhook(opts)
+                self.assertTrue(res)
+                _, kwargs = mock_post.call_args
+                self.assertEqual(kwargs["headers"]["Content-Type"], expected)
+
+    @patch('requests.post')
+    def test_13_replace_recursive_edge_cases(self, mock_post):
+        """replace_recursive must handle multi-key dicts, nested dicts,
+        non-string values, and arrays at any depth."""
+        mock_post.return_value.status_code = 200
+        g = self._make_g()
+
+        cases = [
+            # (description, input payload, expected output)
+            ("multi-key dict",
+             {"user": "{logged_in_user}", "serial": "{token_serial}", "event": "login"},
+             {"user": "hans", "serial": "", "event": "login"}),
+
+            ("nested multi-key dict",
+             {"outer": {"a": "{realm}", "b": "keep"}, "top": "{logged_in_user}"},
+             {"outer": {"a": "realm1", "b": "keep"}, "top": "hans"}),
+
+            ("non-string values pass through",
+             {"count": 5, "active": True, "nothing": None, "user": "{logged_in_user}"},
+             {"count": 5, "active": True, "nothing": None, "user": "hans"}),
+
+            ("placeholders inside arrays",
+             {"tags": ["{realm}", "{logged_in_user}"], "nested": [{"k": "{realm}"}]},
+             {"tags": ["realm1", "hans"], "nested": [{"k": "realm1"}]}),
+        ]
+        for desc, payload, expected in cases:
+            with self.subTest(desc):
+                opts = self._make_options(g, data=json.dumps(payload), replace=True)
+                res, _ = self._do_webhook(opts)
+                self.assertTrue(res, f"handler returned False for: {desc}")
+                self.assertEqual(self._posted_json(mock_post), expected)
+
+    @patch('requests.post')
+    def test_14_replace_with_create_tag_dict_tags(self, mock_post):
+        """New create_tag_dict tags and backward-compatible aliases both work."""
+        mock_post.return_value.status_code = 200
+
+        init_token({"serial": "SPASS02", "type": "spass"},
+                   User("cornelius", self.realm1))
+        g = FakeFlaskG()
+        g.logged_in_user = {'username': 'admin1', 'realm': self.realm1}
+        g.client_ip = "10.0.0.1"
+        builder = EnvironBuilder(method='POST',
+                                 data={'serial': "SPASS02"},
+                                 headers={})
+        env = builder.get_environ()
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        req = Request(env)
+        req.all_data = {"serial": "SPASS02"}
+        req.User = User("cornelius", self.realm1)
+
+        data = json.dumps({
+            "admin": "{admin}",
+            "serial": "{serial}",
+            "tokentype": "{tokentype}",
+            "legacy_user": "{logged_in_user}",
+            "legacy_serial": "{token_serial}",
+            "ip": "{client_ip}"
+        })
+        opts = self._make_options(g, data=data, replace=True, request=req)
+        res, _ = self._do_webhook(opts)
+        self.assertTrue(res)
+        posted_data = self._posted_json(mock_post)
+        self.assertEqual(posted_data["admin"], "admin1")
+        self.assertEqual(posted_data["serial"], "SPASS02")
+        self.assertEqual(posted_data["tokentype"], "spass")
+        # {logged_in_user} is sourced from request.User (the authenticating end-user),
+        # not from g.logged_in_user (the admin) — preserving old behavior
+        self.assertEqual(posted_data["legacy_user"], "cornelius")
+        self.assertEqual(posted_data["legacy_serial"], "SPASS02")
+        self.assertEqual(posted_data["ip"], "10.0.0.1")
+
+    @patch('requests.post')
+    def test_15_replace_false_string_does_not_trigger_replacement(self, mock_post):
+        """The string 'False' from the DB must not enable placeholder replacement."""
+        mock_post.return_value.status_code = 200
+        g = self._make_g()
+        data = '{"user": "{logged_in_user}"}'
+        opts = self._make_options(g, data=data, replace="False")
+        res, _ = self._do_webhook(opts)
+        self.assertTrue(res)
+        # The data should be sent unchanged — no replacement performed
+        posted = mock_post.call_args.kwargs["data"]
+        self.assertEqual(posted, data)
+
+    @patch('privacyidea.lib.eventhandler.base.get_tokens')
+    @patch('requests.post')
+    def test_16_token_lookup_failure_does_not_propagate(self, mock_post, mock_get_tokens):
+        """A failing token lookup while gathering tags must be swallowed like a
+        rendering failure, not propagate out of the handler."""
+        mock_post.return_value.status_code = 200
+        mock_get_tokens.side_effect = AttributeError("lookup boom")
+
+        with mock.patch("logging.Logger.warning") as mock_log:
+            g = self._make_g()
+            builder = EnvironBuilder(method='POST', data={'serial': "SPASS01"}, headers={})
+            req = Request(builder.get_environ())
+            req.all_data = {"serial": "SPASS01"}
+
+            data = '{"user": "{logged_in_user}"}'
+            opts = self._make_options(g, data=data, replace=True, request=req)
+            res, _ = self._do_webhook(opts)
+            self.assertTrue(res)
+            mock_log.assert_any_call(
+                "Unable to replace placeholder: (lookup boom)!"
+                " Please check the webhooks data option.")
+        # The unformatted data is still sent — the webhook call itself is not aborted
+        posted = mock_post.call_args.kwargs["data"]
+        self.assertEqual(posted, data)

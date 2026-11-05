@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2016-12-21 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Initial writup
 #
@@ -25,20 +23,21 @@ You can put any script in the directory specified in
 PI_SCRIPT_HANDLER_DIRECTORY and call this script in any event.
 
 The scripts can take parameters like
+
 * serial
 * user
 * realm
-* resolver
 * logged_in_user
+* logged_in_role
 """
 from privacyidea.lib.eventhandler.base import BaseEventHandler
 from privacyidea.lib.utils import is_true
 from privacyidea.lib.framework import get_app_config_value
-from privacyidea.lib.error import ServerError
+from privacyidea.lib.error import HandlerAbortError, ConfigAdminError
 from privacyidea.lib import _
 from privacyidea.app import db
 import logging
-import subprocess
+import subprocess  # nosec B404 # We know what we are doing and only allow trusted script calls
 import os
 import traceback
 
@@ -58,35 +57,33 @@ class ScriptEventHandler(BaseEventHandler):
     identifier = "Script"
     description = "This event handler can trigger external scripts."
 
-    def __init__(self, script_directory=None):
-        if not script_directory:
-            try:
-                self.script_directory = get_app_config_value("PI_SCRIPT_HANDLER_DIRECTORY",
-                                                       "/etc/privacyidea/scripts")
-            except RuntimeError as e:
-                # In case of the tests we are outside of the application context
-                self.script_directory = "tests/testdata/scripts"
-
-        else:
-            self.script_directory = script_directory
+    def __init__(self):
+        super().__init__()
+        self.script_directory = get_app_config_value("PI_SCRIPT_HANDLER_DIRECTORY",
+                                                     "/etc/privacyidea/scripts")
 
     @property
-    def allowed_positions(cls):
+    def allowed_positions(self):
         """
         This returns the allowed positions of the event handler definition.
+
         :return: list of allowed positions
         """
         return ["post", "pre"]
 
     @property
-    def actions(cls):
+    def actions(self):
         """
         This method returns a dictionary of allowed actions and possible
         options in this handler module.
 
         :return: dict with actions
         """
-        scripts = os.listdir(cls.script_directory)
+        try:
+            scripts = os.listdir(self.script_directory)
+        except (FileNotFoundError, PermissionError) as e:
+            log.error(f"Unable to read script directory: {e}")
+            raise ConfigAdminError(f"Unable to open script directory: {e}")
         actions = {}
         for script in scripts:
             actions[script] = {
@@ -169,9 +166,9 @@ class ScriptEventHandler(BaseEventHandler):
                               "realm": "none",
                               "role": "none"}
 
-        serial = request.all_data.get("serial") or \
-                 content.get("detail", {}).get("serial") or \
-                 g.audit_object.audit_data.get("serial")
+        serial = (request.all_data.get("serial")
+                  or content.get("detail", {}).get("serial")
+                  or g.audit_object.audit_data.get("serial"))
 
         if is_true(handler_options.get("serial")):
             proc_args.append("--serial")
@@ -196,27 +193,25 @@ class ScriptEventHandler(BaseEventHandler):
 
         rcode = 0
         try:
-            log.info("Starting script {script!r}.".format(script=script_name))
+            log.info(f"Starting script {script_name!r}.")
             if is_true(handler_options.get('sync_to_database', False)):
                 log.debug('Committing current transaction for script '
-                          '{0!s}'.format(script_name))
+                          f'{script_name!s}')
                 db.session.commit()
-            p = subprocess.Popen(proc_args, cwd=self.script_directory, universal_newlines=True)
+            # Trusted input/no user input: The scripts are created by user root and read from hard disk
+            p = subprocess.Popen(proc_args, cwd=self.script_directory, universal_newlines=True)  # nosec B603
             if handler_options.get("background") == SCRIPT_WAIT:
                 rcode = p.wait()
 
         except Exception as e:
-            log.warning("Failed to execute script {0!r}: {1!r}".format(
-                script_name, e))
+            log.warning(f"Failed to execute script {script_name!r}: {e!r}")
             log.warning(traceback.format_exc())
             if handler_options.get("background") == SCRIPT_WAIT and is_true(handler_options.get("raise_error")):
-                raise ServerError("Failed to start script.")
+                raise HandlerAbortError("Failed to start script.")
 
         if rcode:
-            log.warning("Script {script!r} failed to execute with error code {error!r}".format(script=script_name,
-                                                                                               error=rcode))
+            log.warning(f"Script {script_name!r} failed to execute with error code {rcode!r}")
             if is_true(handler_options.get("raise_error")):
-                raise ServerError("Error during execution of the script.")
+                raise HandlerAbortError("Error during execution of the script.")
 
         return ret
-

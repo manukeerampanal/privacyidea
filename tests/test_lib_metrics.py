@@ -1,0 +1,514 @@
+# SPDX-FileCopyrightText: 2026 NetKnights GmbH <https://netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Tests for ``privacyidea.lib.metrics``."""
+import datetime
+from unittest.mock import patch
+
+from sqlalchemy import select
+
+from privacyidea.lib import metrics
+from privacyidea.lib.metrics import (
+    _BUCKETS,
+    _labels_key,
+    _parse_labels_key,
+    _percentile_from_buckets,
+    _utc_now,
+    _window_start,
+    cleanup_old_metrics,
+    get_metrics,
+    inc,
+    observe,
+)
+from privacyidea.models import db
+from privacyidea.models.metric_aggregate import MetricAggregate
+from tests.base import MyTestCase
+
+
+def _wipe_metrics():
+    db.session.query(MetricAggregate).delete()
+    db.session.commit()
+
+
+class LabelKeyTest(MyTestCase):
+    """``_labels_key`` and its inverse ``_parse_labels_key``."""
+
+    def test_empty_labels(self):
+        self.assertEqual(_labels_key(None), "")
+        self.assertEqual(_labels_key({}), "")
+        self.assertEqual(_parse_labels_key(""), {})
+
+    def test_sorted_serialization(self):
+        # Keys are emitted in sorted order so the same dict always hashes
+        # to the same row, regardless of the caller's insertion order.
+        self.assertEqual(_labels_key({"b": "2", "a": "1"}), '{"a":"1","b":"2"}')
+        self.assertEqual(_labels_key({"a": "1", "b": "2"}), '{"a":"1","b":"2"}')
+
+    def test_round_trip(self):
+        labels = {"resolver": "ldap1", "op": "checkPass", "node": "n1"}
+        self.assertEqual(_parse_labels_key(_labels_key(labels)), labels)
+
+    def test_round_trip_with_special_characters(self):
+        # Gateway / resolver identifiers can legally contain commas, equals
+        # signs, quotes and unicode. Round-trip must survive all of them.
+        labels = {"gateway": 'a,b="c"=d', "resolver": "ümläut"}
+        self.assertEqual(_parse_labels_key(_labels_key(labels)), labels)
+
+
+class WindowStartTest(MyTestCase):
+    """``_window_start`` truncates to 5-minute boundaries."""
+
+    def test_truncates_to_5min(self):
+        now = datetime.datetime(2026, 4, 30, 12, 37, 42)
+        # 12:37:42 -> 12:35:00
+        self.assertEqual(_window_start(now), datetime.datetime(2026, 4, 30, 12, 35, 0))
+        now2 = datetime.datetime(2026, 4, 30, 12, 35, 0)
+        self.assertEqual(_window_start(now2), now2)
+
+
+class PercentileTest(MyTestCase):
+    """``_percentile_from_buckets`` against the active bucket set."""
+
+    def test_empty_returns_none(self):
+        self.assertIsNone(_percentile_from_buckets({}, 0, 0.95))
+
+    def test_p95_lands_on_first_bucket_above_target(self):
+        # 100 samples, 95 of them <= 100 ms -> p95 == 100 ms.
+        buckets = {col: 100 for _, col in _BUCKETS}
+        # All samples were small, so every bucket reports 100.
+        # p95 lands on the smallest bucket whose cumulative count >= 95.
+        self.assertEqual(_percentile_from_buckets(buckets, 100, 0.95), 0.05)
+
+    def test_p95_above_largest_bucket_returns_none(self):
+        # If only 50 of 100 samples are <= 5s, the >5s tail dominates p95.
+        buckets = {col: 50 for _, col in _BUCKETS}
+        self.assertIsNone(_percentile_from_buckets(buckets, 100, 0.95))
+
+    def test_p50_picks_right_bucket(self):
+        # 100 samples; 60 <= 100 ms, all higher buckets carry that 60 too.
+        buckets = {col: 60 for _, col in _BUCKETS}
+        buckets["bucket_le_50ms"] = 10
+        # Target is 50; cumulative counts: 10 (50ms), 60 (100ms) -> 100ms.
+        self.assertEqual(_percentile_from_buckets(buckets, 100, 0.50), 0.1)
+
+
+class IncTest(MyTestCase):
+    """``inc`` round-trips."""
+
+    def setUp(self):
+        _wipe_metrics()
+
+    def test_simple_counter(self):
+        inc("test_counter")
+        results = get_metrics(name="test_counter")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["count"], 1)
+        self.assertEqual(results[0]["labels"], {})
+
+    def test_repeated_inc_accumulates_in_same_row(self):
+        for _ in range(5):
+            inc("test_counter", {"channel": "push"})
+        rows = db.session.execute(
+            select(MetricAggregate).where(MetricAggregate.metric_name == "test_counter")
+        ).scalars().all()
+        # All five increments in the current 5-minute window collapse to one row.
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].count, 5)
+
+    def test_inc_by_amount(self):
+        inc("test_counter", by=7)
+        inc("test_counter", by=3)
+        results = get_metrics(name="test_counter")
+        self.assertEqual(results[0]["count"], 10)
+
+    def test_label_separation(self):
+        inc("test_counter", {"result": "ok"})
+        inc("test_counter", {"result": "ok"})
+        inc("test_counter", {"result": "failed"})
+        results = {tuple(sorted(r["labels"].items())): r["count"]
+                   for r in get_metrics(name="test_counter")}
+        self.assertEqual(results[(("result", "ok"),)], 2)
+        self.assertEqual(results[(("result", "failed"),)], 1)
+
+
+class ObserveTest(MyTestCase):
+    """``observe`` records count/sum/max + bucket boundaries correctly."""
+
+    def setUp(self):
+        _wipe_metrics()
+
+    def test_count_sum_max(self):
+        observe("test_hist", 0.05)
+        observe("test_hist", 0.10)
+        observe("test_hist", 0.30)
+        results = get_metrics(name="test_hist")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["count"], 3)
+        self.assertAlmostEqual(results[0]["avg"], (0.05 + 0.10 + 0.30) / 3)
+        self.assertAlmostEqual(results[0]["max"], 0.30)
+
+    def test_bucket_assignment(self):
+        # Cumulative semantics: every bucket whose upper bound >= value is incremented. 0.07s
+        # therefore ticks every bucket from 100ms onward but not 50ms.
+        observe("test_hist", 0.07)
+        row = db.session.execute(
+            select(MetricAggregate).where(MetricAggregate.metric_name == "test_hist")
+        ).scalar_one()
+        self.assertEqual(row.bucket_le_50ms, 0)
+        self.assertEqual(row.bucket_le_100ms, 1)
+        self.assertEqual(row.bucket_le_150ms, 1)
+        self.assertEqual(row.bucket_le_200ms, 1)
+        self.assertEqual(row.bucket_le_250ms, 1)
+        self.assertEqual(row.bucket_le_500ms, 1)
+        self.assertEqual(row.bucket_le_1s, 1)
+        self.assertEqual(row.bucket_le_5s, 1)
+
+    def test_value_above_largest_bucket_only_counts(self):
+        # 7s falls in the implicit +inf bucket - count goes up but no bucket column.
+        observe("test_hist", 7.0)
+        row = db.session.execute(
+            select(MetricAggregate).where(MetricAggregate.metric_name == "test_hist")
+        ).scalar_one()
+        self.assertEqual(row.count, 1)
+        for _, col in _BUCKETS:
+            self.assertEqual(getattr(row, col), 0)
+        self.assertAlmostEqual(row.max_value, 7.0)
+
+    def test_p95_computed_at_active_bucket_set(self):
+        # 100 samples at ~75ms -> p95 should be the 100ms bucket.
+        for _ in range(100):
+            observe("test_hist", 0.075)
+        results = get_metrics(name="test_hist")
+        self.assertEqual(results[0]["p95"], 0.1)
+
+    def test_buckets_are_exposed_as_cumulative_pairs(self):
+        # 3 fast (<=50ms) and 1 slow (~160ms) sample. The exposed buckets are
+        # ordered [upper_bound, cumulative_count] pairs so a caller can re-derive
+        # the percentile after summing several histograms together.
+        for _ in range(3):
+            observe("test_hist", 0.01)
+        observe("test_hist", 0.16)
+        results = get_metrics(name="test_hist")
+        buckets = results[0]["buckets"]
+        # Ascending boundaries matching _BUCKETS.
+        self.assertEqual([b[0] for b in buckets], [b for b, _ in _BUCKETS])
+        as_dict = {bound: cnt for bound, cnt in buckets}
+        # All 3 fast samples land in <=50ms; the 160ms one only reaches <=200ms.
+        self.assertEqual(as_dict[0.05], 3)
+        self.assertEqual(as_dict[0.15], 3)
+        self.assertEqual(as_dict[0.2], 4)
+        # Cumulative count never decreases as the boundary grows.
+        counts = [cnt for _, cnt in buckets]
+        self.assertEqual(counts, sorted(counts))
+
+
+class CrossWindowAndNodeAggregationTest(MyTestCase):
+    """Reads fold across nodes and 5-minute windows."""
+
+    def setUp(self):
+        _wipe_metrics()
+
+    def test_aggregates_across_nodes(self):
+        # Drop two rows under the same (metric, labels_key, window) but
+        # different node values, then read back - get_metrics should fold them.
+        now = _window_start(_utc_now())
+        for node in ("nodeA", "nodeB"):
+            row = MetricAggregate(metric_name="cross_test", labels_key="",
+                                  node=node, window_start=now,
+                                  count=4, sum_value=0.4, max_value=0.2)
+            db.session.add(row)
+        db.session.commit()
+        results = get_metrics(name="cross_test")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["count"], 8)
+        self.assertAlmostEqual(results[0]["avg"], 0.1)
+        self.assertAlmostEqual(results[0]["max"], 0.2)
+
+    def test_aggregates_across_windows(self):
+        now = _window_start(_utc_now())
+        earlier = now - datetime.timedelta(seconds=300)
+        for window in (now, earlier):
+            row = MetricAggregate(metric_name="cross_test", labels_key="",
+                                  node="n1", window_start=window,
+                                  count=10, sum_value=1.0, max_value=0.3)
+            db.session.add(row)
+        db.session.commit()
+        results = get_metrics(name="cross_test", since_seconds=3600)
+        self.assertEqual(results[0]["count"], 20)
+
+    def test_since_seconds_excludes_old_windows(self):
+        now = _window_start(_utc_now())
+        old = now - datetime.timedelta(hours=2)
+        for window, count in [(now, 5), (old, 99)]:
+            db.session.add(MetricAggregate(
+                metric_name="cross_test", labels_key="",
+                node="n1", window_start=window,
+                count=count, sum_value=0.0, max_value=0.0))
+        db.session.commit()
+        # Default 1h window must skip the 2h-old row.
+        results = get_metrics(name="cross_test", since_seconds=3600)
+        self.assertEqual(results[0]["count"], 5)
+
+
+class CleanupTest(MyTestCase):
+    """``cleanup_old_metrics`` deletes rows older than the cutoff."""
+
+    def setUp(self):
+        _wipe_metrics()
+
+    def test_cleanup_drops_only_old_rows(self):
+        now = _utc_now()
+        old = now - datetime.timedelta(days=2)
+        recent = now - datetime.timedelta(minutes=10)
+        for window in (old, recent):
+            db.session.add(MetricAggregate(
+                metric_name="cleanup_test", labels_key="",
+                node="n1", window_start=window,
+                count=1, sum_value=0.0, max_value=0.0))
+        db.session.commit()
+        deleted = cleanup_old_metrics(older_than_seconds=86400)  # 24h
+        self.assertEqual(deleted, 1)
+        rows = db.session.execute(
+            select(MetricAggregate).where(MetricAggregate.metric_name == "cleanup_test")
+        ).scalars().all()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].window_start, recent)
+
+
+def _aggregate(count=1, value=0.01):
+    """Build the aggregate that a buffered sample produces, as ``_record`` would."""
+    return {"count": count, "sum_value": value * count, "max_value": value,
+            "buckets": [count if value <= boundary else 0 for boundary, _column in _BUCKETS]}
+
+
+class RaceToleranceTest(MyTestCase):
+    """A write recovers from another worker inserting the same row first."""
+
+    def setUp(self):
+        _wipe_metrics()
+
+    @staticmethod
+    def _counts():
+        return {row.metric_name: row.count for row in
+                db.session.execute(select(MetricAggregate)).scalars().all()}
+
+    @staticmethod
+    def _lose_the_insert_race_on(metric_name):
+        """Patch the UPDATE to report "no such row" once, so the INSERT hits the constraint.
+
+        That is the race window: another worker inserts the row between our UPDATE and
+        our INSERT.
+        """
+        original_increment = metrics._increment_row
+        already_lost = {"done": False}
+
+        def increment(session, name, *args, **kwargs):
+            if name == metric_name and not already_lost["done"]:
+                already_lost["done"] = True
+                return 0
+            return original_increment(session, name, *args, **kwargs)
+
+        return patch.object(metrics, "_increment_row", side_effect=increment)
+
+    def test_a_lost_insert_race_adds_to_the_row_that_won(self):
+        window = _window_start(_utc_now())
+        db.session.add(MetricAggregate(metric_name="race_a", labels_key="",
+                                       node="", window_start=window,
+                                       count=11, sum_value=1.1, max_value=0.5))
+        db.session.commit()
+
+        with self._lose_the_insert_race_on("race_a"):
+            metrics._write_observations({("race_a", (), "", window): _aggregate(count=5)})
+
+        # No duplicate row, and the samples landed on the row that won.
+        self.assertEqual({"race_a": 16}, self._counts())
+
+    def test_a_lost_insert_race_keeps_the_earlier_rows_of_the_batch(self):
+        # The rows are visited in sorted order, so race_a is applied before race_b loses
+        # its race. Recovering from that must not discard what race_a already applied.
+        window = _window_start(_utc_now())
+        db.session.add(MetricAggregate(metric_name="race_b", labels_key="",
+                                       node="", window_start=window,
+                                       count=3, sum_value=0.3, max_value=0.5))
+        db.session.commit()
+
+        with self._lose_the_insert_race_on("race_b"):
+            metrics._write_observations({("race_a", (), "", window): _aggregate(count=5),
+                                         ("race_b", (), "", window): _aggregate(count=5)})
+
+        self.assertEqual({"race_a": 5, "race_b": 8}, self._counts())
+
+    def test_a_lost_insert_race_whose_row_is_gone_again_is_logged(self):
+        # The recovery UPDATE can match nothing too, if the row that won the race is deleted
+        # or rolled back before it runs. There is nothing left to add the sample to, but a
+        # metric that is quietly short of samples is worse than one that visibly lost them.
+        window = _window_start(_utc_now())
+        db.session.add(MetricAggregate(metric_name="race_c", labels_key="",
+                                       node="", window_start=window,
+                                       count=7, sum_value=0.7, max_value=0.5))
+        db.session.commit()
+
+        with patch.object(metrics, "_increment_row", return_value=0):
+            with self.assertLogs("privacyidea.lib.metrics", level="WARNING") as captured:
+                metrics._write_observations({("race_c", (), "", window): _aggregate(count=5)})
+
+        logged = "\n".join(captured.output)
+        self.assertIn("Lost 5 sample(s) of metric 'race_c'", logged)
+        self.assertIn("(labels '', node '', window ", logged)
+        # No duplicate row either, and the existing one is untouched.
+        self.assertEqual({"race_c": 7}, self._counts())
+
+    def test_a_non_race_failure_does_not_lose_the_other_rows_of_the_batch(self):
+        # A lost insert race (above) recovers inside _apply_aggregate itself. Anything else --
+        # a lock-wait timeout, a deadlock -- is not: it must still cost only the one key that
+        # failed, not every other observation buffered in the same request.
+        window = _window_start(_utc_now())
+        original_increment = metrics._increment_row
+
+        def failing_increment(session, name, *args, **kwargs):
+            if name == "boom":
+                raise Exception("lock wait timeout exceeded")
+            return original_increment(session, name, *args, **kwargs)
+
+        with patch.object(metrics, "_increment_row", side_effect=failing_increment):
+            metrics._write_observations({
+                ("ok_a", (), "", window): _aggregate(count=5),
+                ("boom", (), "", window): _aggregate(count=5),
+                ("ok_z", (), "", window): _aggregate(count=5),
+            })
+
+        self.assertEqual({"ok_a": 5, "ok_z": 5}, self._counts())
+
+    def test_rows_are_visited_in_a_deterministic_order(self):
+        # Workers of one node share the rows of a window; a stable lock order is what
+        # keeps two overlapping flushes from deadlocking.
+        window = _window_start(_utc_now())
+        observations = {("order_c", (), "", window): _aggregate(),
+                        ("order_a", (), "", window): _aggregate(),
+                        ("order_b", (), "", window): _aggregate()}
+        with patch.object(metrics, "_apply_aggregate") as apply_aggregate:
+            metrics._write_observations(observations)
+        visited = [call.args[1] for call in apply_aggregate.call_args_list]
+        self.assertEqual(["order_a", "order_b", "order_c"], visited)
+
+
+class BufferedWriteTest(MyTestCase):
+    """Observations made during a request are aggregated and written once at teardown."""
+
+    def setUp(self):
+        _wipe_metrics()
+
+    @staticmethod
+    def _rows(name):
+        return db.session.execute(
+            select(MetricAggregate).where(MetricAggregate.metric_name == name)
+        ).scalars().all()
+
+    def test_a_request_writes_its_observations_in_one_transaction(self):
+        labels = {"resolver": "passwd1", "op": "get_user_info"}
+        with patch.object(metrics, "_write_observations",
+                          side_effect=metrics._write_observations) as write:
+            with self.app.test_request_context("/user/"):
+                for _ in range(70):
+                    observe("buffer_test", 0.01, labels)
+                # Nothing is written while the request is still running.
+                self.assertEqual([], self._rows("buffer_test"))
+                write.assert_not_called()
+            # Leaving the request context tears it down, which runs the finalizer.
+            self.assertEqual(1, write.call_count)
+        # The 70 samples collapsed into a single row.
+        rows = self._rows("buffer_test")
+        self.assertEqual(1, len(rows))
+        self.assertEqual(70, rows[0].count)
+        self.assertAlmostEqual(0.7, rows[0].sum_value)
+        self.assertAlmostEqual(0.01, rows[0].max_value)
+        self.assertEqual(70, rows[0].bucket_le_50ms)
+
+    def test_one_row_per_label_set(self):
+        with patch.object(metrics, "_write_observations",
+                          side_effect=metrics._write_observations) as write:
+            with self.app.test_request_context("/user/"):
+                for _ in range(5):
+                    observe("buffer_test", 0.01, {"op": "get_user_info"})
+                for _ in range(3):
+                    observe("buffer_test", 0.02, {"op": "get_username"})
+                inc("buffer_counter", {"op": "get_user_info"})
+            self.assertEqual(1, write.call_count)
+        counts = {row.labels_key: row.count for row in self._rows("buffer_test")}
+        self.assertEqual({'{"op":"get_user_info"}': 5, '{"op":"get_username"}': 3}, counts)
+        self.assertEqual(1, self._rows("buffer_counter")[0].count)
+
+    def test_the_buffer_adds_to_a_row_an_earlier_request_created(self):
+        for _ in range(2):
+            with self.app.test_request_context("/user/"):
+                observe("buffer_test", 0.01)
+        rows = self._rows("buffer_test")
+        self.assertEqual(1, len(rows))
+        self.assertEqual(2, rows[0].count)
+
+    def test_samples_are_kept_apart_per_window(self):
+        base = _utc_now()
+        window = _window_start(base)
+        with patch.object(metrics, "_utc_now", return_value=base):
+            with self.app.test_request_context("/user/"):
+                observe("buffer_test", 0.01)
+                # A request that spans a window boundary reports into the window each sample
+                # was taken in, not the one the flush happens in.
+                metrics._utc_now.return_value = base + datetime.timedelta(seconds=300)
+                observe("buffer_test", 0.01)
+        windows = sorted(row.window_start for row in self._rows("buffer_test"))
+        self.assertEqual([window, window + datetime.timedelta(seconds=300)], windows)
+
+    def test_without_a_request_the_sample_is_written_through(self):
+        # A cron job or a pi-manage call has no teardown that could flush a buffer, so the
+        # sample must reach the table right away.
+        observe("buffer_test", 0.01)
+        self.assertEqual(1, self._rows("buffer_test")[0].count)
+
+    def test_a_failing_flush_is_swallowed(self):
+        with patch.object(metrics, "_write_observations",
+                          side_effect=RuntimeError("db gone")):
+            with self.app.test_request_context("/user/"):
+                observe("buffer_test", 0.01)
+
+
+class FailureSafetyTest(MyTestCase):
+    """``observe`` and ``inc`` must never raise."""
+
+    def setUp(self):
+        _wipe_metrics()
+
+    def test_observe_swallows_db_errors(self):
+        with patch.object(metrics, "_apply_aggregate",
+                          side_effect=RuntimeError("db gone")):
+            # Should not raise even though the underlying call explodes.
+            observe("safe_test", 0.1)
+
+    def test_inc_swallows_db_errors(self):
+        with patch.object(metrics, "_apply_aggregate",
+                          side_effect=RuntimeError("db gone")):
+            inc("safe_test")
+
+
+class KillSwitchTest(MyTestCase):
+    """``PI_NO_INTERNAL_METRICS`` short-circuits writes but leaves reads alone."""
+
+    def setUp(self):
+        _wipe_metrics()
+
+    def test_disabled_skips_observe_and_inc(self):
+        # When the flag is set, writes never reach the DB and the helper that
+        # would update / create a row must not be called.
+        with (patch.object(metrics, "_metrics_disabled", return_value=True),
+              patch.object(metrics, "_apply_aggregate") as apply_aggregate):
+            observe("kill_test", 0.05)
+            inc("kill_test")
+        apply_aggregate.assert_not_called()
+        # And nothing landed in the table.
+        rows = db.session.execute(select(MetricAggregate)).scalars().all()
+        self.assertEqual(rows, [])
+
+    def test_enabled_by_default(self):
+        # No PI_NO_INTERNAL_METRICS in the test config - writes should land.
+        inc("kill_test")
+        rows = db.session.execute(select(MetricAggregate)).scalars().all()
+        self.assertEqual(len(rows), 1)

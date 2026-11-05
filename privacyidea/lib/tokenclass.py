@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2022-02-03 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Add verified enrollment
 #  2018-01-21 Cornelius Kölbel <cornelius.koelbel@netknights.it>
@@ -61,7 +59,7 @@ This is the Token Base class, which is inherited by all token types.
 It depends on lib.user and lib.config.
 
 The token object also contains a database token object as self.token.
-The token object runs the self.update() method during the initialization 
+The token object runs the self.update() method during the initialization
 process in the API /token/init.
 
 The update method takes a dictionary. Some of the following parameters:
@@ -72,46 +70,57 @@ genkey      -> genkey=1 : privacyIDEA generates an OTPKey, creates the token
 2stepinit   -> Will do a two step rollout.
                privacyIDEA creates the first part of the OTPKey, sends it
                to the client and the clients needs to send back the second part.
-               
-In case of 2stepinit the key is generated from the server_component and the 
+
+In case of 2stepinit the key is generated from the server_component and the
 client_component using the TokenClass method generate_symmetric_key.
 This method is supposed to be overwritten by the corresponding token classes.
 """
-import logging
 import hashlib
+import logging
 import traceback
-from datetime import datetime, timedelta
+from base64 import b32encode
+from binascii import unhexlify
+from datetime import datetime, timedelta, UTC
 
-from .error import (TokenAdminError,
-                    ParameterError)
-
-from ..api.lib.utils import getParam
-from .log import log_with
-
-from .config import (get_from_config, get_prepend_pin)
-from .user import (User,
-                   get_username)
-from ..models import (TokenOwner, TokenTokengroup, Tokengroup, Challenge, cleanup_challenges)
-from .challenge import get_challenges
-from privacyidea.lib.crypto import (encryptPassword, decryptPassword,
-                                    generate_otpkey)
-from .policydecorators import libpolicy, auth_otppin, challenge_response_allowed
-from .decorators import check_token_locked
 from dateutil.parser import parse as parse_date_string, ParserError
 from dateutil.tz import tzlocal, tzutc
+from flask_babel import lazy_gettext
+from sqlalchemy import select, delete
+
+from privacyidea.lib import _
+from privacyidea.lib.conditional_access.authentication_event_types import (AUTH_EVENT_REASON_KEY, AuthEventReason,
+                                                                          CHALLENGE_LAPSED_KEY)
+from privacyidea.lib.crypto import (decryptPassword,
+                                    generate_otpkey, encryptPassword)
+from privacyidea.lib.params import get_optional, get_required
+from privacyidea.lib.tokenrolloutstate import RolloutState
 from privacyidea.lib.utils import (is_true, decode_base32check,
                                    to_unicode, create_img, parse_timedelta,
                                    parse_legacy_time, split_pin_pass)
-from privacyidea.lib import _
-from privacyidea.lib.policy import (get_action_values_from_options, SCOPE, ACTION)
+from .challenge import get_challenges
+from .challenge_types import ChallengeSession
+# Re-exported for backwards compatibility: these live in challenge_types so that
+# models.challenge and lib.cache.redis can import them without a circular import.
+from .challenge_types import (  # noqa: F401
+    CHALLENGE_REFUSAL_STATUS,
+    CHALLENGE_REFUSAL_SESSIONS,
+    is_challenge_open,
+)
+from .config import (get_from_config, get_prepend_pin)
+from .decorators import check_token_locked
+from .error import (TokenAdminError,
+                    ParameterError, PolicyError, ResourceNotFoundError)
+from .log import log_with, redacted_attributes
+from .policies.actions import PolicyAction
+from .policydecorators import libpolicy, auth_otppin, challenge_response_allowed
+from .resolver import get_resolver_type
+from .user import (User)
+from ..models import (TokenOwner, TokenTokengroup, cleanup_challenges, TokenInfo, db, TokenRealm, Realm,
+                      Tokengroup, TokenCredentialIdHash)
+from ..models.token import TOKENINFO_TYPE_SUFFIX
 
-
-#DATE_FORMAT = "%d/%m/%y %H:%M"
 DATE_FORMAT = '%Y-%m-%dT%H:%M%z'
-# LASTAUTH is utcnow()
 AUTH_DATE_FORMAT = "%Y-%m-%d %H:%M:%S.%f%z"
-optional = True
-required = False
 FAILCOUNTER_EXCEEDED = "failcounter_exceeded"
 FAILCOUNTER_CLEAR_TIMEOUT = "failcounter_clear_timeout"
 
@@ -121,66 +130,170 @@ TWOSTEP_DEFAULT_DIFFICULTY = 10000
 log = logging.getLogger(__name__)
 
 
-class CHALLENGE_SESSION(object):
-    ENROLLMENT = "enrollment"
-
-
-class TOKENKIND(object):
+class Tokenkind:
     SOFTWARE = "software"
     HARDWARE = "hardware"
     VIRTUAL = "virtual"
 
 
-class AUTHENTICATIONMODE(object):
+class AuthenticationMode:
     AUTHENTICATE = 'authenticate'
     CHALLENGE = 'challenge'
     # If the challenge is answered out of band
     OUTOFBAND = 'outofband'
 
 
-class CLIENTMODE(object):
+class ClientMode:
     """
-    This informs privacyIDEA clients how to
-    handle challenge-responses
+    This informs privacyIDEA clients how to handle challenge-responses
     """
     INTERACTIVE = 'interactive'
     POLL = 'poll'
-    U2F = 'u2f'
     WEBAUTHN = 'webauthn'
 
-    
-class ROLLOUTSTATE(object):
-    CLIENTWAIT = 'clientwait'
-    # The rollout is pending in the backend, like CSRs that need to be approved
-    PENDING = 'pending'
-    # This means the user needs to authenticate to verify that the token was successfully enrolled.
-    VERIFYPENDING = 'verify'
-    ENROLLED = 'enrolled'
-    BROKEN = 'broken'
-    FAILED = 'failed'
-    DENIED = 'denied'
 
-
-class TokenClass(object):
-
+class TokenClass:
     # Class properties
     using_pin = True
     hKeyRequired = False
-    mode = [AUTHENTICATIONMODE.AUTHENTICATE, AUTHENTICATIONMODE.CHALLENGE]
-    client_mode = CLIENTMODE.INTERACTIVE
-    # Usually a token will be checked in the lib:check_token_list, even if it is disabled
-    check_if_disabled = True
+    mode = [AuthenticationMode.AUTHENTICATE, AuthenticationMode.CHALLENGE]
+    client_mode = ClientMode.INTERACTIVE
     # If the token provides means that the user has to prove/verify that the token was successfully enrolled.
     can_verify_enrollment = False
-    # If the token is enrollable via multichallenge
-    is_multichallenge_enrollable = False
 
+    desc_key_gen = lazy_gettext("Force the key to be generated on the server.")
+
+    # Token info keys that this token class owns: they are written by the token class itself or by an endpoint
+    # that has its own dedicated action, and their value decides how the token authenticates or whether it may
+    # authenticate at all. They are not free-form metadata an administrator may edit, so a generic token info
+    # write must not reach them.
+    #
+    # A class only declares the keys it introduces itself, the effective set is the union over the class
+    # hierarchy. Use owned_tokeninfo_prefixes for a whole namespace such as "radius.". A class whose keys are
+    # not known up front (the questions of a questionnaire token) overrides is_owned_tokeninfo_key instead.
+    owned_tokeninfo_keys = frozenset({
+        "assignment_date",
+        "count_auth",
+        "count_auth_max",
+        "count_auth_success",
+        "count_auth_success_max",
+        "creation_date",
+        FAILCOUNTER_EXCEEDED,
+        "hashlib",
+        "import_date",
+        PolicyAction.LASTAUTH,
+        "next_password_change",
+        "next_pin_change",
+        "tokenkind",
+        "validity_period_end",
+        "validity_period_start",
+    })
+    owned_tokeninfo_prefixes = frozenset()
+
+    # Owned keys that may still be removed through a generic token info write, declared the same way. The value
+    # of an owned key is issued by the server and is not written from a request, but removing the entry only
+    # drops the capability it carries, which is a legitimate administrative action.
+    deletable_tokeninfo_keys = frozenset()
+    deletable_tokeninfo_prefixes = frozenset()
+
+    # Owned keys that POST /token/set may write, declared the same way. An owned key is either issued by the
+    # server, e.g. the sign count of a passkey, or supplied at enrollment, e.g. the server a radius token
+    # forwards to. The second kind does change over the lifetime of a token, so it is listed here and can be
+    # written through that endpoint, which has its own action and audits every field it writes. The keys that
+    # carry the secret of a token, e.g. the TANs of a TAN token or the public id a yubikey is recognized by,
+    # are deliberately not listed: those only change by enrolling or rolling over the token.
+    settable_tokeninfo_keys = frozenset({
+        "count_auth_max",
+        "count_auth_success_max",
+        "hashlib",
+        "validity_period_end",
+        "validity_period_start",
+    })
+    settable_tokeninfo_prefixes = frozenset()
+
+    @classmethod
+    def _collect_tokeninfo_declaration(cls, keys_attribute: str, prefixes_attribute: str) -> tuple:
+        """
+        Return the effective (keys, prefixes) of one token info declaration, as the union of everything declared
+        along the class hierarchy. The result is cached per class, the declarations do not change at runtime.
+
+        :param keys_attribute: Name of the class attribute holding the exact keys
+        :param prefixes_attribute: Name of the class attribute holding the key prefixes
+        :return: Tuple of a frozenset of keys and a frozenset of prefixes
+        """
+        cache_attribute = f"_collected_{keys_attribute}"
+        collected = cls.__dict__.get(cache_attribute)
+        if collected is None:
+            keys = set()
+            prefixes = set()
+            for klass in cls.__mro__:
+                keys.update(vars(klass).get(keys_attribute, ()))
+                prefixes.update(vars(klass).get(prefixes_attribute, ()))
+            collected = (frozenset(keys), frozenset(prefixes))
+            setattr(cls, cache_attribute, collected)
+        return collected
+
+    @classmethod
+    def is_owned_tokeninfo_key(cls, key: str) -> bool:
+        """
+        Whether the given token info key is owned by this token class, see owned_tokeninfo_keys.
+
+        :param key: The token info key to check
+        :return: True if the key is owned by the token class
+        """
+        keys, prefixes = cls._collect_tokeninfo_declaration("owned_tokeninfo_keys", "owned_tokeninfo_prefixes")
+        return key in keys or any(key.startswith(prefix) for prefix in prefixes)
+
+    def is_being_enrolled(self) -> bool:
+        """
+        Whether the token is still going through its enrollment, which includes a token that was just created,
+        one waiting for the client and one waiting to be verified.
+
+        init_token() updates an existing token when it is called with a serial that already exists, so update()
+        runs both for an enrollment and for a request against a token that is already in use. The token info a
+        token class writes from the enrollment parameters describes what the token authenticates against, so
+        those entries belong to the enrollment and are only written while this returns True. They are changed
+        later through POST /token/set.
+
+        :return: True while the token is being enrolled
+        """
+        return self.token.rollout_state != RolloutState.ENROLLED
+
+    @classmethod
+    def is_deletable_tokeninfo_key(cls, key: str) -> bool:
+        """
+        Whether the given token info key may be removed through a generic token info write. Every key the token
+        class does not own may be, and of the owned ones those declared in deletable_tokeninfo_keys.
+
+        :param key: The token info key to check
+        :return: True if the key may be deleted
+        """
+        if not cls.is_owned_tokeninfo_key(key):
+            return True
+        keys, prefixes = cls._collect_tokeninfo_declaration("deletable_tokeninfo_keys",
+                                                            "deletable_tokeninfo_prefixes")
+        return key in keys or any(key.startswith(prefix) for prefix in prefixes)
+
+    @classmethod
+    def is_settable_tokeninfo_key(cls, key: str) -> bool:
+        """
+        Whether POST /token/set may write the given token info key, see settable_tokeninfo_keys. A key the token
+        class does not own is free-form and is written through the token info endpoints instead.
+
+        :param key: The token info key to check
+        :return: True if the key may be written through POST /token/set
+        """
+        if not cls.is_owned_tokeninfo_key(key):
+            return False
+        keys, prefixes = cls._collect_tokeninfo_declaration("settable_tokeninfo_keys",
+                                                            "settable_tokeninfo_prefixes")
+        return key in keys or any(key.startswith(prefix) for prefix in prefixes)
 
     @log_with(log)
     def __init__(self, db_token):
         """
         Create a new token object.
-        
+
         :param db_token: A database token object
         :type db_token: Token
         :return: A TokenClass object
@@ -200,17 +313,17 @@ class TokenClass(object):
         """
         Set the tokentype in this object and
         also in the underlying database-Token-object.
-        
+
         :param tokentype: The type of the token like HOTP or TOTP
         :type tokentype: string
         """
-        tokentype = u'' + tokentype
+        tokentype = '' + tokentype
         self.type = tokentype
         self.token.tokentype = tokentype
 
     @classmethod
     def is_outofband(cls):
-        return AUTHENTICATIONMODE.OUTOFBAND in cls.mode
+        return AuthenticationMode.OUTOFBAND in cls.mode
 
     @staticmethod
     def get_class_type():
@@ -228,46 +341,95 @@ class TokenClass(object):
         return self.token.tokentype
 
     @check_token_locked
-    def add_user(self, user, report=None):
+    def add_user(self, user, report=None, override=False):
         """
         Set the user attributes (uid, resolvername, resolvertype) of a token.
-        
+
         :param user: a User() object, consisting of loginname and realm
-        :param report: tbdf.
+        :param report: Not used.
+        :param override: If the token already belongs to another user, replace that user instead of raising
+            a TokenAdminError.
         :return: None
         """
         (uid, resolvertype, resolvername) = user.get_user_identifiers()
         # prevent to init update a token changing the token owner
         # FIXME: We need to remove this, if we one day want to assign several users to one token
-        if self.user and self.user != user:
-            log.info(u"The token with serial {0!s} is already assigned "
-                     u"to user {1!s}. Can not assign to {2!s}.".format(self.token.serial, self.user, user))
-            raise TokenAdminError("This token is already assigned to another user.")
+        token_owner = self.user
+        if not token_owner:
+            new_owner = TokenOwner(token_id=self.token.id, user_id=uid, resolver=resolvername, realm_id=user.realm_id,
+                                   realmname=user.realm)
+            db.session.add(new_owner)
+            # Add users realm to token realms
+            self.set_realms([user.realm], add=True, commit_db_session=False)
+            self.write_tokeninfo("assignment_date", datetime.now(UTC).isoformat(timespec="seconds"),
+                               commit_db_session=False)
+            db.session.commit()
+        elif token_owner != user:
+            if override:
+                # We remove the old user
+                self.remove_user()
+            else:
+                log.warning(f"The token with serial {self.token.serial!s} is already assigned "
+                            f"to user {self.user!s}. Can not assign to {user!s}.")
+                raise TokenAdminError("This token is already assigned to another user.")
 
-        if not self.user:
-            # If the tokenowner is not set yet, set it / avoid setting the same tokenowner multiple times
-            r = TokenOwner(token_id=self.token.id,
-                           user_id=uid, resolver=resolvername,
-                           realmname=user.realm).save()
-        # set the tokenrealm
-        self.set_realms([user.realm])
-
-    def add_tokengroup(self, tokengroup=None, tokengroup_id=None):
+    def add_tokengroup(self, tokengroup: str = None, tokengroup_id: int = None):
         """
         Adds a new tokengroup to this token.
 
         :param tokengroup: The name of the token group to add
-        :type tokengroup: basestring
         :param tokengroup_id: The id of the tokengroup to add
-        :type tokengroup_id: int
         :return: True
         """
         if not tokengroup and not tokengroup_id:
             raise ParameterError("You either need to specify a tokengroup name or id.")
-        r = TokenTokengroup(token_id=self.token.id,
-                            tokengroup_id=tokengroup_id,
-                            tokengroupname=tokengroup).save()
-        return r > 0
+
+        statement = select(Tokengroup)
+        if tokengroup:
+            statement = statement.filter_by(name=tokengroup)
+        if tokengroup_id:
+            statement = statement.filter_by(id=tokengroup_id)
+        tokengroup_db = db.session.execute(statement).scalar_one_or_none()
+        if not tokengroup_db:
+            log.error("Tokengroup %s does not exist. Cannot add it to token %s.", tokengroup, self.get_serial())
+            raise ResourceNotFoundError(_("The tokengroup does not exist."))
+
+        if tokengroup_db not in self.token.tokengroup_list:
+            association = TokenTokengroup(token_id=self.token.id, tokengroup_id=tokengroup_db.id)
+            db.session.add(association)
+        else:
+            log.debug("Token %s is already assigned to tokengroup %s.", self.get_serial(), tokengroup_db.name)
+
+        return True
+
+    @property
+    def owner_realms(self) -> set[str]:
+        """
+        return all the realms of the token owners
+        """
+        realms = set()
+        for tokenowner in self.token.all_owners:
+            if tokenowner.realm:
+                realms.add(tokenowner.realm.name)
+        return realms
+
+    @property
+    def owners(self):
+        """
+        return all the owners of a token
+        If the token has no owner assigned, we return an empty list
+
+        :return: The owners of the token
+        :rtype: A list of user object
+        """
+        user_objects = []
+        for tokenowner in self.token.all_owners:
+            realm_name = tokenowner.realm.name if tokenowner.realm else None
+            user_object = User(resolver=tokenowner.resolver,
+                               realm=realm_name,
+                               uid=tokenowner.user_id)
+            user_objects.append(user_object)
+        return user_objects
 
     @property
     def user(self):
@@ -281,32 +443,52 @@ class TokenClass(object):
         user_object = None
         tokenowner = self.token.first_owner
         if tokenowner:
-            username = get_username(tokenowner.user_id, tokenowner.resolver)
-            user_object = User(login=username,
-                               resolver=tokenowner.resolver,
-                               realm=tokenowner.realm.name)
+            realm_name = tokenowner.realm.name if tokenowner.realm else None
+            user_object = User(resolver=tokenowner.resolver,
+                               realm=realm_name,
+                               uid=tokenowner.user_id)
         return user_object
 
-    def is_orphaned(self):
+    def remove_user(self):
+        """
+        Remove the user (owner) of a token.
+        If the token has no owner assigned, we return None
+
+        :return: The owner of the token
+        :rtype: User object or None
+        """
+        user_object = self.user
+        if user_object:
+            self.token.first_owner.delete()
+            self.token.save()
+        return user_object
+
+    def is_orphaned(self, orphaned_on_error=True):
         """
         Return True if the token is orphaned.
-        
-        An orphaned token means, that it has a user assigned, but the user 
+
+        An orphaned token means, that it has a user assigned, but the user
         does not exist in the user store (anymore)
 
         :return: True / False
         :rtype: bool
         """
         orphaned = False
-        if self.token.first_owner:
+        owner = self.token.first_owner
+        if owner:
+            if owner.resolver and not get_resolver_type(owner.resolver):
+                # The resolver of the owner was deleted, so the user can not exist any more. This is certain, unlike
+                # an error of the user store, which orphaned_on_error decides about.
+                return True
             try:
-                if not self.user or not self.user.login:
+                if not self.user or not self.user.login or not self.user.realm:
                     # The token is assigned, but the username does not resolve
                     orphaned = True
             except Exception:
                 # If any other resolving error occurs, we also assume the
-                # token to be orphaned
-                orphaned = True
+                # token to be orphaned per default, You can change this with
+                # the parameter orphaned_on_error.
+                orphaned = orphaned_on_error
         return orphaned
 
     def get_user_displayname(self):
@@ -316,11 +498,11 @@ class TokenClass(object):
 
         :return: tuple
         """
-        user_object = self.user
-        user_info = user_object.info
-        user_identifier = u"{0!s}_{1!s}".format(user_object.login, user_object.realm)
-        user_displayname = u"{0!s} {1!s}".format(user_info.get("givenname", "."),
-                                      user_info.get("surname", "."))
+        user = self.user
+        user_info = user.get_specific_info(["givenname", "surname"])
+        user_identifier = f"{user.login!s}_{user.realm!s}"
+        user_displayname = "{!s} {!s}".format(user_info.get("givenname", "."),
+                                              user_info.get("surname", "."))
         return user_identifier, user_displayname
 
     @check_token_locked
@@ -360,41 +542,97 @@ class TokenClass(object):
         return self.init_details
 
     @check_token_locked
-    def set_tokeninfo(self, info):
+    def set_tokeninfo(self, info: dict):
         """
-        Set the tokeninfo field in the DB. Old values will be deleted.
+        Set the tokeninfo field in the DB. Old values will be deleted. This replaces the whole token info of the
+        token, including the keys the token class owns, so it is server side only.
 
         :param info: dictionary with key and value
-        :type info: dict
         :return:
         """
-        self.token.del_info()
-        for k, v in info.items():
-            # check if type is a password
-            if k.endswith(".type") and v == "password":
-                # of type password, so we need to encrypt the value of
-                # the original key (without type)
-                orig_key = ".".join(k.split(".")[:-1])
-                info[orig_key] = encryptPassword(info.get(orig_key, ""))
-
-        self.token.set_info(info)
+        self.remove_tokeninfo()
+        self.add_tokeninfo_dict(info)
 
     @check_token_locked
-    def add_tokeninfo(self, key, value, value_type=None):
+    def add_tokeninfo(self, key: str, value: str, value_type: str = None, commit_db_session: bool = True):
         """
-        Add a key and a value to the DB tokeninfo
+        Add a key and a value to the DB tokeninfo on behalf of a request, e.g. the token info endpoints or the
+        token event handler. A key the token class owns is refused, see owned_tokeninfo_keys: its value decides
+        how the token authenticates, so it is maintained by the server and is not free-form metadata.
+
+        Server side code that maintains such a key writes it with write_tokeninfo() instead.
 
         :param key:
         :param value:
-        :return:
+        :param value_type: See write_tokeninfo()
+        :param commit_db_session: See write_tokeninfo()
+        :raises PolicyError: If the key is owned by the token class.
+        :raises ParameterError: If the key uses the reserved ".type" suffix.
         """
-        add_info = {key: value}
-        if value_type:
-            add_info[key + ".type"] = value_type
-            if value_type == "password":
-                # encrypt the value
-                add_info[key] = encryptPassword(value)
-        self.token.set_info(add_info)
+        if self.is_owned_tokeninfo_key(key):
+            log.info(f"Refusing to set the token info '{key}' of token {self.token.serial} through a generic "
+                     f"token info write, the key is managed by the token.")
+            raise PolicyError(f"The token info key '{key}' is managed by the token and can not be modified.")
+        self.write_tokeninfo(key, value, value_type=value_type, commit_db_session=commit_db_session)
+
+    @check_token_locked
+    def write_tokeninfo(self, key: str, value: str, value_type: str = None, commit_db_session: bool = True) -> None:
+        """
+        Add a key and a value to the DB tokeninfo without checking whether the token class owns the key. This is
+        the writer for server side code that maintains the token info of a token, a write that comes from a
+        request has to go through add_tokeninfo() so that the owned keys stay under the control of the server.
+
+        :param key:
+        :param value:
+        :param value_type: If type is "password", the value will be encrypted. If it is None and an entry for this
+            key already exists, the type of that entry is kept. Callers that do not know about the type of a key
+            must not silently turn an encrypted entry into a plaintext one, so clearing the type requires deleting
+            the entry and adding it again.
+        :param commit_db_session: Whether the database changes should be committed to be persistent. Only use false if
+            you are doing multiple database changes with a final single commit.
+        :raises ParameterError: If the key uses the reserved ".type" suffix.
+        """
+        # A "<key>.type" entry is not stored as a row, it is synthesized from the Type column of "<key>" when the
+        # token info is read. A real row with that name would shadow the synthetic one and make the value of
+        # "<key>" be read with the wrong type, so the suffix is reserved.
+        if key.endswith(TOKENINFO_TYPE_SUFFIX):
+            raise ParameterError(f"The token info key '{key}' uses the reserved "
+                                 f"'{TOKENINFO_TYPE_SUFFIX}' suffix.")
+
+        statement = select(TokenInfo).where(TokenInfo.token_id == self.token.id, TokenInfo.Key == key)
+        token_info = db.session.execute(statement).scalar_one_or_none()
+
+        if token_info is not None and value_type is None:
+            value_type = token_info.Type
+
+        if value_type == "password":
+            value = encryptPassword(value)
+
+        if token_info is None:
+            # Create new info entry
+            token_info = TokenInfo(token_id=self.token.id, Key=key, Value=value, Type=value_type)
+            db.session.add(token_info)
+        else:
+            # Update existing info
+            token_info.Value = value
+            token_info.Type = value_type
+        if commit_db_session:
+            db.session.commit()
+
+    @check_token_locked
+    def add_tokeninfo_dict(self, info: dict):
+        """
+        Write several token info entries at once. Used server side, e.g. during enrollment and token import, so
+        it writes the keys the token class owns as well.
+
+        :param info: dictionary with key and value, optionally with "<key>.type" entries carrying the value type
+        """
+        for key, value in info.items():
+            if key.endswith(TOKENINFO_TYPE_SUFFIX):
+                continue
+            value_type = info.get(f"{key}{TOKENINFO_TYPE_SUFFIX}", None)
+            self.write_tokeninfo(key, value, value_type, commit_db_session=False)
+        db.session.commit()
 
     @check_token_locked
     def check_otp(self, otpval, counter=None, window=None, options=None):
@@ -428,7 +666,7 @@ class TokenClass(object):
         The default token does not support getting the otp value
         will return a tuple of four values
         a negative value is a failure.
-        
+
         :return: something like:  (1, pin, otpval, combined)
         """
         return -2, 0, 0, 0
@@ -473,7 +711,7 @@ class TokenClass(object):
         :return: If the PIN is correct, return True
         :rtype: bool
         """
-        # check PIN against the token database
+        # Check PIN against the token database
         res = self.token.check_pin(pin)
         return res
 
@@ -511,13 +749,12 @@ class TokenClass(object):
         otp_counter = -1
         reply = None
 
-        (res, pin, otpval) = self.split_pin_pass(passw, user=user,
-                                                 options=options)
-        if res != -1:
+        (res, pin, otpval) = self.split_pin_pass(passw, user=user, options=options)
+        if res:
+            # If the otpvalue is too short, we do not check the PIN at all, since res is False
             pin_match = self.check_pin(pin, user=user, options=options)
             if pin_match is True:
                 otp_counter = self.check_otp(otpval, options=options)
-                #self.set_otp_count(otp_counter)
 
         return pin_match, otp_counter, reply
 
@@ -542,24 +779,24 @@ class TokenClass(object):
         elif otpkeyformat == "base32check":
             return decode_base32check(otpkey)
         else:
-            raise ParameterError("Unknown OTP key format: {!r}".format(otpkeyformat))
+            raise ParameterError(f"Unknown OTP key format: {otpkeyformat!r}")
 
     def update(self, param, reset_failcount=True):
         """
         Update the token object
-        
+
         :param param: a dictionary with different params like keysize,
                       description, genkey, otpkey, pin
         :type: param: dict
         """
-        tdesc = getParam(param, "description", optional)
-        rollover = getParam(param, "rollover", optional)
+        tdesc = get_optional(param, "description")
+        rollover = get_optional(param, "rollover")
         if tdesc is not None:
             self.token.set_description(tdesc)
 
         # key_size as parameter overrules a prevoiusly set
         # value e.g. in hashlib in the upper classes
-        key_size = int(getParam(param, "keysize", optional) or 20)
+        key_size = int(get_optional(param, "keysize") or 20)
 
         #
         # process the otpkey:
@@ -569,11 +806,11 @@ class TokenClass(object):
         #   if required and otpkey == None:
         #      raise param Exception, that we require an otpkey
         #
-        otpKey = getParam(param, "otpkey", optional)
-        genkey = is_true(getParam(param, "genkey", optional))
-        twostep_init = is_true(getParam(param, "2stepinit", optional))
-        verify = getParam(param, "verify", optional)
-        otpkeyformat = getParam(param, "otpkeyformat", optional)
+        otpKey = get_optional(param, "otpkey")
+        genkey = is_true(get_optional(param, "genkey"))
+        twostep_init = is_true(get_optional(param, "2stepinit"))
+        verify = get_optional(param, "verify")
+        otpkeyformat = get_optional(param, "otpkeyformat")
 
         if otpKey is not None and otpkeyformat is not None:
             # have to decode OTP key
@@ -583,7 +820,7 @@ class TokenClass(object):
             if is_true(rollover):
                 # We reset the rollout state
                 self.token.rollout_state = None
-            if self.token.rollout_state == ROLLOUTSTATE.CLIENTWAIT:
+            if self.token.rollout_state == RolloutState.CLIENTWAIT:
                 # We do not do 2stepinit in the second step
                 raise ParameterError("2stepinit is only to be used in the "
                                      "first initialization step.")
@@ -592,8 +829,7 @@ class TokenClass(object):
             # The token is disabled
             self.token.active = False
 
-
-        #if genkey not in [0, 1]:
+        # if genkey not in [0, 1]:
         #    raise ParameterError("TokenClass supports only genkey in  range ["
         #                         "0,1] : %r" % genkey)
 
@@ -601,15 +837,15 @@ class TokenClass(object):
             raise ParameterError('[ParameterError] You may either specify '
                                  'genkey or otpkey, but not both!', id=344)
 
-        if otpKey is None and genkey:
+        if otpKey is None and genkey and not verify:
             otpKey = self._genOtpKey_(key_size)
 
-        # otpKey still None?? - raise the exception, if an otpkey is required and we are not in verify state
+        # otpKey still None?? - raise the exception, if an otpkey is required, and we are not in verify state
         if otpKey is None and self.hKeyRequired is True and not verify:
-            otpKey = getParam(param, "otpkey", required)
+            otpKey = get_required(param, "otpkey")
 
         if otpKey is not None:
-            if self.token.rollout_state == ROLLOUTSTATE.CLIENTWAIT:
+            if self.token.rollout_state == RolloutState.CLIENTWAIT:
                 # If we have otpkey and the token is in the enrollment-state
                 # generate the new key
                 server_component = to_unicode(self.token.get_otpkey().getKey())
@@ -624,34 +860,42 @@ class TokenClass(object):
 
         if twostep_init:
             # After the key is generated, we set "waiting for the client".
-            self.token.rollout_state = ROLLOUTSTATE.CLIENTWAIT
+            self.token.rollout_state = RolloutState.CLIENTWAIT
 
-        pin = getParam(param, "pin", optional)
+        pin = get_optional(param, "pin")
         if pin is not None:
-            storeHashed = True
-            enc = getParam(param, "encryptpin", optional)
-            if enc is not None and (enc is True or enc.lower() == "true"):
-                storeHashed = False
-            self.token.set_pin(pin, storeHashed)
+            store_hashed = True
+            encrypt_pin = get_optional(param, "encryptpin")
+            if is_true(encrypt_pin):
+                store_hashed = False
+            self.token.set_pin(pin, store_hashed)
 
-        otplen = getParam(param, 'otplen', optional)
+        otplen = get_optional(param, 'otplen')
         if otplen is not None:
             self.set_otplen(otplen)
 
-        # Add parameters starting with the tokentype-name to the tokeninfo:
-        for p in param.keys():
-            if p.startswith(self.type + "."):
-                self.add_tokeninfo(p, getParam(param, p))
+        # Add parameters starting with the tokentype-name to the tokeninfo. These are keys the token class owns,
+        # e.g. the server a radius token forwards to, so they are only accepted while the token is being
+        # enrolled, see is_being_enrolled().
+        if self.is_being_enrolled():
+            for p in param.keys():
+                if p.startswith(self.type + "."):
+                    self.write_tokeninfo(p, get_optional(param, p))
+        else:
+            ignored = [p for p in param.keys() if p.startswith(self.type + ".")]
+            if ignored:
+                log.info(f"Ignoring the parameters {ignored!s} for the already enrolled token "
+                         f"{self.token.serial}, they are only set during the enrollment.")
 
         # The base class will be a software tokenkind
-        self.add_tokeninfo("tokenkind", TOKENKIND.SOFTWARE)
+        self.write_tokeninfo("tokenkind", Tokenkind.SOFTWARE)
 
         return
 
     def _genOtpKey_(self, otpkeylen=None):
-        '''
+        """
         private method, to create an otpkey
-        '''
+        """
         if otpkeylen is None:
             if hasattr(self, 'otpkeylen'):
                 otpkeylen = getattr(self, 'otpkeylen')
@@ -663,13 +907,14 @@ class TokenClass(object):
     def set_description(self, description):
         """
         Set the description on the database level
-        
+
         :param description: description of the token
         :type description: string
         """
-        self.token.set_description(u'' + description)
+        self.token.set_description('' + description)
         return
 
+    @check_token_locked
     def set_defaults(self):
         """
         Set the default values on the database level
@@ -681,14 +926,47 @@ class TokenClass(object):
         self.token.sync_window = int(get_from_config("DefaultSyncWindow")
                                      or 1000)
 
-        self.token.tokentype = u'' + self.type
+        self.token.tokentype = '' + self.type
         return
 
+    @log_with(log)
     def delete_token(self):
         """
         delete the database token
         """
-        self.token.delete()
+        # First delete all relationships that are not automatically removed by cascade delete
+        delete_stmt_token_realm = delete(TokenRealm).where(TokenRealm.token_id == self.token.id)
+        db.session.execute(delete_stmt_token_realm)
+
+        # Routed through delete_challenges() so Redis-cached challenges
+        # for this serial are invalidated alongside any DB rows; otherwise
+        # transaction IDs would keep resolving until their TTL expires.
+        # commit=False keeps the SQL DELETE inside this method's outer
+        # transaction so token + challenge removal stays atomic on the DB
+        # side (Redis eviction has no transaction concept and runs up-front).
+        #
+        # Caveat: if the outer transaction aborts after this point, the SQL
+        # challenge rows are restored but the Redis entries are already gone.
+        # Two cases:
+        # * DB-only challenges (cache off, or fallback writes): the SQL row
+        #   comes back on rollback, the next read finds it via the normal
+        #   cache-miss -> DB-fallback path. No observable loss.
+        # * Redis-only challenges (cache on, the steady state): there is no
+        #   SQL twin to restore. In-flight authentications for those
+        #   transaction IDs immediately fail with "challenge not found" and
+        #   the user has to start the MFA flow over.
+        # Token deletes rarely roll back in practice, but the asymmetry is
+        # real - do not rely on cross-store transactional semantics.
+        from privacyidea.lib.challenge import delete_challenges
+        delete_challenges(serial=self.token.serial, commit=False)
+
+        if self.get_tokentype().lower() in ["webauthn", "passkey"]:
+            delete_stmt_token_credential = delete(TokenCredentialIdHash).where(
+                TokenCredentialIdHash.token_id == self.token.id)
+            db.session.execute(delete_stmt_token_credential)
+
+        db.session.delete(self.token)
+        db.session.commit()
 
     def save(self):
         """
@@ -707,6 +985,20 @@ class TokenClass(object):
 
     def is_active(self):
         return self.token.active
+
+    def use_for_authentication(self, options):
+        """
+        This method checks, if this token should be used for authentication.
+        Certain token classes could be excluded from the authentication request in
+        certain situations.
+
+        Returns True, if the token should be used for authentication.
+        Returns False, if the token should be completely ignored for authentication.
+
+        :param options: This is the option list, that basically contains the Request parameters.
+        :return:
+        """
+        return True
 
     @property
     def rollout_state(self):
@@ -732,13 +1024,14 @@ class TokenClass(object):
     def get_failcount(self):
         return self.token.failcount
 
+    @check_token_locked
     def set_failcount(self, failcount):
         """
         Set the failcounter in the database
         """
         self.token.failcount = failcount
         if failcount == 0:
-            self.del_tokeninfo(FAILCOUNTER_EXCEEDED)
+            self.remove_tokeninfo(FAILCOUNTER_EXCEEDED)
 
     def get_max_failcount(self):
         return self.token.maxfail
@@ -747,28 +1040,84 @@ class TokenClass(object):
         tokenowner = self.token.first_owner
         return "" if not tokenowner else tokenowner.user_id
 
-    def set_tokengroups(self, tokengroups, add=False):
+    def set_tokengroups(self, tokengroups: list[str], add: bool = False):
         """
         Set the list of the tokengroups of a token.
 
-        :param tokengroups: realms the token should be assigned to
-        :type tokengroups: list
+        :param tokengroups: token groups the token should be assigned to
         :param add: if the tokengroups should be added and not replaced
-        :type add: boolean
         """
-        self.token.set_tokengroups(tokengroups, add=add)
+        existing_groups: list[Tokengroup] = self.token.tokengroup_list
+        new_groups: set[str] = set(tokengroups) - {group.name for group in existing_groups}
+        if not add:
+            # delete existing token groups which are not in the new list
+            group_ids_to_delete = [group.id for group in existing_groups if group.name not in tokengroups]
+            statement = delete(TokenTokengroup).where(TokenTokengroup.token_id == self.token.id,
+                                                      TokenTokengroup.tokengroup_id.in_(group_ids_to_delete))
+            db.session.execute(statement)
 
-    def set_realms(self, realms, add=False):
+        # Add new token groups
+        for group in new_groups:
+            statement = select(Tokengroup).filter_by(name=group)
+            tokengroup_db = db.session.execute(statement).scalar_one_or_none()
+            if not tokengroup_db:
+                log.warning("Tokengroup %s does not exist. Cannot add it to token %s.", group, self.get_serial())
+                continue
+
+            association = TokenTokengroup(token_id=self.token.id, tokengroup_id=tokengroup_db.id)
+            db.session.add(association)
+
+        db.session.commit()
+
+    @check_token_locked
+    def set_realms(self, realms: list[str], add: bool = False, commit_db_session: bool = True):
         """
         Set the list of the realms of a token.
 
         :param realms: realms the token should be assigned to
-        :type realms: list
         :param add: if the realms should be added and not replaced
-        :type add: boolean
+        :param commit_db_session: Whether the database changes should be committed to be persistent. Only use false if
+            you are doing multiple database changes with a final single commit.
         """
-        self.token.set_realms(realms, add=add)
-        
+        # get existing realms
+        statement = select(TokenRealm).where(TokenRealm.token_id == self.token.id)
+        existing_realms = db.session.scalars(statement).unique().all()
+        existing_realm_names = {tr.realm.name for tr in existing_realms}
+        realms_to_add = set(realms) - existing_realm_names
+
+        if not add:
+            # delete realms that are not in the new list
+            realm_names_to_delete = existing_realm_names - set(realms)
+            # exclude the realm of the owner from deletion
+            if self.owner_realms:
+                owner_realms_delete = realm_names_to_delete & self.owner_realms
+                realm_names_to_delete = realm_names_to_delete - self.owner_realms
+                if owner_realms_delete:
+                    log.info(f"The realms ({', '.join(owner_realms_delete)}) of assigned users cannot be removed from "
+                             f"the token {self.get_serial()}.")
+            realms_to_delete = [realm for realm in existing_realms if realm.realm.name in realm_names_to_delete]
+            if realms_to_delete:
+                realm_ids = [realm.realm_id for realm in realms_to_delete]
+                delete_stmt = delete(TokenRealm).where(TokenRealm.token_id == self.token.id)
+                if len(realm_ids) > 0:
+                    delete_stmt = delete_stmt.where(TokenRealm.realm_id.in_(realm_ids))
+                db.session.execute(delete_stmt)
+                log.debug(f"Remove realm {', '.join(realm_names_to_delete)} from token {self.get_serial()} due to "
+                          f"setting new realms ({', '.join(realms)}).")
+
+        for realm_name in realms_to_add:
+            statement = select(Realm).filter_by(name=realm_name)
+            realm_db = db.session.execute(statement).scalar_one_or_none()
+            if realm_db:
+                token_realm = TokenRealm(token_id=self.token.id, realm_id=realm_db.id)
+                db.session.add(token_realm)
+            else:  # pragma no cover
+                # should already be covered on lib layer
+                log.warning(f"Realm {realm_name} does not exist. Cannot add it to token {self.get_serial()}.")
+
+        if commit_db_session:
+            db.session.commit()
+
     def get_realms(self):
         """
         Return a list of realms the token is assigned to
@@ -777,10 +1126,10 @@ class TokenClass(object):
         :rtype: list
         """
         return self.token.get_realms()
-        
+
     def get_serial(self):
         return self.token.serial
-    
+
     def get_tokentype(self):
         return self.token.tokentype
 
@@ -800,7 +1149,6 @@ class TokenClass(object):
     def set_otplen(self, otplen):
         self.token.otplen = int(otplen)
 
-    @check_token_locked
     def get_otplen(self):
         return self.token.otplen
 
@@ -839,7 +1187,7 @@ class TokenClass(object):
     def revoke(self):
         """
         This revokes the token.
-        By default it
+        By default, it
         1. sets the revoked-field
         2. set the locked field
         3. disables the token.
@@ -873,19 +1221,19 @@ class TokenClass(object):
 
     @check_token_locked
     def set_hashlib(self, hashlib):
-        self.add_tokeninfo("hashlib", hashlib)
+        self.write_tokeninfo("hashlib", hashlib)
 
     @check_token_locked
     def inc_failcount(self):
         if self.token.failcount < self.token.maxfail:
             self.token.failcount = (self.token.failcount + 1)
             if self.token.failcount == self.token.maxfail:
-                self.add_tokeninfo(FAILCOUNTER_EXCEEDED,
+                self.write_tokeninfo(FAILCOUNTER_EXCEEDED,
                                    datetime.now(tzlocal()).strftime(
                                        DATE_FORMAT))
         try:
             self.token.save()
-        except:  # pragma: no cover
+        except Exception:  # pragma: no cover
             log.error('update failed')
             raise TokenAdminError("Token Fail Counter update failed", id=1106)
         return self.token.failcount
@@ -937,7 +1285,7 @@ class TokenClass(object):
         else:
             return hashlib.sha1
 
-    def get_tokeninfo(self, key=None, default=None):
+    def get_tokeninfo(self, key=None, default=None, decrypted=False):
         """
         return the complete token info or a single key of the tokeninfo.
         When returning the complete token info dictionary encrypted entries
@@ -949,34 +1297,84 @@ class TokenClass(object):
         :type key: string
         :param default: the default value, if the key does not exist
         :type default: string
+        :param decrypted: Indicates that passwords should be decrypted when fetching the whole dict
+        :type decrypted: bool
         :return: the value for the key
         :rtype: int or str or dict
         """
         tokeninfo = self.token.get_info()
+        ret = tokeninfo
+
         if key:
             ret = tokeninfo.get(key, default)
-            if tokeninfo.get(key + ".type") == "password":
-                # we need to decrypt the return value
+            key_type = tokeninfo.get(key + TOKENINFO_TYPE_SUFFIX)
+            if key_type == "password":
                 ret = decryptPassword(ret)
-        else:
-            ret = tokeninfo
+        elif decrypted:
+            ret = {x: (decryptPassword(y) if tokeninfo.get(x + TOKENINFO_TYPE_SUFFIX) == "password" else y)
+                   for x, y in tokeninfo.items()}
+
         return ret
 
-    def del_tokeninfo(self, key=None):
-        self.token.del_info(key)
+    def delete_tokeninfo(self, key: str = None):
+        """
+        Deletes the token info for the given key on behalf of a request, e.g. the token info endpoints or the
+        token event handler. A key the token class owns is refused unless it is declared deletable, and so is
+        deleting the whole token info, because that would remove the owned keys along with the free-form ones.
 
-    def del_tokengroup(self, tokengroup=None, tokengroup_id=None):
+        Server side code that maintains such a key removes it with remove_tokeninfo() instead.
+
+        :param key: The key to delete
+        :raises PolicyError: If the key may not be deleted, or if no key is given.
+        """
+        if key is None:
+            raise PolicyError("Deleting the whole token info of a token is not supported, the token would lose "
+                              "the entries it needs to function.")
+        if not self.is_deletable_tokeninfo_key(key):
+            log.info(f"Refusing to delete the token info '{key}' of token {self.token.serial} through a generic "
+                     f"token info write, the key is managed by the token.")
+            raise PolicyError(f"The token info key '{key}' is managed by the token and can not be deleted.")
+        self.remove_tokeninfo(key)
+
+    def remove_tokeninfo(self, key: str = None) -> None:
+        """
+        Deletes the token info for the given key without checking whether the token class owns the key. If no key
+        is given, all info entries from this token are deleted. This is the remover for server side code that
+        maintains the token info of a token, a delete that comes from a request has to go through
+        delete_tokeninfo().
+
+        :param key: The key to delete, or None to delete every entry
+        """
+        statement = delete(TokenInfo).where(TokenInfo.token_id == self.token.id)
+        if key:
+            statement = statement.where(TokenInfo.Key == key)
+        db.session.execute(statement)
+        db.session.commit()
+
+    def delete_tokengroup(self, tokengroup: str = None, tokengroup_id: int = None) -> bool:
         """
         Removes a token group from a token.
-        You either need to specify the name or the ID of the tokengroup.
+        You either need to specify the name or the ID of the tokengroup. If none of them is given, all token groups
+        are removed from the token.
 
         :param tokengroup: The name of the tokengroup
-        :type tokengroup: basestring
         :param tokengroup_id: The ID of the tokengroup
-        :type tokengroup_id: int
         :return: True in case of success
         """
-        self.token.del_tokengroup(tokengroup=tokengroup, tokengroup_id=tokengroup_id)
+        statement = delete(TokenTokengroup).where(TokenTokengroup.token_id == self.token.id)
+        if tokengroup_id:
+            statement = statement.where(TokenTokengroup.tokengroup_id == tokengroup_id)
+        elif tokengroup:
+            group_stmt = select(Tokengroup).where(Tokengroup.name == tokengroup)
+            tokengroup_db = db.session.execute(group_stmt).scalar_one_or_none()
+            if not tokengroup_db:
+                log.warning("Tokengroup %s does not exist. Cannot remove it from token %s.", tokengroup,
+                            self.get_serial())
+                raise ResourceNotFoundError(_("Tokengroup {0!s} does not exist.").format(tokengroup))
+            statement = statement.where(TokenTokengroup.tokengroup_id == tokengroup_db.id)
+        db.session.execute(statement)
+        db.session.commit()
+        return True
 
     @check_token_locked
     def set_count_auth_success_max(self, count):
@@ -987,7 +1385,7 @@ class TokenClass(object):
         :param count: a number
         :type count: int
         """
-        self.add_tokeninfo("count_auth_success_max", int(count))
+        self.write_tokeninfo("count_auth_success_max", int(count))
 
     @check_token_locked
     def set_count_auth_success(self, count):
@@ -998,7 +1396,7 @@ class TokenClass(object):
         :param count: a number
         :type count: int
         """
-        self.add_tokeninfo("count_auth_success", int(count))
+        self.write_tokeninfo("count_auth_success", int(count))
 
     @check_token_locked
     def set_count_auth_max(self, count):
@@ -1009,18 +1407,18 @@ class TokenClass(object):
         :param count: a number
         :type count: int
         """
-        self.add_tokeninfo("count_auth_max", int(count))
+        self.write_tokeninfo("count_auth_max", int(count))
 
     @check_token_locked
     def set_count_auth(self, count):
         """
-        Sets the counter for the occurred login attepms
+        Sets the counter for the occurred login attempts
         as key "count_auth" in token info
 
         :param count: a number
         :type count: int
         """
-        self.add_tokeninfo("count_auth", int(count))
+        self.write_tokeninfo("count_auth", int(count))
 
     def get_count_auth_success_max(self):
         """
@@ -1052,8 +1450,8 @@ class TokenClass(object):
 
     def get_validity_period_end(self):
         """
-        returns the end of validity period (if set)
-        if not set, "" is returned.
+        Returns the end of validity period (if set).
+        If it is not set, "" is returned.
 
         :return: the end of the validity period
         :rtype: str
@@ -1074,15 +1472,15 @@ class TokenClass(object):
         :type end_date: str
         """
         if not end_date:
-            self.del_tokeninfo("validity_period_end")
+            self.remove_tokeninfo("validity_period_end")
         else:
             #  upper layer will catch. we just try to verify the date format
             try:
                 d = parse_date_string(end_date)
             except ValueError as _e:
-                log.debug('{0!s}'.format(traceback.format_exc()))
+                log.debug(f'{traceback.format_exc()!s}')
                 raise TokenAdminError('Could not parse validity period end date!')
-            self.add_tokeninfo("validity_period_end", d.strftime(DATE_FORMAT))
+            self.write_tokeninfo("validity_period_end", d.strftime(DATE_FORMAT))
 
     def get_validity_period_start(self):
         """
@@ -1108,16 +1506,17 @@ class TokenClass(object):
         :type start_date: str
         """
         if not start_date:
-            self.del_tokeninfo("validity_period_start")
+            self.remove_tokeninfo("validity_period_start")
         else:
             try:
                 d = parse_date_string(start_date)
             except ValueError as _e:
-                log.debug('{0!s}'.format(traceback.format_exc()))
+                log.debug(f'{traceback.format_exc()!s}')
                 raise TokenAdminError('Could not parse validity period start date!')
 
-            self.add_tokeninfo("validity_period_start", d.strftime(DATE_FORMAT))
+            self.write_tokeninfo("validity_period_start", d.strftime(DATE_FORMAT))
 
+    @check_token_locked
     def set_next_pin_change(self, diff=None, password=False):
         """
         Sets the timestamp for the next_pin_change. Provide a
@@ -1133,7 +1532,7 @@ class TokenClass(object):
         if password:
             key = "next_password_change"
         new_date = datetime.now(tzlocal()) + timedelta(days=days)
-        self.add_tokeninfo(key, new_date.strftime(DATE_FORMAT))
+        self.write_tokeninfo(key, new_date.strftime(DATE_FORMAT))
 
     def is_pin_change(self, password=False):
         """
@@ -1160,8 +1559,8 @@ class TokenClass(object):
         succcess_counter += 1
         auth_counter = self.get_count_auth()
         auth_counter += 1
-        self.token.set_info({"count_auth_success": int(succcess_counter),
-                             "count_auth": int(auth_counter)})
+        self.add_tokeninfo_dict({"count_auth_success": int(succcess_counter),
+                                 "count_auth": int(auth_counter)})
         return succcess_counter
 
     @check_token_locked
@@ -1195,7 +1594,7 @@ class TokenClass(object):
         except Exception as exx:
             log.warning("Misconfiguration. Error retrieving "
                         "failcounter_clear_timeout: "
-                        "{0!s}".format(exx))
+                        f"{exx!s}")
         if timeout and self.token.failcount == self.get_max_failcount():
             now = datetime.now(tzlocal())
             lastfail = self.get_tokeninfo(FAILCOUNTER_EXCEEDED)
@@ -1220,8 +1619,8 @@ class TokenClass(object):
         """
         This function checks the count_auth and the count_auth_success.
         If the counters are less or equal than the maximum allowed counters
-        it returns True. Otherwise False.
-        
+        it returns True. Otherwise, False.
+
         :return: success if the counter is less than max
         :rtype: bool
         """
@@ -1270,27 +1669,33 @@ class TokenClass(object):
 
         This is used in the function token.check_token_list
 
+        The first failing check also records its machine-readable
+        :class:`~privacyidea.lib.conditional_access.authentication_event_types.AuthEventReason` on
+        ``self.auth_details``, so the authentication log can say *why* a token was unusable rather than only that it
+        was. Both come from one table below, so the message and the reason can never drift apart.
+
         :param message_list: A list of messages
         :return: False, if any of the checks fail
         """
-        r = False
-        # Check if the max auth is succeeded
-        if not self.check_auth_counter():
-            message_list.append("Authentication counter exceeded")
-        # Check if the token is disabled
-        elif not self.is_active():
-            message_list.append("Token is disabled")
-        elif not self.check_failcount():
-            message_list.append("Failcounter exceeded")
-        elif not self.check_validity_period():
-            message_list.append("Outside validity period")
-        elif self.rollout_state in [ROLLOUTSTATE.CLIENTWAIT, ROLLOUTSTATE.VERIFYPENDING]:
-            message_list.append("Token is not yet enrolled")
-        else:
-            r = True
-        if not r:
-            log.info("{0} {1}".format(message_list, self.get_serial()))
-        return r
+        checks = (
+            # Check if the max auth is succeeded
+            (self.check_auth_counter, "Authentication counter exceeded",
+             AuthEventReason.TOKEN_AUTH_COUNTER_EXCEEDED),
+            # Check if the token is disabled
+            (self.is_active, "Token is disabled", AuthEventReason.TOKEN_DISABLED),
+            (self.check_failcount, "Failcounter exceeded", AuthEventReason.TOKEN_FAILCOUNT_EXCEEDED),
+            (self.check_validity_period, "Outside validity period",
+             AuthEventReason.TOKEN_OUTSIDE_VALIDITY_PERIOD),
+            (lambda: self.rollout_state not in [RolloutState.CLIENTWAIT, RolloutState.VERIFY_PENDING],
+             "Token is not yet enrolled", AuthEventReason.TOKEN_NOT_YET_ENROLLED),
+        )
+        for passes, message, reason in checks:
+            if not passes():
+                message_list.append(message)
+                self.auth_details[AUTH_EVENT_REASON_KEY] = reason
+                log.info(f"{message_list} {self.get_serial()}")
+                return False
+        return True
 
     @log_with(log)
     @check_token_locked
@@ -1320,7 +1725,7 @@ class TokenClass(object):
             reset_counter = True
 
         if (reset_counter and self.token.active and self.token.failcount <
-            self.token.maxfail):
+                self.token.maxfail):
             self.set_failcount(0)
 
         # make DB persistent immediately, to avoid the re-usage of the counter
@@ -1332,7 +1737,7 @@ class TokenClass(object):
         checks if the given OTP value is/are values of this very token.
         This is used to autoassign and to determine the serial number of
         a token.
-        
+
         :param otp: the OTP value
         :param window: The look ahead window
         :type window: int
@@ -1377,10 +1782,11 @@ class TokenClass(object):
         :rtype: tuple
         """
         # The database field is always an integer
-        otplen = self.token.otplen
-        log.debug("Splitting the an OTP value of length {0!s} from the password.".format(otplen))
-        pin, otpval = split_pin_pass(passw, otplen, get_prepend_pin())
-        return True, pin, otpval
+        otp_length = self.token.otplen
+        log.debug(f"Splitting the OTP value of length {otp_length} from the password.")
+        pin, otp_value = split_pin_pass(passw, otp_length, get_prepend_pin())
+        # If the provided passw is shorter than the expected otp_length, we return the status False
+        return len(passw) >= otp_length, pin, otp_value
 
     def status_validation_fail(self):
         """
@@ -1401,24 +1807,18 @@ class TokenClass(object):
         :return: token state as string representation
         :rtype:  string
         """
-        ldict = {}
-        for attr in self.__dict__:
-            key = "{0!r}".format(attr)
-            val = "{0!r}".format(getattr(self, attr))
-            ldict[key] = val
-        res = "<{0!r} {1!r}>".format(self.__class__, ldict)
-        return res
+        return f"<{self.__class__!r} {redacted_attributes(self)!r}>"
 
     def get_init_detail(self, params=None, user=None):
         """
         to complete the token initialization, the response of the initialization
-        should be build by this token specific method.
+        should be built by this token specific method.
         This method is called from api/token after the token is enrolled
 
         get_init_detail returns additional information after an admin/init
         like the QR code of an HOTP/TOTP token.
         Can be anything else.
-        
+
         :param params: The request params during token creation token/init
         :type params: dict
         :param user: the user, token owner
@@ -1438,7 +1838,7 @@ class TokenClass(object):
 
         if otpkey is not None:
             response_detail["otpkey"] = {"description": "OTP seed",
-                                         "value": "seed://{0!s}".format(otpkey),
+                                         "value": f"seed://{otpkey!s}",
                                          "img": create_img(otpkey)}
 
         return response_detail
@@ -1458,7 +1858,7 @@ class TokenClass(object):
         is triggered by overwriting this method.
 
         .. note:: in case of ``pin policy == 2`` (no pin is required)
-                  the ``check_pin`` would always return true! Thus each request
+                  the ``check_pin`` would always return true! Thus, each request
                   containing a ``data`` or ``challenge`` would trigger a challenge!
 
         The Challenge workflow is like this.
@@ -1481,7 +1881,7 @@ class TokenClass(object):
                      V                       V
             challenge_janitor       challenge_janitor
 
-        :param passw: password, which might be pin or pin+otp
+        :param passw: password, which might be the pin or pin+otp
         :type passw: string
         :param user: The user from the authentication request
         :type user: User object
@@ -1547,6 +1947,13 @@ class TokenClass(object):
             # Now we also need to check, if there is a corresponding DB entry
             chals = get_challenges(serial=self.token.serial, transaction_id=transaction_id)
             challenge_response = bool(chals)
+            # Note whether they have all lapsed, for the authentication log: this is the last point at which they
+            # exist, since checking the answer ends in challenge_janitor(), which deletes the expired ones. Recorded
+            # here rather than asked again later, so the log costs no extra challenge query. Nothing to note when the
+            # transaction holds none at all - with the Redis backend a long-expired challenge is already evicted, and
+            # "no challenge here" is then what the log should say.
+            if chals and all(not chal.is_valid() for chal in chals):
+                self.auth_details[CHALLENGE_LAPSED_KEY] = True
 
         return challenge_response
 
@@ -1580,31 +1987,38 @@ class TokenClass(object):
 
         # get the challenges for this transaction ID
         if transaction_id is not None:
-            challengeobject_list = get_challenges(serial=self.token.serial,
-                                                  transaction_id=transaction_id)
+            challenges = get_challenges(serial=self.token.serial, transaction_id=transaction_id)
 
-            for challengeobject in challengeobject_list:
-                if challengeobject.is_valid():
+            for challenge in challenges:
+                if challenge.is_valid():
                     # challenge is still valid
                     # Add the challenge to the options for check_otp
-                    options["challenge"] = challengeobject.challenge
-                    options["data"] = challengeobject.data
-                    if challengeobject.session == CHALLENGE_SESSION.ENROLLMENT:
+                    options["challenge"] = challenge.challenge
+                    options["data"] = challenge.get_data()
+                    if challenge.session == ChallengeSession.ENROLLMENT:
                         self.enroll_via_validate_2nd_step(passw, options=options)
-                        challengeobject.delete()
+                        challenge.delete()
                         # Basically we have a successfully answered challenge
                         otp_counter = 0
                     else:
                         # Now see if the OTP matches:
-                        otp_counter = self.check_otp(passw, options=options)
+                        try:
+                            otp_counter = self.check_otp(passw, options=options)
+                        except ParameterError as e:
+                            # ParameterError can be expected because options does not contain the data for every token
+                            # type to do a successful check. This is the case if the user has multiple token, e.g.
+                            # push and passkey, and uses push. In the final call with the push token, there is obviously
+                            # no data for the passkey in the options
+                            log.debug(e)
+                            otp_counter = -1
                         if otp_counter >= 0:
                             # We found the matching challenge, so lets return the
                             # successful result and delete the challenge object.
-                            challengeobject.delete()
+                            challenge.delete()
                             break
                         else:
                             # increase the received_count
-                            challengeobject.set_otp_status()
+                            challenge.set_otp_status()
 
         self.challenge_janitor()
         return otp_counter
@@ -1622,14 +2036,14 @@ class TokenClass(object):
         """
         return False
 
-    @staticmethod
-    def challenge_janitor():
+    def challenge_janitor(self):
         """
-        Just clean up all challenges, for which the expiration has expired.
+        Clean up all challenges for this token, for which the expiration has
+        expired.
 
         :return: None
         """
-        cleanup_challenges()
+        cleanup_challenges(self.token.serial)
 
     def create_challenge(self, transactionid=None, options=None):
         """
@@ -1652,9 +2066,8 @@ class TokenClass(object):
         additional challenge ``reply_dict``, which are displayed in the JSON challenges response.
         """
         options = options or {}
-        message = get_action_values_from_options(SCOPE.AUTH,
-                                                 ACTION.CHALLENGETEXT,
-                                                 options) or _('please enter otp: ')
+        message = options.get(PolicyAction.CHALLENGETEXT, _('please enter otp: ')).replace(r"\,", ",")
+
         data = None
         reply_dict = {}
 
@@ -1664,14 +2077,14 @@ class TokenClass(object):
         lookup_for = tokentype.capitalize() + 'ChallengeValidityTime'
         validity = int(get_from_config(lookup_for, validity))
 
-        # Create the challenge in the database
-        db_challenge = Challenge(self.token.serial,
-                                 transaction_id=transactionid,
-                                 challenge=options.get("challenge"),
-                                 data=data,
-                                 session=options.get("session"),
-                                 validitytime=validity)
-        db_challenge.save()
+        # Create the challenge (Redis if available, DB fallback)
+        from privacyidea.lib.token import create_challenge as _create_challenge
+        db_challenge = _create_challenge(self.token.serial,
+                                         transaction_id=transactionid,
+                                         challenge=options.get("challenge"),
+                                         data=data,
+                                         session=options.get("session"),
+                                         validitytime=validity)
         self.challenge_janitor()
         return True, message, db_challenge.transaction_id, reply_dict
 
@@ -1703,8 +2116,7 @@ class TokenClass(object):
         :param g: The Flask global object g
         :return: Flask Response or text
         """
-        raise ParameterError("{0!s} does not support the API endpoint".format(
-                             cls.get_tokentype()))
+        raise ParameterError(f"{cls.get_tokentype()!s} does not support the API endpoint")
 
     @staticmethod
     def test_config(params=None):
@@ -1753,6 +2165,16 @@ class TokenClass(object):
         :type params: dict
         :return: default parameters
         """
+        return cls._get_default_settings(g)
+
+    @classmethod
+    def _get_default_settings(cls, g, role="user", username=None, userrealm=None,
+                              adminuser=None, adminrealm=None):
+        """
+        Internal function that can be called either during enrollment via /token/init or during
+        enrollment via validate/check.
+        This way we have consistent policy handling.
+        """
         return {}
 
     def check_last_auth_newer(self, last_auth):
@@ -1770,23 +2192,22 @@ class TokenClass(object):
         :type last_auth: basestring
         :return: bool
         """
-        # per default we return True
+        # By default, we return True
         res = True
         # The tdelta in the policy
         tdelta = parse_timedelta(last_auth)
 
         # The last successful authentication of the token
-        date_s = self.get_tokeninfo(ACTION.LASTAUTH)
+        date_s = self.get_tokeninfo(PolicyAction.LASTAUTH)
         if date_s:
             log.debug("Compare the last successful authentication of "
-                      "token %s with policy "
-                      "tdelta %s: %s" % (self.token.serial, tdelta,
-                                         date_s))
+                      f"token {self.token.serial} with policy "
+                      f"tdelta {tdelta}: {date_s}")
             # parse the string from the database
             try:
                 last_success_auth = parse_date_string(date_s)
             except ParserError:
-                log.info("Failed to parse the date in 'last_auth' of token {0!s}.".format(self.token.serial))
+                log.info(f"Failed to parse the date in 'last_auth' of token {self.token.serial!s}.")
                 return False
 
             if not last_success_auth.tzinfo:
@@ -1797,27 +2218,27 @@ class TokenClass(object):
             if last_success_auth + tdelta < datetime.now(tzlocal()):
                 res = False
                 log.debug("The last successful authentication is too old: "
-                          "{0!s}".format(last_success_auth))
+                          f"{last_success_auth!s}")
 
         return res
 
     def generate_symmetric_key(self, server_component, client_component,
                                options=None):
         """
-        This method generates a symmetric key, from a server component and a 
-        client component. 
+        This method generates a symmetric key, from a server component and a
+        client component.
         This key generation could be based on HMAC, KDF or even Diffie-Hellman.
-        
-        The basic key-generation is simply replacing the last n byte of the 
+
+        The basic key-generation is simply replacing the last n byte of the
         server component with bytes of the client component.
-                
+
         :param server_component: The component usually generated by privacyIDEA.
                                  This is a hex string
         :type server_component: str
         :param client_component: The component usually generated by the
             client (e.g. smartphone). This is a hex string.
         :type client_component: str
-        :param options: 
+        :param options:
         :return: the new generated key as hex string
         :rtype: str
         """
@@ -1829,17 +2250,17 @@ class TokenClass(object):
         return key
 
     @staticmethod
-    def get_import_csv(l):
+    def get_import_csv(row):
         """
         Read the list from a csv file and return a dictionary, that can be used
         to do a token_init.
 
-        :param l: The list of the line of a csv file
-        :type l: list
+        :param row: The list of the line of a csv file
+        :type row: list
         :return: A dictionary of init params
         """
         # The OTPKey is at the second column
-        key = l[1].strip()
+        key = row[1].strip()
         if len(key) == 64:
             hashlib = "sha256"
         elif len(key) == 128:
@@ -1851,20 +2272,20 @@ class TokenClass(object):
         else:
             hashlib = "sha1"
 
-        params = {"serial": l[0].strip(),
+        params = {"serial": row[0].strip(),
                   "hashlib": hashlib,
                   "otpkey": key,
-                  "type": l[2].strip()}
+                  "type": row[2].strip()}
 
         # get OTP len
-        if len(l) >= 4:
-            params["otplen"] = l[3].strip()
+        if len(row) >= 4:
+            params["otplen"] = row[3].strip()
         else:
             params["otplen"] = 6
 
         return params
 
-    def prepare_verify_enrollment(self):
+    def prepare_verify_enrollment(self, options=None):
         """
         This is called, if the token should be enrolled in a way, that the user
         needs to provide a proof, that the server can verify, that the token
@@ -1889,7 +2310,7 @@ class TokenClass(object):
         return False
 
     @classmethod
-    def enroll_via_validate(cls, g, content, user_obj):
+    def enroll_via_validate(cls, g, content, user_obj, message=None):
         """
         This class method is used in the policy ENROLL_VIA_MULTICHALLENGE.
         It enrolls a new token of this type and returns the necessary information
@@ -1898,6 +2319,7 @@ class TokenClass(object):
         :param g: context object
         :param content: The content of a response
         :param user_obj: A user object
+        :param message: An alternative message displayed to the user during enrollment
         :return: None, the content is modified
         """
         return True
@@ -1912,3 +2334,68 @@ class TokenClass(object):
         :return:
         """
         return True
+
+    def _to_dict(self, b32=False):
+        """
+        export the token information to a dictionary.
+
+        This can be used to re-encrypt tokens.
+
+        :param b32: Export otp key b32encoded
+
+        :return: a dict, containing the token and the tokeninfo
+        """
+        token_dict = {
+            "serial": self.get_serial(),
+            "type": self.get_type(),
+            "otpkey": self.token.get_otpkey().getKey(),
+            "description": self.token.description,
+            "otplen": self.get_otplen(),
+            "maxfail": self.get_max_failcount(),
+            "failcount": self.get_failcount(),
+            "counter": self.get_otp_count(),
+            "window": self.get_otp_count_window(),
+            "active": self.is_active(),
+            "revoked": self.token.revoked,
+            "locked": self.token.locked,
+            "rollout_state": self.token.rollout_state,
+            "_hashed_pin": self.token.pin_hash
+        }
+        if b32:
+            token_dict["otpkey"] = b32encode(unhexlify(token_dict.get("otpkey")))
+        token_dict["otpkey"] = to_unicode(token_dict.get("otpkey"))
+        token_dict["info_list"] = self.get_tokeninfo(decrypted=True)
+        return token_dict
+
+    @classmethod
+    def is_multichallenge_enrollable(cls):
+        return False
+
+    def get_enroll_url(self, user: User, params: dict):
+        """
+        Return the URL to enroll this token. It is not supported by all token types.
+        """
+        return None
+
+    def export_token(self, export_user: bool = False) -> dict:
+        """
+        Create a dictionary with the token information that can be exported.
+        """
+        token_dict = self._to_dict()
+        token_dict['issuer'] = 'privacyIDEA'
+        if export_user and self.token.first_owner:
+            token_dict["user"] = self.user.user_export_dict()
+
+        return token_dict
+
+    def import_token(self, token_information: dict):
+        """
+        Import a given token.
+        """
+        self.token.set_otpkey(token_information.setdefault("otpkey", ''))
+        self.token.otplen = int(token_information.setdefault("otplen", 6))
+        self.token.description = token_information.setdefault("description", '')
+        self.token.pin_hash = token_information.setdefault("_hashed_pin", None)
+        self.add_tokeninfo_dict(token_information.setdefault("info_list", {}))
+        self.write_tokeninfo("import_date", datetime.now(UTC).isoformat(timespec="seconds"))
+        self.save()

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  (c) Cornelius Kölbel
 #  License:  AGPLv3
 #  contact:  http://www.privacyidea.org
@@ -18,12 +16,15 @@
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-import logging
 import functools
-from privacyidea.lib.error import TokenAdminError
-from privacyidea.lib.error import ParameterError
+import logging
+
+from privacyidea.lib.params import get_optional_one_of, get_optional
 from privacyidea.lib import _
+from privacyidea.lib.error import ParameterError
+from privacyidea.lib.error import TokenAdminError, Error
 from privacyidea.lib.utils import check_serial_valid
+
 log = logging.getLogger(__name__)
 
 
@@ -40,19 +41,38 @@ def check_token_locked(func):
         # The token object
         token = args[0]
         if token.is_locked():
-            raise TokenAdminError(_("This action is not possible, since the "
-                                    "token is locked"), id=1007)
+            raise TokenAdminError(_("This action is not possible, since the token is locked"),
+                                  id=Error.TOKEN_LOCKED)
         f_result = func(*args, **kwds)
         return f_result
 
     return token_locked_wrapper
 
 
+def check_token_otp_length(func):
+    """
+    Decorator to check if a given otp value has the correct length.
+    The decorator is to be used in token class method check_otp.
+
+    If the given otp value has a wrong length it returns -1 and logs the info.
+    """
+    @functools.wraps(func)
+    def token_otp_lenght_wrapper(*args, **kwds):
+        token = args[0]
+        if len(args[1]) != token.token.otplen:
+            log.info(f"OTP value for token {token.token.serial} (type: {token.type}) "
+                     f"has wrong length ({len(args[1])} != {token.token.otplen})")
+            return -1
+        f_result = func(*args, **kwds)
+        return f_result
+    return token_otp_lenght_wrapper
+
+
 def check_user_or_serial(func):
     """
     Decorator to check user and serial at the beginning of a function
     The wrapper will check the parameters user and serial and verify that
-    not both parameters are None. Otherwise it will throw an exception
+    not both parameters are None. Otherwise, it will throw an exception
     ParameterError.
     """
     @functools.wraps(func)
@@ -65,7 +85,7 @@ def check_user_or_serial(func):
         if (serial is None and (len(args) == 0 or args[0] is None) and
                 (user is None or (user is not None and user.is_empty()))):
             # We either have an empty User object or None
-            raise ParameterError(ParameterError.USER_OR_SERIAL)
+            raise ParameterError(_('You either need to provide user or serial'))
 
         if serial:
             check_serial_valid(serial)
@@ -76,11 +96,12 @@ def check_user_or_serial(func):
     return user_or_serial_wrapper
 
 
-class check_user_or_serial_in_request(object):
+class check_user_serial_or_cred_id_in_request:
     """
     Decorator to check user and serial in a request.
     If the request does not contain a serial number (serial) or a user
     (user) it will throw a ParameterError.
+    # todo this is becoming pointless
     """
     def __init__(self, request):
         self.request = request
@@ -90,8 +111,10 @@ class check_user_or_serial_in_request(object):
         def check_user_or_serial_in_request_wrapper(*args, **kwds):
             user = self.request.all_data.get("user", "").strip()
             serial = self.request.all_data.get("serial", "").strip()
-            if not serial and not user:
-                raise ParameterError(_("You need to specify a serial or a user."))
+            credential_id = get_optional_one_of(self.request.all_data, ["credential_id", "credentialid"])
+            cancel_enrollment = get_optional(self.request.all_data, "cancel_enrollment")
+            if not serial and not user and not credential_id and not cancel_enrollment:
+                raise ParameterError(_("You need to specify a serial, user or credential_id."))
             if "*" in serial:
                 raise ParameterError(_("Invalid serial number."))
             if "%" in user:
@@ -126,4 +149,3 @@ def check_copy_serials(func):
         return f_result
 
     return check_serial_wrapper
-

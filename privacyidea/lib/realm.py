@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 #  privacyIDEA is a fork of LinOTP
 #
 #  Nov 27, 2014 Cornelius Kölbel <cornelius@privacyidea.org>
@@ -29,37 +28,61 @@
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-'''
+"""
 These are the library functions to create, modify and delete realms in the
 database. It depends on the lib.resolver.
 
 It is independent of any user or token libraries and can be tested standalone
 in tests/test_lib_realm.py
-'''
-from ..models import (Realm,
-                      ResolverRealm,
-                      Resolver, db, save_config_timestamp)
-from .log import log_with
-from privacyidea.lib.config import get_config_object
+"""
 import logging
+
+from sqlalchemy import delete, select
+
+from privacyidea.lib.config import get_config_object
+from privacyidea.lib.error import DatabaseError, Error, UserError
 from privacyidea.lib.utils import sanity_name_check, fetch_one_resource, is_true
 from privacyidea.lib.utils.export import (register_import, register_export)
+from .framework import get_app_config_value
+from .log import log_with
+from ..models import (Realm,
+                      ResolverRealm,
+                      Resolver, db, save_config_timestamp, TokenRealm, TokenOwner, TokenContainerOwner)
+
 log = logging.getLogger(__name__)
 
 
 @log_with(log)
-#@cache.memoize(10)
+# @cache.memoize(10)
 def get_realms(realmname=None):
-    '''
-    either return all defined realms or a specific realm
-    
-    :param realmname: the realm, that is of interestet, if ==""
-                      all realms are returned
-    :type realmname: string
+    """
+    Either return all defined realms or a specific realm.
+    The dictionary looks like this:
 
-    :return: a dict with realm description like
+    {
+      'realmname': {
+        'id': <id of the realm>,
+        'option': <>,
+        'default': <default realm>,
+        'resolver': [
+          {
+            'name': <resolver name>',
+            'type': <resolver type>,
+            'priority': <resolver priority>,
+            'node': <resolver node>
+          },
+          {
+            ...
+          }
+        ]
+    }
+
+    :param realmname: the realm, that is of interest. If not given, all realms
+                      are returned
+    :type realmname: string
+    :return: a dictionary with the realm description
     :rtype: dict
-    '''
+    """
     config_object = get_config_object()
     realms = config_object.realm
     if realmname:
@@ -70,7 +93,7 @@ def get_realms(realmname=None):
     return realms
 
 
-#@cache.memoize(10)
+# @cache.memoize(10)
 def get_realm(realmname):
     """
     :param realmname:
@@ -85,6 +108,7 @@ def get_realm(realmname):
 def get_realm_id(realmname):
     """
     Returns the realm_id for a realm name
+
     :param realmname: The name of the realm
     :return: The ID of the realm. If the realm does not exist, returns None.
     """
@@ -95,10 +119,9 @@ def get_realm_id(realmname):
 def realm_is_defined(realm):
     """
     check, if a realm already exists or not
-    
+
     :param realm: the realm, that should be verified
     :type  realm: string
-    
     :return: found or not found
     :rtype: boolean
     """
@@ -114,128 +137,275 @@ def set_default_realm(default_realm=None):
     """
     set the default realm attribute.
     If the realm name is empty, the default realm is cleared.
-        
-    :param defaultRealm: the default realm name
-    :type  defualtRealm: string
-    
-    :return: success or not
-    :rtype: boolean
+
+    :param default_realm: the default realm name
+    :type  default_realm: str or None
+    :return: db ID of the realm set as default
+    :rtype: int
     """
-    r = Realm.query.filter_by(default=True).first()
-    if r:
+    res = 0
+    stmt = select(Realm).filter_by(default=True)
+    existing_default_realm = db.session.scalar(stmt)
+    if existing_default_realm:
         # delete the old entry
-        r.default = False
+        existing_default_realm.default = False
+        res = existing_default_realm.id
     if default_realm:
         # set the new realm as default realm
-        r = Realm.query.filter_by(name=default_realm).first()
+        r = fetch_one_resource(Realm, name=default_realm)
         r.default = True
-    if db.session.dirty or db.session.new:
-        save_config_timestamp()
-        db.session.commit()
-    return r.id
+        res = r.id
+    save_config_timestamp()
+    db.session.commit()
+    return res
 
 
 @log_with(log)
-#@cache.memoize(10)
+# @cache.memoize(10)
 def get_default_realm():
     """
     return the default realm
     - lookup in the config for the DefaultRealm key
-    
+
     @return: the realm name
-    @rtype : string
+    @rtype : str
     """
     return get_config_object().default_realm
 
 
-@log_with(log)
-def delete_realm(realmname):
+def _get_conditional_access_policies_referencing_realm(realm_name: str) -> list:
     """
-    delete the realm from the Database Table with the given name
-    If, after deleting this realm, there is only one realm left,
-    the remaining realm is set the default realm.
-    
-    :param realmname: the to be deleted realm
-    :type  realmname: string
-    """
-    # Check if there is a default realm
-    defRealm = get_default_realm()
-    hadDefRealmBefore = (defRealm != "")
+    Return the names of all conditional-access policies whose ``USER_REALM``
+    condition references ``realm_name``.
 
-    ret = fetch_one_resource(Realm, name=realmname).delete()
+    The realm stays in the condition's value list even after deletion - the
+    policy itself is never touched - which is a problem on its own:
+
+    * the condition still names a realm that no longer exists, so the policy
+      becomes invalid/un-saveable the next time it is edited;
+    * re-creating a realm with the same name silently rebinds the condition
+      to whatever that new realm turns out to be;
+    * a user who is migrated to another realm loses whatever exemption or
+      restriction the condition was giving them, without the policy ever
+      being touched.
+
+    Evaluation deliberately never re-validates a condition's value against the
+    current realm list (see :func:`~privacyidea.lib.conditional_access.policy.
+    _validate_condition_value`), so nothing else surfaces this on its own.
+
+    :param realm_name: the realm about to be deleted
+    :return: sorted, deduplicated list of policy names
+    """
+    from ..models.conditional_access_policy import ConditionalAccessPolicy, ConditionalAccessPolicyCondition
+    from .conditional_access.conditions import ConditionType
+
+    stmt = select(ConditionalAccessPolicy.name, ConditionalAccessPolicyCondition.value).join(
+        ConditionalAccessPolicyCondition,
+        ConditionalAccessPolicyCondition.policy_id == ConditionalAccessPolicy.id).where(
+        ConditionalAccessPolicyCondition.condition_type == ConditionType.USER_REALM)
+    # value is always a list of exact-match strings (see _validate_condition_value), never a bare
+    # string, so this membership test cannot false-positive on a substring of another realm's name.
+    policy_names = {policy_name for policy_name, value in db.session.execute(stmt).all()
+                     if value and realm_name in value}
+    return sorted(policy_names)
+
+
+def get_realm_delete_warnings(realm_name: str) -> dict:
+    """
+    Return, without deleting anything, everything about ``realm_name`` that
+    would make :func:`delete_realm` ask for confirmation: its custom user
+    attribute keys and the conditional-access policies still referencing it.
+    Lets a caller (the WebUI) show a single confirmation dialog naming every
+    consequence up front, instead of hitting them one at a time as separate
+    UserErrors from :func:`delete_realm`.
+
+    Does not check token/container assignment - that block is unconditional
+    (not something a caller can confirm past) and is left to :func:`delete_realm`.
+
+    :param realm_name: the realm that might be deleted
+    :return: ``{"custom_attribute_keys": [...], "ca_policy_names": [...]}``,
+        both sorted and empty when there is nothing to warn about
+    """
+    from ..models import CustomUserAttribute
+    realm_obj = fetch_one_resource(Realm, name=realm_name)
+    stmt = select(CustomUserAttribute.Key).where(CustomUserAttribute.realm_id == realm_obj.id).distinct()
+    custom_attribute_keys = sorted(db.session.scalars(stmt).all())
+    ca_policy_names = _get_conditional_access_policies_referencing_realm(realm_name)
+    return {"custom_attribute_keys": custom_attribute_keys, "ca_policy_names": ca_policy_names}
+
+
+@log_with(log)
+def delete_realm(realm_name: str, delete_custom_attributes: bool = False, confirm_ca_policies: bool = False):
+    """
+    Delete the realm from the database table with the given name.
+    If a user from this realm is assigned to a token or container a UserError is raised.
+    If, after deleting this realm, there is only one realm left, the remaining realm is set the default realm.
+
+    Custom user attributes are bound to a realm, so deleting the realm would orphan
+    them. If any exist and ``delete_custom_attributes`` is False, a UserError
+    (id :attr:`Error.REALM_DELETE_CUSTOM_ATTRIBUTES`) naming the attribute keys is
+    raised so the caller can ask for confirmation. With ``delete_custom_attributes``
+    True the attributes are deleted along with the realm.
+
+    Conditional-access policies can reference this realm in a ``USER_REALM``
+    condition. Deleting the realm does not touch those policies, but leaves them
+    referencing a realm that no longer exists (see
+    :func:`_get_conditional_access_policies_referencing_realm`). If any such
+    policy exists and ``confirm_ca_policies`` is False, a UserError (id
+    :attr:`Error.REALM_DELETE_CA_POLICY_REFERENCE`) naming the affected policies
+    is raised so the caller can ask for confirmation. With ``confirm_ca_policies``
+    True the realm is deleted anyway and the affected policies are logged as a
+    warning.
+
+    :param realm_name: the to be deleted realm
+    :param delete_custom_attributes: also delete the realm's custom user attributes
+        instead of refusing the deletion
+    :param confirm_ca_policies: delete the realm anyway although conditional-access
+        policies still reference it, instead of refusing the deletion
+    """
+    from ..models import CustomUserAttribute
+    realm = fetch_one_resource(Realm, name=realm_name)
+    realm_id = realm.id
+
+    # Check the owner tables directly: resolving the owners into User objects would query the resolver
+    stmt = select(TokenOwner.id).where(TokenOwner.realm_id == realm_id).limit(1)
+    if db.session.scalar(stmt) is not None:
+        raise UserError("Realm can not be deleted, because a user of this realm is still assigned to a token.")
+    stmt = select(TokenContainerOwner.id).where(TokenContainerOwner.realm_id == realm_id).limit(1)
+    if db.session.scalar(stmt) is not None:
+        raise UserError("Realm can not be deleted, because a user of this realm is still assigned to a container.")
+
+    # Custom user attributes reference the realm. Refuse the deletion unless the
+    # caller explicitly opted in to removing them, naming the affected keys so a
+    # WebUI/CLI can ask for confirmation.
+    warnings = get_realm_delete_warnings(realm_name)
+    custom_attribute_keys = warnings["custom_attribute_keys"]
+    if custom_attribute_keys and not delete_custom_attributes:
+        keys = ", ".join(custom_attribute_keys)
+        raise UserError(
+            f"Realm '{realm_name}' contains custom user attributes ({keys}). "
+            f"Deleting the realm will also delete these custom user attributes.",
+            id=Error.REALM_DELETE_CUSTOM_ATTRIBUTES)
+
+    ca_policy_names = warnings["ca_policy_names"]
+    if ca_policy_names:
+        if not confirm_ca_policies:
+            names = ", ".join(ca_policy_names)
+            raise UserError(
+                f"Realm '{realm_name}' is still referenced by conditional-access policies ({names}). "
+                f"Deleting the realm will leave those policies referencing a realm that no longer exists.",
+                id=Error.REALM_DELETE_CA_POLICY_REFERENCE)
+        log.warning(f"Deleting realm '{realm_name}' although it is still referenced by conditional-access "
+                    f"policies ({', '.join(ca_policy_names)}).")
+
+    # Check if there is a default realm
+    def_realm = get_default_realm()
+    had_def_realm_before = (def_realm != "")
+
+    # Delete relationships
+    stmt = delete(TokenRealm).where(TokenRealm.realm_id == realm.id)
+    db.session.execute(stmt)
+    stmt = delete(ResolverRealm).where(ResolverRealm.realm_id == realm.id)
+    db.session.execute(stmt)
+    if delete_custom_attributes:
+        stmt = delete(CustomUserAttribute).where(CustomUserAttribute.realm_id == realm.id)
+        db.session.execute(stmt)
+
+    # Delete realm
+    db.session.delete(realm)
+    save_config_timestamp()
+    db.session.commit()
 
     # If there was a default realm before
     # and if there is only one realm left, we set the
     # remaining realm the default realm
-    if hadDefRealmBefore is True:
-        defRealm = get_default_realm()
-        if not defRealm:
+    if had_def_realm_before is True:
+        def_realm = get_default_realm()
+        if not def_realm:
             realms = get_realms()
             if len(realms) == 1:
                 for key in realms:
                     set_default_realm(key)
 
-    return ret
+    return realm_id
 
 
 @log_with(log)
-def set_realm(realm, resolvers=None, priority=None):
+def set_realm(realm, resolvers=None):
     """
-    It takes a list of resolvers and adds these to the realm.
+    It takes a list of dictionaries describing the resolvers.
+    The list looks like this:
+
+      [ {'name': <resolvername1>,
+         'node': <uuid of the node/optional>,
+         'priority': <priority of the resolver/optional> },
+        {'name': <resolvername2>
+        }
+      ]
+
     If the realm does not exist, it is created.
     If the realm exists, the old resolvers are removed and the new ones
     are added.
-    
-    :param realm: an existing or a new realm
-    :param resolvers: names of resolvers
-    :type resolvers: list
-    :param priority: The priority of the resolvers in the realm
-    :type priority: dict, with resolver names as keys
-    
+
+    :param realm: name of an existing or a new realm
+    :type realm: str
+    :param resolvers: list with names and options of resolvers
+    :type resolvers: list of dicts
     :return: tuple of lists of added resolvers and resolvers, that could
              not be added
+    :rtype: tuple
+    .. versionchanged:: 3.10 accept a node in the resolver configuration
     """
     if resolvers is None:
         resolvers = []
     added = []
     failed = []
-    priority = priority or {}
     realm_created = False
     realm = realm.lower().strip()
     realm = realm.replace(" ", "-")
-    nameExp = r"^[A-Za-z0-9_\-\.]*$"
-    sanity_name_check(realm, nameExp)
+    sanity_name_check(realm, r"^[A-Za-z0-9_\-\.]+$")
 
     # create new realm if it does not exist
-    R = Realm.query.filter_by(name=realm).first()
-    if not R:
-        R = Realm(realm)
-        R.save()
+    stmt = select(Realm).filter_by(name=realm)
+    db_realm = db.session.scalar(stmt)
+    if not db_realm:
+        # create a new database entry for realm
+        db_realm = Realm(realm)
+        db.session.add(db_realm)
         realm_created = True
-        
+
     if not realm_created:
-        # delete old resolvers
-        oldResos = ResolverRealm.query.filter_by(realm_id=R.id)
-        for oldReso in oldResos:
-            oldReso.delete()
-        
+        # delete old resolvers if we update the realm
+        delete_stmt = delete(ResolverRealm).where(ResolverRealm.realm_id == db_realm.id)
+        db.session.execute(delete_stmt)
+
     # assign the resolvers
-    for reso_name in resolvers:
-        reso_name = reso_name.strip()
-        Reso = Resolver.query.filter_by(name=reso_name).first()
-        if Reso:
-            ResolverRealm(Reso.id, R.id,
-                          priority=priority.get(reso_name)).save()
-            added.append(reso_name)
+    for reso in resolvers:
+        reso_name = reso['name'].strip()
+        resolver_stmt = select(Resolver).filter_by(name=reso_name)
+        db_resolver = db.session.scalar(resolver_stmt)
+        if db_resolver:
+            try:
+                new_resolver_realm = ResolverRealm(db_resolver.id, db_realm.id,
+                                                   node_uuid=str(reso.get('node', '')),
+                                                   priority=reso.get('priority'))
+                db.session.add(new_resolver_realm)
+                added.append(reso_name)
+            except DatabaseError as exx:
+                log.warning(f"Could not add resolver {reso_name} to realm {realm}: {exx}")
+                failed.append(reso_name)
         else:
+            log.debug(f"Could not find resolver {reso_name} in database.")
             failed.append(reso_name)
 
     # if this is the first realm, make it the default
-    if Realm.query.count() == 1:
-        r = Realm.query.filter_by(name=realm).first()
-        r.default = True
-        save_config_timestamp()
-        db.session.commit()
+    num_realms_stmt = select(Realm.id)
+    realms = db.session.scalars(num_realms_stmt).all()
+    if len(realms) == 1:
+        db_realm.default = True
+
+    save_config_timestamp()
+    db.session.commit()
 
     return added, failed
 
@@ -252,18 +422,81 @@ def export_realms(name=None):
 def import_realms(data, name=None):
     """
     Import given realm configurations
+
+    Ignores realm id and realm options
     """
     # TODO: the set_realm() function always creates the realm in the DB even if
     #  the associated resolver are not available. So the realms must be imported
     #  *after* the resolver.
-    log.debug('Import realm config: {0!s}'.format(data))
+    log.debug(f'Import realm config: {data!s}')
     for realm, r_config in data.items():
         if name and name != realm:
             continue
-        added, failed = set_realm(
-            realm, resolvers=[r['name'] for r in r_config['resolver']],
-            priority={r['name']: r['priority'] for r in r_config['resolver']})
+        added, failed = set_realm(realm, resolvers=r_config.get('resolver', []))
         if is_true(r_config['default']):
             set_default_realm(realm)
-        log.info('realm: {0!s:<15} resolver added: {1!s} '
-                 'failed: {2!s}'.format(realm, added, failed))
+        log.info(f'realm: {realm!s:<15} resolver added: {added!s} '
+                 f'failed: {failed!s}')
+
+
+def split_realms(value: str | list | None) -> list[str]:
+    """
+    Return the realm names of a realm parameter, which is a single name, a comma-separated string of names or a
+    list of either. Realm names are lowercase and can not contain a comma (see :func:`set_realm`), so the names
+    are lowercased, and empty and repeated ones are dropped, keeping the order.
+
+    Whatever checks a realm parameter and whatever acts on it should both read it with this function, so the
+    realms that were checked are exactly the realms that are acted on.
+
+    :param value: the realm parameter of a request
+    :return: list of realm names
+    """
+    items = value if isinstance(value, (list, tuple)) else [value]
+    names = (part.strip().lower() for item in items if item is not None for part in str(item).split(","))
+    return list(dict.fromkeys(name for name in names if name))
+
+
+def get_realms_of_resolver(resolver_name: str) -> list[str]:
+    """
+    Return a list of realm names that contain the given resolver.
+
+    :param resolver_name: The name of the resolver
+    :return: list of realm names
+    """
+    all_realms = get_realms()
+    return [
+        realm_name
+        for realm_name, realm_conf in all_realms.items()
+        if any(r.get("name") == resolver_name for r in realm_conf.get("resolver", []))
+    ]
+
+
+@log_with(log)
+def get_ordered_resolvers(realm: str, realm_config: dict | None = None) -> list[str]:
+    """
+    Return the resolvers of the given realm ordered by priority (lowest priority number first).
+    Resolvers with the same priority are ordered alphabetically by name. Resolvers pinned to a node
+    are filtered to the local node (``PI_NODE_UUID``). Duplicate resolver names are removed while
+    preserving order.
+
+    :param realm: The name of the realm
+    :param realm_config: optional, the result of ``get_realms(realm)`` when the caller already
+        fetched it, to avoid querying it again.
+    :return: list of resolver names
+    """
+    resolver_tuples = []
+    realm_config = get_realms(realm) if realm_config is None else realm_config
+    resolvers_in_realm = realm_config.get(realm, {}).get("resolver", [])
+    for resolver in resolvers_in_realm:
+        resolver_tuples.append((resolver.get("name"),
+                                resolver.get("priority") or 1000,
+                                resolver.get("node")))
+
+    # sort the resolvers first by priority and then alphabetically by name
+    sorted_resolvers = sorted(resolver_tuples, key=lambda res: (res[1], res[0] or ""))
+    # if the resolver contains a node setting, we only add it if it is on the correct node
+    local_node_uuid = get_app_config_value("PI_NODE_UUID")
+    resolvers = [r[0] for r in sorted_resolvers if not r[2] or r[2] == local_node_uuid]
+    # remove duplicate resolver names but keeping the order
+    seen = set()
+    return [x for x in resolvers if not (x in seen or seen.add(x))]

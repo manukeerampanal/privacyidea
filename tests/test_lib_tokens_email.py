@@ -1,24 +1,29 @@
 """
 This test file tests the lib.tokens.smstoken
 """
+import datetime
+import logging
 
-from .base import MyTestCase, FakeFlaskG, FakeAudit
-from privacyidea.lib.resolver import (save_resolver)
-from privacyidea.lib.realm import (set_realm)
-from privacyidea.lib.user import (User)
-from privacyidea.lib.utils import is_true
-from privacyidea.lib.tokenclass import DATE_FORMAT
-from privacyidea.lib.tokens.emailtoken import EmailTokenClass, EMAILACTION
-from privacyidea.models import (Token, Config, Challenge)
+from unittest import mock
+from dateutil.tz import tzlocal
+from testfixtures import log_capture
+
+from privacyidea.lib import _
 from privacyidea.lib.config import (set_privacyidea_config, set_prepend_pin,
                                     delete_privacyidea_config)
 from privacyidea.lib.policy import set_policy, SCOPE, PolicyClass
+from privacyidea.lib.realm import set_realm
+from privacyidea.lib.resolver import save_resolver
 from privacyidea.lib.smtpserver import add_smtpserver, delete_smtpserver
-from privacyidea.lib import _
-import datetime
-from dateutil.tz import tzlocal
+from privacyidea.lib.token import remove_token, get_tokens, import_tokens, init_token
+from privacyidea.lib.tokenclass import DATE_FORMAT
+from privacyidea.lib.tokens.emailtoken import EmailTokenClass, EMAILACTION
+from privacyidea.lib.tokens.emailtoken import log as email_log
+from privacyidea.lib.user import User
+from privacyidea.lib.utils import is_true
+from privacyidea.models import Token, Config
 from . import smtpmock
-import mock
+from .base import MyTestCase, FakeFlaskG, FakeAudit
 
 PWFILE = "tests/testdata/passwords"
 TEMPLATE_FILE = "tests/testdata/emailtemplate.html"
@@ -47,8 +52,7 @@ class EmailTokenTestCase(MyTestCase):
                              "fileName": PWFILE})
         self.assertTrue(rid > 0, rid)
 
-        (added, failed) = set_realm(self.realm1,
-                                    [self.resolvername1])
+        (added, failed) = set_realm(self.realm1, [{'name': self.resolvername1}])
         self.assertTrue(len(failed) == 0)
         self.assertTrue(len(added) == 1)
 
@@ -56,13 +60,13 @@ class EmailTokenTestCase(MyTestCase):
                     realm=self.realm1,
                     resolver=self.resolvername1)
 
-        user_str = "{0!s}".format(user)
+        user_str = f"{user!s}"
         self.assertTrue(user_str == "<root.resolver1@realm1>", user_str)
 
         self.assertFalse(user.is_empty())
         self.assertTrue(User().is_empty())
 
-        user_repr = "{0!r}".format(user)
+        user_repr = f"{user!r}"
         expected = "User(login='root', realm='realm1', resolver='resolver1')"
         self.assertTrue(user_repr == expected, user_repr)
 
@@ -278,7 +282,8 @@ class EmailTokenTestCase(MyTestCase):
         token.inc_otp_counter(counter=20)
         self.assertTrue(token.token.count == 21, token.token.count)
 
-    def test_13_check_otp(self):
+    @log_capture()
+    def test_13_check_otp(self, capture):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = EmailTokenClass(db_token)
         token.update({"otpkey": self.otpkey,
@@ -286,10 +291,20 @@ class EmailTokenTestCase(MyTestCase):
                       "otplen": 6,
                       "email": self.email})
         # OTP does not exist
-        self.assertTrue(token.check_otp_exist("222333") == -1)
+        self.assertEqual(-1, token.check_otp("222333"))
         # OTP does exist
-        res = token.check_otp_exist("969429")
-        self.assertTrue(res == 3, res)
+        self.assertEqual(3, token.check_otp("969429"))
+        # Check OTP length
+        self.assertEqual(-1, token.check_otp("12345"))
+        capture.check_present(
+            ('privacyidea.lib.decorators', 'INFO',
+             f'OTP value for token {self.serial1} (type: {token.type}) has wrong length (5 != 6)')
+        )
+        self.assertEqual(-1, token.check_otp("1234567"))
+        capture.check_present(
+            ('privacyidea.lib.decorators', 'INFO',
+             f'OTP value for token {self.serial1} (type: {token.type}) has wrong length (7 != 6)')
+        )
 
     def test_14_split_pin_pass(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
@@ -320,13 +335,18 @@ class EmailTokenTestCase(MyTestCase):
         self.assertTrue(token.check_pin("test"))
         self.assertFalse(token.check_pin("wrong pin"))
 
-    def test_17_challenge_token(self):
+    @log_capture(level=logging.DEBUG)
+    def test_17_challenge_token(self, capture):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = EmailTokenClass(db_token)
         token.set_pin(self.otppin)
 
+        email_log.setLevel(logging.DEBUG)
         r = token.is_challenge_request(self.otppin)
         self.assertTrue(r)
+        log_msg = str(capture)
+        self.assertNotIn(self.otppin, log_msg, log_msg)
+        email_log.setLevel(logging.INFO)
 
     @smtpmock.activate
     def test_18_challenge_request(self):
@@ -371,21 +391,24 @@ class EmailTokenTestCase(MyTestCase):
         self.assertTrue(r, r)
 
     def test_18b_challenge_request_dynamic_multivalue(self):
+        # The mock replaces the resolver, which the Redis user cache answers
+        # before: reading token.user.info below would then cache the real address
+        # and the mocked one would never be seen
+        self.pin_to_database("users")
         db_token = Token.query.filter_by(serial=self.serial2).first()
         token = EmailTokenClass(db_token)
         # if the email is a multi-value attribute, the first address should be chosen
         new_user_info = token.user.info.copy()
         new_user_info['email'] = ['email1@example.com', 'email2@example.com']
-        with mock.patch('privacyidea.lib.resolvers.PasswdIdResolver.IdResolver.getUserInfo') as mock_user_info:
+        with mock.patch('privacyidea.lib.resolvers.PasswdIdResolver.IdResolver.get_user_info') as mock_user_info:
             mock_user_info.return_value = new_user_info
             self.assertEqual(token._email_address, 'email1@example.com')
-
 
     @smtpmock.activate
     def test_19_emailtext(self):
         # create a EMAILTEXT policy:
         p = set_policy(name="emailtext",
-                       action="{0!s}={1!s}".format(EMAILACTION.EMAILTEXT, "'Your <otp>'"),
+                       action=f"{EMAILACTION.EMAILTEXT}='Your {{otp}}'",
                        scope=SCOPE.AUTH)
         self.assertTrue(p > 0)
 
@@ -402,7 +425,7 @@ class EmailTokenTestCase(MyTestCase):
         self.assertTrue(c[0], c)
         display_message = c[1]
         self.assertTrue(c[3]["attributes"]["state"], transactionid)
-        self.assertEqual(display_message, _("Enter the OTP from the Email:"))
+        self.assertEqual(display_message, _("Enter the OTP from the Email"))
         _n, mimetype = token._get_email_text_or_subject(options, EMAILACTION.EMAILTEXT)
         self.assertEqual(mimetype, "plain")
 
@@ -423,7 +446,7 @@ class EmailTokenTestCase(MyTestCase):
 
         # create a EMAILTEXT policy with template
         p = set_policy(name="emailtext",
-                       action="{0!s}=file:{1!s}".format(EMAILACTION.EMAILTEXT, TEMPLATE_FILE),
+                       action=f"{EMAILACTION.EMAILTEXT!s}=file:{TEMPLATE_FILE!s}",
                        scope=SCOPE.AUTH)
         self.assertTrue(p > 0)
 
@@ -443,7 +466,7 @@ class EmailTokenTestCase(MyTestCase):
         self.assertTrue(c[0], c)
         display_message = c[1]
         self.assertTrue(c[3]["attributes"]["state"], transactionid)
-        self.assertEqual(display_message, _("Enter the OTP from the Email:"))
+        self.assertEqual(display_message, _("Enter the OTP from the Email"))
 
     @smtpmock.activate
     def test_20_sending_email_exception(self):
@@ -499,7 +522,7 @@ class EmailTokenTestCase(MyTestCase):
         # set it to the token instead of changing the global config
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = EmailTokenClass(db_token)
-        token.add_tokeninfo("email.identifier", "myServer")
+        token.write_tokeninfo("email.identifier", "myServer")
         self.assertTrue(token.check_otp("123456", 1, 10) == -1)
         c = token.create_challenge(transactionid)
         self.assertTrue(c[0], c)
@@ -510,3 +533,105 @@ class EmailTokenTestCase(MyTestCase):
         r = token.check_challenge_response(passw=otp)
         self.assertTrue(r, r)
         delete_smtpserver("myServer")
+
+    def test_24_email_token_export(self):
+        # Set up the EmailTokenClass for testing
+        emailtoken = init_token(param={'serial': "PIEM12345678", 'type': 'email', 'otpkey': '12345',
+                                       "email": "test@example.com"})
+        emailtoken.set_description("this is a email token export test")
+        emailtoken.write_tokeninfo("hashlib", "sha512")
+
+        # Test that all expected keys are present in the exported dictionary
+        exported_data = emailtoken.export_token()
+
+        expected_keys = ["serial", "type", "description", "otpkey", "issuer"]
+        self.assertTrue(set(expected_keys).issubset(exported_data.keys()))
+
+        expected_tokeninfo_keys = ["email", "hashlib", "tokenkind"]
+        self.assertTrue(set(expected_tokeninfo_keys).issubset(exported_data["info_list"].keys()))
+
+        # Test that the exported values match the token's data
+        exported_data = emailtoken.export_token()
+        self.assertEqual(exported_data["serial"], "PIEM12345678")
+        self.assertEqual(exported_data["type"], "email")
+        self.assertEqual(exported_data["info_list"]["email"], "test@example.com")
+        self.assertEqual(exported_data["description"], "this is a email token export test")
+        self.assertEqual(exported_data["info_list"]["hashlib"], "sha512")
+        self.assertEqual(exported_data["otpkey"], '12345')
+        self.assertEqual(exported_data["info_list"]["tokenkind"], "software")
+        self.assertEqual(exported_data["issuer"], "privacyIDEA")
+
+        # Clean up
+        remove_token(emailtoken.token.serial)
+
+    @smtpmock.activate
+    def test_25_email_token_import(self):
+        # Define the token data to be imported
+        token_data = [{
+            "serial": "PIEM12345678",
+            "type": "email",
+            "description": "this is an email token import test",
+            "otpkey": self.otpkey,
+            "email": self.email,
+            "hashlib": "sha512",
+            "tokenkind": "software",
+            "issuer": "privacyIDEA",
+            "info_list": {"hashlib": "sha512", "timeWindow": 180, "email": self.email,
+                          "tokenkind": "software"}
+        }]
+
+        # Import the token
+        result = import_tokens(token_data)
+        self.assertIn("PIEM12345678", result.successful_tokens, result)
+
+        # Retrieve the imported token
+        emailtoken = get_tokens(serial=token_data[0]["serial"])[0]
+
+        # Verify that the token data matches the imported data
+        self.assertEqual(emailtoken.token.serial, token_data[0]["serial"])
+        self.assertEqual(emailtoken.type, token_data[0]["type"])
+        self.assertEqual(emailtoken.token.description, token_data[0]["description"])
+        self.assertEqual(emailtoken.token.get_otpkey().getKey().decode("utf-8"), token_data[0]["otpkey"])
+        self.assertEqual(emailtoken.get_tokeninfo("email"), token_data[0]["info_list"]["email"])
+        self.assertEqual(emailtoken.get_tokeninfo("hashlib"), token_data[0]["info_list"]["hashlib"])
+        self.assertEqual(emailtoken.get_tokeninfo("tokenkind"), token_data[0]["info_list"]["tokenkind"])
+
+        # Check that token works
+        self.assertEqual(0, emailtoken.check_otp('125165'))
+
+        # Clean up
+        remove_token(emailtoken.token.serial)
+
+    def test_26_update_dynamic_email_replaces_static_email(self):
+        """
+        Test that updating a token with dynamic_email removes the static email
+        address and vice versa.
+        """
+        # 1. Create a token with a static email address
+        token = init_token(param={'serial': "PIEM_DYN_TEST1", 'type': 'email', 'otpkey': '12345',
+                                  "email": "static@example.com"})
+
+        # Verify the static email is set and dynamic_email is not
+        self.assertEqual("static@example.com", token.get_tokeninfo("email"))
+        self.assertIsNone(token.get_tokeninfo("dynamic_email"))
+
+        # Now update the token to use dynamic_email
+        token.update({"dynamic_email": True})
+        token.save()
+
+        # Verify that the static email address has been removed
+        # and dynamic_email is set
+        self.assertTrue(is_true(token.get_tokeninfo("dynamic_email")))
+        self.assertIsNone(token.get_tokeninfo("email"))
+
+        # 2. Now update back to a static email address
+        token.update({"email": "new_static@example.com"})
+        token.save()
+
+        # Verify that dynamic_email has been removed
+        # and the static email address is set
+        self.assertEqual("new_static@example.com", token.get_tokeninfo("email"))
+        self.assertIsNone(token.get_tokeninfo("dynamic_email"))
+
+        # Clean up
+        remove_token("PIEM_DYN_TEST1")

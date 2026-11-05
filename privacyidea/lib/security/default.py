@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  product:  privacyIDEA is a fork of LinOTP
 #  May, 08 2014 Cornelius Kölbel
 #  http://www.privacyidea.org
@@ -51,7 +49,6 @@ from privacyidea.lib.utils import (is_true, to_unicode, to_bytes,
                                    hexlify_and_unicode)
 
 from .password import PASSWORD
-from ..framework import get_app_config_value
 from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives import padding
 
@@ -72,7 +69,11 @@ def create_key_from_password(password):
     return key
 
 
-class SecurityModule(object):
+def int_list_to_bytestring(int_list):  # pragma: no cover
+    return b"".join([bytes((i, )) for i in int_list])
+
+
+class SecurityModule:
     TOKEN_KEY = 0
     CONFIG_KEY = 1
     VALUE_KEY = 2
@@ -94,27 +95,27 @@ class SecurityModule(object):
     def setup_module(self, params):
         fname = 'setup_module'
         log.error("This is the base class. You should implement "
-                  "the method : %s " % (fname,))
-        raise NotImplementedError("Should have been implemented {0!s}".format(fname))
+                  f"the method : {fname} ")
+        raise NotImplementedError(f"Should have been implemented {fname!s}")
 
     ''' base methods '''
     def random(self, length):
         fname = 'random'
         log.error("This is the base class. You should implement "
-                  "the method : %s " % (fname,))
-        raise NotImplementedError("Should have been implemented {0!s}".format(fname))
+                  f"the method : {fname} ")
+        raise NotImplementedError(f"Should have been implemented {fname!s}")
 
     def encrypt(self, data, iv, key_id=TOKEN_KEY):
         fname = 'encrypt'
         log.error("This is the base class. You should implement "
-                  "the method : %s " % (fname,))
-        raise NotImplementedError("Should have been implemented {0!s}".format(fname))
+                  f"the method : {fname} ")
+        raise NotImplementedError(f"Should have been implemented {fname!s}")
 
     def decrypt(self, enc_data, iv, key_id=TOKEN_KEY):
         fname = 'decrypt'
         log.error("This is the base class. You should implement "
-                  "the method : %s " % (fname,))
-        raise NotImplementedError("Should have been implemented {0!s}".format(fname))
+                  f"the method : {fname} ")
+        raise NotImplementedError(f"Should have been implemented {fname!s}")
 
     def decrypt_password(self, crypt_pass):
         """
@@ -148,11 +149,10 @@ class SecurityModule(object):
 
         This function returns a unicode string with a
         hexlified contents of the IV and the encrypted data separated by a
-        colon like u"4956:44415441"
+        colon like "4956:44415441"
 
         :param password: The password that is to be encrypted
         :type password: str
-
         :return: encrypted data - leading iv, separated by the ':'
         :rtype: str
         """
@@ -164,11 +164,10 @@ class SecurityModule(object):
 
         This function returns a unicode string with a
         hexlified contents of the IV and the encrypted data separated by a
-        colon like u"4956:44415441"
+        colon like "4956:44415441"
 
         :param pin: the pin that should be encrypted
         :type pin: str
-
         :return: encrypted data - leading iv, separated by the ':'
         :rtype: str
         """
@@ -228,7 +227,7 @@ class SecurityModule(object):
         :return: Module dependent
         """
         fname = "create_keys"
-        raise NotImplementedError("Should have been implemented {0!s}".format(fname))
+        raise NotImplementedError(f"Should have been implemented {fname!s}")
 
 
 class DefaultSecurityModule(SecurityModule):
@@ -314,7 +313,7 @@ class DefaultSecurityModule(SecurityModule):
 
             try:
                 keys = self.password_decrypt(cipher, password)
-            except UnicodeDecodeError as e:
+            except UnicodeDecodeError:
                 raise HSMException("Error decrypting the encryption key. You "
                                    "probably provided the wrong password.")
             secret = keys[slot_id*32:(slot_id+1)*32]
@@ -326,9 +325,8 @@ class DefaultSecurityModule(SecurityModule):
                     secret = f.read(32)
 
             if secret == b"":
-                raise HSMException("No secret key defined for index: %s !\n"
-                                   "Please extend your %s"" !"
-                                   % (str(slot_id), self.secFile))
+                raise HSMException(f"No secret key defined for index: {str(slot_id)} !\n"
+                                   f"Please extend your {self.secFile}"" !")
 
         # cache the result
         self.secrets[slot_id] = secret
@@ -436,7 +434,7 @@ class DefaultSecurityModule(SecurityModule):
         cipher = aes_cbc_encrypt(bkey, iv, input_data)
         iv_hex = hexlify_and_unicode(iv)
         cipher_hex = hexlify_and_unicode(cipher)
-        return "{0!s}:{1!s}".format(iv_hex, cipher_hex)
+        return f"{iv_hex!s}:{cipher_hex!s}"
 
     @staticmethod
     def password_decrypt(enc_data, password):

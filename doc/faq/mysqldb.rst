@@ -1,39 +1,66 @@
+.. _database_connect:
+
+Database connect string
+-----------------------
+
+Due to its use of a database abstraction layer, privacyIDEA can work with several
+databases with the help of corresponding database drivers.
+
+The database and corresponding driver are specified in the connect string
+``SQLALCHEMY_DATABASE_URI`` in :ref:`cfgfile`
+
+.. _tested_databases:
+
+Tested database versions
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The continuous integration runs the full test suite against **MariaDB 10.11**
+(the LTS most installations run) and **PostgreSQL 17**. On every change to the
+database models or migrations it additionally runs the migration test suite,
+which verifies that the schema migrations apply cleanly in both directions
+(upgrade *and* downgrade) starting from the v3.9 schema — against **MariaDB
+10.11 and 11**, **MySQL 8.4** and **PostgreSQL 17**. A single-node MariaDB Galera cluster is
+covered as well, to catch cluster-specific DDL constraints.
+
+**SQLite** is the default for development and small, single-node installations.
+
 .. _mysqldb:
 
-MySQL database connect string
------------------------------
+MySQL / MariaDB
+~~~~~~~~~~~~~~~
 
-You can use the python package ``MySQL-python`` or ``PyMySQL``.
+While there are several database driver packages for MySQL, we recommend *PyMySQL*
+which is a pure Python package and does not require external libraries or a build
+environment on the server.
 
-``PyMySQL`` is a pure python implementation. ``MySQL-python`` is a wrapper
-for a C implementation. I.e. when installing ``MySQL-python`` your python
-virtualenv, you also need to install packages like *python-dev* and
-*libmysqlclient-dev*.
+*PyMySQL* is already installed in the virtual environment as a requirement for
+privacyIDEA.
 
-Depending on whether you are using ``MySQL-python`` or ``PyMySQL`` you need
-to specify different connect strings in ``SQLALCHEMY_DATABASE_URI``.
+**connect string**: ``mysql+pymysql://<user>:<password>@<host>/<database>``
 
-MySQL-python
-~~~~~~~~~~~~
-**connect string**: ``mysql://u:p@host/db``
 
-Installation
-............
+.. _postgresdb:
 
-Install a package *libmysqlclient-dev* from your distribution. The name may
-vary depending on which distribution you are running::
+PostgreSQL
+~~~~~~~~~~
 
-   pip install MySQL-python
+PostgreSQL is tested using the ``psycopg2`` driver which can be installed into
+the privacyIDEA virtual environment with::
 
-PyMySQL
-~~~~~~~
-**connect string**: ``pymysql://u:p@host/db``
+   (privacyidea) $ pip install psycopg2_binary
 
-Installation
-............
+The corresponding connect string looks like this:
 
-Install in your virtualenv::
+**connect string**: ``postgresql+psycopg2://<user>:<password>@<host>/<database>``
 
-   pip install pymysql-sa
-   pip install PyMySQL
 
+Other databases
+~~~~~~~~~~~~~~~
+
+The continuous integration regularly tests MariaDB, MySQL and PostgreSQL, see
+:ref:`tested_databases`.
+
+Other databases like Oracle or MSSQL are working as well but not all
+functionality can be assured, so be aware that "Your mileage may vary".
+For example, ``pi-manage backup`` does not support them, see
+:ref:`pimanage_backup`.

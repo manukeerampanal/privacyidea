@@ -1,19 +1,22 @@
-# coding: utf-8
 """
 This test file tests the lib/radiusserver.py
 """
+import logging
+from testfixtures import LogCapture
+import pyrad
+
 from .base import MyTestCase
-from privacyidea.lib.error import ConfigAdminError, privacyIDEAError
+from privacyidea.lib.error import ConfigAdminError, PrivacyIDEAError
 from privacyidea.lib.radiusserver import (add_radius, delete_radius,
                                           get_radiusservers, get_radius,
-                                          RADIUSServer, test_radius)
-from privacyidea.lib.config import set_privacyidea_config
+                                          test_radius)
 from . import radiusmock
 DICT_FILE = "tests/testdata/dictionary"
 
 
 # prevent nosetests to run test_radius as a unittest
 test_radius.__test__ = False
+
 
 class RADIUSServerTestCase(MyTestCase):
 
@@ -23,8 +26,10 @@ class RADIUSServerTestCase(MyTestCase):
         self.assertTrue(r > 0)
         r = add_radius(identifier="myserver1", server="1.2.3.4",
                        secret="testing123")
+        self.assertTrue(r > 0)
         r = add_radius(identifier="myserver2", server="1.2.3.4",
                        secret="testing123")
+        self.assertTrue(r > 0)
 
         server_list = get_radiusservers()
         self.assertTrue(server_list)
@@ -58,27 +63,41 @@ class RADIUSServerTestCase(MyTestCase):
     @radiusmock.activate
     def test_04_RADIUS_request(self):
         radiusmock.setdata(response=radiusmock.AccessAccept)
-        r = add_radius(identifier="myserver", server="1.2.3.4",
-                       secret="testing123", dictionary=DICT_FILE)
-        self.assertTrue(r > 0)
+        logging.getLogger("privacyidea.lib.radiusserver").setLevel(logging.DEBUG)
+        with LogCapture(level=logging.DEBUG) as lc:
+            r = add_radius(identifier="myserver", server="1.2.3.4",
+                           secret="testing123", dictionary=DICT_FILE)
+            self.assertIn("'secret': 'HIDDEN'", lc.records[0].message)
+            self.assertTrue(r > 0)
+
         radius = get_radius("myserver")
-        r = RADIUSServer.request(radius.config, "user", "password")
-        self.assertEqual(r, True)
+        with LogCapture(level=logging.DEBUG) as lc:
+            r = radius.request("user", "Tr0ub4dor&3")
+            self.assertIsInstance(r, pyrad.packet.Packet)
+            self.assertEqual(r.code, pyrad.packet.AccessAccept)
+            # The password is hidden wherever it was passed, so assert on the value rather than on
+            # the position or keyword it arrived in.
+            self.assertNotIn("Tr0ub4dor&3", lc.records[0].message)
+            self.assertIn("HIDDEN", lc.records[0].message)
 
         radiusmock.setdata(response=radiusmock.AccessReject)
-        r = RADIUSServer.request(radius.config, "user", "password")
-        self.assertEqual(r, False)
+        r = radius.request("user", "password")
+        self.assertIsInstance(r, pyrad.packet.Packet)
+        self.assertEqual(r.code, pyrad.packet.AccessReject)
 
     @radiusmock.activate
-    def test_05_RADIUS_request(self):
+    def test_05_timeout_RADIUS_request(self):
         radiusmock.setdata(response=radiusmock.AccessAccept, timeout=True)
         r = add_radius(identifier="myserver", server="1.2.3.4",
                        secret="testing123", dictionary=DICT_FILE)
         self.assertTrue(r > 0)
         radius = get_radius("myserver")
         # A timeout will return false
-        r = RADIUSServer.request(radius.config, "user", "password")
-        self.assertEqual(r, False)
+        with LogCapture(level=logging.WARNING) as lc:
+            r = radius.request("user", "password")
+            self.assertIsNone(r)
+            self.assertIn("Timeout while contacting remote radius server 1.2.3.4",
+                          lc.records[0].message)
 
     @radiusmock.activate
     def test_06_test_radius(self):
@@ -94,8 +113,21 @@ class RADIUSServerTestCase(MyTestCase):
                         secret="testing123", dictionary=DICT_FILE)
         self.assertTrue(r)
 
+        logging.getLogger("privacyidea.lib.radiusserver").setLevel(logging.DEBUG)
+        with LogCapture(level=logging.DEBUG, attributes=lambda rec: (rec.levelname, rec.message)) as lc:
+            radiusmock.setdata(response=radiusmock.AccessChallenge,
+                               response_data={"Reply-Message": "Please enter OTP"})
+            r = test_radius(identifier="myserver", server="1.2.3.4",
+                            user="user", password="password",
+                            secret="testing123", dictionary=DICT_FILE)
+            self.assertFalse(r)
+            self.assertNotIn("testing123", lc.records[0].message)
+            self.assertIn("'password': 'HIDDEN', 'secret': 'HIDDEN'", lc.records[0].message)
+            lc.check_present(("INFO", "RADIUS Server test failed! Server requires "
+                                      "Challenge-Response (Answer: ['Please enter OTP'])"))
+
         # raises error on long secrets
-        self.assertRaises(privacyIDEAError,
+        self.assertRaises(PrivacyIDEAError,
                           test_radius,
                           identifier="myserver", server="1.2.3.4",
                           user="user", password="password",
@@ -108,5 +140,61 @@ class RADIUSServerTestCase(MyTestCase):
                        secret="testing123", dictionary=DICT_FILE)
         self.assertTrue(r > 0)
         radius = get_radius("myserver")
-        r = RADIUSServer.request(radius.config, u"nönäscii", u"passwörd")
-        self.assertEqual(r, True)
+        r = radius.request("nönäscii", "passwörd")
+        self.assertIsInstance(r, pyrad.packet.Packet)
+        self.assertEqual(r.code, pyrad.packet.AccessAccept)
+
+    @radiusmock.activate
+    def test_08_RADIUS_with_message_authenticator(self):
+        # TODO: The RADIUS mock does not support the Message-Authenticator attribute
+        #       so we can only test for the absence of the attribute
+        r = add_radius(identifier="myserver", server="1.2.3.4",
+                       secret="testing123", dictionary="deploy/privacyidea/dictionary",
+                       options={"message_authenticator": True})
+        self.assertTrue(r > 0)
+        radius = get_radius("myserver")
+        radiusmock.setdata(response=radiusmock.AccessAccept)
+        with LogCapture(level=logging.WARNING) as lc:
+            self.assertRaises(PrivacyIDEAError, radius.request, "user", "password")
+            self.assertTrue(lc.records[0].message.startswith("Unable to verify Message-Authenticator "
+                                                             "Attribute in response:"))
+        delete_radius("myserver")
+
+    def test_09_export_import_roundtrip_and_censor(self):
+        from privacyidea.lib.radiusserver import (export_radiusserver, import_radiusserver,
+                                                  list_radiusservers)
+        from privacyidea.lib.crypto import CENSORED
+        add_radius(identifier="exprad", server="1.2.3.4", secret="radsecret", dictionary=DICT_FILE)
+        # censored export replaces the secret
+        censored = export_radiusserver(censor=True)
+        self.assertEqual(censored["exprad"]["secret"], CENSORED)
+        # clear-text export contains the secret and round-trips through import
+        # (regression: import used to KeyError on a 'password' key the export
+        # never produced)
+        exported = export_radiusserver()
+        self.assertEqual(exported["exprad"]["secret"], "radsecret")
+        delete_radius("exprad")
+        import_radiusserver(exported)
+        servers = list_radiusservers()
+        self.assertIn("exprad", servers)
+        self.assertEqual(servers["exprad"]["secret"], "radsecret")
+        delete_radius("exprad")
+
+    def test_10_import_legacy_password_key(self):
+        from privacyidea.lib.radiusserver import import_radiusserver, list_radiusservers
+        # Config files exported by older privacyIDEA versions serialize the RADIUS
+        # secret under the legacy 'password' key. Importing them must still work
+        # (the secret is mapped onto the 'secret' key add_radius() expects).
+        legacy_export = {"legacyrad": {"server": "1.2.3.4",
+                                       "port": 1812,
+                                       "dictionary": DICT_FILE,
+                                       "description": "",
+                                       "password": "legacysecret",
+                                       "timeout": 5,
+                                       "retries": 3,
+                                       "options": {}}}
+        import_radiusserver(legacy_export)
+        servers = list_radiusservers()
+        self.assertIn("legacyrad", servers)
+        self.assertEqual("legacysecret", servers["legacyrad"]["secret"])
+        delete_radius("legacyrad")

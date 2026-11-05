@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# (c) NetKnights GmbH 2024,  https://netknights.it
 #
 #  privacyIDEA is a fork of LinOTP
 #  May 08, 2014 Cornelius Kölbel
@@ -29,7 +29,10 @@
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-__doc__="""This is the BaseClass for audit trails
+# SPDX-FileCopyrightText: 2025 Paul Lettich <paul.lettich@netknights.it>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+"""This is the BaseClass for audit trails
 
 The audit is supposed to work like this. First we need to create an audit
 object. E.g. this can be done in the before_request:
@@ -40,9 +43,9 @@ During the request, the g.audit_object can be used to add audit information:
 
     g.audit_object.log({"client": "123.2.3.4", "action": "validate/check"})
 
-Thus at many different places in the code, audit information can be added to
+Thus, at many different places in the code, audit information can be added to
 the audit object.
-Finally the audit_object needs to be stored to the audit storage. So we call:
+Finally, the audit_object needs to be stored to the audit storage. So we call::
 
     g.audit_object.finalize_log()
 
@@ -53,9 +56,11 @@ storage.
 import logging
 from collections import OrderedDict
 
-log = logging.getLogger(__name__)
+from privacyidea.config import ConfigKey
 from privacyidea.lib.log import log_with
 from privacyidea.lib.utils import parse_timedelta, get_module_class
+
+log = logging.getLogger(__name__)
 
 
 @log_with(log, log_entry=False)
@@ -73,13 +78,13 @@ def getAudit(config, startdate=None):
     :param startdate: The datetime startdate of the request
     :return: Audit Object
     """
-    audit_module = config.get("PI_AUDIT_MODULE")
+    audit_module = config.get(ConfigKey.AUDIT_MODULE)
     audit = get_module_class(audit_module, "Audit", "log")(config, startdate)
     return audit
 
 
 @log_with(log)
-def search(config, param=None, user=None):
+def search(config, param=None, admin_params: dict | None = None):
     """
     Returns a list of audit entries, supports pagination
 
@@ -101,10 +106,13 @@ def search(config, param=None, user=None):
         sortorder = param["sortorder"]
         del param["sortorder"]
     if "page" in param:
-        page = param["page"]
+        page = max(1, int(param["page"]))
         del param["page"]
     if "page_size" in param:
-        page_size = param["page_size"]
+        page_size = int(param["page_size"])
+        if page_size < 1:
+            log.info("Requested Audit-Log page size is negative. Setting it to 15")
+            page_size = 15
         del param["page_size"]
     if "timelimit" in param:
         timelimit = parse_timedelta(param["timelimit"])
@@ -113,7 +121,7 @@ def search(config, param=None, user=None):
         hidden_columns = param["hidden_columns"]
         del param["hidden_columns"]
 
-    pagination = audit.search(param, sortorder=sortorder, page=page,
+    pagination = audit.search(param, admin_params=admin_params, sortorder=sortorder, page=page,
                               page_size=page_size, timelimit=timelimit)
 
     # delete hidden columns from response

@@ -1,0 +1,72 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { Component, inject, model } from "@angular/core";
+import { MatButtonModule } from "@angular/material/button";
+import { MatIcon } from "@angular/material/icon";
+import { MatFormField, MatInput, MatLabel } from "@angular/material/input";
+import {
+  MessageDialogComponent,
+  MessageDialogData
+} from "@components/shared/dialog/message-dialog/message-dialog.component";
+import { AuthService, AuthServiceInterface } from "@services/auth/auth.service";
+import { DialogService, DialogServiceInterface } from "@services/dialog/dialog.service";
+import { NotificationService, NotificationServiceInterface } from "@services/notification/notification.service";
+import { TokenService, TokenServiceInterface } from "@services/token/token.service";
+
+@Component({
+  selector: "app-set-pin-action",
+  imports: [MatIcon, MatButtonModule, MatFormField, MatLabel, MatInput],
+  templateUrl: "./set-pin-action.component.html",
+  styleUrl: "./set-pin-action.component.scss"
+})
+export class SetPinActionComponent {
+  private readonly notificationService: NotificationServiceInterface = inject(NotificationService);
+  private readonly tokenService: TokenServiceInterface = inject(TokenService);
+  protected readonly authService: AuthServiceInterface = inject(AuthService);
+  private readonly dialogService: DialogServiceInterface = inject(DialogService);
+  setPinValue = model.required<string>();
+  repeatPinValue = model.required<string>();
+
+  setPin() {
+    if (this.setPinValue() !== this.repeatPinValue()) {
+      console.error("PINs do not match.");
+      this.notificationService.warning($localize`:@@common.pinsDoNotMatchError:PINs do not match.`);
+      return;
+    }
+    this.tokenService.setPin(this.tokenService.tokenSerial(), this.setPinValue()).subscribe({
+      next: () => {
+        this.notificationService.success($localize`:@@token.pinSetSuccess:PIN set successfully.`);
+        this.setPinValue.set("");
+        this.repeatPinValue.set("");
+      }
+    });
+  }
+
+  setRandomPin() {
+    this.tokenService.setRandomPin(this.tokenService.tokenSerial()).subscribe({
+      next: (result) => {
+        const dialogData: MessageDialogData = {
+          title: $localize`:@@token.pinSetSuccessfully:PIN Set Successfully`,
+          texts: [$localize`:@@token.randomlyGenerated:Randomly generated PIN:`, result.detail.pin]
+        };
+        this.dialogService.openDialog({ component: MessageDialogComponent, data: dialogData });
+      }
+    });
+  }
+}

@@ -8,26 +8,21 @@ Ubuntu Packages
 
 There are ready made packages for Ubuntu.
 
-Packages of older releases of privacyIDEA up to version 2.23 are available for
-Ubuntu 14.04 LTS and Ubuntu 16.04 LTS from a public ppa repository [#ppa]_.
-Using these is deprecated.
-
-For recent releases of privacyIDEA starting from version 3.0 a repository is
-available which provides packages for Ubuntu 16.04 LTS, 18.04 LTS and 20.04LTS [#ubuntu]_.
+A repository provides packages for Ubuntu 22.04 LTS, 24.04 LTS and 26.04 LTS.
 
 .. note:: The packages ``privacyidea-apache2`` and ``privacyidea-nginx`` assume
    that you want to run a privacyIDEA system. These packages deactivate all
-   other (default) websites. Instead, you may install the package
-   ``privacyidea-mysql`` to install the privacyIDEA application and setup the
-   database without any webserver configuration. After this, you can integrate
+   other (default) websites. Instead, you may install only the package
+   ``privacyidea``, which contains the privacyIDEA application without any
+   webserver or database configuration. After this, you can integrate
    privacyIDEA with your existing webserver configuration.
 
 Read about the upgrading process in :ref:`upgrade_packaged`.
 
-Installing privacyIDEA 3.0 or higher
-....................................
+Installing privacyIDEA
+......................
 
-Before installing privacyIDEA 3.0 or upgrading to 3.0 you need to add the repository.
+Before installing privacyIDEA you need to add the package repository to the package manager.
 
 .. _add_ubuntu_repository:
 
@@ -38,62 +33,44 @@ The packages are digitally signed. First you need to download the signing key::
 
    wget https://lancelot.netknights.it/NetKnights-Release.asc
 
-On Ubuntu 16.04 check the fingerprint of the key::
-
-   gpg --with-fingerprint NetKnights-Release.asc
-
-On 18.04 and 20.04 you need to run::
+Then you can verify the fingerprint::
 
    gpg --import --import-options show-only --with-fingerprint NetKnights-Release.asc
 
-The fingerprint of the key is::
+The output must show the key ``NetKnights GmbH <release@netknights.it>`` with
+this fingerprint::
 
-   pub 4096R/AE250082 2017-05-16 NetKnights GmbH <release@netknights.it>
-   Key fingerprint = 0940 4ABB EDB3 586D EDE4 AD22 00F7 0D62 AE25 0082
+   pub   rsa4096 2017-05-16 [SC]
+         0940 4ABB EDB3 586D EDE4  AD22 00F7 0D62 AE25 0082
+   uid                      NetKnights GmbH <release@netknights.it>
+   sub   rsa4096 2017-05-16 [E]
 
-Now add the signing key to your system::
+Other GnuPG versions arrange the output differently, but the fingerprint must
+be the same.
 
-   apt-key add NetKnights-Release.asc
+Now you can add the signing key to your system::
 
-Now you need to add the repository for your release (either xenial/16.04LTS, bionic/18.04LTS, focal/20.04LTS)
+   mv NetKnights-Release.asc /etc/apt/trusted.gpg.d/
 
-You can do this by running the command::
+Now you need to add the repository for your release (either ``jammy/22.04 LTS``,
+``noble/24.04 LTS`` or ``resolute/26.04 LTS``).
 
-   add-apt-repository http://lancelot.netknights.it/community/xenial/stable
+You can do this by running the following command on Ubuntu 24.04::
 
-or::
+   add-apt-repository http://lancelot.netknights.it/community/noble/stable
 
-   add-apt-repository http://lancelot.netknights.it/community/bionic/stable
+Change the code name to the running Ubuntu version accordingly.
 
-or::
-
-   add-apt-repository http://lancelot.netknights.it/community/focal/stable
-
-As an alternative you can add the repo in a dedicated file. Create a new 
+As an alternative you can add the repo in a dedicated file. Create a new
 file ``/etc/apt/sources.list.d/privacyidea-community.list`` with the
-following contents::
+following contents for Ubuntu 24.04::
 
-   deb http://lancelot.netknights.it/community/xenial/stable xenial main
+    deb http://lancelot.netknights.it/community/noble/stable noble main
 
-or::
+Change the code name to the running Ubuntu version accordingly.
 
-   deb http://lancelot.netknights.it/community/bionic/stable bionic main
-
-or::
-
-   deb http://lancelot.netknights.it/community/focal/stable focal main
-
-.. note:: While the link http://lancelot.netknights.it/community/ and its
-   subdirectories are browsable, it is only available via http! Most browsers
-   will automatically redirect you to https, which will result in a 404 error,
-   since the link http**s**://lancelot.netknights.it/community/ does not
-   exist. So if you want to browse the repository, take care to do this via http.
-   This is OK. The apt program fetches all packages via http.
-   If you still fail to fetch packages, you might most probably need to check
-   your firewall and proxy settings.
-
-Installation of privacyIDEA 3.x
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Installation of privacyIDEA
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 After having added the repositories, run::
 
@@ -102,6 +79,9 @@ After having added the repositories, run::
 
 If you do not like the Apache2 webserver you could
 alternatively use the meta package ``privacyidea-nginx``.
+
+Both packages also install the cron jobs that clean up the database, see
+:ref:`cleanup_jobs`.
 
 ------------
 
@@ -120,15 +100,10 @@ To install this module run::
 
    apt-get install privacyidea-radius
 
+The package enables its own FreeRADIUS site ``privacyidea`` and the module
+``perl-privacyidea``. It disables all other enabled sites and the ``eap``
+module, so install it on a FreeRADIUS server that serves nothing else.
+
+The ``privacyidea-radius`` package is available for Ubuntu 22.04 LTS and 24.04 LTS.
+
 For further details see :ref:`rlm_perl`.
-
-.. rubric:: Footnotes
-
-.. [#ppa] https://launchpad.net/~privacyidea
-.. [#ubuntu] Starting with privacyIDEA 2.15 Ubuntu 16.04 packages are
-   provided. Starting with privacyIDEA 3.0 Ubuntu 16.04 and 18.04 packages
-   are provided, Ubuntu 14.04 packages are dropped.
-   Starting with privacyIDEA 3.5 Ubuntu 20.04 packages are available.
-.. [#simpleSAML] https://github.com/privacyidea/simplesamlphp-module-privacyidea
-.. [#otrs] http://www.otrs.com/
-

@@ -1,0 +1,84 @@
+@use "styles";
+
+.view-conditions-container {
+  display: flex;
+  flex-direction: column;
+
+  * {
+    padding: 0 8px !important;
+
+    &:not(:last-child) {
+      border-bottom: 1px solid var(--mat-sys-outline-variant);
+    }
+  }
+}
+
+.additional-conditions-grid {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+// One card per condition, at the s step of the card scale.
+.additional-condition-item {
+  @include styles.card-recessed(3);
+  display: flex;
+  flex: 1 1 var(--card-width-s);
+  flex-direction: column;
+  gap: 8px;
+  max-width: 100%;
+  min-width: var(--card-width-s);
+  padding: 10px 12px;
+}
+
+.status-row {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+
+  .active-status mat-icon {
+    font-size: 18px;
+    height: 18px;
+    width: 18px;
+    &.active {
+      color: var(--mat-sys-primary);
+    }
+    &:not(.active) {
+      color: var(--mat-sys-error);
+    }
+  }
+
+  .additional-condition-badge {
+    background: var(--mat-sys-secondary-container);
+    border-radius: var(--border-radius);
+    color: var(--mat-sys-on-secondary-container);
+    font-size: 10px;
+    padding: 1px 6px;
+    text-transform: uppercase;
+  }
+}
+
+.data-row {
+  align-items: start;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(4, 1fr);
+  width: 100%;
+}
+
+.force-wrap {
+  color: var(--mat-sys-on-surface);
+  display: block;
+  font-size: 13px;
+  min-width: 0;
+  overflow-wrap: break-word;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.missing-data-info {
+  color: var(--mat-sys-on-surface-variant);
+  font-size: 13px;
+  font-style: italic;
+}

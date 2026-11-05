@@ -1,0 +1,6 @@
+<app-dialog-wrapper
+  [title]="title()"
+  [actions]="actions()"
+  (actionTriggered)="onAction($event)">
+  <p>{{ message() }}</p>
+</app-dialog-wrapper>

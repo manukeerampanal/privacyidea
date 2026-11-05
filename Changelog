@@ -1,3 +1,863 @@
+Version 3.14, 2026-09-30
+
+  Features:
+  * API clients can authenticate with an API key in the `X-API-Key` header, which gives an integration a stable,
+    revocable machine identity of its own. On top of that, such a client can be issued a rotating "remember this
+    device" cookie with theft detection, gated by the new `remember_device` policy and revocable per device by an
+    admin (#5636, #5637, #5639, #5640, #5696)
+  * Users and administrators can store their own settings, e.g. the state of the WebUI widgets, via the new user
+    settings API. Only known setting keys are accepted. Rows whose user no longer exists can be cleaned up with
+    `pi-tokenjanitor user-settings` (#4220, #5657, #5478)
+  * Challenges can optionally be cached in Redis (`PI_REDIS_URL` and `PI_REDIS_CACHE_CHALLENGES`) to keep the
+    short-lived challenge writes off the database. The challenge data is now always an encrypted JSON dict, hence the
+    migration clears the challenge table (#5532, #5620)
+  * The dashboard shows which plugins and client applications talk to this server and whether they are covered by a
+    subscription, with links to the documentation and the products (#4057, #5383)
+  * The new WebUI is the default WebUI. It is served from `static/`, the previous WebUI moved to `static_old/` and can
+    be selected for this version with `PI_STATIC_FOLDER` and `PI_TEMPLATE_FOLDER`, please read the update notes. The
+    WebUI sources are no longer part of the release (#5953)
+  * Conditional access refuses an authentication request because of what happened before it. Every authentication
+    request is classified and written to the new authentication log. Conditional access policies count those events
+    for a user or a source IP over a time window and, once a threshold is reached, lock the user, block the source
+    IP, send an email or deny the request. Locks and blocks stay in force until they expire or an administrator lifts
+    them. Ready-made templates cover common attacks like password spraying and user enumeration. A reused "remember
+    this device" cookie and a suspended API key are events of their own; a reused cookie also revokes every
+    remembered device of the user. Nothing is enabled until a conditional access policy is created (#4914, #5714)
+  * Three further optional Redis caches, each off by default: `PI_REDIS_CACHE_USERS` shares the user store lookups
+    of all resolver types between the workers, `PI_REDIS_CACHE_AUTH` holds the entries of the `auth_cache` policy
+    and `PI_REDIS_CACHE_HEALTH` the certificate health results of the dashboard. The cached users and credentials are
+    stored encrypted (#5792)
+  * Two new passkey policies: `passkey_allowed_authenticator_device_types` (enrollment and authentication scope)
+    restricts passkeys to `single_device` or `multi_device` authenticators, and `passkey_enforce_user_handle`
+    requires the userHandle of the authenticator to match the FIDO2 user id of the token (#5815)
+
+  Enhancements:
+  * The token usage widget on the dashboard also reports how many users already own a token and how many do
+    not, and can be narrowed to a single realm. The chosen realm is stored with the widget. A resolver that
+    cannot be read is left out of both numbers and named below them, so an installation with a broken
+    resolver still sees the count of the resolvers that answered. Both numbers come from the new endpoint
+    `GET /user/count`, which counts the users `GET /user/` lists and how many of them own a token, guarded
+    by the `userlist` action like the user list itself and, as it tells who owns a token, by the `tokenlist`
+    action in every realm counted
+  * The user list can be narrowed to the users that own a token, or to those that do not, with the new
+    `has_tokens` filter of `GET /user/`. Token ownership is privacyIDEA's own record rather than a user
+    store attribute, so the filter is applied after the resolvers answered. A revoked token does not count,
+    a disabled one does. An administrator needs the `tokenlist` action in every realm listed to use the
+    filter. The token usage widget links its two user counts to the matching list
+  * `GET /user/` lists the resolvers it could not query in `detail.skipped_resolvers` and in the audit
+    log, while still returning the users of the others (#5457)
+  * The tags `{now}` and `{current_time}` can be used in event handlers, and the custom user attributes handler
+    replaces tags in the attribute value (#5862, #5935)
+  * `pi-manage backup create` and `restore` support PostgreSQL. Everything that can refuse a restore is checked
+    before the archive is extracted (#5891)
+  * The packages and the Docker image schedule the cleanup of every table that collects stale rows. The new page
+    "Cleanup Jobs" of the documentation lists them (#6005)
+  * Listing tokens resolves the token owners with one user store lookup per resolver instead of one per token (#5750)
+  * The audit signing key is loaded once per process instead of for every response and audit entry (#5913)
+  * The metric samples of a request are written in one transaction, and the last seen time of a client application
+    is written at most every `PI_CLIENTAPPLICATION_WRITE_INTERVAL` seconds (default 60) (#5792, #5793)
+  * The python class named by the `module` of an SMS gateway or the `pinhandling` policy is checked against the
+    shipped classes and `PI_SMS_PROVIDER_MODULES` / `PI_PIN_HANDLER_MODULES`. `PI_MODULE_ALLOWLIST_MODE` defaults to
+    `warn`, so nothing changes on upgrade (#5988)
+  * Self-registration (the `register` scope and the `/register` endpoints) is deprecated (#5988)
+  * PUSH tokens can use Firebase, HTTP, or Script SMS gateways to deliver signed challenge payloads. HTTP and Script
+    gateways require `ALLOW_PUSH=yes`; Firebase gateways remain enabled by default. HTTP gateways can receive the
+    structured payload as JSON, while Script gateways receive it as JSON on stdin. In the options of an HTTP gateway,
+    a PUSH payload additionally expands the `{message}` placeholder; the rendering of SMS messages is unchanged.
+    (#5864)
+  * The decrypted public SSH key of an SSH key token can be retrieved via the new endpoint `GET /token/sshkey/<serial>`,
+    guarded by the new policy action `sshkey_read` (admin and user scope).
+  * SSH key tokens now store an integrity checksum of the SSH key data in the encrypted OTP key field. Manipulations
+    of the database entries (e.g. a database admin changing the public key to gain access to SSH servers) are
+    detected when the key is fetched. The migration adds the checksum to existing tokens. A token that fails the
+    check is left out of `GET /machine/authitem/ssh`, the keys of the other tokens are still returned
+  * Additional SSH key types accepted by the SSH key token can be configured with `PI_ALLOWED_SSH_KEY_TYPES`
+    in `pi.cfg`. The configured types are added to the built-in ones (#4987)
+  * Added a new policy scope "hardening". The action `hide_version` removes the version number from responses to
+    unauthenticated requests and `hide_auth_error_status` returns a uniform 401 for failed authentications, so the
+    status code no longer reveals the reason (#5390, #5630)
+  * Sensitive configuration values are no longer returned by the API. CA connectors, machine resolvers, RADIUS servers,
+    SMS gateways and SMTP servers return the placeholder `__CENSORED__`, which can be sent back unchanged to keep the
+    stored value (#5431)
+  * SMTP and SMS servers now declare which of their fields are secrets, so that headers and options containing
+    credentials are stored encrypted in the database as well (#5462, #5463)
+  * New health endpoints report the remaining validity of the privacyIDEA server certificate and of the certificates
+    used by LDAP, Keycloak and EntraID resolvers, as well as resolver timings and notification delivery, which feed the
+    new dashboard panels (#5266, #4202)
+  * The server records some internal metrics, e.g. how long a resolver takes to answer or whether a notification was
+    delivered, in a new pre-aggregated table. The new command `pi-manage config metrics cleanup` keeps it small, the
+    Ubuntu packages and the Docker image run it daily. The recording can be disabled completely with
+    `PI_NO_INTERNAL_METRICS` in `pi.cfg` (#5270)
+  * Event handler conditions can now check the userinfo of the user, like the additional conditions of a
+    policy (#5023, #4201)
+  * Rolling a token over, which gives an existing token a new secret, is now a right of its own. `POST
+    /token/init` updates a token when it is called with the serial of a token that already exists; while its
+    enrollment is still under way that stays part of the enrollment, but once the token is in use the request
+    needs the new `token_rollover` action in the admin or user scope, matched against the realm of that token.
+    Enrolling a new token is unaffected. Note that an installation which uses rollover has to grant the new
+    action after the upgrade
+  * Every token type now declares which token info entries it maintains itself, e.g. the public key of a passkey
+    or the server a RADIUS token forwards to. Those entries stay readable and usable in policy conditions, but
+    the generic token info endpoints no longer write them, so the value that decides how a token authenticates
+    is only set by the token. The entries that do change over the lifetime of a token, e.g. the acceptance
+    window of a TOTP token or the phone number of an SMS token, are set through `POST /token/set`, which now
+    accepts every entry a token type declares settable. A per-token switch privacyIDEA never writes itself stays
+    free-form
+  * Event handlers can be renamed (#5591)
+  * `GET /token/` accepts a comma-separated list of realms, so the tokens of a user in several realms can be fetched
+    with a single request (#4845)
+  * `GET /container/` accepts a list of container types as filter, e.g. to list all containers a given token could be
+    added to (#5378)
+  * The name a passkey shows in the credential selection can be configured with a policy and may contain tags like
+    `{user}@{realm}`, which helps to tell passkeys of the same login name in different realms apart (#5557)
+  * The new `passthru_ignore_rollout_state` action excludes tokens in a given rollout state, e.g. `verify`, from
+    passthru authentication (#5133)
+  * Every token now has a rollout state: tokens that completed the enrollment have the state `enrolled` instead of an
+    empty value. A migration script updates the existing tokens (#5070)
+  * Internal user information like the FIDO2 user id or the last used token type is no longer written to the custom
+    user attributes but to a new internal table, and reading it requires the new `get_user_internal_attributes`
+    right (#5095)
+  * The push token can send a decline reason, so that "it was not me" and "it was me, cancel anyway" become
+    distinguishable. The server advertises the signed capabilities of a challenge, hence older apps keep working
+    unchanged. The two are separate events in the authentication log
+    (`CHALLENGE_DECLINED_UNKNOWN_TRIGGER` and `CHALLENGE_CANCELLED`), so a conditional access policy can act on a
+    login the user says they did not start without counting the ones they abandoned themselves; the ready-made
+    failure rate limits therefore no longer count a cancelled push (#5562, #5583)
+  * `pi-manage db upgrade` and `downgrade` report the revisions they migrated between. The help now also explains how
+    to pass a relative revision, e.g. `pi-manage db downgrade -- -1` to undo a single revision (#5284)
+  * `pi-manage config import` returns a non-zero exit code on failure, continues after an object that can not be
+    imported and reports the result at the end. Configurations from older versions containing actions that no longer
+    exist can be imported with `--skip-invalid`. `pi-manage config export --censor` replaces the secrets with the
+    placeholder `__CENSORED__`, such an export can only be imported again on the same instance (#5516)
+  * Removed the `/validate/samlcheck` endpoint, which was deprecated in 3.11. Use `/validate/check` with the
+    authorization policies `add_user_in_response` and `add_resolver_in_response` instead (#5414)
+  * The endpoints `POST /token/copypin` and `POST /token/copyuser` are deprecated and will be removed in a
+    future release, together with the `copytokenpin` and `copytokenuser` admin actions. They expose single
+    steps of the lost token process, which can be run as a whole with `POST /token/lost/<serial>`
+  * The lost token process (`POST /token/lost/<serial>`) requires an administrator. The `losttoken` action is
+    defined in the admin scope only
+  * Removed the u2f token type. Existing tokens are set to the type `deprecated` and disabled by the migration and can
+    be removed with `pi-tokenjanitor deprecated delete u2f`. The type `deprecated` can not be enrolled (#5949)
+  * Cancelling an active challenge requires the new admin action `cancelchallenge` instead of the read-only
+    `getchallenges` right. The challenges of a user can be listed with the new `GET /token/challenges/user`, and the
+    challenge listings no longer contain the `id` field, use the `transaction_id` instead.
+  * Database connections are validated before they are used, so a request no longer fails because of an idle timeout or
+    a restarted database. It can be switched off with `SQLALCHEMY_ENGINE_OPTIONS = {"pool_pre_ping": False}` (#5757)
+  * `pi-manage` uses the tarfile package of Python instead of calling the `tar` command (#3815)
+  * The CA connector types are registered explicitly instead of being discovered via subclasses (#4881)
+  * Replaced the remaining usages of PyOpenSSL with the cryptography package (#1991)
+  * Application specific password tokens can be enrolled in self-service. Listing the defined service IDs with
+    `GET /serviceid/`, which the enrollment needs to offer a choice, is available to users through the new
+    `serviceid_list` action in the user scope; on an installation without any user policy it is allowed like every
+    other action of that scope. Defining, changing and deleting a service ID stays with the administrator (#5611)
+  * The service ID of an application specific password token is checked against the defined service IDs when the
+    token is enrolled. An undefined service ID was accepted and stored, and the token then never matched an
+    authentication request (#5611)
+  * Updated the pinned dependencies of the backend and of the new WebUI (#5958, #5962)
+
+  Fixes:
+  * The token owner table has an index on its token column. This only matters on SQLite, where listing or
+    counting the tokens of a realm slowed down badly once many tokens were assigned. MySQL and MariaDB
+    already index the foreign key themselves, and on PostgreSQL and Oracle the same queries were measured
+    to take the same time with the index as without it, so nothing changes for them either way
+  * `POST /token/copypin` and `POST /token/copyuser` check the `copytokenpin` / `copytokenuser` right for the
+    source as well as for the destination token
+  * The lost token process always creates a new replacement token. An earlier replacement of the same token
+    is disabled when a new one is issued
+  * Realms can be deleted again when a custom user attribute was set for one of their users (#5094)
+  * A realm can be deleted, and the tokens and containers of its users managed, while the resolver of those users
+    is unreachable. An owner whose login name can not be looked up is only matched by admin policies without a user
+    or for every user (`*`), not by policies that name users, exclude them or match them with a regular expression
+    (#6015)
+  * Editing an inactive policy no longer activates it, because the `active` parameter is now honoured (#5411)
+  * A realm administrator with the `userlist` right sees the users of all realms granted to them, instead of only the
+    first realm of the first matching policy (#5421). Each realm of a request is checked on its own, so several
+    realms, given as a list or comma-separated, list no realm the administrator is not granted, and a realm excluded
+    in a policy with `!realm` stays excluded
+  * The resolvers and users named in an admin policy with the `userlist` right restrict the user list as well. Before,
+    only its realm did: such an administrator saw every user of the realm, while asking for one of the others by name
+    was refused
+  * An admin policy for the realm `*`, or for every realm but some (`*` with `!realm`), grants these realms to the token
+    and container list and to the audit log as well. The realm field was read literally there, so such an
+    administrator saw nothing. Several `auditlog` policies now add up, so one without a target scope grants every
+    realm. An `auditlog` policy that also names users or resolvers grants no realm, since the audit log can only be
+    restricted by realm - before, it showed every entry of its realms
+  * A resolver excluded in the resolver field of a policy with `!` or `-`, also from `*`, is excluded. Policy
+    matching ignored such exclusions for resolvers, while it honoured them for realms and users
+  * `GET /user/` no longer returns a single user per realm when the requested `attributes` do not contain the
+    username (#5482)
+  * The user notification handler no longer mails every user of every realm when it is configured to notify an admin
+    realm but no realm is selected (#5481)
+  * Search filters escape `_` and `%`, so `*` is the only wildcard and a serial like `OATH_01` matches literally (#5561)
+  * The `resolver` and `userid` filters of `GET /token/` are applied now. Both parameters were accepted and documented
+    before, but they never became a condition of the query, so all tokens were returned (#5689, #5624)
+  * `GET /container/` filters by the realm of the assigned user when `realm` is given without `user`, instead of
+    returning an empty list (#5684)
+  * Resolvers with the same priority in a realm are sorted alphabetically by name, so that the order of the users of a
+    realm no longer depends on the database (#5063)
+  * `GET /user/` with `realm` and `resolver` lists only the users of that resolver within the realm, and with
+    `resolver` alone only that resolver instead of every resolver of its realms. The documentation of the parameter
+    was corrected accordingly (#5255)
+  * The `force_..._server_generate` policies are only enforced if such a policy is actually defined. Previously the
+    server generation was enforced as soon as no admin or user policies existed at all (#5570)
+  * The machine resolver returns the hostname always as a list and no longer fails to fetch all machines because of a
+    single LDAP entry without a hostname or with a malformed IP (#5584)
+  * `get_tokens` no longer returns an empty list when a specific realm is combined with the allowed realms of a realm
+    administrator (#5525)
+  * Importing tokens no longer deletes an already existing token if the import of that entry fails, and entries without
+    a serial or type are reported as failed instead of raising (#5526)
+  * `assign_tokengroup` and `unassign_tokengroup` no longer report a missing parameter or a database error as
+    "tokengroup does not exist" (#5527)
+  * Fixed several minor issues in the token library, e.g. `check_user_pass` raising when it is called without
+    options (#5528)
+  * The total count of the token list is de-duplicated, so it can not diverge from the returned tokens and point to an
+    empty next page (#5623)
+  * A push challenge that is answered on the phone can be completed even if it expired between the answer and the
+    request that finalizes the authentication (#5423)
+  * PIN policies are enforced again when a request carries no user, e.g. when the PIN of a token is set by
+    serial (#5536)
+  * Made the migration scripts idempotent, so that a schema update can be repeated after it was interrupted (#5367)
+  * Challenges of a `push_wait` authentication are deleted when the request is done. Their transaction id is never
+    returned to the client, hence they could not be answered anymore anyway (#5491)
+  * The step that triggers a challenge during a WebUI login is no longer counted as a failed authentication towards
+    `auth_max_fail`, which could lock out a user during a normal login (#5628)
+  * Enrolling a smartphone container from a template via `/validate/check` no longer fails with an error 500 because
+    the policies of the request were not initialized (#5651)
+  * `POST /container/register/finalize` and setting the realms of a container write a proper success value to the audit
+    log (#5652, #5664)
+  * Policies with a User Agent condition are no longer missing from `pi-manage config export` and from the
+    configuration report. Note that a scope whose policies all carry a User Agent condition is no longer treated as
+    empty, please read the update notes (#5683)
+  * A failing event handler no longer turns a successful request into an error: the failure is audited and the
+    remaining handlers still run. The new `abort_on_error` option restores the old behaviour per handler (#5686)
+  * The HTTP resolver handles special characters in credentials and identifiers correctly, so that a password
+    containing `*` or a user principal name containing `#` no longer breaks the resolver (#5701)
+  * Corrected the redaction configuration of the `log_with` decorator, which hid all arguments of `init_token` and of
+    the RADIUS token instead of only the secret ones (#5524)
+  * Logging an exception object instead of a message no longer raises inside the log handler
+  * `pi-tokenjanitor findcontainer delete_info` reports only the container infos it actually deleted
+  * Corrected the documentation of the "Clear failcounter after minutes" setting: any authentication attempt clears the
+    fail counter, not only a successful one (#5515)
+  * Negated audit search filters also match rows whose column is unset. This corrects the count of the `authmaxfail`
+    policy, which silently ignored failed authentications.
+    Such rows count again after the upgrade, so an upgrade can lock out a user until the time window of the policy has
+    passed (#5629, #5616)
+  * The smartphone's answer to a push challenge is written to the audit log. The entry of the answer names the
+    transaction and the recorded outcome - accepted, confirmed (the smartphone step of code_to_phone), declined
+    or cancelled - plus the reason the app sent with a refusal; the authentication that fails because of a
+    refusal names it as well, instead of only reporting a response that did not match (#5754)
+  * The `auth_cache` policy only caches a complete credential that was verified in a single `/validate/check`
+    request. Challenge-response, push, `passOnNoToken` and `passOnNoUser` are no longer covered by the cache.
+    Please read the update notes if `auth_cache` is combined with a challenge-response token (#5876)
+  * The WebUI policy `login_mode=disable` is applied consistently to all WebUI logins, and a refused login is
+    written to the authentication log (#6017)
+  * During the initial token transfer of a smartphone container, only tokens of an owner of the container, or
+    unassigned tokens of one of its realms, are taken over (#5920)
+  * An enrollment via multichallenge checks the owner of the container, and cancelling it no longer removes a token
+    or container whose enrollment was already answered (#6020, #6021)
+  * Improved the challenge handling of containers: the container types without challenge-response handle such
+    requests consistently, and a container client can only request challenges for the operations that use them
+    (#5986, #5988)
+  * A realm excluded in a policy with `!realm` is also excluded when a list of realms is matched, e.g. the realms of
+    a token or container (#6022)
+  * `hide_specific_error_message` honours the user and realm conditions of the policy (#5798)
+  * The post-policies of `/validate/check`, e.g. the masking of error messages, also apply when the request fails
+    with an error, and `/validate/radiuscheck` answers a malformed request with an empty 400 (#5829)
+  * The webhook handler keeps all keys of a JSON payload when it replaces tags (#5748)
+  * Changing the order of an event handler no longer deletes its options and conditions (#5854)
+  * The recursive LDAP group search handles group names given as a list as well as a single string (#5936)
+  * User and machine resolvers can not be named `test`, which only runs the connection test, and names like `.`
+    or `..` are refused (#6001)
+  * The PIN policies are not applied to the enrollment of token types without a PIN, e.g. certificate and SSH
+    key (#5885)
+  * Responses that carry a token seed are marked `no-store`, an update of a config entry without a type keeps its
+    type, and the configuration documentation censors secret values (#5988)
+  * A PIN stored in the legacy hash format is rewritten in the current format after a successful check, and less
+    sensitive data is written to the log file (#5992)
+  * The vendor name of an uploaded subscription file is validated (#5992)
+  * Fixed several command line tools: `privacyidea-token-janitor --orphaned-on-error` defaults to False, so an LDAP
+    outage no longer marks every LDAP token as orphaned, the `update` action of both janitors keeps the counters and
+    the token kind, and `privacyidea-diag` censors secrets in its support bundle. Tools that no longer work, as well
+    as `reset-privacyidea`, are removed (#6005)
+  * The FIDO2 authentication and registration checks are stricter. `/auth` requires user verification for every
+    passkey and for a login without a username, and the WebAuthn authorization policies are applied consistently. A
+    client that sends `user` together with a FIDO2 answer has to send the login name of the token owner.
+    `WEBUI_PASSKEY_LOGIN_ENABLED` only switches off the login without a username (#6008)
+  * Audit values are always shortened to fit their column, so that every entry is written. `PI_AUDIT_SQL_TRUNCATE`
+    is removed. The audit `serial` column is widened to 200 characters, please read the update notes for the
+    duration of this migration on MySQL and MariaDB. A request to `/validate/check` naming a realm or resolver that
+    does not exist is logged as well (#5852)
+  * The `missing_line` flag of an audit entry no longer reports a missing entry on a Galera cluster, where
+    `wsrep_auto_increment_control` writes the ids of a node several numbers apart (#5785)
+  * The authentication cache hashes with `PI_HASH_ALGO_LIST` and `PI_HASH_ALGO_PARAMS` like everything else (#5914).
+    privacyIDEA refuses to start with an unusable value of either of them instead of failing at the first login
+    (#5926)
+  * `pi-manage config authcache cleanup` without `--minutes` derives the age from the active `auth_cache` policies
+    instead of a fixed 480 minutes, which cut a policy like `2d` short (#6005)
+  * The token event handler fills `{ua_browser}` instead of writing "None" and resolves the tags for the user and
+    token of the event, and the container event handler replaces tags as well (#5786)
+  * Documented the tags of `push_text_on_mobile`. `{ua_browser}` names the browser, the tags of the triggering client
+    are kept when the smartphone polls its challenges, and a text that can not be formatted falls back to the default
+    text instead of failing the authentication (#5787, #5788)
+  * The action and the position of an event handler definition are checked when it is saved (#5988)
+  * `POST /container/<serial>/realms` returns the status of each realm in the sub-dictionary `realms`, so that a
+    realm named `deleted` no longer collides with the flag of the same name (#5934)
+  * The `page` and `pagesize` parameters of paginated endpoints are validated (#5860)
+
+Version 3.13.4, 2026-09-17
+
+  Enhancements:
+  * Updated grpcio to 1.81.1 for compatibility with Python 3.14 on Ubuntu 26.04.
+
+  Fixes:
+  * Sped up /auth for administrators by counting the users with active tokens in the database
+    and only once per request. (#5959)
+  * Fixed several queries that were not valid SQL on Oracle: reading policies filtered by their
+    active state, renaming a policy, resetting an event counter and looking up a passkey by its
+    credential id.
+  * Fixed containers, container templates and token groups being impossible to create on Oracle,
+    because their models no longer declared how the primary key is generated. A migration creates
+    the missing sequences on existing installations.
+
+Version 3.13.3, 2026-06-22
+
+  Fixes:
+  * Fixed migration scripts to be compatible with Oracle (tested with 21c).
+  * Fixed interaction of reset_all_user_tokens with FIDO2 token. (#5340)
+  * Fixed an issue that would cause /healthz/resolversz to return HTTP error 500. (#5459)
+  * Fixed encoding of parameters in the HTTP resolvers. (#5455)
+
+Version 3.13.2, 2026-06-10
+
+  Fixes:
+  * Fixed migration script of 3.13.1 to be compatible with Galera.
+
+Version 3.13.1, 2026-05-20
+
+  * The new WebUI beta has been updated to the current state of development. The menu is now back to the known top
+    side menu with slightly optimized menu structure, because having the horizontal space is better for displaying our
+    tables. The layout has been mostly flattened. Still work in progress!
+
+  Enhancements:
+  * Added a dedicated push_challenge_text policy so the PUSH token notification can be worded independently of the
+    default challenge text — useful when both PUSH and a challenge-response token are active for the same user (#5300)
+  * Testing a Passkey in the WebUI will now show if the one that was used for the test is the one you are viewing
+    the details of. If not, the one that was used is linked. The linking is for admins only. (#5263)
+  * Updated the pinned dependencies for the backend.
+
+  Fixes:
+  * Fixed pi-manage backup create failing on Python 3.12 (#5299)
+  * /system/random no longer writes the generated random bytes to the audit log (#5307)
+  * Fixed authorization on DELETE /user/attribute so users can only delete their own attributes (#5308)
+  * Several small audit-logging and API consistency fixes found during API documentation review (#5309)
+  * Fixed PIN policies preventing passkey enrollment by allowing to set PIN for passkeys during enrollment (#5269)
+  * Added the passkey serial to the audit log for /auth requests (#5264)
+  * Fixed Event Handler conditions failing to handle datetime objects (#5256)
+  * Fixed passkey enrollment not working on MariaDB after an update (#5238)
+  * Fixed the datepicker not working in the old WebUI (#5237)
+  * Fixed signature verification for Yubico Validation Protocol v2 responses (#5229)
+  * Fixed empty email body when sending via Exchange SE (#5217)
+  * Allow registering a passkey on a computer that already has a revoked passkey for the user (#5191)
+  * Exclude custom user attributes from shallow user lookups, e.g. userlist (#5185)
+  * Improved error handling for password updates in the WebUI (#5181)
+  * Improved error handling for password reset via /recovery in the WebUI (#5201)
+  * Fixed the old WebUI dropping the configured custom user agent when editing an existing policy (#5295)
+  * HTTP resolver group config now matches the HTTP method case-insensitively and tolerates non-dict values (#5289)
+
+Version 3.13, 2026-03-31
+
+  Features:
+  * The new WebUI 2.0 is now in beta, containing all admin functionality. But please be aware that layouts are not final and bugs may still occur.
+    If you have any feedback, please share it with us! The old WebUI is still the default for this version.
+
+  Enhancements:
+  * Token in the token table can be filtered by realm and by user. Search for a user is only possible with exact matches and requires to press enter. (#5032)
+  * Added --keep-db-uri flag to pi-manage backup restore, so that the database URI will not be overwritten with the value from the backup (#5033)
+  * Registration of passkeys during authentication can now directly enable offline usage with the
+    enroll_via_multichallenge_passkey_offline policy (#4259)
+  * Alternative Mode for Push Token: push_mode_code_to_phone. After confirming on their phone, the user is shown a
+    number in the app, which they have to enter in the client/login to complete the authentication (#4907)
+  * HTTP Resolvers (including Keycloak and EntraID) can now handle group memberships mapped to an attribute, similar to the LDAP Resolver (#4880)
+  * The unlock mechanism for the smartphone app can now be set explicitly by policy to PIN or biometrics (#4719)
+  * Emails can optionally be signed with S/MIME (#4288)
+  * The passkey login button for the WebUI login can now be disabled (#4949)
+  * Improved the search options for LDAP resolvers to allow more optimized queries with the API (#4874)
+  * Added tags that can be used in configurable messages of SMS and Email token: `phone_redacted` and
+    `email_redacted` (#4766)
+  * Allow to use attributes of the user as destination for Emails (#3963)
+  * Added functions for token containers to the token janitor (#4033)
+  * Updated SQLAlchemy from 1.4 to 2.0 (#3598)
+  * Hardening: Optionally, a strict Content Security Policy and HTTPS enforcement can be enabled in `pi.cfg` by adding
+    `PI_ENABLE_CSP=True` and `PI_FORCE_HTTPS=True` (#4802)
+  * Hardening: Optionally, the message returned by the server in case of failures can be made unspecific. This is done
+    via policy. Be aware that this alters the response for the corresponding endpoint! (#4739, #4684, #4622)
+
+  Fixes
+  * Corrected the Content-Types for the WebHook Event Handler (#4977)
+  * 'enrollpin' right is enforced more rigorously. If the user does not have the right but tries to set a PIN during
+    enrollment, the enrollment will be denied, instead of silently removing the PIN.
+  * Fixed a bug that would cause errors when writing challenges to Oracle databases (#4969)
+  * Keycloak Resolver will now properly use wildcards (*) (#5057)
+  * Fixed a bug with search_on_enter (webui policy) (#4967)
+  * Fixed a bug where passkey_trigger_by_pin in combination with multiple passkeys for the user, would cause failed
+    authentications (#4951)
+  * Fixed a bug with the passwd resolver where trying to access the token details would cause an error (#4887)
+  * Fixed the interaction of two_step_enrollment and verify_enrollment that would previously cause problems (#3170)
+  * Fixed TLS configuration for machine resolver (#4964)
+  * Verify token enrollment now throws an error for a failed verification (#5056)
+  * Fixed displaying of checkbox to use userstore password for container registration (#5114)
+  * Fixed updating of phone and email settings in the token info during SMS and email token rollover (#5073)
+  * Catch FileNotFoundError for saving firebase sms gateway with invalid config file (#5119)
+
+Version 3.12.2, 2025-12-04
+
+  Enhancements:
+  * The WebUI Preview is updated to the current development version.
+    Notably with the new main menu, user details, realms, token and container wizard, and policy feature,
+    which is not complete yet.
+  * Introduced authentication policy action 'set_realm' to set / overwrite the realm parameter for authentication
+    requests (#4813)
+
+  Fixes:
+  * Sanitize 'page' and 'page_size' parameter for querying the Audit-Log (#4758)
+  * Pre-select the first realm when using realm_dropdown for the WebUI login (#4786)
+  * Sanitize inputs and parameters for user search in the frontend and backend if they contain multiple asterisks,
+    which would cause an error (#4778)
+  * The disabled_token_types policy now works correctly for FIDO2 token (#4800)
+  * Apply all user conditions (username, realm, resolver) to the change pin policies (#4744)
+  * Allow to specify a deviating base dn for LDAP group searches (#4829)
+  * Fixed interaction of force_server_generate and 2step_enrollment policies (#4826)
+  * Enrolling a token with only realm assignment now correctly displays the QR Code (#4861)
+
+Version 3.12.1, 2025-10-07
+
+  Enhancements:
+  * Apply the token event handler action also to the users token (#4730)
+
+  Fixes:
+  * 'push_require_presence' policy does not work when 'push_wait' is set (#4702)
+  * Show the own audit logs of helpdesk admins (#4637)
+  * Allow empty user policies to revoke all user rights (#4721)
+  * Fixed saving basic HTTP resolver (#4728)
+  * Fixed database migrations for oracle (#4732)
+  * Config option to clear exceeded fail counters after a certain time: If the timeout is reached, any authentication
+    attempt clears the exceeded fail counter to restrict the number of new authentication attempts (#4706)
+  * Fail counter is not increased for disabled tokens (#4706)
+  * Fixed bulk deletion of tokens in the WebUI (#4690)
+  * Fix error when import json configuration file with pi-manage (#4733)
+
+Version 3.12, 2025-09-09
+
+  Features:
+  * Entra ID and Keycloak resolver (#4217)
+  * Preview for the WebUI 2.0 can be enabled (#4102)
+
+  Enhancements:
+  * Add 'force_server_generate' policies for HOTP, TOTP, mOTP, and Password tokens (#4410)
+  * Add section 'request_data' to extended policy conditions (#4190)
+  * Add policy condition comparators to compare dates and check for substrings (#4380)
+  * Add policy 'require_description_on_edit' in the new scope 'Token' (#4117)
+  * Remove 'u2f' from the enrollable token types (#4107)
+  * Remember last used token type per user and application for multi-challenge as preferred token type (#4179)
+  * Add option 'handle_missing_data' to the extended policy conditions (#4339)
+  * Move project description and building metadata into pyproject.toml (#3525)
+  * Policy to disable specific token types for authentication (#4371)
+  * Dedicated functions to rename and clone policies (#4293)
+  * Clean up user cache and expired challenges via API/WebUI (#4280)
+  * Allow to enroll smartphone containers via multi-challenge (#4361)
+  * Add 'container' and 'container_info' sections to the extended policy conditions (#4208)
+  * Add 'hide_container_info' policy (#4208)
+  * Secure container registration with user store password (#4208)
+  * Allow wildcards in container search query (#4208)
+  * Different URL scheme can be used for push token (#2882)
+  * Add distinct policy condition 'user-agent', with plugin user-agents or custom as predefined options (#4501)
+  * Extended the new tokenjanitor with import and export of token and optionally user assignments (#4000)
+  * Add Message-Authenticator attribute to RADIUS server requests (#4650)
+
+  Fixes:
+  * 'max_auth_fail' and 'max_auth_success' are also applied to local admins and evaluated before checking the password (#4340)
+  * Allow to unassign non-existing users from containers (#4208)
+  * Extended policy conditions on user info also works for web UI policies (#4016)
+  * Close LDAP connection after each request (#4148)
+  * List containers with users from deleted realms and allow to unassign them (#4530)
+  * Reduce PyOpenSSL dependencies for certificate token (#4212)
+  * Consistent handling of whitespaces in usernames for policy checks (#4385)
+  * Increase column sizes in policy and audit table (#4353)
+  * Close Database connections on exit to prevent "aborted connection" warnings in MySQL (#4496)
+  * 'last_auth' policy works for fido2 token (#4543)
+  * 'challenge_text' policy is loaded correctly for HOTP/TOTP token (#4640)
+  * A disabled passkey can no longer be used for authentication (#4612)
+  * Fixed log messages that were redacted by SecureFormatter (#4576)
+  * Improved policy condition checks with user objects (#4509, #4482)
+
+
+Version 3.11.4, 2025-06-26
+
+  Fixes:
+  * Fix wrong token assignment view tokens when using the usercache (#4454)
+  * Remove superfluous error message when max_token_user/realm is set (#4434)
+  * Fix logging passwords in debug mode with some specific token tpes (#4457)
+  * Fix error when wrong key is used in SQL-resolver mapping  (#4461)
+  * Fix error when listing containers with non-existing users/resolver errors (#4464)
+
+Version 3.11.3, 2025-05-28
+
+Enhancements:
+* WebAuthn: The WebAuthn Token can validate challenges that were created by /validate/initialize.
+  This can happen when the authenticator does create a passkey anyway and that webauthn token is then used as a passkey.
+  Therefore, WebAuthn token that were created as passkeys in the authenticator, can now be used for passkey logins (#4400)
+* Added assignment_date to token info when assigning a user (#4351)
+
+Fixes:
+* WebAuthn: sign_count of 0 will result in a successful authentication (#4391)
+* WebUI: Cancelling WebAuthn enrollment will delete the unfinished token and redirect to the token list (#4402)
+* FirebaseProvider: Use proxy setting for authorization (#4403)
+* Fixed a bug that would cause different transaction_ids to be generated when the user has a passkey and /validate/triggerchallenge is used (4399)
+* Fixed a bug that would cause unknown users not be displayed in the audit (#4382)
+
+Version 3.11.2, 2025-04-25
+
+  Fixes:
+  * API: `/validate/initialize` require `type` parameter and add transaction id to details (#4366)
+  * UI: Fix pre-filled user for assigning tokens during rollout (#4355)
+  * WebAuthn: Correct format for evaluation of userHandle parameter (#4357)
+  * Add creation date to token and container info (#4360, #4376)
+  * Fix broken audit entry during enrollment via validate (#4362)
+
+Version 3.11.1, 2025-04-08
+
+  Fixes:
+  * UI: Reload of user list, doubled delete button, container pagination (#4277)
+  * Passkeys: Add policy to enable triggering Passkeys with PIN (#4296)
+  * Passkeys: Disable PIN input during enrollment (#4335)
+  * Passkeys: Disable trigger a challenge since Passkeys use a different method (#4334)
+  * Allow completely random token serials (#4194)
+  * Fix sending unused parameters for event handler configuration (#4286)
+  * Convert bool parameter to fix healthcheck API (#4291)
+  * Always include microseconds in `last_auth` format (#4289)
+  * Fix wrong hashlib in QR-code when enrolling through Keycloak (#4276)
+  * Remove `ttype` parameter from Yubikey signature calculation (#4306)
+  * Fix token query with multiple realms (#4317)
+  * Fix `authentication` return value when using `/validate/samlcheck`,
+    `/validate/triggerchallenge` and `/auth` (#4313, #4334)
+  * Improve log messages when extended conditions fail (#4016)
+  * Use UUID big-endian conversion for GUIDs returned as bytearray (#4304)
+
+Version 3.11, 2025-02-17
+
+  Features:
+  * Passkeys (#4024)
+  * New pi-token-janitor (#3955)
+    * Add ability to remove tokeninfo attribute with token janitor (#3736)
+    * Allow token janitor to run token owner queries (#3830)
+    * Match/Export range of token serials (#3949)
+    * Preliminary Token janitor functions for containers (#4033)
+  * Containers Part 2 (#3950)
+    * Synchronize Smartphone Container with Server
+    * Rollover a Smartphone Container
+    * Container templates
+    * Container Wizard
+
+  Enhancements:
+  * Health check API endpoint (#1115)
+  * UI: Notification for new versions in the UI/Dashboard (#2560)
+  * Allow the "," sign to be used in a text field of a policy (#3667)
+  * PUSH: Send PUSH QR Code Image via UserNotification Handler (#4069)
+  * PUSH: Add push require-presence answer as tag for challenge text (#4135)
+  * Change AUTHTYPE.SASL_KERBEROS behaviour if upn is present in userinfo values (#4008)
+  * Add otpauth link to returned data when using `enroll_via_multichallenge` (#4156)
+  * Improve LDAP-resolver error handling and logging and add timing information (#4219)
+
+  Fixes:
+  * WebAuthn: Better error message for users - enrolling the same webauth token twice (#3807)
+  * WebAuthn: Token that require user for enrollment (webauthn) are created after error (#4133)
+  * Fix typo in Webhook event handler content type (#4119)
+  * Add option to token-janitor to avoid marking tokens as orphaned on resolver error (#4204)
+  * Allow RequestMangler Handler to update the user object in the request (#3845)
+  * UI: Fix Lost token functionality in UI (#4196)
+  * `check_base_action` pre-policy only evaluates the first realm of a token (#4011)
+  * Fix that deleting a policy results in a 'failed' audit log entry (#1720)
+  * Max token policy ignored with enroll via multi challenge (#4146)
+  * Better error checking in ScriptEventHandler (#4250)
+
+Version 3.10.2, 2024-11-26
+
+  Fixes:
+  * Fix some problems with Oracle databases during upgrade (#4105)
+  * Fix broken database restore from backup (#4143)
+  * Fix broken privacyidea-cron commands and banner output (#4171)
+  * Fix text replacement in JSON format with webhook event handler (#4116)
+  * UI: Fix setting of custom user attributes (#4151)
+  * UI: Improve display of challenge message during login (#4121)
+  * UI: Fix adding token to a container from the user view (#4109)
+  * UI: Stop unnecessary polling after PUSH token enrollment (#4124)
+  * PUSH: Require presence was not working when another token was triggered (#4122)
+  * Improve documentation on challenge cleanup and add commented crontab entry (#4172)
+  * Offline tokens can now be deleted without detaching them first (#4136)
+  * Update privacyidea-diag script to work with new pi-manage commands (#4145)
+  * Make deprecated commands and options available in pi-manage (#4158, #4141)
+  * Disable log message when container serial is "null" during token enrollment (#4110)
+  * Add PEM format check for certificate token (#4138)
+
+Version 3.10.1, 2024-10-15
+
+  Fixes:
+  * UI: Follow general button design for Container in token view (#4089)
+  * UI: Audit action filter now working properly (#4093)
+  * UI: Fix empty configuration views (#4068)
+  * WebAuthn: Properly check user verification during authentication (#4083)
+  * Enhance comparison for event condition `user_token_number` (#4049)
+  * Fix token rollover with 2step enrollment and PIN policies (#4037)
+
+Version 3.10, 2024-09-03
+
+  Features:
+  * Node-specific realms (#3758)
+    * Add node names and UUIDs to database (#3757)
+    * Add, remove and configure realms with node-specific resolver configuration (API and WebUI)
+  * Add token containers (#1291)
+    * There are three container types (generic, smartphone, and yubikey) which can contain different token types
+    * A container can have one owner and multiple tokens
+    * Tokens can be added to a container on the fly during the enrollment, on the token, user and container page
+    * Perform actions on all tokens of a container (enable, disable, delete)
+    * Event Handler
+    * Admin and user policies (similar to tokens)
+    * Added container serial and type as columns to the audit log
+
+  Enhancements:
+  * Drop support of Python 3.6 and enable Python 3.11 and 3.12 (#3593, #3711, #3760)
+  * UI: Capitalize headings
+  * UI: Enable/disable tokens, reset the fail counter, delete tokens and unassign user from token in user details
+  * UI: The support button in the footer will now initiate an email to ease the request of support (#3919)
+  * UI: Add multiple choice elements for realms and resolvers (#3793)
+  * UI: Hide enroll token menu entry, if no token-type is allowed (#4053)
+  * MS CA Connector: Added certificate revocation (#3316)
+  * Email and Phone number attributes can be used in challenge texts (#2917)
+  * Validity of JWT can be configured (#3996)
+  * PUSH: Optionally, the user can be required to press a number or character that is displayed on login
+                to complete the push authentication (#3897)
+  * PUSH: Add event handler for declining push requests (#3632)
+  * PUSH: Allow tags in PUSH notifications (#3227)
+  * Added "Authentication" condition to event handlers, which can be used to distinguish between
+    SUCCESS, FAILED and CHALLENGE (#3886)
+  * Enrollment via validate can have a custom enrollment text (#3884)
+  * Allow case insensitive usernames in policies (#3281)
+  * Cleanup of expired challenges externally (#3920)
+  * Tools: Migration of several tools to the click framework (#2498, #3769)
+  * Add functionality to dump token data to YAML (#3005)
+  * Allow extended notes on policies (#1814, #3895)
+  * WebAuthn: Allow offline usage (#3764, #3857, #3866)
+  * Add user-agent to audit log (#3856)
+  * Check Yubikey OTP length before validating (#3746)
+  * Check secret length for Yubikey token during enrollment (#3725)
+  * Enable user-agent version in subscription checks (#3800)
+  * Enhance offline token to allow refill for WebAuthn tokens (#3764)
+  * Add policy to disable PIN+OTP check when using challenge-response (#4051)
+  * Add privacyIDEA version to exported data and warn during import if versions mismatch (#4055)
+  * Make token description available as a tag in the user-notification handler (#3763)
+  * Add "creator" tag to QR-code for enrollment (#3902)
+  * Add email validation to enrollment (#3918)
+
+  Fixes:
+  * UI: Added translation for page navigation in the user details and list pages
+  * UI: Fixed open and close all actions in create new policy and conditions in create new event handler
+  * UI: Removed duplicated controller calls resulting in duplicated API calls (#3421)
+  * UI: Cancel poll-transaction in case another token is used (#3861)
+  * UI: Fix reset of user filters when changing user view (#3543)
+  * UI: Fix error during generation of drop-down lists in UI (#3937)
+  * UI: Hide "unassign" button in token view if the user does not have the proper rights (#3966)
+  * When attaching a token to a machine, validate the serial and the application (#4019)
+  * The realm of the token owner can not be removed from the token, unless the token is unassigned from the user (#3986)
+  * PUSH: Declined PUSH requests are now saved as such and can no longer be polled (#4026)
+  * PUSH: Label policies are now considered for PUSH token enrollment via validate (#3883)
+  * Verify enrollment now works for indexed secret token (#3869)
+  * Remove duplicate messages from response (#3989)
+  * Lazy translation evaluation for static strings (#3721)
+  * Truncate token description (#3747)
+  * Use uppercase hash name for google-authenticator URLs (#3812)
+  * Improve logging of event handler status in Audit log (#3781)
+  * Update config description of LDAP resolver to remove warning (#3854)
+  * Add missing index to Challenge.expiration column (#3920)
+  * Fix usage of challenge text and token defaults policies during multi-challenge enrollment (#3928, #3976)
+  * Enable sms/email text policies when verifying enrollment (#3971)
+
+Version 3.9.3, 2024-04-04
+
+  Fixes:
+  * Fix creation of database tables with galera cluster (#3863)
+
+Version 3.9.2, 2023-12-20
+
+  Fixes:
+  * Allow verify-enroll for paper token and TAN token (#3809)
+  * Fix offline data, when PIN is behind the OTP value (#3831)
+
+Version 3.9.1, 2023-11-06
+
+  Fixes:
+  * Set correct start sequence for empty tables
+  * Fix pi-manage backup
+  * Add privacyIDEA CP to list of clients, that do not
+    need to be unquoted. (#3770)
+  * Fix problem with token description and verify enrollment (#3798)
+
+Version 3.9, 2023-09-12
+
+  Features:
+  * Tokentype: Application Specific password (#3260, #3585)
+  * Tokentype: Day password token (#2781)
+  * Add machine grouping aka service IDs to be used with
+    application specific passwords and SSH keys (#3300, #3246, #3533, #3573)
+
+  Enhancements:
+  * Add event handler to set token application like "offline" (#3335)
+  * Add challenge response with pin reset for better usability with
+    client plugins (#3261)
+  * Add logged_in_user to g-object during /auth request (#3710)
+  * Allow to force description during rollout (#3469)
+  * Allow an administrator to explicitly (only) set a description (#3609)
+  * Add verify enrollment for indexed secret token (#3452)
+  * Handle declined PUSH requests so that plugins know, that they do
+    not need to poll anymore (#3599)
+  * Clean up the usage of PI_NODE and AUDIT_SERVERNAME to allow a
+    consistent naming in the audit log (#3589)
+  * Remove PI_VASCO_LIB error message in log file (#3470)
+  * Add event handler status to audit log (#3430)
+  * Optimize URL decoding for different clients (#3337)
+  * Upgrade to SQLAlchemy 1.4 (#2798)
+  * Add event for poll_transaction (#3692)
+  * Make LDAP Resolver pooling strategy configurable (#3461)
+  * Disable private key checking during loading for speed up (#3590)
+  * Add tool for exporting tokens for database re-encryption (#3005)
+  * UI: Multiselect policies in WebUI (#3493)
+  * UI: Make the whole header of an accordion clickable (#3425)
+  * UI: Improved grouping in the system menu (#3419)
+  * UI: Moved the CA menu to config->system (#3419)
+  * UI: Add italian translation (#3508)
+  * UI: Add user information in selfservice/user context (#3688)
+  * Docs: Improve documentation for /validate/check-enrollment (#3507)
+  * Docs: Improve policy mangle documentation (#3565)
+  * Docs: Add a detailed plugin guide how to write fully functional plugins (#3650)
+  * Docs: Fix description of preferred_client_mode (#3661)
+  * Docs: Update documentation (#3728, #3712, #3728)
+  * Update translations
+  * Infrastructure: Add Bandit and GraphQL runs for pull requests
+
+  Fixes:
+  * Fix /auth endpoint in case no password is available (#3438)
+  * Return all images as data:image, so that they can be used by the
+    client plugins (#3450)
+  * Fix typo in policy definition to fix revoke permission (#3608)
+  * Add missing thread ID to audit log in case of /validate/check
+    (#3578)
+  * Fix pi-manage backup with non-default SQL port (#3570)
+  * Fix SQLAlchemy warnings (#3547)
+  * Fix problems with naming object "." or ".." (#3409)
+  * Use more secure secrets module instead of urandom (#3623)
+  * UI: More explicit description for entering PIN or password (#3370)
+  * Fetch error when decoding JWT (#3028)
+  * UI: Fetch error when user does not exist (#3672)
+  * Ensure subprocess calls are secure (#3625)
+  * TOTP code cleanup: Use time2counter wherever necessary (#3664)
+  * Fix totp.get_otp test function (#3660)
+  * Fix typos (#3661)
+  * Update docs about TOTP apps, that have limited capabilities (#3634)
+  * Enhance schemas for urlopen (#3622)
+  * Add timeout to requests calls (#3621)
+  * Avoid exception if the provided password is shorter than the
+    OTP length (#3467)
+  * Ignore PIN policy during token rollover and verify to avoid
+    wrong error (#2886)
+  * Fixing response data of /auth endpoint to make the handling
+    more consistent (#3436)
+  * Fix parameter error in Webhook event handler (#3676)
+  * Fix calculation of TOTP values (#3734)
+  * Correct ID and help-text for Daypassword (#3742, #3744)
+
+Version 3.8.1, 2023-02-06
+
+  Fixes:
+  * Update diag tool (#3146)
+  * Fix tokengroup error in WebUI (#3441)
+  * Fix dependencies when deleting tokengroups (#3423)
+  * Fix wrong QR code in enroll-via-validate (#3427)
+  * Add missing preferred client mode in validate-check-enrollment (#3429)
+  * Add missing enrollment parameters with challenge-response-enrollment (#3478)
+  * Fix password problem with special chars -
+    Disable unquoting of LDAP-Proxy and simpleSAMLphp (#3337)
+  * Remove false error message when user assigns a token (#3499)
+  * Fix tags in email tokens (#3330)
+  * Fix LDAP NTLM Authentication (#3482)
+  * Add missing Webhook Eventhandler in UI (#3475)
+  * Remove redundant id in SQL resolver (#3454)
+  * Fix ca-parameter policy during enrollment (#3479)
+  * Fix removing node from a policy (#3500)
+
+Version 3.8, 2022-12-20
+
+  Features:
+  * Drop support for Python 3.5. Support for 2.7 will be dropped
+    in privacyIDEA 3.9 (#3263)
+  * Add MS CA connector to issue certificates from a Microsoft CA
+    (#3233, #3232, #2966, #2158)
+  * Add enrollment of HOTP, TOTP, SMS, Email or PUSH token during
+    authentication via Multi-Challenge (#2993)
+  * Add webhook event handler (#3178, #2938)
+  * Allow Kerberos Authentication for LDAP resolvers (#770)
+  * Add token groups in preparation for SSH key and Offline-Token
+    management (#3299)
+
+  Enhancements:
+  * Avoid double registration of webauthn tokens per user (#3207)
+  * Add WebAuthn attestation format "packed" (#3150)
+  * Support Windows Hello as WebAuthn token (#3142)
+  * Add preferred client mode to define the authentication behaviour of
+    plugins (#3373)
+  * Display multiple serials in auditlog in case of C/R (#3285)
+  * Add PI_LOGOUT_REDIRECT_URL for using a SAML logout link from the WebUI  (#3257)
+  * Add passthru policy to audit log, even if password was wrong (#3212)
+  * Improve the description for appimageurl (#3133)
+  * Allow to choose padding for default security module (#3115)
+  * Make available languages configurable in pi.cfg (#3076)
+  * Add translation for admin error messages (#3066)
+  * Allow HTTPSMSProvider to send data as JSON (#3056)
+  * Rename pi-manage createdb to create-tables (#2996)
+  * Add ed25519-sk/ecdsa-sk for SSH tokens (#2792)
+  * Avoid spamming with SMS or Email by allowing to increase failcounter
+  * Add thread ID to audit log (#3381)
+    during challenge-response (#933)
+  * Configure Email address in the subject of a certificate request (#3327)
+  * Be more relaxing about subscription checking of plugins (#3296)
+  UI
+  * Add policy for audit_page_size (#3167)
+  * Add search highlighting in event handler conditions (#3062)
+  * Link online documentation in WebUI (#2952)
+  * Search and filter for actions in configured policies (#2788)
+  Documentation
+  * Add a glossary (#2783)
+
+  Fixes:
+  * Automatically delete MachineTokenOptions when a MachineToken is deleted (#3165)
+  * Fixing int-str conversion with Python 3.10 (#3303)
+  * Remove pillow dependency (#3268)
+  * Fix default AD attributes to (ObjectCategory=person) (#3218)
+  * Fix WebAuthn trust anchor directory (#3216)
+  * Fix enrolling SSH keys with an empty comment (#3198)
+  * Avoid fails in case of content-type header mismatch (#3194)
+  * Fix App device in certain cases as WebAuthn token (#3136)
+  * Fix ImportException to be subclass of privacyIDEAError (#3131)
+  * Fix URL encoding in TiQR URL (#3121)
+  * Add index for timestamp in DB (#3120)
+  * AES module also encrypts empty strings (#2899)
+  * Fix Push_Wait if user presses decline on smartphone (#2865)
+  * Fix fetching SSH keys under certain circumstances (#3375)
+  * Add missing sequences for certain database tables (#3356)
+  * Remove user fields from token API (#3343)
+  * Add SMPP encoding check (#3321)
+  WebUI:
+  * Disable realm button in case of reasolverread (UI) (#3149)
+  * Add missing translation for PSKC import (#3129)
+
 Version 3.8dev3, 2022-12-07
 
   Features:
@@ -14,24 +874,24 @@ Version 3.8dev3, 2022-12-07
     during challenge-response (#933)
   * Configure Email address in the subject of a certificate request (#3327)
 
-
   Fixes:
   * Fix fetching SSH keys under certain circumstances (#3375)
   * Add missing sequences for certain database tables (#3356)
   * Remove user fields from token API (#3343)
   * Add SMPP encoding check (#3321)
-  * Fix encrpyting empty strings in AES module (#2899)
+  * Fix encrypting empty strings in AES module (#2899)
   * Rename createdb and dropdb to createtables and droptables (#2996)
   * Make subscription checking more relaxing (#3296)
 
 Version 3.8dev1, 2022-10-06
 
   Features:
-  * Drop support for Python 3.5 and 2.7 (#3263)
+  * Drop support for Python 3.5. Support for 2.7 will be dropped
+    in privacyIDEA 3.9 (#3263)
   * Add MS CA connector to issue certificates from a Microsoft CA (#3233,
   #3232, #2966, #2158)
   * Add webhook event handler (#3178, #2938)
-  * Allow Kerebos Authentication for LDAP resolvers (#770)
+  * Allow Kerberos Authentication for LDAP resolvers (#770)
 
   Enhancements:
   * add policy for audit_page_size (#3167)
@@ -43,8 +903,8 @@ Version 3.8dev1, 2022-10-06
   * Add WebAuthn attestation format "packed" (#3150)
   * Support Windows Hello as WebAuthn token (#3142)
   * Improve the description for appimageurl (#3133)
-  * Allow to choose padding for defaul security module (#3115)
-  * Make available languages configureable in pi.cfg (#3076)
+  * Allow to choose padding for default security module (#3115)
+  * Make available languages configurable in pi.cfg (#3076)
   * Add translation for admin error messages (#3066)
   * Allow HTTPSMSProvider to send data as JSON (#3056)
   * Rename pi-manage createdb to create-tables (#2996)
@@ -55,8 +915,6 @@ Version 3.8dev1, 2022-10-06
   * Search and filter for actions in configured policies (#2788)
   Documentation
   * Add a glossary (#2783)
-
-
 
   Fixes:
   * Automatically delete MachineTokenOptions when a MachineToken is deleted (#3165)
@@ -82,7 +940,6 @@ Version 3.7.4, 2022-10-18
   * Fix the PassOnNoToken and passthru in Offline mode with Credential
   Provider (#3333)
   * URLencode password and username for remote token (#3337)
-
 
 Version 3.7.3, 2022-08-01
 
@@ -135,14 +992,14 @@ Version 3.7, 2022-03-31
     during token import (#2698)
   * Event Handler: Notification Handler now allows placeholders like "tokenowner" in reply-to. (#2711)
   * UI: Allow to login to WebUI using Push-Tokens (#2893)
-  * UI: If an adminitrator is allowed to manage only one realm, this realm is autoselected in the UI. (#2908)
+  * UI: If an administrator is allowed to manage only one realm, this realm is autoselected in the UI. (#2908)
   * UI: Rename buttons from "create" to "save" to avoid misunderstanding (#2932)
   * UI: Use new dependency injection in javascript code (#1917)
   * UI: Policy to exclude tokeninfo in token details (#2819)
   * UI: Highlight policy search term (#2577)
-  * Tools: The tokenjanitor can check for the pure existence of a tokeninfo key (#2753)
+  * Tools: The token--janitor can check for the pure existence of a tokeninfo key (#2753)
   * Tools: Improve the token janitor documentation (#2885)
-  * Tools: LinOTP miration script now also works with PostgreSQL (#2770)
+  * Tools: LinOTP migration script now also works with PostgreSQL (#2770)
   * Tools: The "orphaned" parameter of the token-janitor allows to use
     0/False or 1/True to also search for non-orphaned tokens (#2838)
   * Tools: Add more export/import functions to pi-manage (#2455)
@@ -214,10 +1071,10 @@ Version 3.7dev3, 2022-02-22
   * Policies: Also honor the user resolver in policies, when administrator is managing tokens (#2778)
   * Token: Redesign the code logic of is_previous_otp and make it more robust for HOTP and TOTP tokens (#2916)
   * Add detailed log messages to track HSM sessions (#3000)
-  * UI: If an adminitrator is allowed to manage only one realm, this realm is autoselected in the UI. (#2908)
+  * UI: If an administrator is allowed to manage only one realm, this realm is autoselected in the UI. (#2908)
   * UI: Rename buttons from "create" to "save" to avoid misunderstanding (#2932)
   * UI: Use new dependency injection in javascript code (#1917)
-  * Tools: The tokenjanitor can check for the pure existence of a tokeninfo key (#2753)
+  * Tools: The token-janitor can check for the pure existence of a tokeninfo key (#2753)
   * Tools: Improve the token janitor documentation (#2885)
   * Add new translated languages from the community: cs, es, it nb_NO, pl, ru, si, tr, uk, zh_HANS
   * Add nightly tests with a MySQL database (2477)
@@ -243,9 +1100,8 @@ Version 3.7dev3, 2022-02-22
 Version 3.6.3, 2021-11-18
 
   Fixes:
-  * Fix endianess for certain GUID bytestrings in LDAP resovler returned from AD
+  * Fix endianness for certain GUID bytestrings in LDAP resolver returned from AD
   * Fix problem with old OTP values of TOTP tokens in autoresync
-
 
 Version 3.7dev2, 2021-10-08
 
@@ -265,7 +1121,7 @@ Version 3.7dev1, 2021-08-25
   * Token Handler can use the serial numbers of the tokens
     during token import (#2698)
   * Notification Handler now allows placeholders like "tokenowner" in reply-to. (#2711)
-  * LinOTP miration script now also works with PostgreSQL (#2770)
+  * LinOTP migration script now also works with PostgreSQL (#2770)
   * consolidate client_wait in token enrollment. All tokens now
     get the rollout_state "clientwait" or "enrolled" which can
     be used in Token Handlers and in the token-janitor (#2784)
@@ -284,7 +1140,6 @@ Version 3.7dev1, 2021-08-25
   * Fix AD little endian in objectGUID
   * Fix upper case realm names in policy check (#2869)
   * Fix deleting expired auth_cache entries (#2481)
-
 
 Version 3.6.2, 2021-07-22
 
@@ -355,7 +1210,6 @@ Version 3.6, 2021-06-07
   * Save fractions of seconds in the audit log #2706
   * Fix pi-manage restore #2728
 
-
 Version 3.5.2, 2021-03-23
 
   Fixes:
@@ -373,7 +1227,6 @@ Version 3.5.1, 2021-01-28
   * Fix the internal interface of container audit module (#2562)
   * Add missing headers to /auth request (#2599)
   * Fix tokeninfo value filter with Oracle db (#2602)
-
 
 Version 3.5, 2020-12-22
 
@@ -399,7 +1252,7 @@ Version 3.5, 2020-12-22
   * Policies:
     * Add extended conditions for tokeninfo (#1947)
   * Web UI
-    * PIN can be changed with Challlenge Response when authenticating
+    * PIN can be changed with Challenge Response when authenticating
       at the WebUI (#2474)
     * Hide some audit log columns for service desk users (#2372)
     * Allow to configure a link to a policy statement/GDPR (#2325)
@@ -434,10 +1287,9 @@ Version 3.5, 2020-12-22
   * Fix url_decode (#2345)
   * Fix missing adminuser when importing policies (#2340)
   * Hide browser autocomplete in user search field (#2292)
-  * Disable browser autocomple fields that clash with
+  * Disable browser autocomplete fields that clash with
     search fields in the UI (#2401)
   * Fix challenge response with multiple FIDO2 tokens (#2092)
-
 
 Version 3.4.1, 2020-10-09
 
@@ -448,7 +1300,7 @@ Version 3.4.1, 2020-10-09
    * Move from PBKDF2 to Argon2 for password hashes. Might want to
      reset local admin passwords to use new hashing algo (#2412)
    * Hide dashboard for normal users (#2384)
-   * Fix problem with missing templates in CA conncetor (#2374)
+   * Fix problem with missing templates in CA connector (#2374)
    * Fix missing successful authentications in dashboard (#2394)
    * Improve error handling in token janitor in case of
      problematic user (#2405)
@@ -530,12 +1382,11 @@ Version 3.4, 2020-09-08
    * Fix url_decode (#2360)
    * Fix token settings for Yubikey in UI enrollment (#2365, #2366)
 
-
 Version 3.3.3, 2020-05-19
 
   Fixes:
     * Fix failing Challenge Response in WebUI (#2192)
-    * Add better logging for contradciting policy calls
+    * Add better logging for contradicting policy calls
     * Case insensitive user check failsafe in policy matching (#2198)
 
 Version 3.3.2, 2020-05-04
@@ -547,7 +1398,7 @@ Version 3.3.1, 2020-04-29
 
   Fixes:
     * Fix broken U2F support (#2157)
-    * Fix creation of PGP keys with pi-maange (#2165)
+    * Fix creation of PGP keys with pi-manage (#2165)
 
 Version 3.3, 2020-04-06
 
@@ -564,7 +1415,7 @@ Version 3.3, 2020-04-06
         to email notifications (#1226)
     * Policies:
       * Added a policy to define the allowed characters for PINs (#2051)
-      * Add policies to limit the number of destinct tokentypes per user (#1375)
+      * Add policies to limit the number of distinct tokentypes per user (#1375)
       * Improved distinction between the username of the administrator
         and the username of the user. Add an admin username to policies. (#1867)
         Thus allowing:
@@ -685,7 +1536,6 @@ Version 3.2, 2019-12-02
   * Make the policy creation at the command line with pi-manage more
     consistent (#1807)
 
-
 Version 3.1.2, 2019-11-15
 
   Fixes:
@@ -697,7 +1547,6 @@ Version 3.1.1, 2019-09-25
   Fixes:
   * Fix the wrong token_type key in the audit log which caused the tokentype
     to not be contained in the audit (#1846)
-
 
 Version 3.1, 2019-09-04
 
@@ -716,7 +1565,7 @@ Version 3.1, 2019-09-04
   * Authentication and Challenge Response:
     * RADIUS token supports a single AccessChallenge with the remote RADIUS server (#1790)
     * Improving Push token performance by reusing still valid access token (#1795)
-    * Improving TiQR token: It returns the remaining attemps after a wrong PIN is given (#1777)
+    * Improving TiQR token: It returns the remaining attempts after a wrong PIN is given (#1777)
     * Improving TiQR token: Make TiQR info URL configurable (#1782)
     * Enhance validate check logic in regards to serials and user names (#1768)
     * User may now have several TiQR tokens at the same time (#1739)
@@ -749,7 +1598,7 @@ Version 3.1, 2019-09-04
     * Add image url to the otpauth QR code, allow images in e.g. FreeOTP (#1228)
     * Add MAC to PSKC token export (#1663)
   * Performance:
-    * Make the serverpool in LDAP resolver persistant improving redundancy performance (#1396)
+    * Make the serverpool in LDAP resolver persistent improving redundancy performance (#1396)
 
   Fixes:
   * Improve the stability of the schema-update-script (#1760)
@@ -769,7 +1618,6 @@ Version 3.1, 2019-09-04
   * Fix double listing in policy list (#1132)
   * Remove additional empty line in audit log in case of an error (#1707)
   * Fix enrollment of certificate tokens under Python 3 (#1799)
-
 
 Version 3.0.2, 2019-06-17
 
@@ -835,8 +1683,8 @@ Version 3.0, 2019-04-10
   * Fix manual resync of TOTP token (#1479)
   * Fix audit log entry if token resync fails (#1416)
   * Fix authcache to actually *write* values to the authcache (#1386)
-  * Fix UI language determiniation in IE (#1379)
-  * Fix tokenjanitor which sometimes did not delete all matching tokens (#1322)
+  * Fix UI language determination in IE (#1379)
+  * Fix token-janitor which sometimes did not delete all matching tokens (#1322)
   * Fix bug in two step enrollment (#1347)
   * Do not pass LDAP service account credentials in GET /resolver (#1271)
   * Redirect to login page in case of missing authorization header (#1326)
@@ -853,18 +1701,16 @@ Version 3.0, 2019-04-10
     into its own database table. This will allow to assign several users to
     one token (#1288)
   * Unify password hashing in SQLResolver by using passlib (#1372)
-  * Redesign the cryptolayer and replace pycrypto with cryptography (#1340)
+  * Redesign the crypto-layer and replace pycrypto with cryptography (#1340)
   * Remove the old statistics, that were based on the audit log in favour
     of the generic event handler based statistics (#1314)
   * Deterministic installation with pinned dependencies on all distributions (#1127)
-
 
 Version 2.23.5, 2019-03-04
 
   Fixes:
   * Fix authcache
   * Fix correct syncwindow for manually resyncing TOTP tokens
-
 
 Version 2.23.4, 2019-02-06
 
@@ -881,7 +1727,7 @@ Version 2.23.3, 2018-10-26
   Fixes:
   * Performance: avoid using wildcard serials in functions like
     get_tokens, get_realms_of_token and copy_token
-  * Performance: avoid reload of static configuration
+  * Performance: avoid reload of static configuration (#1523)
   * Performance: Clean up LDAP cache, so that it will not grow to big and
     further LDAP cache usage optimization (#1246)
   * Performance: Make signing the audit log configurable (#1262)
@@ -897,6 +1743,10 @@ Version 2.23.3, 2018-10-26
     the SQL Audit module.
   * Cast userid to string to avoid casts problems with PostgreSQL
   * Update pyopenssl dependency.
+  * Allow SQL audit signing to be deactivated
+  * Allow token auth counter to be deactivated
+  * Remove double "get" of Token challenges in UI
+  * Fix performance issue with wildcard serials (#1225)
 
 Version 2.23.2, 2018-09-07
 
@@ -971,7 +1821,6 @@ Version 2.23, 2018-08-29
   * Shorten audit information to fit into the database column (#1037)
   * Fix the RADIUS configuration test (#1042)
 
-
 Version 2.22.1, 2018-04-20
 
   Fixes in WebUI:
@@ -991,7 +1840,6 @@ Version 2.22.1, 2018-04-20
   * Fix validation of OCRA and TiQR token (#1008)
   * Add retry to cope with HSM issues (#1003)
   * Fix unicode in resolverconf database table with Oracle (#999)
-
 
 Version 2.22, 2018-03-27
 
@@ -1037,13 +1885,11 @@ Version 2.22, 2018-03-27
   * Fix Editing SMTP Server definition clears the password (#923)
   * Fix pi-manage backup crash (Thanks to Pavol Ipoth for this contribution!)
 
-
 Version 2.21.4, 2018-01-24
 
   Fixes:
   * HTTP Timeout of HTTP SMS Gateway (#889)
   * Remove console.log from webui
-
 
 Version 2.21.1, 2018-01-09
 
@@ -1053,13 +1899,11 @@ Version 2.21.1, 2018-01-09
 Version 2.21, 2017-12-20
 
   Features:
-
-   * Allow export of tokens to PKSC file (#790)
+   * Allow export of tokens to PSKC file (#790)
    * Implement two-step enrollment of HOTP/TOTP tokens (#797, #863, #865, #866)
    * Allow WebUI customization via policies (#795)
 
   Enhancements:
-
    * Add script to decrypt safeword tokens
    * Allow using tags in the tokenissuer of smartphone tokens
    * Try to re-establish lost HSM connections (#787)
@@ -1078,7 +1922,6 @@ Version 2.21, 2017-12-20
    * Allow to configure length of generated serial numbers (#583)
 
   Fixes:
-
    * Fix handling of only_realm option in token event handler (#809)
    * Fix scrollbar issues in WebUI (#806, #823)
    * Fix OTP counter of offline token (#840)
@@ -1103,7 +1946,6 @@ Version 2.20.1, 2017-10-30
 Version 2.20, 2017-09-27
 
   Features:
-
    * New Token-Type OCRA and DisplayTAN to support
      transaction signing for online banking (#767)
    * Federation Handler allows to forward authentication
@@ -1114,7 +1956,6 @@ Version 2.20, 2017-09-27
    * Authentication Cache policy (#729)
 
   Enhancements:
-
    * !!!NOTE!!! following policies now also honor the resolvers,
     which they did not previously:
     (AUTH, challenge_response), (AUTH, otppin),
@@ -1145,7 +1986,6 @@ Version 2.20, 2017-09-27
      email text and SMS text.
 
   Fixes:
-
    * Set default loglevel from DEBUG to INFO (#765)
    * Fixed PIN logging, which could lead to exceptions
    * Fixed unicode handling in log messages
@@ -1156,33 +1996,29 @@ Version 2.20, 2017-09-27
    * Allow multiple tries for challenge/response (#708)
    * Fix problem with certificate serial number (#737)
 
-
 Version 2.19.1, 2017-07-02
 
   Enhancements:
-
   * Add "pi-manage policy load" and "pi-manage policy export". (#721)
   * Allow customization via pi.cfg file.
   * Add {username} and {realm} as tags for the tokenhandler. (#735)
 
  Fixes:
-
   * Fix pi-manage file permission for backup
   * Fix search for resolver in audit log
   * Allow to read old legacy time from validity period
-  * Fix wrong enddate with lost_token
+  * Fix wrong end date with lost_token
   * Fix typos
   * Improve documentation for yubikey
   * Improve documentation for cache decorator
   * Improve documentation for webui policy
-
 
 Version 2.19, 2017-05-25
 
   Features:
   * Add generic User Cache to speed up authentication (#670, #683)
   * Support multiple challenge-response tokens with the same PIN (#654)
-  * Restrict U2F registration based on assertion certificte (#648)
+  * Restrict U2F registration based on assertion certificate (#648)
   * Restrict authentication with U2F devices based on assertion
     certificate (#648)
   * Add privacyidea-token-janitor script, that can clean orphaned or
@@ -1194,13 +2030,12 @@ Version 2.19, 2017-05-25
     HTTP return codes. (#703)
 
   Enhancements:
-
   * Allow to unset token validity period and other tokeninfo
     fields (#691)
   * Add a quick-resolver test for LDAP resolvers (#688)
   * Add additional tokeninfo tags {client_ip}, {ua_browser},
     {ua_string} in token handler (#687)
-  * Allow to set decription of U2F tokens during enrollment (#685)
+  * Allow to set description of U2F tokens during enrollment (#685)
   * Reduce the number of LDAP requests to increase authentication
     performance (#664, #655, #650)
   * Realm administrator is only allowed to see actions on this allowed
@@ -1262,7 +2097,7 @@ Version 2.18, 2017-03-09
   * Allow tokenhandler to set tokeninfo field.
   * Allow tokenhandler to set syncwindow.
   * Add event handler condition for count_auth_success and
-    cound_auth_fail
+    count_auth_fail
   * Add event handler condition for last_auth.
   * Improve Audit Log for Event Handler. Each triggered action
     will now also create an audit entry. (#609)
@@ -1275,7 +2110,7 @@ Version 2.18, 2017-03-09
     of subschema. (#585)
   * LDAP Resolver: Support StartTLS over Port 389.
   * Simplify LDAP Resolver: Remove username from Attribute Mapping.
-  * Simplefy LDAP Resolver: Remove reverse filter.
+  * Simplify LDAP Resolver: Remove reverse filter.
 
   Misc Enhancements:
   * Automatically add user's mobile number if tokentype is SMS.
@@ -1285,7 +2120,7 @@ Version 2.18, 2017-03-09
   * WebUI: Add a busy indicator spinner.
   * Improve the pi-manage script in regards to backup and restore.
     Let you choose whether to backup encryption key or not.
-    Better handling for individual pathes. (#626, #623)
+    Better handling for individual path's. (#626, #623)
 
   Fixes:
   * LDAP Resolver: Verify SSL Certificate (Security)
@@ -1295,7 +2130,7 @@ Version 2.18, 2017-03-09
     a smartphone may import the key during HOTP/TOTP token enrollment
     by clicking the link. (#620)
   * Use defusexml to avoid XML bombs on token import (Security)
-  * Replace eval with ast.literal_evel (Security)
+  * Replace eval with ast.literal_eval (Security)
   * Add missing attributes for U2F tokens in
     validate/triggerchallenge API
   * Let /validate/triggerchallenge write to audit log.
@@ -1306,13 +2141,12 @@ Version 2.18, 2017-03-09
   * Remove unused policy action "motp_webprovision"
   * Allow emailtext policy in triggerchallenge API (#642)
 
-
 Version 2.17, 2016-12-29
 
   Features
   * Token Handler. Using the token handler the administrator
     can defined actions in response to events, to modify tokens
-    like deleting, modifying, initilizing... tokens (#532)
+    like deleting, modifying, initializing... tokens (#532)
   * Script Event Handler or Shell Event Handler allows to
     trigger an external shell script, if some event occurs. (#536)
   * Add additional endpoint to trigger a challenge response
@@ -1327,7 +2161,7 @@ Version 2.17, 2016-12-29
     even if there is no serial number in the request:
     If the user from the request only has one token assigned. (#571)
   * Allow event definitions to be disabled (#537)
-  * Allow event to be addressed by a destinct name (#522)
+  * Allow event to be addressed by a distinct name (#522)
   * Improving LDAP performance by addressing different functionality
     of ldap3 version 1.x and 2.x. (#549)
   * Improve SQL Audit by adding the SQL Audit table to the schema.
@@ -1349,10 +2183,9 @@ Version 2.17, 2016-12-29
   * Add documentation for SMS provider (#566)
   * Remove 301 redirects from WebUI (#576)
 
-
 Version 2.16, 2016-11-10
 
-  Featurs
+  Features
   * Add HSM support via AES keys (#534)
   * Improved Event Handler for flexible notification (#511)
   * Signed subscription files for adding and checking
@@ -1372,7 +2205,6 @@ Version 2.16, 2016-11-10
   * Fix enabled flag with certain database types (#527)
   * Catch error in case of faulty overrideClient definition (#526)
   * Truncate Audit lines, that are too long for the DB table (#525)
-
 
 Version 2.15, 2016-10-06
 
@@ -1396,7 +2228,6 @@ Version 2.15, 2016-10-06
   * Fixing RemoteUser fails to display WebUI (#499)
   * String comparison in HOSTS resolver (#484)
 
-
 Version 2.14, 2016-08-17
 
   Features
@@ -1417,18 +2248,17 @@ Version 2.14, 2016-08-17
   Fixes
   * Restrict GET /user for corresponding admins #460
 
-
 Version 2.13, 2016-06-30
 
   Features
   * Allow central definition of SMS gateways
     to be used with tokens. #392
-  * User SMS for User Notificaton Event Handler. #435
+  * User SMS for User Notification Event Handler. #435
   * Add PIN change setting for each token. #429
   * Force PIN change in web UI. #432
 
   Enhancements
-  * Performence enhancements
+  * Performance enhancements
     * speed up loading of audit log in web UI.
     * avoid double loadin of tokens and audit entries in web UI. #436
   * Additional log level (enhanced Debug) to even log passwords in
@@ -1444,8 +2274,6 @@ Version 2.13, 2016-06-30
   * Display token count in web UI. #437
   * Use correct default_tokentype in token enrollment. #427
   * Fix HOTP resync problems. #412
-
-
 
 Version 2.12, 2016-05-24
 
@@ -1479,7 +2307,6 @@ Version 2.12, 2016-05-24
   * Authentication with active token not possible if
     the user has a disabled token #339
 
-
 Version 2.11, 2016-03-29
 
   Features
@@ -1506,7 +2333,6 @@ Version 2.11, 2016-03-29
   * Fix Enrollment Wizard for non-default realm users
   * Registration process: If an email can not be delivered,
     the token is deleted, since it can not be used.
-
 
 Version 2.10, 2016-02-11
 
@@ -1584,7 +2410,8 @@ Version 2.8, 2015-11-26
   * Fix email token TLS checkbox saving
   * Fix TOTP testing in Web UI
   * Fix SMS config loading in Web UI
-
+  * Add Challenge Response support to SAML
+  * Add U2F support to SAML
 
 Version 2.7, 2015-10-03
 
@@ -1635,8 +2462,8 @@ Version 2.6, 2015-09-09
   * Fix link to privacyIDEA logo in Web UI
   * Fixed bug, that user was not able to resync his own tokens.
 
-
 Version 2.5, 2015-07-23
+
   Features
   * Add statistics
   * Add German translation
@@ -1647,7 +2474,7 @@ Version 2.5, 2015-07-23
   Enhancements
   * Preset Email and SMS of a user when enrolling token
   * Enable LDAP anonymous bind
-  * Add Hashalgorithms and digits to QR Code
+  * Add Hash algorithms and digits to QR Code
   * Add support for CentOS 6 and 7
 
   Fixes
@@ -1661,7 +2488,7 @@ Version 2.4, 2015-06-24
   * Add API key, that can be used for accessing /validate/check
   * Load PSKC Token seed files.
   * Add more sophisticated logging. Severe errors via Email
-  * WebUI: Registrtion token can be enrolled in WebUI
+  * WebUI: Registration token can be enrolled in WebUI
   * WebUI: The token seed can be displayed in WebUI after generation
   * WebUI: Only the token types that are allowed to be enrolled are displayed
   * WebUI: Login_Mode Policy: Disable access to WebUI for certain users
@@ -1673,7 +2500,7 @@ Version 2.4, 2015-06-24
   * Improve RADIUS module
   * WebUI: Fix download of audit log
   * Fix missing access right of user to GET /caconnector
-
+  * Fix SMS token
 
 Version 2.3, 2015-05-22
 
@@ -1695,8 +2522,8 @@ Version 2.3, 2015-05-22
 
 Version 2.2, 2015-04-09
 
-  * pi-manage.py: create resolvers and realms
-  * pi-manage.py: manage policies
+  * pi-manage: create resolvers and realms
+  * pi-manage: manage policies
   * Add LostToken UI
   * Add Offline Application
   * Add PAM authentication module with offline support
@@ -1707,7 +2534,6 @@ Version 2.2, 2015-04-09
   * Add bash script for ssh key fetching
   * Make WebUI logout time configurable via webui policy.
   * Add NTLM authentication to the LDAP resolver.
-
 
 Version 2.1, 2015-03-10
 
@@ -1721,26 +2547,23 @@ Version 2.1, 2015-03-10
   * Fix user list for AD (referrals) #99
   * Fix max_token_per_user policy #101
 
-
 Version 2.0, 2015-02-21
 
   * Migrate privacyIDEA to Flask Web framework
   * The WebUI was migrated to bootstrap and angularJS
-  * The database model was restructered to allow an easier handling and
+  * The database model was restructured to allow an easier handling and
     programming
   * Use the pi-manage.py tool to migrate old data
   * provide ubuntu packages for privacyidea base package and
     privacyidea-apache2 and privacyidea-nginx
   * provide pi-manage.py tool to manage the installation and create new admins.
-  * policies are restructered. Internally the policies now use decorators to
+  * policies are restructured. Internally the policies now use decorators to
     have a minimum code impact. No all policies are migrated, yet.
   * OCRA token and Email token is not migrated, yet.
-
 
 Version 1.5.1, 2015-01-12
 
   * Fix splitting the @-sign to allow users like user@email.com@realm1
-
 
 Version 1.5, 2014-12-25
 
@@ -1752,7 +2575,6 @@ Version 1.5, 2014-12-25
   * Fix the empty result audit search problem
   * Fix the port problem with SQL resolver
 
-
 Version 1.4, 2014-10-06
 
   * Add "wrong password" message on login screen
@@ -1762,7 +2584,6 @@ Version 1.4, 2014-10-06
   * Add admin/checkserial policy
   * Add help on logon screen
   * Fixed the session timeout bug in the management UI
-
 
 Version 1.3.2, 2014-09-22
 

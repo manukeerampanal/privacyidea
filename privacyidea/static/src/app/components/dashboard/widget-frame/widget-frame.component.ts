@@ -1,0 +1,136 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { CdkDragHandle } from "@angular/cdk/drag-drop";
+import { NgComponentOutlet, NgTemplateOutlet } from "@angular/common";
+import { Component, computed, inject, input, TemplateRef, viewChild } from "@angular/core";
+import { MatIconButton } from "@angular/material/button";
+import { MatIcon } from "@angular/material/icon";
+import { MatProgressSpinner } from "@angular/material/progress-spinner";
+import { MatTooltip } from "@angular/material/tooltip";
+import { RouterLink } from "@angular/router";
+import { DashboardWidget, WidgetInstance, WidgetState } from "@models/dashboard";
+import { AuthService, AuthServiceInterface } from "@services/auth/auth.service";
+import { DashboardLayoutService, DashboardLayoutServiceInterface } from "@services/dashboard/dashboard-layout.service";
+import { WidgetRegistryService, WidgetRegistryServiceInterface } from "@services/dashboard/widget-registry.service";
+
+interface DashboardWidgetLike {
+  state?: () => WidgetState;
+  loading?: () => boolean;
+  partialLoading?: () => boolean;
+  refreshFailed?: () => boolean;
+  reload?: () => void;
+  headerActions?: () => TemplateRef<unknown> | undefined;
+}
+
+@Component({
+  selector: "app-widget-frame",
+  standalone: true,
+  imports: [
+    NgComponentOutlet,
+    NgTemplateOutlet,
+    MatIcon,
+    MatIconButton,
+    MatProgressSpinner,
+    MatTooltip,
+    CdkDragHandle,
+    RouterLink
+  ],
+  templateUrl: "./widget-frame.component.html",
+  styleUrl: "./widget-frame.component.scss"
+})
+export class WidgetFrameComponent {
+  private readonly registry: WidgetRegistryServiceInterface = inject(WidgetRegistryService);
+  private readonly authService: AuthServiceInterface = inject(AuthService);
+  protected readonly layoutService: DashboardLayoutServiceInterface = inject(DashboardLayoutService);
+
+  readonly instance = input.required<WidgetInstance>();
+
+  private readonly outlet = viewChild<NgComponentOutlet>("widgetOutlet");
+
+  protected readonly widgetType = computed(() => this.registry.get(this.instance().type));
+  protected readonly component = computed(() => this.widgetType() ?? null);
+  protected readonly pinned = computed(() => this.widgetType()?.pinned ?? false);
+  protected readonly outletInputs = computed(() => ({ instance: this.instance() }));
+
+  protected readonly initialLoading = computed(() => {
+    const instance = this.outlet()?.componentInstance as DashboardWidget | undefined;
+    return instance?.state() === "loading";
+  });
+
+  protected readonly loading = computed(() => {
+    const instance = this.outlet()?.componentInstance as DashboardWidget | undefined;
+    return instance?.loading() ?? false;
+  });
+
+  protected readonly partialLoading = computed(() => {
+    const instance = this.outlet()?.componentInstance as DashboardWidget | undefined;
+    return instance?.partialLoading() ?? false;
+  });
+
+  protected readonly canReload = computed(() => {
+    const instance = this.outlet()?.componentInstance as DashboardWidget | undefined;
+    return instance?.canReload() ?? true;
+  });
+
+  protected readonly refreshFailed = computed(() => {
+    const instance = this.outlet()?.componentInstance as DashboardWidget | undefined;
+    return instance?.refreshFailed() ?? false;
+  });
+
+  protected readonly headerIcon = computed(() => this.widgetType()?.headerIcon ?? null);
+
+  protected readonly headerActions = computed(() => {
+    const instance = this.outlet()?.componentInstance as DashboardWidgetLike | undefined;
+    return instance?.headerActions?.() ?? null;
+  });
+
+  protected readonly titleLink = computed(() => {
+    if (this.layoutService.editMode()) {
+      return null;
+    }
+    const instance = this.outlet()?.componentInstance as DashboardWidget | undefined;
+    const route = instance?.titleRoute() ?? null;
+    if (route) {
+      return route;
+    }
+    const widgetType = this.widgetType();
+    const link = widgetType?.titleLink ?? null;
+    if (!link) {
+      return null;
+    }
+    const action = widgetType?.titleLinkAction ?? null;
+    return !action || this.authService.actionAllowed(action) ? link : null;
+  });
+
+  protected readonly showHeaderSpinner = computed(
+    () => !this.initialLoading() && (this.loading() || this.partialLoading())
+  );
+  protected readonly showReload = computed(
+    () => !this.initialLoading() && !this.showHeaderSpinner() && this.canReload()
+  );
+
+  protected reload(): void {
+    const instance = this.outlet()?.componentInstance as DashboardWidget | undefined;
+    instance?.reload();
+  }
+
+  protected remove(): void {
+    this.layoutService.removeWidget(this.instance().id);
+  }
+}

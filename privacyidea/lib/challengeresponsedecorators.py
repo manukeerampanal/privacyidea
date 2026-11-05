@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2020-08-03 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Initial writeup
 #
@@ -29,21 +27,19 @@ Currently the decorator is only tested in tests/test_lib_token.py
 import logging
 
 from privacyidea.lib.policy import Match
-from privacyidea.lib.policy import ACTION, SCOPE, check_pin, SCOPE
+from privacyidea.lib.policy import check_pin, SCOPE
+from privacyidea.lib.policies.actions import PolicyAction
 from privacyidea.lib.config import get_from_config
-from privacyidea.lib.crypto import pass_hash, verify_pass_hash, get_rand_digit_str
-from privacyidea.models import Challenge
+from privacyidea.lib.crypto import pass_hash, verify_pass_hash
 from privacyidea.lib.challenge import get_challenges
 from privacyidea.lib import _
+from privacyidea.lib.tokenclass import ClientMode
 
 
 log = logging.getLogger(__name__)
 
 
-SEED_LENGTH = 16
-
-
-class CHALLENGE_TYPE(object):
+class CHALLENGE_TYPE:
     PIN_RESET = "generic_pin_reset"
     RESYNC = "generic_resync"
 
@@ -52,14 +48,15 @@ def _create_challenge(token_obj, challenge_type, message, challenge_data=None):
     validity = int(get_from_config('DefaultChallengeValidityTime', 120))
     if challenge_type == CHALLENGE_TYPE.PIN_RESET:
         validity = int(get_from_config('PinResetChallengeValidityTime', validity))
-    db_challenge = Challenge(token_obj.token.serial,
-                             challenge=challenge_type,
-                             data=challenge_data,
-                             validitytime=validity)
-    db_challenge.save()
+    from privacyidea.lib.token import create_challenge
+    db_challenge = create_challenge(serial=token_obj.token.serial,
+                                    challenge=challenge_type,
+                                    data=challenge_data,
+                                    validitytime=validity)
     token_obj.challenge_janitor()
     reply_dict = {}
     reply_dict["multi_challenge"] = [{"transaction_id": db_challenge.transaction_id,
+                                      "client_mode": ClientMode.INTERACTIVE,
                                       "message": message,
                                       "attributes": None,
                                       "serial": token_obj.token.serial,
@@ -103,32 +100,34 @@ def generic_challenge_response_reset_pin(wrapped_function, *args, **kwds):
         if len(challenges) == 1:
             challenge = challenges[0]
             # check if challenge matches a token and if it is valid
-            token_obj = next(t for t in args[0] if t.token.serial == challenge.serial)
-            if token_obj:
+            token = next(t for t in args[0] if t.token.serial == challenge.serial)
+            if token:
                 # Then either verify the PIN or set the PIN the first time. The
                 # PIN from the 1st response is stored in challenge.data
-                if challenge.data:
+                challenge_data = challenge.get_data()
+                pin_hash = challenge_data.get("pin_hash")
+                if pin_hash:
                     # Verify the password
-                    if verify_pass_hash(args[1], challenge.data):
+                    if verify_pass_hash(args[1], pin_hash):
                         g = options.get("g")
                         challenge.set_otp_status(True)
-                        token_obj.challenge_janitor()
+                        token.challenge_janitor()
                         # Success, set new PIN and return success
-                        token_obj.set_pin(args[1])
-                        pinpol = Match.token(g, scope=SCOPE.ENROLL, action=ACTION.CHANGE_PIN_EVERY,
-                                             token_obj=token_obj).action_values(unique=True)
+                        token.set_pin(args[1])
+                        pinpol = Match.token(g, scope=SCOPE.ENROLL, action=PolicyAction.CHANGE_PIN_EVERY,
+                                             token=token).action_values(unique=True)
                         # Set a new next_pin_change
                         if pinpol:
                             # Set a new next pin change
-                            token_obj.set_next_pin_change(diff=list(pinpol)[0])
+                            token.set_next_pin_change(diff=list(pinpol)[0])
                         else:
                             # Obviously the admin removed the policy for changing pins,
                             # so we will not require to change the PIN again
-                            token_obj.del_tokeninfo("next_pin_change")
+                            token.remove_tokeninfo("next_pin_change")
                         return True, {"message": "PIN successfully set.",
-                                      "serial": token_obj.token.serial}
+                                      "serial": token.token.serial}
                     else:
-                        return False, {"serial": token_obj.token.serial,
+                        return False, {"serial": token.token.serial,
                                        "message": "PINs do not match"}
                 else:
                     # The PIN is presented the first time.
@@ -141,13 +140,12 @@ def generic_challenge_response_reset_pin(wrapped_function, *args, **kwds):
                         # check_pin would fail.
                         g.logged_in_user["username"] = user_obj.login
                         g.logged_in_user["realm"] = user_obj.realm
-                    check_pin(g, args[1], token_obj.token.tokentype, user_obj)
+                    check_pin(g, args[1], token.token.tokentype, user_obj)
                     # We need to ask for a 2nd time
                     challenge.set_otp_status(True)
-                    seed = get_rand_digit_str(SEED_LENGTH)
-                    reply_dict = _create_challenge(token_obj, CHALLENGE_TYPE.PIN_RESET,
+                    reply_dict = _create_challenge(token, CHALLENGE_TYPE.PIN_RESET,
                                                    _("Please enter the new PIN again"),
-                                                   pass_hash(args[1]))
+                                                   {"pin_hash": pass_hash(args[1])})
                     return False, reply_dict
 
     success, reply_dict = wrapped_function(*args, **kwds)
@@ -158,9 +156,9 @@ def generic_challenge_response_reset_pin(wrapped_function, *args, **kwds):
         # Determine the realm by the serial
         serial = reply_dict.get("serial")
         # The tokenlist can contain more than one token. So we get the matching token object
-        token_obj = next(t for t in args[0] if t.token.serial == serial)
-        if g and Match.token(g, scope=SCOPE.AUTH, action=ACTION.CHANGE_PIN_VIA_VALIDATE, token_obj=token_obj).any():
-            reply_dict = _create_challenge(token_obj, CHALLENGE_TYPE.PIN_RESET, _("Please enter a new PIN"))
+        token = next(t for t in args[0] if t.token.serial == serial)
+        if g and Match.token(g, scope=SCOPE.AUTH, action=PolicyAction.CHANGE_PIN_VIA_VALIDATE, token=token).any():
+            reply_dict = _create_challenge(token, CHALLENGE_TYPE.PIN_RESET, _("Please enter a new PIN"))
             return False, reply_dict
 
     return success, reply_dict
@@ -173,7 +171,7 @@ def generic_challenge_response_resync(wrapped_function, *args, **kwds):
     Conditions: To do so we check for "otp1c" in the tokeninfo data.
 
     Policies: A policy defines that the token resync should be allowed this way.
-    Note: The general config "autoresync" needs to be set anyways.
+    Note: The general config "autoresync" needs to be set anyway.
 
     args are:
     :param tokenobject_list: The list of all the tokens of the user, that will be checked
@@ -192,12 +190,12 @@ def generic_challenge_response_resync(wrapped_function, *args, **kwds):
         serial = reply_dict.get("serial")
         g = options.get("g")
         # The tokenlist can contain more than one token. So we get the matching token object
-        token_obj = next(t for t in args[0] if t.token.serial == serial)
-        if token_obj and token_obj.get_tokeninfo("otp1c"):
+        token = next(t for t in args[0] if t.token.serial == serial)
+        if token and token.get_tokeninfo("otp1c"):
             # We have an entry for resync
-            if g and Match.token(g, scope=SCOPE.AUTH, action=ACTION.RESYNC_VIA_MULTICHALLENGE,
-                                 token_obj=token_obj).any():
-                reply_dict = _create_challenge(token_obj, CHALLENGE_TYPE.RESYNC,
+            if g and Match.token(g, scope=SCOPE.AUTH, action=PolicyAction.RESYNC_VIA_MULTICHALLENGE,
+                                 token=token).any():
+                reply_dict = _create_challenge(token, CHALLENGE_TYPE.RESYNC,
                                                _("To resync your token, please enter the next OTP value"))
 
     return success, reply_dict

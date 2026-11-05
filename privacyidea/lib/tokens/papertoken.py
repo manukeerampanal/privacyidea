@@ -1,6 +1,4 @@
-# -*- coding: utf-8 -*-
-#
-#  2016-12-05 Cornelisu Kölbel <cornelius.koelbel@netknights.it>
+#  2016-12-05 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Add policy papertoken_count
 #
 #  2015-11-30 Cornelius Kölbel <cornelius.koelbel@netknights.it>
@@ -29,26 +27,24 @@ import logging
 from privacyidea.lib.log import log_with
 from privacyidea.lib.tokenclass import TokenClass
 from privacyidea.lib.tokens.hotptoken import HotpTokenClass
-from privacyidea.lib.policy import SCOPE, ACTION, GROUP
+from privacyidea.lib.policy import SCOPE, GROUP
+from privacyidea.lib.policies.actions import PolicyAction
 from privacyidea.lib import _
 
 log = logging.getLogger(__name__)
 DEFAULT_COUNT = 100
 
 
-class PAPERACTION(object):
+class PAPERACTION:
     PAPERTOKEN_COUNT = "papertoken_count"
 
 
 class PaperTokenClass(HotpTokenClass):
-
     """
     The Paper Token allows to print out the next e.g. 100 OTP values.
     This sheet of paper can be used to authenticate and strike out the used
     OTP values.
     """
-    # If the token is enrollable via multichallenge
-    is_multichallenge_enrollable = False
 
     @log_with(log)
     def __init__(self, db_token):
@@ -59,7 +55,7 @@ class PaperTokenClass(HotpTokenClass):
         :type db_token:  orm object
         """
         TokenClass.__init__(self, db_token)
-        self.set_type(u"paper")
+        self.set_type("paper")
         self.hKeyRequired = False
 
     @staticmethod
@@ -95,11 +91,11 @@ class PaperTokenClass(HotpTokenClass):
         """
         res = {'type': 'paper',
                'title': 'Paper Token',
-               'description': 'PPR: One Time Passwords printed on a sheet '
-                              'of paper.',
+               'description': _('PPR: One Time Passwords printed on a sheet '
+                                'of paper.'),
                'init': {},
                'config': {},
-               'user':  ['enroll'],
+               'user': ['enroll'],
                # This tokentype is enrollable in the UI for...
                'ui_enroll': ["admin", "user"],
                'policy': {
@@ -109,12 +105,12 @@ class PaperTokenClass(HotpTokenClass):
                            "desc": _("The number of OTP values, which are "
                                      "printed on the paper.")
                        },
-                       ACTION.MAXTOKENUSER: {
+                       PolicyAction.MAXTOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of paper tokens assigned."),
                            'group': GROUP.TOKEN
                        },
-                       ACTION.MAXACTIVETOKENUSER: {
+                       PolicyAction.MAXACTIVETOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of active paper tokens assigned."),
                            'group': GROUP.TOKEN
@@ -132,11 +128,19 @@ class PaperTokenClass(HotpTokenClass):
         return ret
 
     def update(self, param, reset_failcount=True):
-        if "otpkey" not in param:
+        if "otpkey" not in param and "verify" not in param:
             param["genkey"] = 1
         HotpTokenClass.update(self, param, reset_failcount=reset_failcount)
         papertoken_count = int(param.get("papertoken_count", DEFAULT_COUNT))
         # Now we calculate all the OTP values and add them to the
-        # init_details. Thus they will be returned by token/init.
-        otps = self.get_multi_otp(count=papertoken_count)
-        self.add_init_details("otps", otps[2].get("otp", {}))
+        # init_details. Thus, they will be returned by token/init.
+        # But only if this is not in verify state.
+        # TODO: check if can finish the request after verifying the token in the
+        #  prepolicy. Thus we would not need to go through all the token updates
+        if "verify" not in param:
+            otps = self.get_multi_otp(count=papertoken_count)
+            self.add_init_details("otps", otps[2].get("otp", {}))
+
+    @classmethod
+    def is_multichallenge_enrollable(cls):
+        return False

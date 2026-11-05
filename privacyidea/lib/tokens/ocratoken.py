@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  http://www.privacyidea.org
 #  2018-04-16 Friedrich Weber <friedrich.weber@netknights.it>
 #             Fix validation of challenge responses
@@ -21,8 +19,8 @@
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 __doc__ = """
-The OCRA token is the base OCRA functionality. Usually it is created by 
-importing a CSV or PSKC file. 
+The OCRA token is the base OCRA functionality. Usually it is created by
+importing a CSV or PSKC file.
 
 This code is tested in tests/test_lib_tokens_tiqr.
 """
@@ -30,30 +28,30 @@ This code is tested in tests/test_lib_tokens_tiqr.
 import logging
 import hashlib
 
-from privacyidea.api.lib.utils import getParam
+from privacyidea.lib.params import get_optional
 from privacyidea.lib.config import get_from_config
 from privacyidea.lib.tokenclass import TokenClass
 from privacyidea.lib.log import log_with
 from privacyidea.lib.utils import create_img, hexlify_and_unicode, to_bytes
-from privacyidea.models import Challenge
+from privacyidea.lib.token import create_challenge
 from privacyidea.lib.user import get_user_from_param
 from privacyidea.lib.tokens.ocra import OCRASuite, OCRA
 from privacyidea.lib import _
 from privacyidea.lib.decorators import check_token_locked
 from privacyidea.lib.crypto import get_alphanum_str
-from privacyidea.lib.policy import SCOPE, ACTION, GROUP
+from privacyidea.lib.policy import SCOPE, GROUP
+from privacyidea.lib.policies.actions import PolicyAction
 
 OCRA_DEFAULT_SUITE = "OCRA-1:HOTP-SHA1-8:QH40"
 
 log = logging.getLogger(__name__)
-optional = True
-required = False
 
 
 class OcraTokenClass(TokenClass):
     """
     The OCRA Token Implementation
     """
+    owned_tokeninfo_keys = frozenset({"ocrasuite"})
 
     @staticmethod
     def get_class_type():
@@ -96,12 +94,12 @@ class OcraTokenClass(TokenClass):
                'ui_enroll': [],
                'policy': {
                    SCOPE.ENROLL: {
-                       ACTION.MAXTOKENUSER: {
+                       PolicyAction.MAXTOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of OCRA tokens assigned."),
                            'group': GROUP.TOKEN
                        },
-                       ACTION.MAXACTIVETOKENUSER: {
+                       PolicyAction.MAXACTIVETOKENUSER: {
                            'type': 'int',
                            'desc': _("The user may only have this maximum number of active OCRA tokens assigned."),
                            'group': GROUP.TOKEN
@@ -126,7 +124,7 @@ class OcraTokenClass(TokenClass):
         :type db_token: DB object
         """
         TokenClass.__init__(self, db_token)
-        self.set_type(u"ocra")
+        self.set_type("ocra")
         self.hKeyRequired = False
 
     def update(self, param):
@@ -137,13 +135,13 @@ class OcraTokenClass(TokenClass):
         :type param: dict
         :return: None
         """
-        user_object = get_user_from_param(param, optional)
+        user_object = get_user_from_param(param)  # user is optional
         if user_object:
             self.add_user(user_object)
 
-        ocrasuite = getParam(param, "ocrasuite", default=OCRA_DEFAULT_SUITE)
+        ocrasuite = get_optional(param, "ocrasuite", default=OCRA_DEFAULT_SUITE)
         OCRASuite(ocrasuite)
-        self.add_tokeninfo("ocrasuite", ocrasuite)
+        self.write_tokeninfo("ocrasuite", ocrasuite)
         TokenClass.update(self, param)
 
         if user_object:
@@ -160,8 +158,7 @@ class OcraTokenClass(TokenClass):
 
         At the moment we do not think of other ways to trigger a challenge.
 
-        This function is not decorated with
-            @challenge_response_allowed
+        This function is not decorated with ``@challenge_response_allowed``,
         as the OCRA token is always a challenge response token!
 
         :param passw: The PIN of the token.
@@ -225,17 +222,13 @@ class OcraTokenClass(TokenClass):
             elif options.get("hashchallenge", "").lower() == "sha512":
                 challenge = hexlify_and_unicode(hashlib.sha512(to_bytes(challenge)).digest())
             elif options.get("hashchallenge"):
-                challenge = hexlify_and_unicode(hashlib.sha1(to_bytes(challenge)).digest())
-
+                challenge = hexlify_and_unicode(hashlib.sha1(to_bytes(challenge)).digest())  # nosec B324 # ocra definition
 
         # Create the challenge in the database
-        db_challenge = Challenge(self.token.serial,
-                                 transaction_id=None,
-                                 challenge=challenge,
-                                 data=None,
-                                 session=None,
-                                 validitytime=validity)
-        db_challenge.save()
+        db_challenge = create_challenge(self.token.serial,
+                                        transaction_id=None,
+                                        challenge=challenge,
+                                        validitytime=validity)
 
         attributes["challenge"] = challenge
         reply_dict = {"attributes": attributes}
@@ -276,23 +269,23 @@ class OcraTokenClass(TokenClass):
         return self.verify_response(otpval, options['challenge'])
 
     @staticmethod
-    def get_import_csv(l):
+    def get_import_csv(row):
         """
         Read the list from a csv file and return a dictionary, that can be used
         to do a token_init.
 
-        :param l: The list of the line of a csv file
-        :type l: list
+        :param row: The list of the line of a csv file
+        :type row: list
         :return: A dictionary of init params
         """
-        params = TokenClass.get_import_csv(l)
+        params = TokenClass.get_import_csv(row)
 
         # Delete the otplen, if it exists. The fourth column is the ocrasuite!
         if "otplen" in params:
             del params["otplen"]
 
         # ocrasuite
-        if len(l) >= 4:
-            params["ocrasuite"] = l[3].strip()
+        if len(row) >= 4:
+            params["ocrasuite"] = row[3].strip()
 
         return params

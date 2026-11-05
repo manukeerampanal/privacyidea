@@ -1,0 +1,44 @@
+name: GitLab Tag Master Branch
+
+on:
+  push:
+    tags:
+      - '*'
+
+# No permissions needed for this action
+permissions: {}
+
+jobs:
+  trigger-gitlab:
+    name: Trigger internal GitLab pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: gitlab
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine if tag is on a branch-* branch
+        id: check
+        uses: ./.github/actions/tag-source-branch
+        with:
+          sha: ${{ github.sha }}
+
+      - name: On Tag Trigger Pipeline
+        # Tags on a branch-* branch are handled by gitlab-trigger-branch-tag.
+        if: steps.check.outputs.match == 'false'
+        env:
+          GITLAB_TRIGGER_URL: https://lucan.netknights.it/api/v4/projects/3/trigger/pipeline
+          GITLAB_TRIGGER_TOKEN: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
+          GITHUB_TAG: ${{ github.ref_name }}
+          GITHUB_REPO_URL: https://github.com/${{ github.repository }}.git
+        run: |
+          curl --fail -X POST "$GITLAB_TRIGGER_URL" \
+            -F token="$GITLAB_TRIGGER_TOKEN" \
+            -F ref=main \
+            -F variables[GITHUB_TAG]="$GITHUB_TAG" \
+            -F variables[GITHUB_REPO]="$GITHUB_REPO_URL"

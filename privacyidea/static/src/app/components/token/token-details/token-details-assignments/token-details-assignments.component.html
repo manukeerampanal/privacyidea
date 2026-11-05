@@ -1,0 +1,181 @@
+<!--
+ (c) NetKnights GmbH 2026,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<app-details-card
+  class="details-card--assignment"
+  title="Assignments"
+  i18n-title="@@token.assignments">
+  <div class="details-field-list">
+    <app-detail-field-row
+      label="Token Realms"
+      i18n-label="@@token.tokenRealms"
+      [isEditing]="realmsField.isEditing()">
+      <ng-container fieldValue>
+        @if (realmsField.isEditing()) {
+          <app-details-multi-select-cell
+            selectLabel="Select Realms"
+            i18n-selectLabel="@@common.selectRealms"
+            [options]="realmOptions()"
+            [selected]="realmService.selectedRealms()"
+            (selectionChange)="realmService.selectedRealms.set($event)" />
+        } @else {
+          <app-details-list-display [items]="tokenDetails().realms" />
+        }
+      </ng-container>
+      <ng-container fieldEdit>
+        @if (realmsEditable()) {
+          <app-edit-buttons
+            [element]="realmsField.editButtonsElement"
+            [toggleEdit]="realmsField.toggle"
+            [saveEdit]="realmsField.commit"
+            [cancelEdit]="realmsField.cancel"
+            [shouldHideEdit]="isAnyEditingOrRevoked()"
+            [isEditingUser]="false"
+            [isEditingInfo]="false"></app-edit-buttons>
+        }
+      </ng-container>
+    </app-detail-field-row>
+
+    <app-detail-field-row
+      label="Token Groups"
+      i18n-label="@@token.tokenGroups"
+      [isEditing]="tokengroupField.isEditing()">
+      <ng-container fieldValue>
+        @if (tokengroupField.isEditing()) {
+          <app-details-multi-select-cell
+            selectLabel="Select Token Group"
+            i18n-selectLabel="@@token.selectTokenGroup"
+            [options]="tokengroupSelectOptions()"
+            [selected]="selectedTokengroup()"
+            (selectionChange)="selectedTokengroup.set($event)" />
+        } @else {
+          <app-details-list-display [items]="$any(tokenDetails().tokengroup)" />
+        }
+      </ng-container>
+      <ng-container fieldEdit>
+        @if (tokengroupEditable()) {
+          <app-edit-buttons
+            [element]="tokengroupField.editButtonsElement"
+            [toggleEdit]="tokengroupField.toggle"
+            [saveEdit]="tokengroupField.commit"
+            [cancelEdit]="tokengroupField.cancel"
+            [shouldHideEdit]="isAnyEditingOrRevoked()"
+            [isEditingUser]="false"
+            [isEditingInfo]="false"></app-edit-buttons>
+        }
+      </ng-container>
+    </app-detail-field-row>
+
+    <app-detail-field-row
+      label="Container Serial"
+      i18n-label="@@common.containerSerial"
+      [isEditing]="containerField.isEditing()">
+      <ng-container fieldValue>
+        <div class="container-serial-row">
+          @if (containerField.isEditing()) {
+            <mat-form-field
+              class="input-width-m height-52"
+              subscriptSizing="dynamic">
+              <mat-label i18n="@@token.enterContainer">Enter Container</mat-label>
+              <app-clearable-input
+                (clearButtonClick)="containerService.selectedContainerSerial.set('')"
+                [showClearButton]="containerService.selectedContainerSerial() !== ''">
+                <input
+                  [value]="containerService.selectedContainerSerial()"
+                  (input)="containerService.selectedContainerSerial.set($any($event.target).value)"
+                  [matAutocomplete]="containerAuto"
+                  appAutofocus
+                  matInput />
+              </app-clearable-input>
+              <mat-autocomplete
+                #containerAuto="matAutocomplete"
+                (optionSelected)="containerService.selectedContainerSerial.set($event.option.value)">
+                @for (option of containerService.containersForTokenType(); track option) {
+                  <mat-option [value]="option">{{ option }}</mat-option>
+                }
+              </mat-autocomplete>
+            </mat-form-field>
+            @if (!selfService()) {
+              <mat-checkbox
+                [checked]="containerService.filterContainersByTokenOwner()"
+                (change)="containerService.filterContainersByTokenOwner.set($event.checked)"
+                [disabled]="!tokenDetails().username"
+                i18n="@@token.filterByToken"
+                >Filter by token owner</mat-checkbox
+              >
+            }
+          } @else if (selfService()) {
+            <app-copyable [copyText]="containerSerial()">
+              @if (containerService.containerBelongsToUser(containerSerial())) {
+                <a
+                  (click)="contentService.navigateContainerDetails(containerSerial())"
+                  (keydown.enter)="contentService.navigateContainerDetails(containerSerial())"
+                  (keydown.space)="$event.preventDefault(); contentService.navigateContainerDetails(containerSerial())"
+                  aria-label="Container Serial Link"
+                  i18n-aria-label="@@token.containerSerial"
+                  role="button"
+                  tabindex="0">
+                  {{ containerSerial() }}
+                </a>
+              } @else {
+                {{ containerSerial() }}
+              }
+            </app-copyable>
+          } @else {
+            <div class="flex-row flex-nowrap ali-center">
+              <a
+                (click)="contentService.navigateContainerDetails(containerSerial())"
+                (keydown.enter)="contentService.navigateContainerDetails(containerSerial())"
+                (keydown.space)="$event.preventDefault(); contentService.navigateContainerDetails(containerSerial())"
+                aria-label="Container Serial Link"
+                i18n-aria-label="@@token.containerSerial"
+                role="button"
+                tabindex="0">
+                {{ containerSerial() }}
+              </a>
+              @if (containerSerial() !== "") {
+                <app-copy-button [copyText]="containerSerial()"></app-copy-button>
+              }
+            </div>
+          }
+        </div>
+      </ng-container>
+      <ng-container fieldEdit>
+        @if (!isAnyEditingOrRevoked() && containerSerial() && containerCanRemove()) {
+          <button
+            (click)="removeContainer()"
+            aria-label="Delete Container"
+            class="red"
+            i18n-aria-label="@@container.deleteContainer"
+            mat-icon-button>
+            <mat-icon>folder_delete</mat-icon>
+          </button>
+        } @else if (containerEditable()) {
+          <app-edit-buttons
+            [element]="containerField.editButtonsElement"
+            [toggleEdit]="containerField.toggle"
+            [saveEdit]="containerField.commit"
+            [cancelEdit]="containerField.cancel"
+            [shouldHideEdit]="isAnyEditingOrRevoked()"
+            [isEditingUser]="false"
+            [isEditingInfo]="false"></app-edit-buttons>
+        }
+      </ng-container>
+    </app-detail-field-row>
+  </div>
+</app-details-card>

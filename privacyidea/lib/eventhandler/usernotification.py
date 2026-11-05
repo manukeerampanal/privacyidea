@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2018-05-07 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Use tags in email subject.
 #  2017-10-27 Cornelius Kölbel <cornelius.koelbel@netknights.it>
@@ -39,28 +37,26 @@ It can be bound to each event and can perform the action:
 
 The module is tested in tests/test_lib_eventhandler_usernotification.py
 """
-from privacyidea.lib.eventhandler.base import BaseEventHandler
-from privacyidea.lib.smtpserver import send_email_identifier
-from privacyidea.lib.smsprovider.SMSProvider import send_sms_identifier
-from privacyidea.lib.auth import get_db_admins, get_db_admin
-from privacyidea.lib.framework import get_app_config_value
-from privacyidea.lib.token import get_tokens
-from privacyidea.lib.smtpserver import get_smtpservers
-from privacyidea.lib.smsprovider.SMSProvider import get_smsgateway
-from privacyidea.lib.user import User, get_user_list, is_attribute_at_all
-from privacyidea.lib.utils import create_tag_dict, to_unicode, is_true
-from privacyidea.lib.crypto import get_alphanum_str
-from privacyidea.lib import _
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.image import MIMEImage
-try:
-    from urllib.request import urlopen
-except ImportError:  # pragma: no cover
-    from urllib import urlopen
+
 import logging
 import os
 import traceback
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from urllib.request import urlopen
+
+from privacyidea.lib import _
+from privacyidea.lib.auth import get_db_admin, get_all_db_admins
+from privacyidea.lib.crypto import get_alphanum_str
+from privacyidea.lib.eventhandler.base import BaseEventHandler
+from privacyidea.lib.framework import get_app_config_value
+from privacyidea.lib.smsprovider.SMSProvider import get_smsgateway
+from privacyidea.lib.smsprovider.SMSProvider import send_sms_identifier
+from privacyidea.lib.smtpserver import get_smtpservers
+from privacyidea.lib.smtpserver import send_email_identifier
+from privacyidea.lib.user import User, get_user_list, is_attribute_at_all
+from privacyidea.lib.utils import create_tag_dict, to_unicode, is_true
 
 log = logging.getLogger(__name__)
 
@@ -75,7 +71,7 @@ To check your tokens you may login to the Web UI:
 """
 
 
-class NOTIFY_TYPE(object):
+class NOTIFY_TYPE:
     """
     Allowed token owner
     """
@@ -85,6 +81,7 @@ class NOTIFY_TYPE(object):
     ADMIN_REALM = "admin realm"
     EMAIL = "email"
     NO_REPLY_TO = ""
+
 
 class UserNotificationEventHandler(BaseEventHandler):
     """
@@ -99,15 +96,59 @@ class UserNotificationEventHandler(BaseEventHandler):
     description = "This eventhandler notifies the user about actions on his tokens"
 
     @property
-    def allowed_positions(cls):
+    def allowed_positions(self):
         """
         This returns the allowed positions of the event handler definition.
         :return: list of allowed positions
         """
         return ["post", "pre"]
 
+    @staticmethod
+    def attach_qr(body, url_img, mimetype, serial):
+        """
+        Attach the QR-Code image to the email body.
+
+        :param body: email body
+        :param url_img: URL of the QR-Code image
+        :param mimetype: mimetype of the email
+        :param serial: serial number of the token
+        :return: body with the attached QR-Code image
+        """
+        # get the image part of the url
+        url = urlopen(url_img)  # nosec B310   # no user input
+        mail_body = MIMEMultipart('related')
+        mail_body.attach(MIMEText(body, mimetype))
+        mail_img = MIMEImage(url.read())
+        mail_img.add_header('Content-ID', '<token_image>')
+        mail_img.add_header('Content-Disposition',
+                            f'inline; filename="{serial}.png"')
+        mail_body.attach(mail_img)
+        body = mail_body
+        return body
+
+    @staticmethod
+    def get_admin_realm_emails(admin_realm):
+        """
+        Collect the email addresses of all users in the given admin realm.
+
+        A broken resolver in the realm would otherwise silently drop its admins
+        from the result, so skipped resolvers are captured and warn-logged --
+        the returned list may be incomplete.
+
+        :param admin_realm: the name of the admin realm
+        :return: a list of email addresses of users that have an email
+        """
+        attr = is_attribute_at_all()
+        failures: list[str] = []
+        ulist = get_user_list({"realm": admin_realm}, include_custom_attributes=attr, failures=failures)
+        if failures:
+            skipped = sorted(failures)
+            log.warning(f"Admin recipient list for realm {admin_realm!r} may be incomplete; "
+                        f"resolvers skipped due to errors: {skipped}")
+        return [u.get("email") for u in ulist if u.get("email")]
+
     @property
-    def actions(cls):
+    def actions(self):
         """
         This method returns a dictionary of allowed actions and possible
         options in this handler module.
@@ -150,13 +191,14 @@ class UserNotificationEventHandler(BaseEventHandler):
                         NOTIFY_TYPE.EMAIL]},
                 "reply_to " + NOTIFY_TYPE.ADMIN_REALM: {
                     "type": "str",
-                    "value": get_app_config_value("SUPERUSER_REALM", []),
+                    "required": True,
+                    "value": get_app_config_value("SUPERUSER_REALM", None),
                     "visibleIf": "reply_to",
                     "visibleValue": NOTIFY_TYPE.ADMIN_REALM},
                 "reply_to " + NOTIFY_TYPE.INTERNAL_ADMIN: {
                     "type": "str",
                     "value": [a.username for a in
-                              get_db_admins()],
+                              get_all_db_admins()],
                     "visibleIf": "reply_to",
                     "visibleValue":
                         NOTIFY_TYPE.INTERNAL_ADMIN},
@@ -166,10 +208,31 @@ class UserNotificationEventHandler(BaseEventHandler):
                                      "should be sent."),
                     "visibleIf": "reply_to",
                     "visibleValue": NOTIFY_TYPE.EMAIL},
+                "reply_to " + NOTIFY_TYPE.TOKENOWNER: {
+                    "type": "str",
+                    "description": _(
+                        "You can enter a user attribute here to use an email address other than the default."),
+                    "required": False,
+                    "visibleIf": "reply_to",
+                    "visibleValue": NOTIFY_TYPE.TOKENOWNER},
+                "reply_to " + NOTIFY_TYPE.LOGGED_IN_USER: {
+                    "type": "str",
+                    "description": _(
+                        "You can enter a user attribute here to use an email address other than the default."),
+                    "required": False,
+                    "visibleIf": "reply_to",
+                    "visibleValue": NOTIFY_TYPE.LOGGED_IN_USER},
                 "body": {
                     "type": "text",
                     "required": False,
-                    "description": _("The body of the mail that is sent.")},
+                    "description": _("The template of the mail body that will be sent. It may contain the following "
+                                     "tags as specified in the documentation: <code>{admin}, {realm}, {action}, "
+                                     "{serial}, {url}, {user}, {givenname}, {surname}, {username}, {userrealm}, "
+                                     "{tokentype}, {tokendescription}, {registrationcode}, {recipient_givenname}, "
+                                     "{recipient_surname}, {googleurl_value}, {googleurl_img}, {pushurl_value}, "
+                                     "{pushurl_img}, {container_url_value}, {container_url_img}, {time}, {date}, "
+                                     "{client_ip}, {ua_browser}, {ua_string}, {pin}."
+                                     "</code>")},
                 "To": {
                     "type": "str",
                     "required": True,
@@ -182,13 +245,14 @@ class UserNotificationEventHandler(BaseEventHandler):
                         NOTIFY_TYPE.EMAIL]},
                 "To " + NOTIFY_TYPE.ADMIN_REALM: {
                     "type": "str",
-                    "value": get_app_config_value("SUPERUSER_REALM", []),
+                    "required": True,
+                    "value": get_app_config_value("SUPERUSER_REALM", None),
                     "visibleIf": "To",
                     "visibleValue": NOTIFY_TYPE.ADMIN_REALM},
                 "To " + NOTIFY_TYPE.INTERNAL_ADMIN: {
                     "type": "str",
                     "value": [a.username for a in
-                              get_db_admins()],
+                              get_all_db_admins()],
                     "visibleIf": "To",
                     "visibleValue":
                         NOTIFY_TYPE.INTERNAL_ADMIN},
@@ -197,7 +261,21 @@ class UserNotificationEventHandler(BaseEventHandler):
                     "description": _("Any email address, to which the notification "
                                      "should be sent."),
                     "visibleIf": "To",
-                    "visibleValue": NOTIFY_TYPE.EMAIL}
+                    "visibleValue": NOTIFY_TYPE.EMAIL},
+                "To " + NOTIFY_TYPE.TOKENOWNER: {
+                    "type": "str",
+                    "description": _(
+                        "You can enter a user attribute here to use an email address other than the default."),
+                    "required": False,
+                    "visibleIf": "To",
+                    "visibleValue": NOTIFY_TYPE.TOKENOWNER},
+                "To " + NOTIFY_TYPE.LOGGED_IN_USER: {
+                    "type": "str",
+                    "description": _(
+                        "You can enter a user attribute here to use an email address other than the default."),
+                    "required": False,
+                    "visibleIf": "To",
+                    "visibleValue": NOTIFY_TYPE.LOGGED_IN_USER}
             },
             "sendsms": {
                 "smsconfig": {
@@ -208,7 +286,14 @@ class UserNotificationEventHandler(BaseEventHandler):
                     "value": smsgateways},
                 "body": {"type": "text",
                          "required": False,
-                         "description": _("The text of the SMS.")},
+                         "description": _("The text template of the SMS. It may contain the following tags "
+                                          "as specified in the documentation: <code>{admin}, {realm}, {action}, "
+                                          "{serial}, {url}, {user}, {givenname}, {surname}, {username}, {userrealm}, "
+                                          "{tokentype}, {tokendescription}, {registrationcode}, {recipient_givenname}, "
+                                          "{recipient_surname}, {googleurl_value}, {googleurl_img}, {pushurl_value}, "
+                                          "{pushurl_img}, {container_url_value}, {container_url_img}, {time}, {date}, "
+                                          "{client_ip}, {ua_browser}, {ua_string}, "
+                                          "{pin}.</code>")},
                 "To": {"type": "str",
                        "required": True,
                        "description": _("Send notification to this user."),
@@ -218,9 +303,14 @@ class UserNotificationEventHandler(BaseEventHandler):
                 "body": {
                     "type": "text",
                     "required": True,
-                    "description": _("This is the template content of "
-                                     "the new file. Can contain the tags "
-                                     "as specified in the documentation.")},
+                    "description": _("This is the template content of the new file. It may contain the following tags "
+                                     "as specified in the documentation: <code>{admin}, {realm}, {action}, "
+                                     "{serial}, {url}, {user}, {givenname}, {surname}, {username}, {userrealm}, "
+                                     "{tokentype}, {tokendescription}, {registrationcode}, {recipient_givenname}, "
+                                     "{recipient_surname}, {googleurl_value}, {googleurl_img}, {pushurl_value}, "
+                                     "{pushurl_img}, {container_url_value}, {container_url_img}, {time}, {date}, "
+                                     "{client_ip}, {ua_browser}, {ua_string}, {pin}."
+                                     "</code>")},
                 "filename": {
                     "type": "str",
                     "required": True,
@@ -256,66 +346,22 @@ class UserNotificationEventHandler(BaseEventHandler):
             logged_in_user = {}
 
         tokenowner = self._get_tokenowner(request)
-        log.debug(u"Executing event for action {0!r}, user {1!r}, "
-                  u"logged_in_user {2!r}".format(action, tokenowner,
-                                                 logged_in_user))
+        log.debug(f"Executing event for action {action}, user {tokenowner}, logged_in_user {logged_in_user}")
 
         # Determine recipient
         recipient = None
         reply_to = None
 
-        if reply_to_type == NOTIFY_TYPE.NO_REPLY_TO:
-            reply_to = ""
-
-        elif reply_to_type == NOTIFY_TYPE.TOKENOWNER and not tokenowner.is_empty():
-            reply_to = tokenowner.info.get("email")
-
-        elif reply_to_type == NOTIFY_TYPE.INTERNAL_ADMIN:
-            username = handler_options.get("reply_to " + NOTIFY_TYPE.INTERNAL_ADMIN)
-            internal_admin = get_db_admin(username)
-            reply_to = internal_admin.email if internal_admin else ""
-
-        elif reply_to_type == NOTIFY_TYPE.ADMIN_REALM:
-            # Adds all email addresses from a specific admin realm to the reply-to-header
-            admin_realm = handler_options.get("reply_to " + NOTIFY_TYPE.ADMIN_REALM)
-            attr = is_attribute_at_all()
-            ulist = get_user_list({"realm": admin_realm}, custom_attributes=attr)
-            # create a list of all user-emails, if the user has an email
-            emails = [u.get("email") for u in ulist if u.get("email")]
-            reply_to = ",".join(emails)
-
-        elif reply_to_type == NOTIFY_TYPE.LOGGED_IN_USER:
-            # Add email address from the logged in user into the reply-to header
-            if logged_in_user.get("username") and not logged_in_user.get(
-                    "realm"):
-                # internal admins have no realm
-                internal_admin = get_db_admin(logged_in_user.get("username"))
-                if internal_admin:
-                    reply_to = internal_admin.email if internal_admin else ""
-
-            else:
-                # Try to find the user in the specified realm
-                user_obj = User(logged_in_user.get("username"),
-                                logged_in_user.get("realm"))
-                if user_obj:
-                    reply_to = user_obj.info.get("email") if user_obj else ""
-
-        elif reply_to_type == NOTIFY_TYPE.EMAIL:
-            email = handler_options.get("reply_to " + NOTIFY_TYPE.EMAIL, "").split(",")
-            reply_to = email[0]
-
-        else:
-            log.warning("Was not able to determine the email for the reply-to "
-                        "header: {0!s}".format(handler_def))
-
         if notify_type == NOTIFY_TYPE.TOKENOWNER and not tokenowner.is_empty():
+            email = handler_options.get("To " + NOTIFY_TYPE.TOKENOWNER, 'email')
+            user_info = tokenowner.get_specific_info(["givenname", "surname", email, "mobile"])
             recipient = {
-                "givenname": tokenowner.info.get("givenname"),
-                "surname": tokenowner.info.get("surname"),
+                "givenname": user_info.get("givenname"),
+                "surname": user_info.get("surname"),
                 "username": tokenowner.login,
                 "userrealm": tokenowner.realm,
-                "email": tokenowner.info.get("email"),
-                "mobile": tokenowner.info.get("mobile")
+                "email": user_info.get(email),
+                "mobile": user_info.get("mobile")
             }
         elif notify_type == NOTIFY_TYPE.INTERNAL_ADMIN:
             username = handler_options.get("To " + NOTIFY_TYPE.INTERNAL_ADMIN)
@@ -325,16 +371,18 @@ class UserNotificationEventHandler(BaseEventHandler):
                 "email": internal_admin.email if internal_admin else ""
             }
         elif notify_type == NOTIFY_TYPE.ADMIN_REALM:
-            # Send emails to all the users in the specified admin realm
+            # Send emails to all the users in the specified admin realm.
             admin_realm = handler_options.get("To " + NOTIFY_TYPE.ADMIN_REALM)
-            attr = is_attribute_at_all()
-            ulist = get_user_list({"realm": admin_realm}, custom_attributes=attr)
-            # create a list of all user-emails, if the user has an email
-            emails = [u.get("email") for u in ulist if u.get("email")]
-            recipient = {
-                "givenname": "admin of realm {0!s}".format(admin_realm),
-                "email": emails
-            }
+            if admin_realm:
+                recipient = {
+                    "givenname": f"admin of realm {admin_realm}",
+                    "email": self.get_admin_realm_emails(admin_realm)
+                }
+            else:
+                log.warning("No admin realm specified for ADMIN_REALM notification. "
+                            "No recipients will be notified.")
+                self.run_details = ("No admin realm configured for the notification. "
+                                    "No notification was sent.")
         elif notify_type == NOTIFY_TYPE.LOGGED_IN_USER:
             # Send notification to the logged in user
             if logged_in_user.get("username") and not logged_in_user.get(
@@ -348,14 +396,16 @@ class UserNotificationEventHandler(BaseEventHandler):
                     }
             else:
                 # Try to find the user in the specified realm
-                user_obj = User(logged_in_user.get("username"),
-                                logged_in_user.get("realm"))
-                if user_obj:
+                user = User(logged_in_user.get("username"),
+                            logged_in_user.get("realm"))
+                email = handler_options.get("To " + NOTIFY_TYPE.LOGGED_IN_USER, 'email')
+                if user:
+                    user_info = user.get_specific_info(["givenname", "surname", email, "mobile"])
                     recipient = {
-                        "givenname": user_obj.info.get("givenname"),
-                        "surname": user_obj.info.get("surname"),
-                        "email": user_obj.info.get("email"),
-                        "mobile": user_obj.info.get("mobile")
+                        "givenname": user_info.get("givenname"),
+                        "surname": user_info.get("surname"),
+                        "email": user_info.get(email),
+                        "mobile": user_info.get("mobile")
                     }
 
         elif notify_type == NOTIFY_TYPE.EMAIL:
@@ -363,9 +413,6 @@ class UserNotificationEventHandler(BaseEventHandler):
             recipient = {
                 "email": email
             }
-        else:
-            log.warning("Was not able to determine the recipient for the user "
-                        "notification: {0!s}".format(handler_def))
 
         if recipient or action.lower() == "savefile":
             # In case of "savefile" we do not need a recipient
@@ -375,80 +422,131 @@ class UserNotificationEventHandler(BaseEventHandler):
                 # We read the template from the file.
                 filename = body[5:]
                 try:
-                    with open(filename, "r", encoding="utf-8") as f:
+                    with open(filename, encoding="utf-8") as f:
                         body = f.read()
                 except Exception as e:
-                    log.warning(u"Failed to read email template from file {0!r}: {1!r}".format(filename, e))
-                    log.debug(u"{0!s}".format(traceback.format_exc()))
+                    log.warning(f"Failed to read email template from file {filename}: {e}")
+                    log.debug(traceback.format_exc())
 
-            subject = handler_options.get("subject") or \
-                      "An action was performed on your token."
-            serial = request.all_data.get("serial") or \
-                     content.get("detail", {}).get("serial") or \
-                     g.audit_object.audit_data.get("serial")
+            subject = handler_options.get("subject") or "An action was performed on your token."
+            serial = (request.all_data.get("serial")
+                      or content.get("detail", {}).get("serial")
+                      or g.audit_object.audit_data.get("serial"))
+            container_serial = request.all_data.get("container_serial")
             registrationcode = content.get("detail", {}).get("registrationcode")
             pin = content.get("detail", {}).get("pin")
             googleurl_value = content.get("detail", {}).get("googleurl",
                                                             {}).get("value")
             googleurl_img = content.get("detail", {}).get("googleurl",
                                                           {}).get("img")
-            tokentype = None
-            if serial:
-                tokens = get_tokens(serial=serial)
-                if tokens:
-                    tokentype = tokens[0].get_tokentype()
-            else:
-                token_objects = get_tokens(user=tokenowner)
-                serial = ','.join([tok.get_serial() for tok in token_objects])
+            pushurl_value = content.get("detail", {}).get("pushurl",
+                                                          {}).get("value")
+            pushurl_img = content.get("detail", {}).get("pushurl",
+                                                        {}).get("img")
+            container_content = content.get("result", {}).get("value", {})
+            container_url_value = container_url_img = None
+            if isinstance(container_content, dict):
+                container_url_value = container_content.get("container_url", {}).get("value")
+                container_url_img = container_content.get("container_url", {}).get("img")
+            serial, tokentype, tokendescription = self._get_token_data(serial, tokenowner)
 
             tags = create_tag_dict(logged_in_user=logged_in_user,
                                    request=request,
                                    client_ip=g.client_ip,
                                    pin=pin,
                                    googleurl_value=googleurl_value,
+                                   googleurl_img=googleurl_img,
+                                   pushurl_value=pushurl_value,
+                                   pushurl_img=pushurl_img,
                                    recipient=recipient,
                                    tokenowner=tokenowner,
                                    serial=serial,
+                                   container_serial=container_serial,
                                    tokentype=tokentype,
+                                   tokendescription=tokendescription,
                                    registrationcode=registrationcode,
-                                   escape_html=action.lower() == "sendmail" and
-                                               handler_options.get("mimetype", "").lower() == "html")
+                                   escape_html=(action.lower() == "sendmail"
+                                                and handler_options.get("mimetype", "").lower() == "html"),
+                                   container_url_value=container_url_value,
+                                   container_url_img=container_url_img)
 
-            body = to_unicode(body).format(googleurl_img=googleurl_img, **tags)
+            body = to_unicode(body).format(**tags)
             subject = subject.format(**tags)
             # Send notification
             if action.lower() == "sendmail":
+                if reply_to_type:
+                    if reply_to_type == NOTIFY_TYPE.NO_REPLY_TO:
+                        reply_to = ""
+
+                    elif reply_to_type == NOTIFY_TYPE.TOKENOWNER and not tokenowner.is_empty():
+                        email = handler_options.get("reply_to " + NOTIFY_TYPE.TOKENOWNER, 'email')
+                        reply_to = tokenowner.info.get(email)
+
+                    elif reply_to_type == NOTIFY_TYPE.INTERNAL_ADMIN:
+                        username = handler_options.get("reply_to " + NOTIFY_TYPE.INTERNAL_ADMIN)
+                        internal_admin = get_db_admin(username)
+                        reply_to = internal_admin.email if internal_admin else ""
+
+                    elif reply_to_type == NOTIFY_TYPE.ADMIN_REALM:
+                        # Adds all email addresses from a specific admin realm to the reply-to-header.
+                        admin_realm = handler_options.get("reply_to " + NOTIFY_TYPE.ADMIN_REALM)
+                        if admin_realm:
+                            reply_to = ",".join(self.get_admin_realm_emails(admin_realm))
+                        else:
+                            log.warning("No admin realm specified for ADMIN_REALM reply-to. "
+                                        "Reply-To will fall back to the SMTP sender address.")
+                            reply_to = None
+
+                    elif reply_to_type == NOTIFY_TYPE.LOGGED_IN_USER:
+                        # Add email address from the logged in user into the reply-to header
+                        email = handler_options.get("reply_to " + NOTIFY_TYPE.LOGGED_IN_USER, 'email')
+                        if logged_in_user.get("username") and not logged_in_user.get(
+                                "realm"):
+                            # internal admins have no realm
+                            internal_admin = get_db_admin(logged_in_user.get("username"))
+                            if internal_admin:
+                                reply_to = internal_admin.email if internal_admin else ""
+
+                        else:
+                            # Try to find the user in the specified realm
+                            user = User(logged_in_user.get("username"),
+                                        logged_in_user.get("realm"))
+                            if user:
+                                reply_to = user.get_specific_info([email]).get(email) if user else ""
+
+                    elif reply_to_type == NOTIFY_TYPE.EMAIL:
+                        email = handler_options.get("reply_to " + NOTIFY_TYPE.EMAIL, "").split(",")
+                        reply_to = email[0]
+                    else:
+                        log.warning(f"Unable to determine the email for the reply-to header: {handler_def}")
+
                 emailconfig = handler_options.get("emailconfig")
                 mimetype = handler_options.get("mimetype", "plain")
                 useremail = recipient.get("email")
                 attach_qrcode = is_true(handler_options.get("attach_qrcode"))
 
-                if attach_qrcode and googleurl_img:
-                    # get the image part of the googleurl
-                    googleurl = urlopen(googleurl_img)
-                    mail_body = MIMEMultipart('related')
-                    mail_body.attach(MIMEText(body, mimetype))
-                    mail_img = MIMEImage(googleurl.read())
-                    mail_img.add_header('Content-ID', '<token_image>')
-                    mail_img.add_header('Content-Disposition',
-                                        'inline; filename="{0!s}.png"'.format(serial))
-                    mail_body.attach(mail_img)
-                    body = mail_body
+                if attach_qrcode:
+                    if googleurl_img:
+                        body = self.attach_qr(body, googleurl_img, mimetype, serial)
+                    elif pushurl_img:
+                        body = self.attach_qr(body, pushurl_img, mimetype, serial)
+                    elif container_url_img:
+                        body = self.attach_qr(body, container_url_img, mimetype, serial)
                 try:
                     ret = send_email_identifier(emailconfig,
                                                 recipient=useremail,
                                                 subject=subject, body=body,
                                                 reply_to=reply_to,
                                                 mimetype=mimetype)
-                except Exception as exx:
-                    log.error("Failed to send email: {0!s}".format(exx))
+                except Exception as e:  # pragma: no cover
+                    log.error(f"Failed to send email: {e}")
+                    self.run_details = str(e)
                     ret = False
                 if ret:
-                    log.info("Sent a notification email to user {0}".format(
-                        recipient))
+                    log.info(f"Sent a notification email to user {recipient}")
                 else:
-                    log.warning("Failed to send a notification email to user "
-                                "{0}".format(recipient))
+                    log.warning(f"Failed to send a notification email to user {recipient}")
+                    self.run_details = f"Failed: {useremail}."
 
             elif action.lower() == "savefile":
                 spooldir = get_app_config_value("PI_NOTIFICATION_HANDLER_SPOOLDIRECTORY",
@@ -458,27 +556,27 @@ class UserNotificationEventHandler(BaseEventHandler):
                 filename = filename.format(random=random, **tags).lstrip(os.path.sep)
                 outfile = os.path.normpath(os.path.join(spooldir, filename))
                 if not outfile.startswith(spooldir):
-                    log.error(u'Cannot write outside of spooldir {0!s}!'.format(spooldir))
+                    log.error(f'Cannot write outside of spooldir {spooldir}!')
                 else:
                     try:
                         with open(outfile, "w") as f:
                             f.write(body)
                     except Exception as err:
-                        log.error(u"Failed to write notification file: {0!s}".format(err))
+                        log.error(f"Failed to write notification file: {err}")
 
             elif action.lower() == "sendsms":
+                if not recipient:
+                    log.warning("Was not able to determine the recipient for the user")
                 smsconfig = handler_options.get("smsconfig")
                 userphone = recipient.get("mobile")
                 try:
                     ret = send_sms_identifier(smsconfig, userphone, body)
-                except Exception as exx:
-                    log.error("Failed to send sms: {0!s}".format(exx))
+                except Exception as e:
+                    log.error(f"Failed to send sms: {e}")
                     ret = False
                 if ret:
-                    log.info("Sent a notification sms to user {0}".format(
-                        recipient))
+                    log.info(f"Sent a notification sms to user {recipient}")
                 else:
-                    log.warning("Failed to send a notification email to user "
-                                "{0}".format(recipient))
+                    log.warning(f"Failed to send a notification sms to user {recipient}")
 
         return ret

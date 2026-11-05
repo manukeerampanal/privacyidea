@@ -1,0 +1,308 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+
+import { HttpClient, httpResource, HttpResourceRef } from "@angular/common/http";
+import { effect, inject, Injectable, signal, untracked, WritableSignal } from "@angular/core";
+import { PiResponse } from "@app/app.component";
+import { SimpleConfirmationDialogComponent } from "@components/shared/dialog/confirmation-dialog/confirmation-dialog.component";
+import { environment } from "@env/environment";
+import { AuthService, AuthServiceInterface } from "@services/auth/auth.service";
+import { ContentService, ContentServiceInterface } from "@services/content/content.service";
+import { DialogService, DialogServiceInterface } from "@services/dialog/dialog.service";
+import { NotificationService } from "@services/notification/notification.service";
+import { catchError, forkJoin, lastValueFrom, Observable, of, throwError } from "rxjs";
+
+export interface PeriodicTask {
+  id: number;
+  name: string;
+  active: boolean;
+  interval: string;
+  nodes: string[];
+  taskmodule: string;
+  retry_if_failed: boolean;
+  last_update: string;
+  ordering: number;
+  options: Record<string, string>;
+  last_runs: Record<string, string>;
+}
+
+export interface PeriodicTaskEdit extends Omit<PeriodicTask, "id"> {
+  id: number | null;
+}
+
+export const EMPTY_PERIODIC_TASK: PeriodicTaskEdit = {
+  id: null,
+  name: "",
+  active: true,
+  interval: "",
+  nodes: [],
+  taskmodule: "SimpleStats",
+  retry_if_failed: false,
+  last_update: "",
+  ordering: 0,
+  options: {},
+  last_runs: {}
+};
+
+export const TASK_KEY_MAPPING: Record<string, string> = {
+  id: $localize`:@@common.id:ID`,
+  name: $localize`:@@common.name:Name`,
+  active: $localize`:@@common.active:Active`,
+  interval: $localize`:@@periodicTask.interval:Interval`,
+  nodes: $localize`:@@periodicTask.nodes:Nodes`,
+  taskmodule: $localize`:@@periodicTask.taskModule:Task Module`,
+  retry_if_failed: $localize`:@@periodicTask.retryIfFailed:Retry If Failed`,
+  last_update: $localize`:@@periodicTask.lastUpdate:Last Update`,
+  ordering: $localize`:@@common.ordering:Ordering`,
+  options: $localize`:@@common.options:Options`,
+  last_runs: $localize`:@@periodicTask.lastRuns:Last Runs`
+};
+
+export interface PeriodicTaskOption {
+  name: string;
+  description: string;
+  type: string;
+  required?: boolean;
+  value?: string;
+}
+
+export const EMPTY_PERIODIC_TASK_OPTION: PeriodicTaskOption = {
+  name: "",
+  description: "",
+  type: "",
+  value: ""
+};
+
+export type PeriodicTaskModule = "SimpleStats" | "EventCounter";
+export const PERIODIC_TASK_MODULES: PeriodicTaskModule[] = ["SimpleStats", "EventCounter"];
+export const PERIODIC_TASK_MODULE_MAPPING: Record<PeriodicTaskModule, string> = {
+  SimpleStats: $localize`:@@periodicTask.simpleStatistics:Simple Statistics`,
+  EventCounter: $localize`:@@periodicTask.eventCounter:Event Counter`
+};
+
+export interface PeriodicTaskServiceInterface {
+  periodicTasksResource: HttpResourceRef<PiResponse<PeriodicTask[]> | undefined>;
+  periodicTaskModuleResource: HttpResourceRef<PiResponse<PeriodicTaskModule[]> | undefined>;
+  moduleOptions: WritableSignal<Record<string, Record<string, PeriodicTaskOption>>>;
+
+  enablePeriodicTask(taskId: number): Promise<PiResponse<number, never> | undefined>;
+
+  disablePeriodicTask(taskId: number): Promise<PiResponse<number, never> | undefined>;
+
+  deletePeriodicTask(taskId: number): Observable<PiResponse<number, never>>;
+
+  deleteWithConfirmDialog(task: PeriodicTask): Promise<PiResponse<number, never> | undefined>;
+
+  savePeriodicTask(task: PeriodicTaskEdit): Observable<PiResponse<number, never> | undefined>;
+
+  fetchAllModuleOptions(): void;
+}
+
+@Injectable()
+export class PeriodicTaskService implements PeriodicTaskServiceInterface {
+  private readonly authService: AuthServiceInterface = inject(AuthService);
+  private readonly contentService: ContentServiceInterface = inject(ContentService);
+  private readonly dialogService: DialogServiceInterface = inject(DialogService);
+  private readonly notificationService = inject(NotificationService);
+  private readonly http = inject(HttpClient);
+
+  private periodicTaskBaseUrl = environment.proxyUrl + "/periodictask/";
+  periodicTasksResource = httpResource<PiResponse<PeriodicTask[]>>(() => {
+    if (!this.contentService.onConfigurationPeriodicTasks() || !this.authService.actionAllowed("periodictask_read")) {
+      return undefined;
+    }
+    return {
+      url: this.periodicTaskBaseUrl,
+      method: "GET",
+      headers: this.authService.getHeaders()
+    };
+  });
+  periodicTaskModuleResource = httpResource<PiResponse<PeriodicTaskModule[]>>(() => {
+    if (!this.contentService.onConfigurationPeriodicTasks() || !this.authService.actionAllowed("periodictask_read")) {
+      return undefined;
+    }
+    return {
+      url: this.periodicTaskBaseUrl + "taskmodules/",
+      method: "GET",
+      headers: this.authService.getHeaders()
+    };
+  });
+  moduleOptions = signal<Record<string, Record<string, PeriodicTaskOption>>>({});
+
+  constructor() {
+    effect(() => {
+      this.notificationService.handleResourceError(this.periodicTasksResource.error(), "periodic tasks");
+    });
+    effect(() => {
+      this.notificationService.handleResourceError(this.periodicTaskModuleResource.error(), "periodic task modules");
+    });
+    effect(() => {
+      const modules = this.periodicTaskModuleResource.value()?.result?.value;
+      if (!modules?.length) return;
+      untracked(() => this.fetchAllModuleOptions());
+    });
+  }
+
+  enablePeriodicTask(taskId: number) {
+    const headers = this.authService.getHeaders();
+    return lastValueFrom(
+      this.http
+        .post<
+          PiResponse<number, never>
+        >(this.periodicTaskBaseUrl + "enable/" + encodeURIComponent(taskId), {}, { headers: headers })
+        .pipe(
+          catchError(() => {
+            this.periodicTasksResource.reload();
+            this.notificationService.error(
+              $localize`:@@periodicTask.failedToEnablePeriodicTask:Failed to enable periodic task!`
+            );
+            return of(undefined);
+          })
+        )
+    );
+  }
+
+  disablePeriodicTask(taskId: number) {
+    const headers = this.authService.getHeaders();
+    const response$ = this.http
+      .post<
+        PiResponse<number, never>
+      >(this.periodicTaskBaseUrl + "disable/" + encodeURIComponent(taskId), {}, { headers: headers })
+      .pipe(
+        catchError(() => {
+          this.periodicTasksResource.reload();
+          this.notificationService.error(
+            $localize`:@@periodicTask.failedToDisablePeriodicTask:Failed to disable periodic task!`
+          );
+          return of(undefined);
+        })
+      );
+    return lastValueFrom(response$);
+  }
+
+  deletePeriodicTask(taskId: number): Observable<PiResponse<number, never>> {
+    const headers = this.authService.getHeaders();
+
+    return this.http
+      .delete<PiResponse<number, never>>(this.periodicTaskBaseUrl + encodeURIComponent(taskId), { headers })
+      .pipe(
+        catchError((error) => {
+          console.error("Failed to delete periodic task.", error);
+          const message = error.error?.result?.error?.message || "";
+          this.notificationService.error(
+            $localize`:@@periodicTask.failedToDeletePeriodicTask:Failed to delete periodic task. ${message}:MESSAGE:`
+          );
+          return throwError(() => error);
+        })
+      );
+  }
+
+  async deleteWithConfirmDialog(task: PeriodicTask): Promise<PiResponse<number, never> | undefined> {
+    const confirmation = await lastValueFrom(
+      this.dialogService
+        .openDialog({
+          component: SimpleConfirmationDialogComponent,
+          data: {
+            title: $localize`:@@periodicTask.deletePeriodic:Delete Periodic Task`,
+            items: [task.name],
+            itemType: $localize`:@@periodicTask.periodicTask:periodic task`,
+            confirmAction: { label: $localize`:@@common.delete:Delete`, value: true, type: "destruct" }
+          }
+        })
+        .afterClosed()
+    );
+    if (!confirmation) {
+      return;
+    }
+    try {
+      const response = await lastValueFrom(this.deletePeriodicTask(task.id));
+      if (response?.result?.value !== undefined) {
+        this.notificationService.success(
+          $localize`:@@periodicTask.successfullyDeleted:Successfully deleted periodic task.`
+        );
+      }
+      return response;
+    } catch {
+      // error already handled in deletePeriodicTask
+    }
+    return undefined;
+  }
+
+  savePeriodicTask(task: PeriodicTaskEdit): Observable<PiResponse<number, never> | undefined> {
+    const headers = this.authService.getHeaders();
+    const { id, ...rest } = task;
+    const params = {
+      ...rest,
+      nodes: this.convertNodesArrayToString(task.nodes),
+      ...(id != null ? { id } : {})
+    };
+    return this.http.post<PiResponse<number, never>>(this.periodicTaskBaseUrl, params, { headers }).pipe(
+      catchError((error) => {
+        console.error("Failed to save periodic task.", error.error);
+        const message = error.error.result?.error?.message || "";
+        this.notificationService.error(
+          $localize`:@@periodicTask.failedToSavePeriodicTask:Failed to save periodic task. ${message}:MESSAGE:`
+        );
+        return of(undefined);
+      })
+    );
+  }
+
+  fetchAllModuleOptions() {
+    const modules: string[] = this.periodicTaskModuleResource.value()?.result?.value ?? PERIODIC_TASK_MODULES;
+    const alreadyLoaded = Object.keys(this.moduleOptions());
+    const missing = modules.filter((m) => !alreadyLoaded.includes(m));
+    if (!missing.length) return;
+
+    const requests = missing.map((module) =>
+      this.http.get<PiResponse<Record<string, PeriodicTaskOption>>>(
+        this.periodicTaskBaseUrl + "options/" + encodeURIComponent(module),
+        { headers: this.authService.getHeaders() }
+      )
+    );
+
+    forkJoin(requests).subscribe({
+      next: (responses) => {
+        const newOptions: Record<string, Record<string, PeriodicTaskOption>> = {};
+        responses.forEach((response, idx) => {
+          const options = response.result?.value ?? {};
+          Object.keys(options).forEach((key) => {
+            options[key].name = key;
+          });
+          newOptions[missing[idx]] = options;
+        });
+        this.moduleOptions.update((existing) => ({ ...existing, ...newOptions }));
+      },
+      error: () => {
+        this.notificationService.error(
+          $localize`:@@periodicTask.failedToFetchModuleOptions:Failed to fetch module options.`
+        );
+      }
+    });
+  }
+
+  convertNodesArrayToString(nodes: string[] | string | null | undefined): string {
+    if (Array.isArray(nodes)) {
+      return nodes.join(",");
+    } else if (typeof nodes === "string") {
+      return nodes;
+    }
+    return "";
+  }
+}

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2022-03-10 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Init
 
@@ -18,14 +16,16 @@
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 #
+import os
+import time
+import sys
 import contextlib
 import getopt
 import logging
-from privacyidea.lib.security.default import DefaultSecurityModule
+from privacyidea.lib.security.default import (DefaultSecurityModule,
+                                              int_list_to_bytestring)
 from privacyidea.lib.error import HSMException
-from six import int2byte
 from getpass import getpass
-import sys
 
 
 __doc__ = """
@@ -56,13 +56,10 @@ except ImportError:
     log.info("The python module PyKCS11 is not available. "
              "So we can not use the PKCS11 security module.")
 
-
-def int_list_to_bytestring(int_list):  # pragma: no cover
-    return b"".join([int2byte(i) for i in int_list])
-
-import os
-import time
-DEFAULT_LOCK_DIR = "/dev/shm/pilock"
+# The lock directory is used for locking the different processes during startup
+# to avoid a deadlock when accessing the HSM.
+# The directory for logging can be configured via PI_HSM_MODULE_LOCK_DIR in pi.cfg
+DEFAULT_LOCK_DIR = "/dev/shm/pilock"  # nosec B108 # Used for locking during startup
 DEFAULT_TIMEOUT = 15
 
 
@@ -82,7 +79,7 @@ def hsm_lock(timeout=DEFAULT_TIMEOUT, lock_dir=DEFAULT_LOCK_DIR):
             break
         except FileExistsError:
             # Some other process got the lock in the meantime.
-            log.info("Can not get the lock on {0!s}. Can not initialize the HSM, yet.".format(lock_dir))
+            log.info(f"Can not get the lock on {lock_dir!s}. Can not initialize the HSM, yet.")
             time.sleep(1)
         finally:
             # Cleanup
@@ -163,7 +160,7 @@ class EncryptKeyHardwareSecurityModule(DefaultSecurityModule):  # pragma: no cov
             log.debug("PKCS11 initialized")
 
             slotlist = self.pkcs11.getSlotList()
-            log.debug("Found the slots: {0!s}".format(slotlist))
+            log.debug(f"Found the slots: {slotlist!s}")
             if not len(slotlist):
                 raise HSMException("No HSM connected. No slots found.")
 
@@ -175,20 +172,20 @@ class EncryptKeyHardwareSecurityModule(DefaultSecurityModule):  # pragma: no cov
                     for slot in slotlist:
                         # Find the slot via the slotname
                         slotinfo = self.pkcs11.getSlotInfo(slot)
-                        log.debug("Found slot '{}'".format(slotinfo.slotDescription))
+                        log.debug(f"Found slot '{slotinfo.slotDescription}'")
                         if slotinfo.slotDescription.startswith(self.slotname):
                             self.slot = slot
                             break
-            log.info("Using slot {0!s}".format(self.slot))
+            log.info(f"Using slot {self.slot!s}")
 
             if self.slot not in slotlist:
-                raise HSMException("Slot {0:d} ({1:s}) not present".format(self.slot, self.slotname))
+                raise HSMException(f"Slot {self.slot:d} ({self.slotname:s}) not present")
 
             slotinfo = self.pkcs11.getSlotInfo(self.slot)
-            log.info("Setting up slot {0!s}: '{1!s}'".format(self.slot, slotinfo.slotDescription))
+            log.info(f"Setting up slot {self.slot!s}: '{slotinfo.slotDescription!s}'")
 
             self.session = self.pkcs11.openSession(slot=self.slot)
-            log.info("Logging on to '{}'".format(slotinfo.slotDescription))
+            log.info(f"Logging on to '{slotinfo.slotDescription}'")
             try:
                 self.session.login(self.password)
             except PyKCS11.PyKCS11Error as e:
@@ -205,7 +202,7 @@ class EncryptKeyHardwareSecurityModule(DefaultSecurityModule):  # pragma: no cov
                     raise e
                 else:
                     raise e
-            log.info("Logged into slot {0!s}".format(self.slot))
+            log.info(f"Logged into slot {self.slot!s}")
 
             if "encfile" in self.config:
                 self._decrypt_file(self.config.get("encfile"))
@@ -230,7 +227,7 @@ class EncryptKeyHardwareSecurityModule(DefaultSecurityModule):  # pragma: no cov
         """
         log.debug("Getting private key handles")
         objs = self.session.findObjects(self._add_template([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PRIVATE_KEY)]))
-        log.debug("Found {0!s} private keys.".format(len(objs)))
+        log.debug(f"Found {len(objs)!s} private keys.")
         return objs[0]
 
     def _encrypt_file(self, infile, outfile):
@@ -242,10 +239,10 @@ class EncryptKeyHardwareSecurityModule(DefaultSecurityModule):  # pragma: no cov
         with open(infile, "rb") as f:
             enckey = f.read()
         objs = self.session.findObjects(self._add_template([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PUBLIC_KEY)]))
-        log.debug("Found {0!s} public keys.".format(len(objs)))
+        log.debug(f"Found {len(objs)!s} public keys.")
         for obj in objs:
             log.debug("========================================================")
-            log.debug("Found object {0!s}".format(obj))
+            log.debug(f"Found object {obj!s}")
         pubkey = objs[0]
         m = PyKCS11.Mechanism(MECHANISM)
         r = self.session.encrypt(pubkey, enckey, m)
@@ -257,10 +254,10 @@ class EncryptKeyHardwareSecurityModule(DefaultSecurityModule):  # pragma: no cov
             objs = self.session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PUBLIC_KEY)])
         else:
             objs = self.session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PRIVATE_KEY)])
-        log.debug("Found {0!s} keys.".format(len(objs)))
+        log.debug(f"Found {len(objs)!s} keys.")
         for obj in objs:
             log.debug("========================================================")
-            log.debug("Found object {0!s}".format(obj))
+            log.debug(f"Found object {obj!s}")
 
     def _decrypt_file(self, filename):
         log.info("Reading encrypted key file")
@@ -351,14 +348,14 @@ if __name__ == "__main__":  # pragma: no cover
         password = "topSekr3t" * 16
         crypted = p.encrypt_password(password)
         text = p.decrypt_password(crypted)
-        assert(text == password)
+        assert(text == password)  # nosec B101 # This is actually a test
         log.info("password encrypt/decrypt test successful")
 
         # pin
-        password = "topSekr3t"
+        password = "topSekr3t"  # nosec B105 # used for testing
         crypted = p.encrypt_pin(password)
         text = p.decrypt_pin(crypted)
-        assert (text == password)
+        assert (text == password)  # nosec B101 # This is actually a test
         log.info("pin encrypt/decrypt test successful")
 
         # random
@@ -368,7 +365,7 @@ if __name__ == "__main__":  # pragma: no cover
 
         # generic encrypt / decrypt
         cipher = p.encrypt(plain, tmp_iv)
-        assert (plain != cipher)
+        assert (plain != cipher)  # nosec B101 # This is actually a test
         text = p.decrypt(cipher, tmp_iv)
-        assert (text == plain)
+        assert (text == plain)  # nosec B101 # This is actually a test
         log.info("generic encrypt/decrypt test successful")

@@ -1,21 +1,21 @@
-privacyIDEA
-===========
-
-.. image:: https://travis-ci.com/privacyidea/privacyidea.svg?branch=master
-    :alt: Build Status
-    :target: https://travis-ci.com/privacyidea/privacyidea
-
 .. .. image:: https://circleci.com/gh/privacyidea/privacyidea/tree/master.svg?style=shield&circle-token=:circle-token
 ..     :alt: CircleCI
 ..     :target: https://circleci.com/gh/privacyidea/privacyidea
 
-.. image:: https://codecov.io/gh/privacyidea/privacyidea/coverage.svg?branch=master
-    :target: https://codecov.io/gh/privacyidea/privacyidea?branch=master
+Backend |cov-backend| Frontend |cov-frontend|
+
+.. |cov-backend| image:: https://codecov.io/gh/privacyidea/privacyidea/branch/master/graph/badge.svg?flag=backend
+    :alt: Backend coverage
+    :target: https://codecov.io/gh/privacyidea/privacyidea?branch=master&flags[0]=backend
+
+.. |cov-frontend| image:: https://codecov.io/gh/privacyidea/privacyidea/branch/master/graph/badge.svg?flag=frontend
+    :alt: Frontend coverage
+    :target: https://codecov.io/gh/privacyidea/privacyidea?branch=master&flags[0]=frontend
 
 .. .. image:: https://img.shields.io/pypi/dm/privacyidea.svg
 ..    :alt: Downloads
 ..    :target: https://pypi.python.org/pypi/privacyIDEA/
-    
+
 .. image:: https://img.shields.io/pypi/v/privacyidea.svg
     :alt: Latest Version
     :target: https://pypi.python.org/pypi/privacyIDEA/#history
@@ -27,7 +27,7 @@ privacyIDEA
 .. image:: https://img.shields.io/github/license/privacyidea/privacyidea.svg
     :alt: License
     :target: https://pypi.python.org/pypi/privacyIDEA/
-    
+
 .. image:: https://readthedocs.org/projects/privacyidea/badge/?version=master
     :alt: Documentation
     :target: http://privacyidea.readthedocs.org/en/master/
@@ -36,58 +36,55 @@ privacyIDEA
 ..    :alt: Code Climate
 ..    :target: https://codeclimate.com/github/privacyidea/privacyidea
 
-.. image:: https://api.codacy.com/project/badge/grade/d58934978e1a4bcca325f2912ea386ff
+.. .. image:: https://api.codacy.com/project/badge/grade/d58934978e1a4bcca325f2912ea386ff
     :alt: Codacy Badge
     :target: https://www.codacy.com/app/cornelius-koelbel/privacyidea
-    
-.. image:: https://img.shields.io/twitter/follow/privacyidea.svg?style=social&label=Follow
-    :alt: privacyIDEA on twitter
-    
-privacyIDEA is an open solution for strong two-factor authentication like 
-OTP tokens, SMS, smartphones or SSH keys.
-Using privacyIDEA you can enhance your existing applications like local login 
-(PAM, Windows Credential Provider), 
-VPN, remote access, SSH connections, access to web sites or web portals with 
-a second factor during authentication. Thus boosting the security of your 
-existing applications.
 
-Overview
-========
+privacyIDEA: Open-Source Multi-Factor Authentication
+====================================================
 
-privacyIDEA runs as an additional service in your network and you can connect different 
-applications to privacyIDEA.
+privacyIDEA is an open-source MFA platform for orchestrating all your multi-factor authentication needs. Secure your entire stack with a flexible, self-hosted solution that puts you in control. As an on-premise platform, your sensitive user data always remains within your infrastructure.
 
-.. image:: https://privacyidea.org/wp-content/uploads/2017/privacyIDEA-Integration.png
-    :alt: privacyIDEA Integration
-    :scale: 50 %
+Key Features
+------------
 
-privacyIDEA does not bind you to any decision of the authentication
-protocol, nor does it dictate you where your user information should be
-stored. This is achieved by its totally modular architecture.
-privacyIDEA is not only open as far as its modular architecture is
-concerned. But privacyIDEA is completely licensed under the AGPLv3.
+* **Universal MFA:** Add a second factor to virtually any application—from SSH and VPNs to IdPs like Keycloak and web portals.
+* **Extensive Factor Support:** Go beyond simple OTP. We support everything from cutting-edge Passkeys and push authentication to various OTP types.
+* **Vendor-Agnostic:** Connect to your existing user stores (AD, LDAP, SQL, EntraID) without being locked into a specific ecosystem.
+* **Truly Open:** Licensed under AGPLv3 to guarantee your software freedom, always.
 
-It supports a wide variety of authentication devices like OTP tokens 
-(HMAC, HOTP, TOTP, OCRA, mOTP), Yubikey (HOTP, TOTP, AES), FIDO U2F, as well
-as FIDO2 WebAuthn devices like Yubikey and Plug-Up, smartphone Apps like Google
-Authenticator, FreeOTP, Token2  or TiQR, SMS, Email, SSH keys, x509 certificates
-and Registration Codes for easy deployment.
+Supported Authentication Factors
+--------------------------------
 
-privacyIDEA is based on Flask and SQLAlchemy as the python backend. The
-web UI is based on angularJS and bootstrap.
-A MachineToken design lets you assign tokens to machines. Thus you can use
-your Yubikey to unlock LUKS, assign SSH keys to SSH servers or use Offline OTP
-with PAM.
+* 🔑 **Passkeys & Hardware:** FIDO2/WebAuthn devices (like YubiKey, Plug-Up).
+* 💳 **Smartcards (PIV/x509):** Connect to a Microsoft CA using the `ms-ca-service <https://github.com/privacyidea/ms-ca-service>`_ and enroll certificates directly to PIV-compatible devices with our `enrollment client for Windows <https://github.com/privacyidea/smartcard-client-windows>`_.
+* 📱 **Software & Mobile:** Use the `privacyIDEA Authenticator <https://github.com/privacyidea/pi-authenticator>`_ for PUSH notifications, TOTP, and HOTP; for standard TOTP/HOTP, other apps like Google Authenticator are also compatible. TiQR is also supported.
+* 📜 **Classic & Remote:** SMS, Email, SSH Keys, Security Questionnaires, and simple Registration Codes for easy rollout.
 
-You may join the discourse discussion forum to give feedback, help other users,
-discuss questions and ideas:
+Seamless Integration
+--------------------
+
+Enhance the security of your existing infrastructure:
+
+* **Operating Systems:** `Linux (PAM) <https://github.com/privacyidea/privacyidea-pam>`_, `Windows (Credential Provider) <https://github.com/privacyidea/privacyidea-credential-provider>`_
+* **Identity Providers:** `Keycloak <https://github.com/privacyidea/keycloak-provider>`_, `ADFS <https://github.com/privacyidea/adfs-provider>`_, `Shibboleth <https://github.com/privacyidea/shibboleth-plugin>`_, `SimpleSAMLphp <https://github.com/privacyidea/simplesamlphp-module-privacyidea>`_
+* **Remote Access:** VPNs with RADIUS (OpenVPN, Fortinet, Palo Alto), SSH
+* **Web Applications:** Apache, Nginx, any web portal via our REST API.
+* `nextCloud <https://github.com/privacyidea/privacyidea-nextcloud-app>`_, `ownCloud <https://github.com/privacyidea/privacyidea-owncloud-app>`_
+* **and more...**
+
+----
+
+Join the Community
+------------------
+
+Have feedback, questions, or ideas? Join the discussion on our community forum:
 https://community.privacyidea.org
-
 
 Setup
 =====
 
-For setting up the system to *run* it, please read install instructions 
+For setting up the system to *run* it, please read install instructions
 at `privacyidea.readthedocs.io <http://privacyidea.readthedocs.io/en/latest/installation/index
 .html>`_.
 
@@ -98,7 +95,7 @@ If you want to setup a development environment start like this::
     virtualenv venv
     source venv/bin/activate
     pip install -r requirements.txt
-    
+
 .. _testing_env:
 
 You may additionally want to set up your environment for testing, by adding the
@@ -108,21 +105,6 @@ additional dependencies::
 
 You may also want to read the blog post about development and debugging at
 https://www.privacyidea.org/privacyidea-development-howto/
-
-Getting and updating submodules
-===============================
-
-The client-side library for the registering and signing of WebAuthn-Credentials
-resides in a submodule.
-
-To fetch all submodules for this repository, run::
-
-   git submodule update --init --recursive
-
-When pulling changes from upstream later, you can automatically update any outdated
-submodules, by running::
-
-   git pull --recurse-submodules
 
 Running it
 ==========
@@ -151,7 +133,7 @@ Create the first administrator::
 
 Run it::
 
-    ./pi-manage runserver
+    ./pi-manage run
 
 Now you can connect to http://localhost:5000 with your browser and login
 as administrator.
@@ -180,7 +162,7 @@ https://github.com/privacyidea/privacyidea/blob/master/CONTRIBUTING.md
 Code structure
 ==============
 
-The database models are defined in ``models.py`` and tested in 
+The database models are defined in ``models.py`` and tested in
 tests/test_db_model.py.
 
 Based on the database models there are the libraries ``lib/config.py`` which is
@@ -192,18 +174,23 @@ Based on the resolver there is the library ``lib/realm.py`` which provides
 functions
 for the database table ``realm``. Several resolvers are combined into a realm.
 
-Based on the realm there is the library ``lib/user.py`` which provides functions 
-for users. There is no database table user, since users are dynamically read 
+Based on the realm there is the library ``lib/user.py`` which provides functions
+for users. There is no database table user, since users are dynamically read
 from the user sources like SQL, LDAP, SCIM or flat files.
 
+Subscriptions and limitations of community edition
+==================================================
+
+Using privacyIDEA Server and the privacyIDEA FreeRADIUS plugin there is technically no
+limitation of the community edition or the code in this repository.
+Admins will receive a welcome message about possible support, if more than 50 users
+are enrolled.
+
 Plugins
-=======
+-------
 
 The privacyIDEA project also provides several plugins for 3rd party applications like SSO Identity Providers
 or Windows Login.
-
-Subscriptions
--------------
 
 Plugins can be limited in the number of users. I.e. the plugin will complain, if the total number of users
 in privacyIDEA with an active token exceeds a certain limit. There is a certain base number of users, with which
@@ -219,9 +206,12 @@ Name                  contained       in demo subscription
 ====================  ==============  ========================
 Keycloak              10000           N/A
 SimpleSAMLphp         10000           N/A
+Shibboleth            10000           N/A
 ADFS                  50              50
+privacyIDEA PAM       10000           N/A
 Credential Provider   50              50
-OwnCloud              50              N/A
+nextCloud              50              N/A
+ownCloud              50              N/A
 LDAP proxy            50              N/A
 ====================  ==============  ========================
 

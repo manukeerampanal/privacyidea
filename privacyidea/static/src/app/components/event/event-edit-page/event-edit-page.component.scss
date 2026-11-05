@@ -1,0 +1,73 @@
+@use "styles";
+
+.edit-event-handler-layout {
+  display: flex;
+  justify-content: center;
+}
+
+.edit-event-handler-container {
+  @include styles.main-component-style;
+  display: grid;
+  position: relative;
+  box-sizing: border-box;
+  width: min(
+    calc(2 * var(--input-width-l) + 16px + 2 * 16px),
+    calc(100vw - 4 * 16px)
+  );
+}
+
+.header-row {
+  display: flex;
+  flex-direction: row;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+
+.action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+}
+
+.event-details {
+  display: grid;
+  grid-template-columns: auto;
+  gap: 16px;
+  padding: 0;
+  border: 0;
+  margin-bottom: auto;
+  justify-content: center;
+}
+
+.label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+  margin-block: auto;
+  font-weight: bold;
+  justify-self: end;
+}
+
+.value {
+  grid-column: 2;
+  overflow: auto;
+  display: block;
+  margin-block: auto;
+}
+
+.align-right {
+  text-align: right;
+  justify-content: flex-end;
+}
+
+.tab-container {
+  margin: 16px 8px 16px 8px;
+}
+
+.two-col-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}

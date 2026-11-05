@@ -1,0 +1,113 @@
+<!--
+ (c) NetKnights GmbH 2025,  https://netknights.it
+
+ This code is free software; you can redistribute it and/or
+ modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ as published by the Free Software Foundation; either
+ version 3 of the License, or any later version.
+
+ This code is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+ SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+@if (hasAnyAction) {
+  @if (token()?.rollout_state === "verify") {
+    <div class="actions-verify-row">
+      <app-verify-enrollment></app-verify-enrollment>
+      <mat-divider class="margin-top-8 margin-bottom-8" />
+    </div>
+  }
+
+  <div class="actions-sections-row">
+    @if (authService.actionAllowed("setpin") || authService.actionsAllowed(["setrandompin", "otp_pin_set_random"])) {
+      <section class="actions-section actions-section--pin">
+        <app-set-pin-action
+          [repeatPinValue]="repeatPinValue()"
+          [setPinValue]="setPinValue()">
+          <h4
+            panelTitle
+            class="details-card-title"
+            i18n="@@token.pinSetup"
+            >PIN Setup</h4
+          >
+        </app-set-pin-action>
+      </section>
+    }
+
+    @if (tokenType() !== "passkey" && tokenType() !== "webauthn" && authService.actionAllowed("resync")) {
+      <section class="actions-section actions-section--sync test-sync-section">
+        <app-resync-token-action>
+          <h4
+            panelTitle
+            class="details-card-title"
+            i18n="@@token.sync"
+            >Sync</h4
+          >
+        </app-resync-token-action>
+      </section>
+    }
+
+    @if (tokenType() === "passkey") {
+      <section class="actions-section actions-section--test">
+        <div class="passkey-test-panel">
+          <h4
+            class="details-card-title"
+            i18n="@@token.test"
+            >Test</h4
+          >
+          <button
+            (click)="testPasskey.emit()"
+            class="action-button-secondary button-width-l"
+            mat-stroked-button>
+            <mat-icon>key</mat-icon>
+            <span i18n="@@token.testPasskey">Test Passkey</span>
+          </button>
+          @if (passkeyTestResult(); as result) {
+            <p
+              class="passkey-test-result"
+              [class.passkey-test-result--success]="result.kind === 'success'"
+              [class.passkey-test-result--warning]="result.kind === 'warning'">
+              {{ result.message }}
+              @if (result.mismatch; as mismatch) {
+                <br />
+                <span i18n="@@token.matchedToken">Matched token:</span>
+                <a [routerLink]="[ROUTE_PATHS.TOKENS_DETAILS, mismatch.serial]">{{ mismatch.serial }}</a>
+                @if (mismatch.username) {
+                  <span i18n="@@token.user">, user:</span>
+                  @if (mismatch.realm) {
+                    <a
+                      [routerLink]="[ROUTE_PATHS.USERS_DETAILS, mismatch.username]"
+                      [queryParams]="{ realm: mismatch.realm }">
+                      {{ mismatch.username }}@{{ mismatch.realm }}
+                    </a>
+                  } @else {
+                    <span>{{ mismatch.username }}</span>
+                  }
+                }
+              }
+            </p>
+          }
+        </div>
+      </section>
+    }
+
+    @if (tokenType() !== "passkey" && tokenType() !== "webauthn") {
+      <section class="actions-section actions-section--test test-sync-section">
+        <app-test-otp-pin-action>
+          <h4
+            panelTitle
+            class="details-card-title"
+            i18n="@@token.test"
+            >Test</h4
+          >
+        </app-test-otp-pin-action>
+      </section>
+    }
+  </div>
+}

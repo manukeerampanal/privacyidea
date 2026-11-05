@@ -1,0 +1,130 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+import { Component, computed, forwardRef, inject, input, signal } from "@angular/core";
+import { disabled, form, FormField, required, validate } from "@angular/forms/signals";
+import { MatCheckbox } from "@angular/material/checkbox";
+import { MatError, MatFormField, MatLabel } from "@angular/material/form-field";
+import { MatInput } from "@angular/material/input";
+import { TokenService, TokenServiceInterface } from "@services/token/token.service";
+
+import { TokenEnrollmentData } from "@app/mappers/token-api-payload/_token-api-payload.mapper";
+import { MotpApiPayloadMapper, MotpEnrollmentData } from "@app/mappers/token-api-payload/motp-token-api-payload.mapper";
+import { EnrollmentArgs, EnrollTokenBase } from "@components/token/token-enrollment/enroll-token-base";
+import { MaskedInputComponent } from "@components/shared/masked-input/masked-input.component";
+import { AuthService, AuthServiceInterface } from "@services/auth/auth.service";
+
+export interface MotpEnrollmentOptions extends TokenEnrollmentData {
+  type: "motp";
+  generateOnServer: boolean;
+  otpKey?: string;
+  motpPin: string;
+}
+
+@Component({
+  selector: "app-enroll-motp",
+  standalone: true,
+  imports: [FormField, MatFormField, MatInput, MatLabel, MatCheckbox, MatError, MaskedInputComponent],
+  templateUrl: "./enroll-motp.component.html",
+  styleUrl: "./enroll-motp.component.scss",
+  providers: [{ provide: EnrollTokenBase, useExisting: forwardRef(() => EnrollMotpComponent) }]
+})
+export class EnrollMotpComponent extends EnrollTokenBase<MotpEnrollmentData> {
+  protected readonly tokenService: TokenServiceInterface = inject(TokenService);
+  protected readonly enrollmentMapper: MotpApiPayloadMapper = inject(MotpApiPayloadMapper);
+  protected readonly authService: AuthServiceInterface = inject(AuthService);
+
+  wizard = input<boolean>(false);
+  disabled = input<boolean>(false);
+
+  generateOnServer = signal<boolean>(true);
+  otpKey = signal<string>("");
+  motpPin = signal<string>("");
+  repeatMotpPin = signal<string>("");
+
+  otpKeyForm = form(this.otpKey, (f) => {
+    required(f);
+    disabled(
+      f,
+      () => this.disabled() || this.generateOnServer() || this.authService.checkForceServerGenerateOTPKey("motp")
+    );
+  });
+
+  motpPinForm = form(this.motpPin, (f) => {
+    required(f);
+    validate(f, (ctx) => (ctx.value().length < 4 ? [{ kind: "minlength" }] : []));
+    disabled(f, () => this.disabled());
+  });
+
+  repeatMotpPinForm = form(this.repeatMotpPin, (f) => {
+    validate(f, (ctx) => (ctx.value() !== this.motpPin() ? [{ kind: "motpPinMismatch" }] : []));
+    disabled(f, () => this.disabled());
+  });
+
+  motpPinError = computed(() => {
+    if (!this.motpPinForm().touched()) {
+      return "";
+    }
+    const errors = this.motpPinForm().errors();
+    if (errors.some((e) => e.kind === "required")) {
+      return $localize`:@@token.passwordRequired:Password is required`;
+    }
+    if (errors.some((e) => e.kind === "minlength")) {
+      return $localize`:@@token.passwordMustLeast:Password must be at least 4 characters long`;
+    }
+    return "";
+  });
+
+  repeatMotpPinError = computed(() => {
+    const mismatch = this.repeatMotpPinForm()
+      .errors()
+      .some((e) => e.kind === "motpPinMismatch");
+    return mismatch && this.repeatMotpPinForm().touched()
+      ? $localize`:@@token.motpPinsDoNot:mOTP PINs do not match.`
+      : "";
+  });
+
+  buildEnrollmentArgs(basicOptions: TokenEnrollmentData): EnrollmentArgs<MotpEnrollmentData> | null {
+    if (!this.motpPinForm().valid()) {
+      this.motpPinForm().markAsTouched();
+      return null;
+    }
+    if (!this.repeatMotpPinForm().valid()) {
+      this.repeatMotpPinForm().markAsTouched();
+      return null;
+    }
+    if (!this.generateOnServer() && !this.otpKeyForm().valid()) {
+      this.otpKeyForm().markAsTouched();
+      return null;
+    }
+
+    const enrollmentData: MotpEnrollmentOptions = {
+      ...basicOptions,
+      type: "motp",
+      generateOnServer: this.generateOnServer(),
+      motpPin: this.motpPin()
+    };
+    if (!enrollmentData.generateOnServer) {
+      enrollmentData.otpKey = this.otpKey();
+    }
+    return {
+      data: enrollmentData,
+      mapper: this.enrollmentMapper
+    };
+  }
+}

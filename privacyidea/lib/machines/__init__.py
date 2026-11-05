@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  2015-02-25 Cornelius Kölbel <cornelius@privacyidea.org>
 #             Initial writeup
 #
@@ -27,4 +25,6 @@ Directory or the /etc/hosts file.
 Machines can then be used to assign applications and tokens to those machines.
 '''
 from .base import BaseMachineResolver
+
+__all__ = ["BaseMachineResolver"]
 

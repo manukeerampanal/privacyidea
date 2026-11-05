@@ -1,0 +1,470 @@
+/**
+ * (c) NetKnights GmbH 2026,  https://netknights.it
+ *
+ * This code is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
+ * as published by the Free Software Foundation; either
+ * version 3 of the License, or any later version.
+ *
+ * This code is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU AFFERO GENERAL PUBLIC LICENSE for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ **/
+
+import { provideHttpClient } from "@angular/common/http";
+import { ComponentFixture, TestBed } from "@angular/core/testing";
+import { ActivatedRoute, convertToParamMap, Router } from "@angular/router";
+import { ROUTE_PATHS } from "@app/route_paths";
+import { EMPTY_EVENT, EventHandler, EventService } from "@services/event/event.service";
+import { NotificationService } from "@services/notification/notification.service";
+import { PendingChangesService } from "@services/pending-changes/pending-changes.service";
+import { MockNotificationService, MockPendingChangesService, MockRouter } from "@testing/mock-services";
+import { MockEventService } from "@testing/mock-services/mock-event-service";
+import { BehaviorSubject, of, throwError } from "rxjs";
+import { EventEditPageComponent } from "./event-edit-page.component";
+
+globalThis.IntersectionObserver = class IntersectionObserver {
+  disconnect = jest.fn();
+  observe = jest.fn();
+  unobserve = jest.fn();
+  takeRecords = (): IntersectionObserverEntry[] => [];
+} as unknown as typeof IntersectionObserver;
+
+const mockEventHandler: EventHandler = {
+  id: 1,
+  name: "TestHandler",
+  handlermodule: "mockModule",
+  active: true,
+  event: ["eventA", "eventB"],
+  action: "actionB",
+  options: { opt3: "true" },
+  conditions: { condA: "true" },
+  position: "post",
+  ordering: 0,
+  abort_on_error: false
+};
+
+describe("EventEditPageComponent — edit mode", () => {
+  let component: EventEditPageComponent;
+  let fixture: ComponentFixture<EventEditPageComponent>;
+  let mockEventService: MockEventService;
+  let mockNotificationService: MockNotificationService;
+  let mockRouter: MockRouter;
+  let mockPendingChangesService: MockPendingChangesService;
+  let paramMap$: BehaviorSubject<ReturnType<typeof convertToParamMap>>;
+
+  beforeEach(async () => {
+    paramMap$ = new BehaviorSubject(convertToParamMap({ id: String(mockEventHandler.id) }));
+
+    await TestBed.configureTestingModule({
+      imports: [EventEditPageComponent],
+      providers: [
+        provideHttpClient(),
+        { provide: EventService, useClass: MockEventService },
+        { provide: NotificationService, useClass: MockNotificationService },
+        { provide: PendingChangesService, useClass: MockPendingChangesService },
+        { provide: Router, useClass: MockRouter },
+        {
+          provide: ActivatedRoute,
+          useValue: {
+            paramMap: paramMap$.asObservable(),
+            snapshot: { paramMap: convertToParamMap({ id: String(mockEventHandler.id) }) }
+          }
+        }
+      ]
+    }).compileComponents();
+
+    // Inject services and set up data BEFORE creating the component
+    // so the constructor's paramMap subscription finds the handler immediately
+    mockEventService = TestBed.inject(EventService) as unknown as MockEventService;
+    mockNotificationService = TestBed.inject(NotificationService) as unknown as MockNotificationService;
+    mockRouter = TestBed.inject(Router) as unknown as MockRouter;
+    mockPendingChangesService = TestBed.inject(PendingChangesService) as unknown as MockPendingChangesService;
+
+    mockEventService.eventHandlers.set([mockEventHandler]);
+    mockEventService.selectedHandlerModule.set(mockEventHandler.handlermodule);
+
+    fixture = TestBed.createComponent(EventEditPageComponent);
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+  });
+
+  it("should create", () => {
+    expect(component).toBeTruthy();
+  });
+
+  it("should initialize editEvent from the event handlers list and set selected handler module", () => {
+    expect(component.editEvent().id).toBe(mockEventHandler.id);
+    expect(component.editEvent().name).toBe("TestHandler");
+    expect(mockEventService.selectedHandlerModule()).toBe("mockModule");
+  });
+
+  it("should set isNewEvent to false in edit mode", () => {
+    expect(component.isNewEvent()).toBe(false);
+  });
+
+  it("should show 'Edit Event Handler' as title", () => {
+    expect(component.title()).toEqual("Edit Event Handler");
+  });
+
+  it("should set new action using setNewAction", () => {
+    component.setNewAction("actionC");
+    expect(component.editEvent().action).toBe("actionC");
+  });
+
+  it("should set new options using setNewOptions", () => {
+    const newOptions = { optX: "valX", optY: 42 };
+    component.setNewOptions(newOptions);
+    expect(component.editEvent().options).toEqual(newOptions);
+  });
+
+  it("should set new conditions using setNewConditions", () => {
+    const newConditions = { condX: "true", condY: "false" };
+    component.setNewConditions(newConditions);
+    expect(component.editEvent().conditions).toEqual(newConditions);
+  });
+
+  it("should set new events using setNewEvents", () => {
+    const newEvents = ["eventZ", "eventW"];
+    component.setNewEvents(newEvents);
+    expect(component.editEvent().event).toEqual(newEvents);
+  });
+
+  it("should update event handler property using updateEventHandler", () => {
+    component.updateEventHandler("name", "HandlerUpdated");
+    expect(component.editEvent().name).toBe("HandlerUpdated");
+    component.updateEventHandler("ordering", 99);
+    expect(component.editEvent().ordering).toBe(99);
+  });
+
+  it("validConditionsDefinition should be true if no condition is defined", () => {
+    component.editEvent.set({ ...component.editEvent(), conditions: {} });
+    expect(component.validConditionsDefinition()).toBe(true);
+  });
+
+  it("validConditionsDefinition should be true if all conditions have a value defined", () => {
+    component.editEvent.set({
+      ...component.editEvent(),
+      conditions: { cond1: "1", cond2: false } as unknown as Record<string, string>
+    });
+    expect(component.validConditionsDefinition()).toBe(true);
+  });
+
+  it("validConditionsDefinition should be false if at least one condition has no value", () => {
+    component.editEvent.set({
+      ...component.editEvent(),
+      conditions: { cond1: "1", cond2: null } as unknown as Record<string, string>
+    });
+    expect(component.validConditionsDefinition()).toBe(false);
+    component.editEvent.set({ ...component.editEvent(), conditions: { cond1: "1", cond2: "" } });
+    expect(component.validConditionsDefinition()).toBe(false);
+    component.editEvent.set({
+      ...component.editEvent(),
+      conditions: { cond1: "1", cond2: undefined } as unknown as Record<string, string>
+    });
+    expect(component.validConditionsDefinition()).toBe(false);
+  });
+
+  it("canSave should be true if all sections are valid", () => {
+    mockEventService.selectedHandlerModule.set("mockModule");
+    expect(component.sectionValidity()["events"]).toBe(true);
+    expect(component.sectionValidity()["action"]).toBe(true);
+    expect(component.sectionValidity()["name"]).toBe(true);
+    expect(component.sectionValidity()["handlerModule"]).toBe(true);
+    expect(component.sectionValidity()["position"]).toBe(true);
+    expect(component.sectionValidity()["conditions"]).toBe(true);
+    expect(component.canSave()).toBe(true);
+  });
+
+  it("canSave should be false if name is not set", () => {
+    component.editEvent.set({ ...component.editEvent(), name: "" });
+    mockEventService.selectedHandlerModule.set("mockModule");
+    expect(component.sectionValidity()["events"]).toBe(true);
+    expect(component.sectionValidity()["action"]).toBe(true);
+    expect(component.sectionValidity()["name"]).toBe(false);
+    expect(component.sectionValidity()["handlerModule"]).toBe(true);
+    expect(component.sectionValidity()["position"]).toBe(true);
+    expect(component.sectionValidity()["conditions"]).toBe(true);
+    expect(component.canSave()).toBe(false);
+  });
+
+  it("canSave should be false if position is not set", () => {
+    component.editEvent.set({ ...component.editEvent(), position: "" });
+    mockEventService.selectedHandlerModule.set("mockModule");
+    expect(component.sectionValidity()["events"]).toBe(true);
+    expect(component.sectionValidity()["action"]).toBe(true);
+    expect(component.sectionValidity()["name"]).toBe(true);
+    expect(component.sectionValidity()["handlerModule"]).toBe(true);
+    expect(component.sectionValidity()["position"]).toBe(false);
+    expect(component.sectionValidity()["conditions"]).toBe(true);
+    expect(component.canSave()).toBe(false);
+  });
+
+  it("canSave should be false if event is not set", () => {
+    component.editEvent.set({ ...component.editEvent(), event: [] });
+    mockEventService.selectedHandlerModule.set("mockModule");
+    expect(component.sectionValidity()["events"]).toBe(false);
+    expect(component.sectionValidity()["action"]).toBe(true);
+    expect(component.sectionValidity()["name"]).toBe(true);
+    expect(component.sectionValidity()["handlerModule"]).toBe(true);
+    expect(component.sectionValidity()["position"]).toBe(true);
+    expect(component.sectionValidity()["conditions"]).toBe(true);
+    expect(component.canSave()).toBe(false);
+  });
+
+  it("canSave should be false if action definition is invalid", () => {
+    component.editEvent.set({ ...component.editEvent(), action: "" });
+    mockEventService.selectedHandlerModule.set("mockModule");
+    expect(component.sectionValidity()["events"]).toBe(true);
+    expect(component.sectionValidity()["action"]).toBe(false);
+    expect(component.sectionValidity()["name"]).toBe(true);
+    expect(component.sectionValidity()["handlerModule"]).toBe(true);
+    expect(component.sectionValidity()["position"]).toBe(true);
+    expect(component.sectionValidity()["conditions"]).toBe(true);
+    expect(component.canSave()).toBe(false);
+
+    component.editEvent.set({ ...component.editEvent(), action: "action" });
+    component.validOptions.set(false);
+    mockEventService.selectedHandlerModule.set("mockModule");
+    expect(component.sectionValidity()["events"]).toBe(true);
+    expect(component.sectionValidity()["action"]).toBe(false);
+    expect(component.sectionValidity()["name"]).toBe(true);
+    expect(component.sectionValidity()["handlerModule"]).toBe(true);
+    expect(component.sectionValidity()["position"]).toBe(true);
+    expect(component.sectionValidity()["conditions"]).toBe(true);
+    expect(component.canSave()).toBe(false);
+  });
+
+  it("canSave should be false if handler module is not set", () => {
+    mockEventService.selectedHandlerModule.set(null);
+    expect(component.sectionValidity()["events"]).toBe(true);
+    expect(component.sectionValidity()["action"]).toBe(true);
+    expect(component.sectionValidity()["name"]).toBe(true);
+    expect(component.sectionValidity()["handlerModule"]).toBe(false);
+    expect(component.sectionValidity()["position"]).toBe(true);
+    expect(component.sectionValidity()["conditions"]).toBe(true);
+    expect(component.canSave()).toBe(false);
+  });
+
+  it("canSave should be false if the conditions are invalid", () => {
+    component.editEvent.set({
+      ...component.editEvent(),
+      conditions: { cond1: null } as unknown as Record<string, string>
+    });
+    expect(component.sectionValidity()["events"]).toBe(true);
+    expect(component.sectionValidity()["action"]).toBe(true);
+    expect(component.sectionValidity()["name"]).toBe(true);
+    expect(component.sectionValidity()["handlerModule"]).toBe(true);
+    expect(component.sectionValidity()["position"]).toBe(true);
+    expect(component.sectionValidity()["conditions"]).toBe(false);
+    expect(component.canSave()).toBe(false);
+  });
+
+  it("cancelEdit should navigate back to events list", () => {
+    component.cancelEdit();
+    expect(mockRouter.navigateByUrl).toHaveBeenCalledWith(ROUTE_PATHS.EVENTS);
+  });
+
+  it("should register hasChanges, save and validChanges with PendingChangesService on init", () => {
+    expect(mockPendingChangesService.registerHasChanges).toHaveBeenCalled();
+    expect(mockPendingChangesService.registerSave).toHaveBeenCalled();
+    expect(mockPendingChangesService.registerValidChanges).toHaveBeenCalled();
+  });
+
+  it("hasChanges should be false initially and true after a modification", () => {
+    expect(component.hasChanges()).toBe(false);
+    component.updateEventHandler("name", "Changed");
+    expect(component.hasChanges()).toBe(true);
+  });
+
+  it("should save event, reload events and navigate back", () => {
+    const reloadSpy = jest.spyOn(mockEventService.allEventsResource, "reload");
+    const snackBarSpy = jest.spyOn(mockNotificationService, "success");
+    // ensure effect is triggered to set the selected handler module in the service
+    fixture.detectChanges();
+
+    component.saveEvent();
+
+    const convertedParams = {
+      id: "1",
+      name: "TestHandler",
+      handlermodule: "mockModule",
+      active: true,
+      event: ["eventA", "eventB"],
+      action: "actionB",
+      "option.opt3": "true",
+      conditions: { condA: "true" },
+      position: "post",
+      ordering: 0,
+      abort_on_error: false,
+      clear_options: true
+    };
+    expect(mockEventService.saveEventHandler).toHaveBeenCalledWith(convertedParams);
+    expect(reloadSpy).toHaveBeenCalled();
+    expect(snackBarSpy).toHaveBeenCalledWith("Event handler updated successfully.");
+    expect(mockRouter.navigateByUrl).toHaveBeenCalledWith(ROUTE_PATHS.EVENTS);
+  });
+
+  it("should delete event, reload events and navigate back", async () => {
+    const reloadSpy = jest.spyOn(mockEventService.allEventsResource, "reload");
+    await component.deleteEvent();
+    expect(mockEventService.deleteWithConfirmDialog).toHaveBeenCalled();
+    expect(reloadSpy).toHaveBeenCalled();
+    expect(mockPendingChangesService.clearAllRegistrations).toHaveBeenCalled();
+    expect(mockRouter.navigateByUrl).toHaveBeenCalledWith(ROUTE_PATHS.EVENTS);
+  });
+
+  it("should stay on the page when the deletion is not confirmed", async () => {
+    const reloadSpy = jest.spyOn(mockEventService.allEventsResource, "reload");
+    mockEventService.deleteWithConfirmDialog.mockResolvedValue(undefined);
+    await component.deleteEvent();
+    expect(reloadSpy).not.toHaveBeenCalled();
+    expect(mockPendingChangesService.clearAllRegistrations).not.toHaveBeenCalled();
+    expect(mockRouter.navigateByUrl).not.toHaveBeenCalled();
+  });
+
+  it("should toggle active and call enable/disable on service", () => {
+    component.toggleActive(true);
+    expect(mockEventService.enableEvent).toHaveBeenCalledWith(mockEventHandler.id);
+    component.toggleActive(false);
+    expect(mockEventService.disableEvent).toHaveBeenCalledWith(mockEventHandler.id);
+  });
+
+  it("should update the selected handler module and mark the form as changed", () => {
+    component.setNewHandlerModule("otherModule");
+    expect(mockEventService.selectedHandlerModule()).toBe("otherModule");
+    expect(component.hasChanges()).toBe(true);
+  });
+
+  it("should resolve to false without navigating when the save response carries no value", async () => {
+    mockEventService.saveEventHandler.mockReturnValue(of({ result: {} }));
+    const resolved = await component.saveEvent();
+    expect(resolved).toBe(false);
+    expect(mockRouter.navigateByUrl).not.toHaveBeenCalled();
+  });
+
+  it("should resolve to false when saving the event fails", async () => {
+    mockEventService.saveEventHandler.mockReturnValue(throwError(() => new Error("boom")));
+    const resolved = await component.saveEvent();
+    expect(resolved).toBe(false);
+    expect(mockRouter.navigateByUrl).not.toHaveBeenCalled();
+  });
+});
+
+describe("EventEditPageComponent — create new mode", () => {
+  let component: EventEditPageComponent;
+  let fixture: ComponentFixture<EventEditPageComponent>;
+  let mockEventService: MockEventService;
+  let mockNotificationService: MockNotificationService;
+  let mockRouter: MockRouter;
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [EventEditPageComponent],
+      providers: [
+        provideHttpClient(),
+        { provide: EventService, useClass: MockEventService },
+        { provide: NotificationService, useClass: MockNotificationService },
+        { provide: PendingChangesService, useClass: MockPendingChangesService },
+        { provide: Router, useClass: MockRouter },
+        {
+          provide: ActivatedRoute,
+          useValue: {
+            paramMap: new BehaviorSubject(convertToParamMap({})).asObservable(),
+            snapshot: { paramMap: convertToParamMap({}) }
+          }
+        }
+      ]
+    }).compileComponents();
+
+    fixture = TestBed.createComponent(EventEditPageComponent);
+    component = fixture.componentInstance;
+    mockEventService = TestBed.inject(EventService) as unknown as MockEventService;
+    mockNotificationService = TestBed.inject(NotificationService) as unknown as MockNotificationService;
+    mockRouter = TestBed.inject(Router) as unknown as MockRouter;
+
+    fixture.detectChanges();
+  });
+
+  it("should set isNewEvent to true", () => {
+    expect(component.isNewEvent()).toBe(true);
+  });
+
+  it("should show 'Create New Event Handler' as title", () => {
+    expect(component.title()).toContain("Create");
+  });
+
+  it("should initialize editEvent to EMPTY_EVENT", () => {
+    expect(component.editEvent().name).toBe(EMPTY_EVENT.name);
+    expect(component.editEvent().event).toEqual(EMPTY_EVENT.event);
+  });
+
+  it("should set selectedHandlerModule to first available module", () => {
+    expect(mockEventService.selectedHandlerModule()).toBe("mockModule");
+  });
+
+  it("should preset abort on error from the default of the handler module", () => {
+    mockEventService.moduleDefaults.set({ abort_on_error: true });
+
+    expect(component.abortOnError()).toBe(true);
+    expect(component.getSaveParameters().abort_on_error).toBe(true);
+  });
+
+  it("should keep the choice of the user over the default of the handler module", () => {
+    component.setAbortOnError(false);
+    mockEventService.moduleDefaults.set({ abort_on_error: true });
+
+    expect(component.abortOnError()).toBe(false);
+    expect(component.getSaveParameters().abort_on_error).toBe(false);
+  });
+
+  it("should not preset abort on error while the default of the handler module is unknown", () => {
+    mockEventService.moduleDefaults.set(null);
+
+    expect(component.abortOnError()).toBe(false);
+  });
+
+  it("should save new event without id and navigate back", () => {
+    mockEventService.selectedHandlerModule.set("mockModule");
+    component.setNewAction("actionB");
+    component.setNewOptions({ opt3: "true" });
+    component.setNewEvents(["eventA", "eventB"]);
+    component.setNewConditions({ condA: "true" });
+    component.updateEventHandler("name", "TestHandler");
+    component.updateEventHandler("position", "pre");
+
+    const reloadSpy = jest.spyOn(mockEventService.allEventsResource, "reload");
+    const snackBarSpy = jest.spyOn(mockNotificationService, "success");
+    component.saveEvent();
+
+    const convertedParams = {
+      name: "TestHandler",
+      handlermodule: "mockModule",
+      active: true,
+      event: ["eventA", "eventB"],
+      action: "actionB",
+      "option.opt3": "true",
+      conditions: { condA: "true" },
+      position: "pre",
+      ordering: 0,
+      abort_on_error: false,
+      clear_options: true
+    };
+    expect(mockEventService.saveEventHandler).toHaveBeenCalledWith(convertedParams);
+    expect(reloadSpy).toHaveBeenCalled();
+    expect(snackBarSpy).toHaveBeenCalledWith("Event handler created successfully.");
+    expect(mockRouter.navigateByUrl).toHaveBeenCalledWith(ROUTE_PATHS.EVENTS);
+  });
+
+  it("should not call enable/disable while the event has not been saved yet", () => {
+    component.toggleActive(true);
+    expect(mockEventService.enableEvent).not.toHaveBeenCalled();
+    expect(mockEventService.disableEvent).not.toHaveBeenCalled();
+  });
+});

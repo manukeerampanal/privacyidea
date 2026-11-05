@@ -3,24 +3,38 @@ This test file tests the lib.tokenclass
 
 The lib.tokenclass depends on the DB model and lib.user
 """
-from .base import MyTestCase, FakeFlaskG
-from privacyidea.lib.resolver import (save_resolver, delete_resolver)
-from privacyidea.lib.realm import (set_realm, delete_realm)
-from privacyidea.lib.user import (User)
-from privacyidea.lib.policy import ACTION
-from privacyidea.lib.tokenclass import (TokenClass, DATE_FORMAT)
-from privacyidea.lib.config import (set_privacyidea_config,
-                                    delete_privacyidea_config)
+from datetime import datetime, timedelta, UTC
+
+import responses
+from dateutil.tz import tzlocal
+from unittest import mock
+from sqlalchemy import select
+
+import privacyidea
+from privacyidea.lib.challenge import get_challenges
+from privacyidea.lib.config import set_privacyidea_config, get_token_class_dict
+from privacyidea.lib.container import init_container, add_token_to_container
 from privacyidea.lib.crypto import geturandom
+from privacyidea.lib.error import TokenAdminError, ParameterError, PolicyError
+from privacyidea.lib.policies.actions import PolicyAction
+from privacyidea.lib.realm import (set_realm)
+from privacyidea.lib.resolver import save_resolver
+from privacyidea.lib.token import init_token, assign_tokengroup, remove_token
+from privacyidea.lib.tokenclass import (TokenClass, DATE_FORMAT, AUTH_DATE_FORMAT)
+from privacyidea.lib.tokens.questionnairetoken import QuestionnaireTokenClass
+from privacyidea.lib.tokens.radiustoken import RadiusTokenClass
+from privacyidea.lib.tokens.totptoken import TotpTokenClass
+from privacyidea.lib.tokengroup import set_tokengroup
+from privacyidea.lib.user import (User)
 from privacyidea.lib.utils import hexlify_and_unicode, to_unicode
-from privacyidea.lib.error import TokenAdminError
 from privacyidea.models import (Token,
                                 Config,
-                                Challenge)
-import datetime
-from dateutil.tz import tzlocal
+                                Challenge, Realm, TokenOwner, db, TokenRealm, Tokengroup, TokenTokengroup, TokenInfo,
+                                TokenContainer, TokenContainerToken)
+from .base import MyTestCase, FakeFlaskG
 
 PWFILE = "tests/testdata/passwords"
+
 
 class TokenBaseTestCase(MyTestCase):
     '''
@@ -33,31 +47,22 @@ class TokenBaseTestCase(MyTestCase):
     realm2 = "realm2"
     serial1 = "SE123456"
     serial2 = "SE222222"
-    
+
     # add_user, get_user, reset, set_user_identifiers
-    
+
     def test_00_create_user_realm(self):
-        rid = save_resolver({"resolver": self.resolvername1,
-                               "type": "passwdresolver",
-                               "fileName": PWFILE})
-        self.assertTrue(rid > 0, rid)
-               
-        (added, failed) = set_realm(self.realm1,
-                                    [self.resolvername1])
-        self.assertTrue(len(failed) == 0)
-        self.assertTrue(len(added) == 1)
-        
+        self.setUp_user_realms()
         user = User(login="root",
                     realm=self.realm1,
                     resolver=self.resolvername1)
-        
-        user_str = "{0!s}".format(user)
+
+        user_str = f"{user!s}"
         self.assertTrue(user_str == "<root.resolver1@realm1>", user_str)
-        
+
         self.assertFalse(user.is_empty())
         self.assertTrue(User().is_empty())
-        
-        user_repr = "{0!r}".format(user)
+
+        user_repr = f"{user!r}"
         expected = "User(login='root', realm='realm1', resolver='resolver1')"
         self.assertTrue(user_repr == expected, user_repr)
 
@@ -68,34 +73,36 @@ class TokenBaseTestCase(MyTestCase):
         self.assertTrue(token.token.serial == self.serial1, token)
         self.assertTrue(token.token.tokentype == "unknown", token.token)
         self.assertTrue(token.type == "unknown", token)
-        
+
         token.set_type("newtype")
         self.assertTrue(token.token.tokentype == "newtype", token.token)
         self.assertTrue(token.type == "newtype", token)
         self.assertTrue(token.get_type() == "newtype", token)
-        
+
         self.assertTrue(token.get_class_prefix() == "UNK", token)
         self.assertTrue(token.get_class_type() is None, token)
         token.save()
 
         info = token.get_class_info()
-        self.assertTrue(info == {}, "{0!s}".format(info))
-        
+        self.assertTrue(info == {}, f"{info!s}")
+
     def test_02_set_user(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = TokenClass(db_token)
         self.assertTrue(token.token.tokentype == "newtype",
                         token.token.tokentype)
         self.assertTrue(token.type == "newtype", token.type)
-        
-        token.add_user(User(login="cornelius",
-                            realm=self.realm1))
+
+        token.add_user(User(login="cornelius", realm=self.realm1))
 
         user_object = token.user
-        self.assertTrue(user_object.login == "cornelius",
-                        user_object)
-        self.assertTrue(user_object.resolver == self.resolvername1,
-                        user_object)
+        self.assertTrue(user_object.login == "cornelius", user_object)
+        self.assertTrue(user_object.resolver == self.resolvername1, user_object)
+        assignment_date = token.get_tokeninfo("assignment_date")
+        self.assertTrue(assignment_date, assignment_date)
+        current_date = datetime.now(UTC)
+        delta = current_date - datetime.fromisoformat(assignment_date)
+        self.assertTrue(delta.total_seconds() < 10, delta)
 
     def test_03_reset_failcounter(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
@@ -104,7 +111,7 @@ class TokenBaseTestCase(MyTestCase):
         token.reset()
         self.assertTrue(token.token.failcount == 0,
                         token.token.failcount)
-        
+
     def test_04_base_methods(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = TokenClass(db_token)
@@ -112,7 +119,7 @@ class TokenBaseTestCase(MyTestCase):
         self.assertTrue(token.get_otp() == (-2, 0, 0, 0))
         res = token.get_multi_otp()
         self.assertTrue(res[0] is False, res)
-        
+
         c = token.create_challenge("transactionid")
         self.assertTrue(c[0], c)
         self.assertTrue("transactionid" in c[2], c)
@@ -126,41 +133,40 @@ class TokenBaseTestCase(MyTestCase):
         # another token.
         db_token2 = Token(self.serial2, tokentype="spass")
         db_token2.save()
-        token2 = TokenClass(db_token)
+        token2 = TokenClass(db_token2)
         c = token2.create_challenge(transaction_id)
         self.assertEqual(c[2], transaction_id)
 
         # Now there should be two entries with the same transaction_id
-        r = Challenge.query.filter(
-            Challenge.transaction_id==transaction_id).all()
+        r = get_challenges(transaction_id=transaction_id)
         self.assertEqual(len(r), 2)
 
         # set the description
         token.set_description("something new")
         self.assertTrue(token.token.description == "something new",
                         token.token)
-        
+
         # set defaults
         token.set_defaults()
         self.assertTrue(token.token.otplen == 6)
         self.assertTrue(token.token.sync_window == 1000)
-        
+
         token.resync("1234", "3456")
-        
+
         token.token.count_window = 17
         self.assertTrue(token.get_otp_count_window() == 17)
-        
+
         token.token.count = 18
         self.assertTrue(token.get_otp_count() == 18)
-        
+
         token.token.active = False
         self.assertTrue(token.is_active() is False)
-        
+
         token.token.failcount = 7
         self.assertTrue(token.get_failcount() == 7)
         token.set_failcount(8)
         self.assertTrue(token.token.failcount == 8)
-        
+
         token.token.maxfail = 12
         self.assertTrue(token.get_max_failcount() == 12)
 
@@ -172,13 +178,13 @@ class TokenBaseTestCase(MyTestCase):
         self.assertFalse(r)
         # reset failcount
         token.token.failcount = 8
-        
+
         self.assertTrue(token.get_user_id() == token.token.first_owner.user_id)
-        
+
         self.assertTrue(token.get_serial() == "SE123456", token.token.serial)
         self.assertTrue(token.get_tokentype() == "newtype",
                         token.token.tokentype)
-        
+
         token.set_so_pin("sopin")
         token.set_user_pin("userpin")
         token.set_otpkey("123456")
@@ -193,15 +199,17 @@ class TokenBaseTestCase(MyTestCase):
         self.assertTrue(token.get_otplen() == 8)
         self.assertTrue(token.token.count == 1000,
                         token.token.count)
-        
+
         token.set_maxfail(1000)
         self.assertTrue(token.token.maxfail == 1000)
-        
+
         token.set_count_window(52)
         self.assertTrue(token.get_count_window() == 52)
-        
+
         token.set_sync_window(53)
         self.assertTrue(token.get_sync_window() == 53)
+        # since we need this token later, we need to persist its data to the db
+        token.save()
 
     def test_06_set_pin(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
@@ -213,32 +221,113 @@ class TokenBaseTestCase(MyTestCase):
         ph2 = token.token.pin_hash
         self.assertTrue(ph1 != ph2)
         token.set_pin_hash_seed(ph1, pseed)
-        
+
     def test_07_enable(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = TokenClass(db_token)
         token.enable(False)
         self.assertTrue(token.token.active is False)
         token.enable()
-        self.assertTrue(token.token.active)        
-        
+        self.assertTrue(token.token.active)
+
     def test_05_get_set_realms(self):
-        set_realm(self.realm2)
-        db_token = Token.query.filter_by(serial=self.serial1).first()
-        token = TokenClass(db_token)
+        self.setUp_user_realm2()
+        token = init_token({"type": "hotp"})
         realms = token.get_realms()
-        self.assertTrue(len(realms) == 1, realms)
+        self.assertEqual(0, len(realms), realms)
+
+        # set multiple realms
         token.set_realms([self.realm1, self.realm2])
         realms = token.get_realms()
-        self.assertTrue(len(realms) == 2, realms)
-        
-    def test_99_delete_token(self):
-        db_token = Token.query.filter_by(serial=self.serial1).first()
-        token = TokenClass(db_token)
+        self.assertSetEqual({self.realm1, self.realm2}, set(realms))
+
+        # Set one existing realm removes the remaining ones
+        with mock.patch("logging.Logger.debug") as mock_log:
+            token.set_realms([self.realm1])
+            realms = token.get_realms()
+            self.assertSetEqual({self.realm1}, set(realms))
+            mock_log.assert_any_call(f"Remove realm {self.realm2} from token {token.get_serial()} due to setting "
+                                     f"new realms ({self.realm1}).")
+
+        # Add realm keeps existing realms
+        token.set_realms([self.realm2], add=True)
+        realms = token.get_realms()
+        self.assertSetEqual({self.realm1, self.realm2}, set(realms))
+
+        # Set empty list removes all realms
+        token.set_realms([self.realm1])
+        with mock.patch("logging.Logger.debug") as mock_log:
+            token.set_realms([])
+            realms = token.get_realms()
+            self.assertTrue(len(realms) == 0, realms)
+            mock_log.assert_any_call(f"Remove realm {self.realm1} from token {token.get_serial()} due to setting new "
+                                     "realms ().")
+
+        # Set new realm keeps the users realm anyway
+        token.add_user(User("hans", self.realm1))
+        self.assertSetEqual({self.realm1}, set(token.get_realms()))
+        with mock.patch("logging.Logger.info") as mock_log:
+            token.set_realms([self.realm2])
+            self.assertEqual({self.realm2, self.realm1}, set(token.get_realms()))
+            mock_log.assert_any_call(f"The realms ({self.realm1}) of assigned users cannot be removed from the token "
+                                     f"{token.get_serial()}.")
+
+        # Set non-existing realm
+        with mock.patch("logging.Logger.warning") as mock_log:
+            token.set_realms(["random"])
+            self.assertEqual({self.realm1}, set(token.get_realms()))
+            mock_log.assert_any_call(f"Realm random does not exist. Cannot add it to token {token.get_serial()}.")
+
         token.delete_token()
-        
-        db_token = Token.query.filter_by(serial=self.serial1).first()
-        self.assertTrue(db_token is None, db_token)
+
+    def test_99_delete_token(self):
+        # Clear token db
+        db_tokens = db.session.scalars(select(Token)).unique().all()
+        for db_token in db_tokens:
+            token = TokenClass(db_token)
+            token.delete_token()
+
+        token = init_token({"type": "hotp", "serial": self.serial1})
+        # set relationships
+        self.setUp_user_realms()
+        user = User("hans", self.realm1)
+        token.add_user(user)
+        token.set_tokeninfo({"key": "value"})
+        Challenge(serial=self.serial1)
+        db.session.commit()
+        set_tokengroup("group")
+        assign_tokengroup(self.serial1, "group")
+        container_serial = init_container({"type": "generic"})["container_serial"]
+        add_token_to_container(container_serial, self.serial1)
+
+        token.delete_token()
+
+        token = db.session.scalar(select(Token).where(Token.serial == self.serial1))
+        self.assertIsNone(token, "Token was not deleted.")
+
+        # Check relationships are deleted
+        realm = db.session.scalar(select(Realm).where(Realm.name == self.realm1))
+        self.assertIsNotNone(realm, "Realm was deleted.")
+        owner = db.session.scalar(
+            select(TokenOwner).where(TokenOwner.realm_id == realm.id, TokenOwner.resolver == user.resolver,
+                                     TokenOwner.user_id == user.uid))
+        self.assertIsNone(owner, "TokenOwner relationship was not deleted.")
+        token_realm = db.session.scalar(select(TokenRealm).where(TokenRealm.realm_id == realm.id))
+        self.assertIsNone(token_realm, "TokenRealm relationships were not deleted.")
+        challenge = db.session.scalar(select(Challenge).where(Challenge.serial == self.serial1))
+        self.assertIsNone(challenge, "Challenge was not deleted.")
+        token_group = db.session.scalar(select(Tokengroup).where(Tokengroup.name == "group"))
+        self.assertIsNotNone(token_group, "Tokengroup was deleted.")
+        token_token_group = db.session.scalar(
+            select(TokenTokengroup).where(TokenTokengroup.tokengroup_id == token_group.id))
+        self.assertIsNone(token_token_group, "TokenTokengroup relationship was not deleted.")
+        token_info = db.session.scalar(select(TokenInfo).where(TokenInfo.Key == "key", TokenInfo.Value == "value"))
+        self.assertIsNone(token_info, "TokenInfo was not deleted.")
+        container = db.session.scalar(select(TokenContainer).where(TokenContainer.serial == container_serial))
+        self.assertIsNotNone(container, "TokenContainer was deleted.")
+        token_container = db.session.scalar(
+            select(TokenContainerToken).where(TokenContainerToken.container_id == container.id))
+        self.assertIsNone(token_container, "TokenContainerToken was not deleted.")
 
     def test_08_info(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
@@ -246,14 +335,14 @@ class TokenBaseTestCase(MyTestCase):
         token.set_hashlib("sha1")
         tinfo = token.token.get_info()
         self.assertTrue("hashlib" in tinfo, tinfo)
-        
+
     def test_09_failcount(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = TokenClass(db_token)
         start = token.token.failcount
         end = token.inc_failcount()
         self.assertTrue(end == start + 1, (end, start))
-        
+
     def test_10_get_hashlib(self):
         # check if functions are returned
         for hl in ["sha1", "md5", "sha256", "sha512",
@@ -261,7 +350,7 @@ class TokenBaseTestCase(MyTestCase):
             self.assertTrue(hasattr(TokenClass.get_hashlib(hl),
                                     '__call__'),
                             TokenClass.get_hashlib(hl))
-    
+
     def test_11_tokeninfo(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = TokenClass(db_token)
@@ -276,7 +365,7 @@ class TokenBaseTestCase(MyTestCase):
         self.assertTrue("key2" not in info2, info2)
         self.assertTrue(token.get_tokeninfo("key1") == "value2",
                         info2)
-        
+
         # auth counter
         token.set_count_auth_success_max(200)
         token.set_count_auth_max(1000)
@@ -288,7 +377,7 @@ class TokenBaseTestCase(MyTestCase):
         self.assertTrue(token.get_count_auth_success() == 101)
         self.assertTrue(token.get_count_auth_max() == 1000)
         self.assertTrue(token.get_count_auth() == 201)
-        
+
         self.assertTrue(token.check_auth_counter())
         token.set_count_auth_max(10)
         self.assertFalse(token.check_auth_counter())
@@ -314,7 +403,7 @@ class TokenBaseTestCase(MyTestCase):
         self.assertTrue(start == "2014-12-30T16:00+0400", start)
         self.assertRaises(TokenAdminError,
                           token.set_validity_period_start, "wrong date")
-        
+
         self.assertFalse(token.check_validity_period())
         # delete the validity period end by passing an empty string
         token.set_validity_period_end('')
@@ -323,7 +412,7 @@ class TokenBaseTestCase(MyTestCase):
         self.assertTrue(token.check_validity_period())
 
         # try the same for the validity period start
-        start_date_5d = datetime.datetime.now(tzlocal()) + datetime.timedelta(5)
+        start_date_5d = datetime.now(tzlocal()) + timedelta(5)
         token.set_validity_period_start(start_date_5d.strftime(DATE_FORMAT))
         self.assertFalse(token.check_validity_period())
         token.set_validity_period_start('')
@@ -339,33 +428,33 @@ class TokenBaseTestCase(MyTestCase):
 
         # check validity period
         # +5 days
-        end_date = datetime.datetime.now(tzlocal()) + datetime.timedelta(5)
+        end_date = datetime.now(tzlocal()) + timedelta(5)
         end = end_date.strftime(DATE_FORMAT)
         token.set_validity_period_end(end)
         # - 5 days
-        start_date = datetime.datetime.now(tzlocal()) - datetime.timedelta(5)
+        start_date = datetime.now(tzlocal()) - timedelta(5)
         start = start_date.strftime(DATE_FORMAT)
         token.set_validity_period_start(start)
         self.assertTrue(token.check_validity_period())
-        
+
         # check before start date
         # +5 days
-        end_date = datetime.datetime.now(tzlocal()) + datetime.timedelta(5)
+        end_date = datetime.now(tzlocal()) + timedelta(5)
         end = end_date.strftime(DATE_FORMAT)
         token.set_validity_period_end(end)
         # + 2 days
-        start_date = datetime.datetime.now(tzlocal()) + datetime.timedelta(2)
+        start_date = datetime.now(tzlocal()) + timedelta(2)
         start = start_date.strftime(DATE_FORMAT)
         token.set_validity_period_start(start)
         self.assertFalse(token.check_validity_period())
-        
+
         # check after enddate
         # -1 day
-        end_date = datetime.datetime.now(tzlocal()) - datetime.timedelta(1)
+        end_date = datetime.now(tzlocal()) - timedelta(1)
         end = end_date.strftime(DATE_FORMAT)
         token.set_validity_period_end(end)
         # - 10 days
-        start_date = datetime.datetime.now(tzlocal()) - datetime.timedelta(10)
+        start_date = datetime.now(tzlocal()) - timedelta(10)
         start = start_date.strftime(DATE_FORMAT)
         token.set_validity_period_start(start)
         self.assertFalse(token.check_validity_period())
@@ -375,8 +464,8 @@ class TokenBaseTestCase(MyTestCase):
         old_time_2 = "24/04/17 22:00"  # April 24th
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = TokenClass(db_token)
-        token.add_tokeninfo("validity_period_start", old_time_1)
-        token.add_tokeninfo("validity_period_end", old_time_2)
+        token.write_tokeninfo("validity_period_start", old_time_1)
+        token.write_tokeninfo("validity_period_end", old_time_2)
         info = token.get_tokeninfo()
         self.assertEqual(info.get("validity_period_start"), old_time_1)
         self.assertEqual(info.get("validity_period_end"), old_time_2)
@@ -386,13 +475,13 @@ class TokenBaseTestCase(MyTestCase):
         self.assertTrue(s.startswith("2017-04-11T22:00"), s)
 
         # old date format has problems with check_validity_date
-        start_date = datetime.datetime.now() - datetime.timedelta(days=15)
-        end_date = datetime.datetime.now() + datetime.timedelta(days=15)
+        start_date = datetime.now() - timedelta(days=15)
+        end_date = datetime.now() + timedelta(days=15)
         start = start_date.strftime("%d/%m/%Y")
         end = end_date.strftime("%d/%m/%Y")
         # Need to write the old format to the database
-        token.add_tokeninfo("validity_period_start", start)
-        token.add_tokeninfo("validity_period_end", end)
+        token.write_tokeninfo("validity_period_start", start)
+        token.write_tokeninfo("validity_period_end", end)
         r = token.check_validity_period()
         self.assertTrue(r)
 
@@ -401,8 +490,15 @@ class TokenBaseTestCase(MyTestCase):
         token = TokenClass(db_token)
         token.add_tokeninfo("radius.secret", "secret", value_type="password")
         info1 = token.get_tokeninfo()
-        self.assertTrue("radius.secret" in info1, info1)
-        self.assertTrue("radius.secret.type" in info1, info1)
+        self.assertIn("radius.secret", info1, info1)
+        self.assertIn("radius.secret.type", info1, info1)
+        # We get the encrypted value
+        self.assertEqual(65, len(info1.get("radius.secret")), info1)
+        # Now we get the tokenvalues, decrypted
+        info2 = token.get_tokeninfo(decrypted=True)
+        # and we can see the plain text value
+        self.assertEqual("secret", info2.get("radius.secret"), info2)
+        self.assertEqual("password", info2.get("radius.secret.type"), info2)
 
         info = token.get_tokeninfo("radius.secret")
         self.assertEqual(info, "secret", info)
@@ -424,24 +520,303 @@ class TokenBaseTestCase(MyTestCase):
         info = token.get_tokeninfo("radius.secret")
         self.assertEqual(info, "topSecret", info)
 
-        # THe same with set_tokeninfo
+        # The same with set_tokeninfo
         token.set_tokeninfo({"radius.secret": "otherSecret",
                              "radius.secret.type": "password"})
         info1 = token.get_tokeninfo()
-        self.assertTrue("radius.secret" in info1, info1)
-        self.assertTrue("radius.secret.type" in info1, info1)
+        self.assertIn("radius.secret", info1, info1)
+        self.assertIn("radius.secret.type", info1, info1)
         # get_tokeninfo without parameters does not decrypt!
-        self.assertTrue(info1.get("radius.secret") != "otherSecret",
-                        info1.get("radius.secret"))
+        self.assertNotEqual(info1.get("radius.secret"), "otherSecret",
+                            info1)
 
         # get_tokeninfo with parameter does decrypt!
         info = token.get_tokeninfo("radius.secret")
-        self.assertTrue(info == "otherSecret", info)
+        self.assertEqual(info, "otherSecret", info)
+
+    def test_11_tokeninfo_type_is_kept_on_overwrite(self):
+        db_token = Token.query.filter_by(serial=self.serial1).first()
+        token = TokenClass(db_token)
+
+        token.add_tokeninfo("radius.secret", "firstSecret", value_type="password")
+        # A caller that does not know about the type of the key overwrites only the value. The entry stays
+        # encrypted, so the value is not readable from the raw token info and decrypts to the new plaintext.
+        token.add_tokeninfo("radius.secret", "secondSecret")
+
+        raw_info = token.get_tokeninfo()
+        self.assertEqual("password", raw_info.get("radius.secret.type"), raw_info)
+        self.assertNotEqual("secondSecret", raw_info.get("radius.secret"), raw_info)
+        self.assertEqual("secondSecret", token.get_tokeninfo("radius.secret"))
+
+        # A key that has no type keeps having none
+        token.add_tokeninfo("plainkey", "one")
+        token.add_tokeninfo("plainkey", "two")
+        raw_info = token.get_tokeninfo()
+        self.assertNotIn("plainkey.type", raw_info, raw_info)
+        self.assertEqual("two", raw_info.get("plainkey"), raw_info)
+
+    def test_11_tokeninfo_type_suffix_is_reserved(self):
+        db_token = Token.query.filter_by(serial=self.serial1).first()
+        token = TokenClass(db_token)
+
+        # The ".type" entries of the token info are synthesized from the Type column, a stored key of that name
+        # would shadow them and make the value be read with the wrong type.
+        self.assertRaises(ParameterError, token.add_tokeninfo, "somekey.type", "password")
+
+        token.add_tokeninfo("somekey", "somevalue")
+        raw_info = token.get_tokeninfo()
+        self.assertNotIn("somekey.type", raw_info, raw_info)
+        self.assertEqual("somevalue", token.get_tokeninfo("somekey"))
+
+    # Token info keys the server writes that are deliberately not owned by a token class. Each one is a switch
+    # an administrator sets on a single token, so it stays free-form and can be written through the token info
+    # endpoints. A new key must be classified rather than silently end up on either side, which is what the
+    # test below enforces.
+    FREE_FORM_WRITTEN_KEYS = frozenset()
+
+    # Token info keys that are declared although the running server never writes them, with the reason:
+    #   original_tokentype, original_active, deprecated_in: a database migration writes them when it retires a
+    #     token type and reads them back when it is reverted, so an administrator must not be able to rewrite
+    #     the recorded origin of a token. Note that the scan below skips the migrations, so a key that only a
+    #     migration writes has to be listed here.
+    #   privatekey, pkcs12_password: a certificate token enrolled before the private key stopped being stored
+    #     in the token info can still carry them, and they are read to keep such a token working. They are the
+    #     private key of the token and the password of its container, so they are not writable either.
+    DECLARED_WITHOUT_A_WRITER = frozenset({"original_tokentype", "original_active", "deprecated_in",
+                                           "privatekey", "pkcs12_password"})
+
+    def test_11_every_tokeninfo_key_the_server_writes_is_declared(self):
+        """
+        A token info key the server writes itself belongs to a token class and must appear in some class'
+        declaration, otherwise it stays writable through the generic token info endpoints. A key the server only
+        ever reads is configuration an administrator sets, and must not be declared, otherwise there is no way
+        left to set it.
+
+        This walks the source of the whole package, collects the keys passed to the writers and to
+        get_tokeninfo, and checks both directions. A key that is written and is meant to stay free-form has to
+        be listed in FREE_FORM_WRITTEN_KEYS, so that adding one is a decision and not an oversight.
+
+        Keys that are built at runtime (the questions of a questionnaire token, the TANs of a TAN token, the
+        refill token of a FIDO2 token) cannot be read from the source and are covered by a declared prefix or by
+        a class that overrides is_owned_tokeninfo_key.
+        """
+        import ast
+        import importlib
+        import pathlib
+
+        writers = {"write_tokeninfo", "remove_tokeninfo", "add_tokeninfo", "delete_tokeninfo", "set_tokeninfo"}
+        readers = {"get_tokeninfo"}
+        package_root = pathlib.Path(privacyidea.__file__).parent
+
+        declared_keys = set()
+        declared_prefixes = set()
+        for token_class in get_token_class_dict()[0].values():
+            keys, prefixes = token_class._collect_tokeninfo_declaration("owned_tokeninfo_keys",
+                                                                       "owned_tokeninfo_prefixes")
+            declared_keys.update(keys)
+            declared_prefixes.update(prefixes)
+
+        def resolve(node: ast.expr, module_globals: dict, local_strings: dict) -> str | None:
+            """Resolve a call argument to a string, if it is a literal or a constant reference."""
+            if isinstance(node, ast.Constant):
+                return node.value if isinstance(node.value, str) else None
+            if isinstance(node, ast.Name):
+                value = module_globals.get(node.id, local_strings.get(node.id))
+                return value if isinstance(value, str) else None
+            if isinstance(node, ast.Attribute):
+                if isinstance(node.value, ast.Name):
+                    if node.value.id == "self":
+                        # A key held in a class attribute, e.g. self.EMAIL_ADDRESS_KEY
+                        return local_strings.get(node.attr)
+                    base = module_globals.get(node.value.id)
+                    value = getattr(base, node.attr, None) if base is not None else None
+                    return value if isinstance(value, str) else None
+            return None
+
+        def collect_module_strings(tree: ast.AST, module_globals: dict) -> tuple:
+            """
+            Return the names that hold a string literal, and the set of keys the module writes without naming
+            them at the call site.
+
+            A key reaches a writer through a name, a class attribute, a loop over a list of keys, or a dict
+            that is built first and handed to add_tokeninfo_dict afterwards. None of those show the key at the
+            call site, so they are collected separately. This over-approximates what is written, which is the
+            safe direction: it can only make the check that a read-only key is not declared more forgiving,
+            never wrong.
+            """
+            names, indirect = {}, set()
+            takes_a_dict = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                               and n.func.attr in ("add_tokeninfo_dict", "set_tokeninfo")
+                               for n in ast.walk(tree))
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                        for target in targets:
+                            if isinstance(target, ast.Name):
+                                names[target.id] = node.value.value
+                            elif isinstance(target, ast.Attribute):
+                                names[target.attr] = node.value.value
+                if isinstance(node, ast.For):
+                    # for key in ["a", "b"] and for key, default in [("a", 1), ("b", 2)]
+                    elements = node.iter.elts if isinstance(node.iter, (ast.List, ast.Tuple)) else []
+                    for element in elements:
+                        candidates = element.elts if isinstance(element, ast.Tuple) else [element]
+                        for candidate in candidates[:1]:
+                            if isinstance(candidate, ast.Constant) and isinstance(candidate.value, str):
+                                indirect.add(candidate.value)
+                if takes_a_dict and isinstance(node, ast.Dict):
+                    # The dict is written as a whole, so every key of it is written
+                    for key in node.keys:
+                        resolved = resolve(key, module_globals, {}) if key is not None else None
+                        if resolved:
+                            indirect.add(resolved)
+            return names, indirect
+
+        # "written" holds the keys a writer is called with and names the call site, which is what the check
+        # that every written key is declared reports. "possibly_written" additionally holds the keys that
+        # reach a writer indirectly, which cannot be pinned to a call site and is only used to keep the check
+        # that a read-only key is not declared from reporting a key that is in fact written.
+        written, only_read, possibly_written = {}, {}, set()
+        for source_path in sorted(package_root.rglob("*.py")):
+            if "migrations" in source_path.parts:
+                continue
+            tree = ast.parse(source_path.read_text(encoding="utf-8"))
+            module_name = ".".join(
+                ("privacyidea",) + source_path.relative_to(package_root).with_suffix("").parts)
+            try:
+                module_globals = vars(importlib.import_module(module_name))
+            except Exception:
+                # A module that cannot be imported here contributes no resolvable keys
+                module_globals = {}
+            local_strings, indirect_writes = collect_module_strings(tree, module_globals)
+            location = str(source_path.relative_to(package_root.parent))
+            possibly_written.update(indirect_writes)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                is_method_call = isinstance(node.func, ast.Attribute)
+                name = node.func.attr if is_method_call else getattr(node.func, "id", None)
+                if name not in writers | readers:
+                    continue
+                # The module level helpers in lib/token/attributes.py take the serial before the key
+                key_index = 0 if is_method_call else 1
+                if len(node.args) <= key_index:
+                    continue
+                key = resolve(node.args[key_index], module_globals, local_strings)
+                if key is None:
+                    continue
+                bucket = written if name in writers else only_read
+                bucket.setdefault(key, []).append(f"{location}:{node.lineno}")
+
+        def is_declared(key: str) -> bool:
+            return key in declared_keys or any(key.startswith(prefix) for prefix in declared_prefixes)
+
+        # A key the server writes belongs to a token class, unless it is knowingly kept free-form
+        undeclared = {key: locations[0] for key, locations in written.items()
+                      if not is_declared(key) and key not in self.FREE_FORM_WRITTEN_KEYS}
+        self.assertEqual({}, undeclared,
+                         "Token info keys the server writes but no token class declares. Declare them, or add "
+                         f"them to FREE_FORM_WRITTEN_KEYS if an administrator is meant to set them: {undeclared}")
+
+        # A key the server only reads is set by an administrator, so declaring it would leave no way to set it.
+        # A key covered by a declared prefix is exempt: a prefix stands for the keys of a namespace that are
+        # generated at runtime and can therefore not be seen at a call site at all.
+        wrongly_declared = {key: locations[0] for key, locations in only_read.items()
+                            if key not in written
+                            and key not in possibly_written
+                            and key not in self.DECLARED_WITHOUT_A_WRITER
+                            and key in declared_keys
+                            and not any(key.startswith(prefix) for prefix in declared_prefixes)}
+        self.assertEqual({}, wrongly_declared,
+                         "Token info keys the server only reads but a token class declares, which leaves no "
+                         f"way to set them: {wrongly_declared}")
+
+    def test_11_owned_tokeninfo_key_lookup(self):
+        db_token = Token.query.filter_by(serial=self.serial1).first()
+        token = TokenClass(db_token)
+
+        # Declared on the base class, so every token class owns it
+        self.assertTrue(token.is_owned_tokeninfo_key("tokenkind"))
+        # Free-form metadata is not owned
+        self.assertFalse(token.is_owned_tokeninfo_key("mynote"))
+
+        # A class declares only its own keys, the effective set is the union over the hierarchy
+        self.assertTrue(TotpTokenClass.is_owned_tokeninfo_key("timeStep"))
+        self.assertTrue(TotpTokenClass.is_owned_tokeninfo_key("2step_difficulty"))
+        self.assertTrue(TotpTokenClass.is_owned_tokeninfo_key("tokenkind"))
+        self.assertFalse(TotpTokenClass.is_owned_tokeninfo_key("timeStep_of_something_else"))
+
+        # A whole namespace can be declared as a prefix
+        self.assertTrue(RadiusTokenClass.is_owned_tokeninfo_key("radius.server"))
+        self.assertTrue(RadiusTokenClass.is_owned_tokeninfo_key("radius.anything_added_later"))
+        self.assertFalse(TotpTokenClass.is_owned_tokeninfo_key("radius.server"))
+
+        # A questionnaire token owns every key, its questions are the keys and are chosen at enrollment
+        self.assertTrue(QuestionnaireTokenClass.is_owned_tokeninfo_key("What is your favourite colour?"))
+        self.assertTrue(QuestionnaireTokenClass.is_owned_tokeninfo_key("mynote"))
+
+    def test_11_owned_tokeninfo_keys_are_not_writable_from_a_request(self):
+        db_token = Token.query.filter_by(serial=self.serial1).first()
+        token = TokenClass(db_token)
+        token.write_tokeninfo("tokenkind", "software")
+
+        # A generic write, the way the token info endpoints and the token event handler do it, cannot touch a
+        # key the token class owns, neither to change it nor to remove it
+        self.assertRaises(PolicyError, token.add_tokeninfo, "tokenkind", "hardware")
+        self.assertRaises(PolicyError, token.delete_tokeninfo, "tokenkind")
+        self.assertEqual("software", token.get_tokeninfo("tokenkind"))
+
+        # Deleting the whole token info would take the owned keys with it
+        self.assertRaises(PolicyError, token.delete_tokeninfo)
+        self.assertEqual("software", token.get_tokeninfo("tokenkind"))
+
+        # Server side code writes the same key through the writer
+        token.write_tokeninfo("tokenkind", "hardware")
+        self.assertEqual("hardware", token.get_tokeninfo("tokenkind"))
+
+        # Free-form metadata stays writable and removable through the generic write
+        token.add_tokeninfo("a note", "some text")
+        self.assertEqual("some text", token.get_tokeninfo("a note"))
+        token.delete_tokeninfo("a note")
+        self.assertIsNone(token.get_tokeninfo("a note"))
+
+    def test_11_a_refill_token_can_be_deleted_but_not_changed(self):
+        # The offline machine application supports HOTP, WebAuthn and passkey tokens, so only those carry a
+        # refill token. An HOTP token has one entry, a FIDO2 token one per machine it is offline on.
+        hotp_token = init_token({"serial": "REFILL001", "type": "hotp", "genkey": 1})
+        hotp_token.write_tokeninfo("refilltoken", "theRefillToken")
+        hotp_token.write_tokeninfo("offline_counter", "100")
+
+        # The value of a refill token is issued by the server, so a request cannot set it
+        self.assertRaises(PolicyError, hotp_token.add_tokeninfo, "refilltoken", "chosenValue")
+        self.assertEqual("theRefillToken", hotp_token.get_tokeninfo("refilltoken"))
+
+        # Removing it only takes the refill capability away, which an administrator may do
+        hotp_token.delete_tokeninfo("refilltoken")
+        self.assertIsNone(hotp_token.get_tokeninfo("refilltoken"))
+
+        # Every other owned key stays undeletable
+        self.assertRaises(PolicyError, hotp_token.delete_tokeninfo, "offline_counter")
+
+        passkey_token = init_token({"serial": "REFILL002", "type": "passkey"})
+        passkey_token.write_tokeninfo("refilltoken_somemachine", "theOtherRefillToken")
+        self.assertRaises(PolicyError, passkey_token.add_tokeninfo, "refilltoken_somemachine", "chosen")
+        passkey_token.delete_tokeninfo("refilltoken_somemachine")
+        self.assertIsNone(passkey_token.get_tokeninfo("refilltoken_somemachine"))
+
+        # A token type that cannot be offline has no refill token, so the key is free-form there
+        spass_token = init_token({"serial": "REFILL003", "type": "spass"})
+        spass_token.add_tokeninfo("refilltoken", "just a note")
+        self.assertEqual("just a note", spass_token.get_tokeninfo("refilltoken"))
+
+        for serial in ("REFILL001", "REFILL002", "REFILL003"):
+            remove_token(serial)
 
     def test_12_inc_otp_counter(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = TokenClass(db_token)
-        
+
         token.set_otp_count(10)
         self.assertTrue(token.token.count == 10, token.token.count)
         # increase counter by 1
@@ -456,11 +831,11 @@ class TokenBaseTestCase(MyTestCase):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = TokenClass(db_token)
         self.assertTrue(token.check_otp_exist("123456") == -1)
-        
+
     def test_14_split_pin_pass(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = TokenClass(db_token)
-        
+
         token.token.otplen = 6
         # postpend pin
         from privacyidea.lib.config import set_prepend_pin
@@ -473,23 +848,24 @@ class TokenBaseTestCase(MyTestCase):
         res, pin, value = token.split_pin_pass("test123456")
         self.assertTrue(pin == "test", pin)
         self.assertTrue(value == "123456", value)
-        
+        # too short
+        res, pin, value = token.split_pin_pass("12345")
+        self.assertFalse(res)
+        self.assertEqual("12345", value)
+        self.assertEqual("", pin)
+
     def test_15_check_pin(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = TokenClass(db_token)
         token.set_pin("test")
         self.assertTrue(token.check_pin("test"))
         self.assertFalse(token.check_pin("wrong pin"))
-        
+
     def test_15_status_validation(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = TokenClass(db_token)
         token.status_validation_fail()
         token.status_validation_success()
-#        d = token.get_vars()
-#        self.assertTrue("type" in d, d)
-#        self.assertTrue("mode" in d, d)
-#        self.assertTrue("token" in d, d)
 
     def test_16_init_detail(self):
         db_token = Token.query.filter_by(serial=self.serial1).first()
@@ -525,13 +901,13 @@ class TokenBaseTestCase(MyTestCase):
                           token.update,
                           {"otpkey": "123456",
                            "genkey": "1"})
-        
+
         token.update({"otpkey": "123456",
                       "pin": "654321",
                       "otplen": 6})
         self.assertTrue(token.check_pin("654321"))
         self.assertTrue(token.token.otplen == 6)
-        
+
         # save pin encrypted
         token.update({"genkey": 1,
                       "pin": "secret",
@@ -539,7 +915,7 @@ class TokenBaseTestCase(MyTestCase):
         # check if the PIN is encrypted
         self.assertTrue(token.token.pin_hash.startswith("@@"),
                         token.token.pin_hash)
-        
+
         # update token without otpkey
         token.update({"description": "test"})
 
@@ -551,7 +927,7 @@ class TokenBaseTestCase(MyTestCase):
         db_token.set_pin("test")
         # No challenge request, since we have the wrong pin
         req = token.is_challenge_request("testX", User(login="cornelius",
-                                                      realm=self.realm1))
+                                                       realm=self.realm1))
         self.assertFalse(req, req)
         # A challenge request, since we have the correct pin
         req = token.is_challenge_request("test",
@@ -559,31 +935,31 @@ class TokenBaseTestCase(MyTestCase):
                                               realm=self.realm1))
         self.assertTrue(req, req)
 
-        resp = token.is_challenge_response(User(login="cornelius",
-                                                realm=self.realm1),
-                                            "test123456")
+        resp = token.is_challenge_response("test123456",
+                                           User(login="cornelius",
+                                                realm=self.realm1))
         self.assertFalse(resp, resp)
 
         # A the token has not DB entry in the challenges table, basically
         # "is_cahllenge_response"
-        resp = token.is_challenge_response(User(login="cornelius",
+        resp = token.is_challenge_response("test123456",
+                                           User(login="cornelius",
                                                 realm=self.realm1),
-                                            "test123456",
-                                            options={"transaction_id": transaction_id})
+                                           options={"transaction_id": transaction_id})
         self.assertTrue(resp)
         # ... but is does not "has_db_challenge_response"
-        resp = token.has_db_challenge_response(User(login="cornelius",
-                                                realm=self.realm1),
-                                               "test123456",
+        resp = token.has_db_challenge_response("test123456",
+                                               User(login="cornelius",
+                                                    realm=self.realm1),
                                                options={"transaction_id": transaction_id})
         self.assertFalse(resp)
 
         # Create a challenge
         C = Challenge(serial=self.serial1, transaction_id=transaction_id, challenge="12")
         C.save()
-        resp = token.is_challenge_response(User(login="cornelius",
+        resp = token.is_challenge_response("test123456",
+                                           User(login="cornelius",
                                                 realm=self.realm1),
-                                           "test123456",
                                            options={"transaction_id": transaction_id})
         self.assertTrue(resp)
 
@@ -623,7 +999,7 @@ class TokenBaseTestCase(MyTestCase):
                                            options={"state": "mytransaction"})
         # The challenge matches, but the OTP does not match!
         self.assertTrue(r == -1, r)
-        
+
         # test the challenge janitor
         c1 = Challenge(self.serial1, transaction_id="t1", validitytime=0)
         c1.save()
@@ -644,10 +1020,10 @@ class TokenBaseTestCase(MyTestCase):
         token = TokenClass(db_token)
         token_data = token.get_as_dict()
 
-        self.assertTrue("info" in token_data)
-        self.assertTrue(token_data.get("user_id") == "1000")
-        self.assertTrue(token_data.get("tokentype") == "newtype")
-        self.assertTrue(token_data.get("count_window") == 52)
+        self.assertIn("info", token_data, token_data)
+        self.assertEqual(token_data.get("user_id"), "1000", token_data)
+        self.assertEqual(token_data.get("tokentype"), "newtype", token_data)
+        self.assertEqual(token_data.get("count_window"), 52, token_data)
 
     def test_22_store_tokeninfo_longer_than_2000_byte(self):
         data = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDJy0rLoxqc8SsY8DVAFi" \
@@ -696,24 +1072,25 @@ class TokenBaseTestCase(MyTestCase):
         self.assertEqual(r, {})
 
     def test_35_next_pin_change(self):
-        ndate = (datetime.datetime.now(tzlocal()) + datetime.timedelta(12)).strftime(
-            DATE_FORMAT)
-
         db_token = Token.query.filter_by(serial=self.serial1).first()
         token = TokenClass(db_token)
         token.set_next_pin_change("12d")
         r = token.get_tokeninfo("next_pin_change")
-        self.assertEqual(r, ndate)
+        self.assertLessEqual(datetime.strptime(r, DATE_FORMAT),
+                             datetime.now(tzlocal()) + timedelta(days=12),
+                             r)
 
         token.set_next_pin_change("12d", password=True)
         r = token.get_tokeninfo("next_password_change")
-        self.assertEqual(r, ndate)
+        self.assertLessEqual(datetime.strptime(r, DATE_FORMAT),
+                             datetime.now(tzlocal()) + timedelta(days=12),
+                             r)
         # The password must not be changed
         r = token.is_pin_change(password=True)
-        self.assertEqual(r, False)
+        self.assertFalse(r)
 
         datestring = "03/04/01 10:00"
-        token.add_tokeninfo("next_pin_change", datestring)
+        token.write_tokeninfo("next_pin_change", datestring)
         r = token.is_pin_change()
         self.assertTrue(r)
 
@@ -733,82 +1110,120 @@ class TokenBaseTestCase(MyTestCase):
                              "type": "passwdresolver",
                              "fileName": PWFILE})
         self.assertTrue(rid > 0, rid)
-        (added, failed) = set_realm(realm,
-                                    [resolver])
+        (added, failed) = set_realm(realm, [{'name': resolver}])
         self.assertTrue(len(failed) == 0)
         self.assertTrue(len(added) == 1)
 
         # Assign token to user "cornelius" "realm1", "resolver1" "uid=1000
-        db_token = Token("orphaned", tokentype="spass", userid=1000,
-                         resolver=resolver, realm=realm)
-        db_token.save()
-        token_obj = TokenClass(db_token)
-        orph = token_obj.is_orphaned()
+        token = init_token({"type": "spass", "serial": "orphaned"},
+                           user=User(uid="1000", realm=realm, resolver=resolver))
+        orph = token.is_orphaned()
         self.assertFalse(orph)
         # clean up token
-        token_obj.delete_token()
+        token.delete_token()
 
         # Assign a token to a user in a resolver. user_id does not exist
-        db_token = Token("orphaned", tokentype="spass", userid=872812,
-                         resolver=resolver, realm=realm)
-        db_token.save()
-        token_obj = TokenClass(db_token)
-        orph = token_obj.is_orphaned()
+        token = init_token({"type": "spass", "serial": "orphaned"})
+        TokenOwner(token_id=token.token.id,
+                   user_id=872812, resolver=resolver,
+                   realmname=realm).save()
+        token.set_realms([realm])
+
+        # testing for default exception
+        orph = token.is_orphaned()
         self.assertTrue(orph)
         # clean up token
-        token_obj.delete_token()
+        token.delete_token()
 
-        # A token, which a resolver name, that does not exist anymore
-        db_token = Token("orphaned", tokentype="spass", userid=1000,
-                         resolver=resolver, realm=realm)
-        db_token.save()
+        # Use HTTP resolver to generate an exception
+        config = {
+            "resolver": "http",
+            "type": "httpresolver",
+            'endpoint': 'http://localhost:8080/get-data',
+            'method': responses.GET,
+            'requestMapping': """{"id": "{userid}"}""",
+            'responseMapping': """{"username": "{data.the_username}"}""",
+            'hasSpecialErrorHandler': False}
+        rid = save_resolver(config)
+        self.assertGreater(rid, 0, rid)
+        (added, failed) = set_realm("http-realm", [{'name': "http"}])
+        self.assertTrue(len(failed) == 0)
+        self.assertTrue(len(added) == 1)
 
+        token = init_token({"type": "spass"})
+        TokenOwner(token_id=token.token.id,
+                   user_id=872812, resolver="http",
+                   realmname="http-realm").save()
+        token.set_realms(["http-realm"])
+
+        # testing for exception_default=True
+        orph = token.is_orphaned(orphaned_on_error=True)
+        self.assertTrue(orph)
+        # testing for exception_default=False
+        orph = token.is_orphaned(orphaned_on_error=False)
+        self.assertFalse(orph)
+
+        # clean up token
+        token.delete_token()
+
+        # A token, with a realm, that does not exist anymore
+        token = init_token({"type": "spass", "serial": "orphaned"})
+        token.add_user(User(uid="1000", realm=realm, resolver=resolver))
         # delete the realm
-        delete_realm(realm)
-        # token is orphaned
-        token_obj = TokenClass(db_token)
-        orph = token_obj.is_orphaned()
+        Realm.query.filter_by(name=realm).first().delete()
+        orph = token.is_orphaned()
         self.assertTrue(orph)
 
-        # delete the resolver
-        delete_resolver(resolver)
-        # token is orphaned
-        token_obj = TokenClass(db_token)
-        orph = token_obj.is_orphaned()
-        self.assertTrue(orph)
         # clean up token
-        token_obj.delete_token()
+        token.delete_token()
+
+        # A token whose owner belongs to a resolver that does not exist anymore is orphaned. This is certain,
+        # unlike an error of the user store, so it does not depend on orphaned_on_error.
+        token = init_token({"type": "spass", "serial": "orphaned"})
+        TokenOwner(token_id=token.token.id, user_id="1000", resolver="deletedresolver").save()
+        self.assertTrue(token.is_orphaned(orphaned_on_error=False))
+        self.assertTrue(token.is_orphaned(orphaned_on_error=True))
+        token.delete_token()
 
     def test_38_last_auth(self):
-        db_token = Token("lastauth001", tokentype="spass", userid=1000)
-        db_token.save()
-        token_obj = TokenClass(db_token)
-        tdelta = datetime.timedelta(days=1)
-        token_obj.add_tokeninfo(ACTION.LASTAUTH,
-                                datetime.datetime.now(tzlocal())-tdelta)
-        r = token_obj.check_last_auth_newer("10h")
+        token = init_token({"type": "hotp", "genkey": True},
+                           user=User(login="root", realm=self.realm1, resolver=self.resolvername1))
+
+        # set last auth and check correct format
+        last_auth = datetime(year=2025, month=3, day=21, hour=7, minute=24, second=12, microsecond=164578,
+                             tzinfo=UTC)
+        token.write_tokeninfo(PolicyAction.LASTAUTH, last_auth.strftime(AUTH_DATE_FORMAT))
+        self.assertEqual("2025-03-21 07:24:12.164578+0000", token.get_tokeninfo(PolicyAction.LASTAUTH))
+        # microseconds are also included if they are 0
+        last_auth = datetime(year=2025, month=3, day=21, hour=16, minute=3, second=8, microsecond=0,
+                             tzinfo=UTC)
+        token.write_tokeninfo(PolicyAction.LASTAUTH, last_auth.strftime(AUTH_DATE_FORMAT))
+        self.assertEqual("2025-03-21 16:03:08.000000+0000", token.get_tokeninfo(PolicyAction.LASTAUTH))
+
+        tdelta = timedelta(days=1)
+        token.write_tokeninfo(PolicyAction.LASTAUTH, datetime.now(tzlocal()) - tdelta)
+        r = token.check_last_auth_newer("10h")
         self.assertFalse(r)
-        r = token_obj.check_last_auth_newer("2d")
+        r = token.check_last_auth_newer("2d")
         self.assertTrue(r)
 
         # Old time format
-        # lastauth_alt = datetime.datetime.utcnow().isoformat()
-        token_obj.add_tokeninfo(ACTION.LASTAUTH,
-                                datetime.datetime.utcnow() - tdelta)
-        r = token_obj.check_last_auth_newer("10h")
+        # lastauth_alt = datetime.utcnow().isoformat()
+        token.write_tokeninfo(PolicyAction.LASTAUTH, datetime.now(UTC) - tdelta)
+        r = token.check_last_auth_newer("10h")
         self.assertFalse(r)
-        r = token_obj.check_last_auth_newer("2d")
+        r = token.check_last_auth_newer("2d")
         self.assertTrue(r)
 
-        # Test a fault last_auth entry does not computer to True
-        token_obj.add_tokeninfo(ACTION.LASTAUTH, "faulty format")
-        r = token_obj.check_last_auth_newer("10h")
+        # Test a fault last_auth entry does not compute to True
+        token.write_tokeninfo(PolicyAction.LASTAUTH, "faulty format")
+        r = token.check_last_auth_newer("10h")
         self.assertFalse(r)
 
-        token_obj.delete_token()
+        token.delete_token()
 
     def test_39_generate_sym_key(self):
-        db_token = Token("symkey", tokentype="no_matter", userid=1000)
+        db_token = Token("symkey", tokentype="no_matter")
         db_token.save()
         token_obj = TokenClass(db_token)
         key = token_obj.generate_symmetric_key("1234567890", "abc")
@@ -820,9 +1235,7 @@ class TokenBaseTestCase(MyTestCase):
 
         # Now run the init/update process
         # 1. step
-        token_obj.update({"2stepinit": "1",
-                          "genkey": "1"
-                          })
+        token_obj.update({"2stepinit": "1", "genkey": "1"})
 
         self.assertEqual(db_token.rollout_state, "clientwait")
         self.assertEqual(db_token.active, False)
@@ -831,9 +1244,7 @@ class TokenBaseTestCase(MyTestCase):
 
         # 2. step
         client_component = "AAAAAA"
-        token_obj.update({"serial": serial,
-                          "otpkey": client_component
-                          })
+        token_obj.update({"serial": serial, "otpkey": client_component})
         self.assertEqual(db_token.rollout_state, "")
         self.assertEqual(db_token.active, True)
 
@@ -843,8 +1254,7 @@ class TokenBaseTestCase(MyTestCase):
         server_component = details.get("otpkey")[:-len(client_component)]
         expected_otpkey = server_component + client_component
 
-        self.assertEqual(to_unicode(db_token.get_otpkey().getKey()),
-                         expected_otpkey)
+        self.assertEqual(to_unicode(db_token.get_otpkey().getKey()), expected_otpkey)
 
         token_obj.delete_token()
 
@@ -856,7 +1266,7 @@ class TokenBaseTestCase(MyTestCase):
         token_obj = TokenClass(db_token)
         for i in range(0, 11):
             token_obj.inc_failcount()
-        now = datetime.datetime.now(tzlocal()).strftime(DATE_FORMAT)
+        now = datetime.now(tzlocal()).strftime(DATE_FORMAT)
         # Now the FAILCOUNTER_EXCEEDED is set
         ti = token_obj.get_tokeninfo(FAILCOUNTER_EXCEEDED)
         # We only compare the date
@@ -871,9 +1281,9 @@ class TokenBaseTestCase(MyTestCase):
         # Now check with failcounter clear, with timeout 5 minutes
         set_privacyidea_config(FAILCOUNTER_CLEAR_TIMEOUT, 5)
         token_obj.set_failcount(10)
-        failed_recently = (datetime.datetime.now(tzlocal()) -
-                           datetime.timedelta(minutes=3)).strftime(DATE_FORMAT)
-        token_obj.add_tokeninfo(FAILCOUNTER_EXCEEDED, failed_recently)
+        failed_recently = (datetime.now(tzlocal()) -
+                           timedelta(minutes=3)).strftime(DATE_FORMAT)
+        token_obj.write_tokeninfo(FAILCOUNTER_EXCEEDED, failed_recently)
 
         r = token_obj.check_reset_failcount()
         # the fail is only 3 minutes ago, so we will not reset and check will
@@ -917,3 +1327,19 @@ class TokenBaseTestCase(MyTestCase):
         token_obj = TokenClass(db_token)
         self.assertFalse(token_obj.has_further_challenge())
         token_obj.delete_token()
+
+    def test_43_remove_token_owner(self):
+        # Create a token and assign a user to it
+        db_token = Token.query.filter_by(serial=self.serial1).first()
+        token = TokenClass(db_token)
+        token.add_user(User(login="cornelius", realm=self.realm1))
+
+        # Check that the user is assigned
+        user_object = token.user
+        self.assertTrue(user_object.login == "cornelius", user_object)
+        self.assertTrue(user_object.resolver == self.resolvername1, user_object)
+
+        # Remove the user from the token
+        removed_user = token.remove_user()
+        self.assertEqual(removed_user.login, "cornelius", removed_user)
+        self.assertEqual(token.user, None, token.user)

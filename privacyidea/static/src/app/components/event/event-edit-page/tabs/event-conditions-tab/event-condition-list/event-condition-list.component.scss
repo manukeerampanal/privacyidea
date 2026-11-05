@@ -1,0 +1,41 @@
+@use "styles";
+
+.condition-name-container {
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+
+.condition-value-container {
+  // grid item
+  justify-self: end;
+  align-self: flex-start;
+  // flex container
+  display: flex;
+  align-items: center;
+  justify-content: end;
+  gap: 16px;
+}
+
+// The parent panel is flattened (see .event-conditions-container); this card carries the recess.
+.action-card-row-grid {
+  // appearance
+  @include styles.card-recessed(3);
+  padding: 8px 16px;
+  // layout
+  display: grid;
+  grid-template-columns: auto auto;
+  justify-content: space-between;
+}
+
+.description {
+  font-size: 0.75rem;
+  white-space: normal;
+  line-break: normal;
+  box-sizing: border-box;
+  overflow-wrap: break-word;
+}
+
+.font-size-16 {
+  font-size: 16px;
+}

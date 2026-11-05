@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 #  privacyIDEA is a fork of LinOTP
 #
 #  2015-04-15 Cornelius Kölbel <cornelius.koelbel@netknights.it>
@@ -44,7 +42,7 @@ from .UserIdResolver import UserIdResolver
 import yaml
 import requests
 import base64
-from six.moves.urllib.parse import urlencode
+from urllib.parse import urlencode
 from privacyidea.lib.utils import to_bytes, to_unicode, convert_column_to_unicode
 
 log = logging.getLogger(__name__)
@@ -56,7 +54,7 @@ class IdResolver (UserIdResolver):
         self.auth_server = ''
         self.resource_server = ''
         self.auth_client = 'localhost'
-        self.auth_secret = ''
+        self.auth_secret = ''  # nosec B105 # default parameter
         self.access_token = None
 
     def checkPass(self, uid, password):
@@ -69,7 +67,7 @@ class IdResolver (UserIdResolver):
         # TODO: Implement password checking with SCIM
         return False
 
-    def getUserInfo(self, userid):
+    def get_user_info(self, user_id: int or str, attributes: list[str] = None) -> dict:
         """
         returns the user information for a given uid.
         """
@@ -78,14 +76,22 @@ class IdResolver (UserIdResolver):
         # Alas, we can not map the ID to any other attribute
         res = self._get_user(self.resource_server,
                              self.access_token,
-                             userid)
+                             user_id)
         user = res
-        ret = self._fill_user_schema_1_0(user)
+        ret = self._fill_user_schema_1_0(user, attributes)
 
         return ret
 
-    @staticmethod
-    def _fill_user_schema_1_0(user):
+    def get_available_info_keys(self) -> list[str]:
+        """
+        This function returns a list of known privacyIDEA user attributes which can be used, e.g. for getUserList or
+        get_user_info
+
+        :return: list of possible keys for searching users
+        """
+        return ["username", "userid", "givenname", "surname", "phone", "email", "mobile"]
+
+    def _fill_user_schema_1_0(self, user: dict, attributes: list[str] = None) -> dict:
         # We assume the schema:
         # "schemas": ["urn:scim:schemas:core:1.0"]
 
@@ -95,17 +101,30 @@ class IdResolver (UserIdResolver):
         #ret['phone'] = user.get(self.mapping.get("phone"), "")
         #ret['mobile'] = user.get(self.mapping.get("mobile"), "")
         #ret['email'] = user.get(self.mapping.get("email"), "")
+        attributes = attributes or self.get_available_info_keys()
 
-        ret = {"phone": "",
-               "email": "",
-               "mobile": ""}
-        ret['username'] = user.get("userName", {})
-        ret['givenname'] = user.get("name", {}).get("givenName", "")
-        ret['surname'] = user.get("name", {}).get("familyName", "")
-        if user.get("phoneNumbers", {}):
-            ret['phone'] = user.get("phoneNumbers")[0].get("value")
-        if user.get("emails", {}):
-            ret['email'] = user.get("emails")[0].get("value")
+        ret = {}
+        if "username" in attributes:
+            ret['username'] = user.get("userName", {})
+        if "userid" in attributes:
+            # The userName is the user id here, as in getUserId. Without it a listed user carries no
+            # id, which callers matching users against privacyIDEA's own records (e.g. token owners)
+            # need to tell them apart.
+            ret['userid'] = user.get("userName", "")
+        if "givenname" in attributes:
+            ret['givenname'] = user.get("name", {}).get("givenName", "")
+        if "surname" in attributes:
+            ret['surname'] = user.get("name", {}).get("familyName", "")
+        if "phone" in attributes:
+            ret["phone"] = ""
+            if user.get("phoneNumbers", {}):
+                ret['phone'] = user.get("phoneNumbers")[0].get("value")
+        if "email" in attributes:
+            ret["email"] = ""
+            if user.get("emails", {}):
+                ret['email'] = user.get("emails")[0].get("value")
+        if "mobile" in attributes:
+            ret["mobile"] = ""
         return ret
 
     def getUsername(self, userid):
@@ -136,7 +155,7 @@ class IdResolver (UserIdResolver):
         # It seems that the userName is the userId
         return convert_column_to_unicode(loginName)
 
-    def getUserList(self, searchDict=None):
+    def getUserList(self, search_dict=None, attributes: list[str] = None) -> list[dict]:
         """
         Return the list of users
         """
@@ -146,11 +165,10 @@ class IdResolver (UserIdResolver):
         res = {}
         if self.access_token:
             res = self._search_users(self.resource_server,
-                                                 self.access_token,
-                                                 "")
+                                     self.access_token)
 
         for user in res.get("Resources"):
-            ret_user = self._fill_user_schema_1_0(user)
+            ret_user = self._fill_user_schema_1_0(user, attributes)
 
             ret.append(ret_user)
 
@@ -187,11 +205,11 @@ class IdResolver (UserIdResolver):
         descriptor = {}
         typ = cls.getResolverClassType()
         descriptor['clazz'] = "useridresolver.SCIMIdResolver.IdResolver"
-        descriptor['config'] = {'authserver': 'string',
-                                'resourceserver': 'string',
-                                'authclient': 'string',
-                                'authsecret': 'string',
-                                'mapping': 'string'}
+        descriptor['config'] = {'Authserver': 'string',
+                                'Resourceserver': 'string',
+                                'Client': 'string',
+                                'Secret': 'password',
+                                'Mapping': 'string'}
         return {typ: descriptor}
 
     def loadConfig(self, config):
@@ -199,7 +217,7 @@ class IdResolver (UserIdResolver):
 
         Keys in the dict are
          * Authserver
-         * Resouceserver
+         * Resourceserver
          * Client
          * Secret
          * Mapping
@@ -220,18 +238,18 @@ class IdResolver (UserIdResolver):
     def testconnection(cls, param):
         """
         This function lets you test the to be saved SCIM connection.
-              
+
         :param param: A dictionary with all necessary parameter to test the
                         connection.
         :type param: dict
         :return: Tuple of success and a description
         :rtype: (bool, string)
-        
+
         Parameters are: Authserver, Resourceserver, Client, Secret, Mapping
         """
         desc = None
         success = False
-               
+
         try:
             access_token = cls.get_access_token(str(param.get("Authserver")),
                                                 param.get("Client"),
@@ -239,13 +257,13 @@ class IdResolver (UserIdResolver):
             content = cls._search_users(param.get("Resourceserver"),
                                                     access_token, "")
             num = content.get("totalResults", -1)
-            desc = "Found {0!s} users".format(num)
+            desc = f"Found {num!s} users"
             success = True
         except Exception as exx:
-            log.error("Failed to retrieve users: {0!s}".format(exx))
-            log.debug("{0!s}".format(traceback.format_exc()))
-            desc = "failed to retrieve users: {0!s}".format(exx)
-            
+            log.error(f"Failed to retrieve users: {exx!s}")
+            log.debug(f"{traceback.format_exc()!s}")
+            desc = f"failed to retrieve users: {exx!s}"
+
         return success, desc
 
     @staticmethod
@@ -255,18 +273,18 @@ class IdResolver (UserIdResolver):
         :type params: dictionary
         """
         params = params or {}
-        headers = {'Authorization': "Bearer {0}".format(access_token),
+        headers = {'Authorization': f"Bearer {access_token}",
                    'content-type': 'application/json'}
-        url = '{0}/Users?{1}'.format(resource_server, urlencode(params))
-        resp = requests.get(url, headers=headers)
+        url = f'{resource_server}/Users?{urlencode(params)}'
+        resp = requests.get(url, headers=headers, timeout=60)
         if resp.status_code != 200:
-            info = "Could not get user list: {0!s}".format(resp.status_code)
+            info = f"Could not get user list: {resp.status_code!s}"
             log.error(info)
             raise Exception(info)
         j_content = yaml.safe_load(resp.content)
 
         return j_content
-    
+
     @staticmethod
     def _get_user(resource_server, access_token, userid):
         """
@@ -280,13 +298,13 @@ class IdResolver (UserIdResolver):
         :type userid: basestring
         :return: Dictionary of User object.
         """
-        headers = {'Authorization': "Bearer {0}".format(access_token),
+        headers = {'Authorization': f"Bearer {access_token}",
                    'content-type': 'application/json'}
-        url = '{0}/Users/{1}'.format(resource_server, userid)
-        resp = requests.get(url, headers=headers)
+        url = f'{resource_server}/Users/{userid}'
+        resp = requests.get(url, headers=headers, timeout=60)
 
         if resp.status_code != 200:
-            info = "Could not get user: {0!s}".format(resp.status_code)
+            info = f"Could not get user: {resp.status_code!s}"
             log.error(info)
             raise Exception(info)
         j_content = yaml.safe_load(resp.content)
@@ -294,16 +312,17 @@ class IdResolver (UserIdResolver):
         return j_content
 
     @staticmethod
-    def get_access_token(server=None, client=None, secret=None):
+    def get_access_token(server=None, client='', secret=''):
 
         auth = to_unicode(base64.b64encode(to_bytes(client + ':' + secret)))
 
-        url = "{0!s}/oauth/token?grant_type=client_credentials".format(server)
+        url = f"{server!s}/oauth/token?grant_type=client_credentials"
         resp = requests.get(url,
-                            headers={'Authorization': 'Basic ' + auth})
+                            headers={'Authorization': 'Basic ' + auth},
+                            timeout=60)
 
         if resp.status_code != 200:
-            info = "Could not get access token: {0!s}".format(resp.status_code)
+            info = f"Could not get access token: {resp.status_code!s}"
             log.error(info)
             raise Exception(info)
 

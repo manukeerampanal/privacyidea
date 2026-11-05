@@ -1,18 +1,19 @@
-import json
+from unittest import mock
 
+from privacyidea.lib.config import set_privacyidea_config
+from privacyidea.lib.container import init_container, add_token_to_container, find_container_by_serial
 from privacyidea.lib.event import set_event, delete_event
+from privacyidea.lib.eventhandler.containerhandler import (ContainerEventHandler, ACTION_TYPE as C_ACTION_TYPE)
 from privacyidea.lib.eventhandler.customuserattributeshandler import ACTION_TYPE, USER_TYPE
+from privacyidea.lib.policies.actions import PolicyAction
 from privacyidea.lib.policy import SCOPE, set_policy, delete_policy
+from privacyidea.lib.smtpserver import add_smtpserver
 from privacyidea.lib.token import init_token, remove_token
 from privacyidea.lib.user import User
-from .base import MyApiTestCase
 from . import smtpmock
-from privacyidea.lib.config import set_privacyidea_config
-
-# TODO: this should be imported from lib.event when available
-HANDLERS = ["UserNotification", "Token", "Federation", "Script", "Counter",
-            "RequestMangler", "ResponseMangler", "Logging", "CustomUserAttributes"]
-
+from .base import MyApiTestCase, FakeFlaskG
+from .test_lib_events import ContainerEventTestCase
+from .test_lib_tokencontainer import MockSmartphone
 
 class APIEventsTestCase(MyApiTestCase):
 
@@ -64,13 +65,32 @@ class APIEventsTestCase(MyApiTestCase):
         self.assertEqual(auditentry['action'], 'POST /event/enable/<eventid>', auditentry)
         self.assertEqual(auditentry['success'], 0, auditentry)
 
-    def test_01_crud_events(self):
+    def test_00b_invalid_conditions_rejected_cleanly(self):
+        # A malformed 'conditions' string (JSONDecodeError) or a non-string value
+        # (TypeError from json.loads) must yield a clean 400 ParameterError, not an
+        # uncaught exception / HTTP 500.
+        base = {"name": "cond_check", "event": "token_init",
+                "action": "sendmail", "handlermodule": "UserNotification"}
+        # Malformed JSON string (form data is always a string).
+        with self.app.test_request_context('/event', method='POST',
+                                           data=dict(base, conditions="{not valid json"),
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 400, res.data)
+            self.assertFalse(res.json["result"]["status"], res.json)
+        # Non-string conditions via a JSON body (a list is valid JSON but not a dict).
+        with self.app.test_request_context('/event', method='POST',
+                                           json=dict(base, conditions=[1, 2, 3]),
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 400, res.data)
+            self.assertFalse(res.json["result"]["status"], res.json)
 
+    def test_01_crud_events(self):
         # list empty events
         with self.app.test_request_context('/event/',
                                            method='GET',
                                            headers={'Authorization': self.at}):
-
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
@@ -96,7 +116,6 @@ class APIEventsTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value"), 1)
 
         # check the event
@@ -104,11 +123,9 @@ class APIEventsTestCase(MyApiTestCase):
                                            method='GET',
                                            headers={
                                                'Authorization': self.at}):
-
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value")[0].get("action"), "sendmail")
             self.assertEqual(result.get("value")[0].get("conditions"),
                              {"blabla": "yes"})
@@ -130,7 +147,6 @@ class APIEventsTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value"), 1)
 
         # check the event
@@ -141,7 +157,6 @@ class APIEventsTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value")[0].get("action"),
                              "sendmail")
             self.assertEqual(result.get("value")[0].get("conditions"),
@@ -152,25 +167,22 @@ class APIEventsTestCase(MyApiTestCase):
                                            method='GET',
                                            headers={
                                                'Authorization': self.at}):
-                res = self.app.full_dispatch_request()
-                self.assertTrue(res.status_code == 200, res)
-                result = res.json.get("result")
-                detail = res.json.get("detail")
-                self.assertEqual(result.get("value")[0].get("action"),
-                                 "sendmail")
-                self.assertEqual(result.get("value")[0].get("conditions"),
-                                 {"always": "yes"})
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            result = res.json.get("result")
+            self.assertEqual(result.get("value")[0].get("action"),
+                             "sendmail")
+            self.assertEqual(result.get("value")[0].get("conditions"),
+                             {"always": "yes"})
 
         # delete event
         with self.app.test_request_context('/event/1',
                                            method='DELETE',
                                            headers={
                                                'Authorization': self.at}):
-
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value"), 1)
 
         # list empty events
@@ -180,11 +192,9 @@ class APIEventsTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value"), [])
 
     def test_02_test_options(self):
-
         # create an event configuration
         param = {
             "name": "Send an email via themis",
@@ -202,7 +212,6 @@ class APIEventsTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertGreaterEqual(result.get("value"), 1, result)
             ev1_id = result.get('value')
 
@@ -223,14 +232,13 @@ class APIEventsTestCase(MyApiTestCase):
                              "themis")
 
         # delete event
-        with self.app.test_request_context('/event/{0!s}'.format(ev1_id),
+        with self.app.test_request_context(f'/event/{ev1_id!s}',
                                            method='DELETE',
                                            headers={
                                                'Authorization': self.at}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value"), ev1_id)
 
         # list empty events
@@ -240,48 +248,110 @@ class APIEventsTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value"), [])
+
+    def test_02b_reorder_keeps_options(self):
+        # Regression test for the "change order in the overview deletes actions"
+        # bug: reordering an event handler sends the binding without any
+        # "option.*" parameters (and without a "conditions" parameter). Such an
+        # update must keep the stored options and conditions.
+        param = {
+            "name": "Reorder me",
+            "event": "token_init",
+            "action": "sendmail",
+            "handlermodule": "UserNotification",
+            "conditions": '{"blabla": "yes"}',
+            "option.emailconfig": "themis",
+            "option.2": "value2"
+        }
+        with self.app.test_request_context('/event', data=param, method='POST',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            ev_id = res.json.get("result").get("value")
+
+        # Simulate the reorder request from the overview: only id, the base
+        # fields and the new ordering, but no option.* and no conditions.
+        reorder = {
+            "id": ev_id,
+            "name": "Reorder me",
+            "event": "token_init",
+            "action": "sendmail",
+            "handlermodule": "UserNotification",
+            "ordering": 3
+        }
+        with self.app.test_request_context('/event', data=reorder, method='POST',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+
+        # The options and conditions must still be there
+        with self.app.test_request_context(f'/event/{ev_id!s}',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            event = res.json.get("result").get("value")[0]
+            self.assertEqual(event.get("ordering"), 3)
+            self.assertEqual(event.get("options").get("emailconfig"), "themis")
+            self.assertEqual(event.get("options").get("2"), "value2")
+            self.assertEqual(event.get("conditions"), {"blabla": "yes"})
+
+        # The clear_options flag clears all options even without option.* params
+        clear = {
+            "id": ev_id,
+            "name": "Reorder me",
+            "event": "token_init",
+            "action": "sendmail",
+            "handlermodule": "UserNotification",
+            "clear_options": True,
+            "conditions": "{}"
+        }
+        with self.app.test_request_context('/event', data=clear, method='POST',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+
+        with self.app.test_request_context(f'/event/{ev_id!s}',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
+            event = res.json.get("result").get("value")[0]
+            self.assertEqual(event.get("options"), {})
+            self.assertEqual(event.get("conditions"), {})
+
+        # cleanup
+        with self.app.test_request_context(f'/event/{ev_id!s}',
+                                           method='DELETE',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(res.status_code, 200, res)
 
     def test_03_available_events(self):
         with self.app.test_request_context('/event/available',
                                            method='GET',
                                            headers={'Authorization': self.at}):
-
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertTrue("token_init" in result.get("value"))
             self.assertTrue("token_assign" in result.get("value"))
             self.assertTrue("token_unassign" in result.get("value"))
-
-    def test_04_handler_modules(self):
-        with self.app.test_request_context('/event/handlermodules',
-                                           method='GET',
-                                           headers={'Authorization': self.at}):
-            res = self.app.full_dispatch_request()
-            self.assertTrue(res.status_code == 200, res)
-            result = res.json.get("result")
-            for h in HANDLERS:
-                self.assertIn(h, result.get("value"), result)
 
     def test_05_get_handler_actions(self):
         with self.app.test_request_context('/event/actions/UserNotification',
                                            method='GET',
                                            headers={'Authorization': self.at}):
-
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
             self.assertTrue("sendmail" in result.get("value"))
             self.assertTrue("sendsms" in result.get("value"))
-            detail = res.json.get("detail")
 
         with self.app.test_request_context('/event/actions/Token',
                                            method='GET',
                                            headers={'Authorization': self.at}):
-
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
@@ -298,7 +368,6 @@ class APIEventsTestCase(MyApiTestCase):
             result = res.json.get("result")
             self.assertTrue("logged_in_user" in result.get("value"))
             self.assertTrue("result_value" in result.get("value"))
-            detail = res.json.get("detail")
 
     def test_06_test_enable_disable(self):
         # create an event configuration
@@ -318,7 +387,6 @@ class APIEventsTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertGreaterEqual(result.get("value"), 1, result)
             ev1_id = result.get('value')
 
@@ -335,7 +403,7 @@ class APIEventsTestCase(MyApiTestCase):
             self.assertEqual(event_list[0].get("active"), True)
 
         # disable event
-        with self.app.test_request_context('/event/disable/{0!s}'.format(ev1_id),
+        with self.app.test_request_context(f'/event/disable/{ev1_id!s}',
                                            method='POST',
                                            headers={
                                                'Authorization': self.at}):
@@ -354,7 +422,7 @@ class APIEventsTestCase(MyApiTestCase):
             self.assertEqual(event_list[0].get("active"), False)
 
         # Enable event
-        with self.app.test_request_context('/event/enable/{0!s}'.format(ev1_id),
+        with self.app.test_request_context(f'/event/enable/{ev1_id!s}',
                                            method='POST',
                                            headers={
                                                'Authorization': self.at}):
@@ -373,14 +441,13 @@ class APIEventsTestCase(MyApiTestCase):
             self.assertEqual(event_list[0].get("active"), True)
 
         # delete event
-        with self.app.test_request_context('/event/{0!s}'.format(ev1_id),
+        with self.app.test_request_context(f'/event/{ev1_id!s}',
                                            method='DELETE',
                                            headers={
                                                'Authorization': self.at}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value"), ev1_id, result)
 
         # list empty events
@@ -390,8 +457,93 @@ class APIEventsTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value"), [])
+
+    def test_06b_module_defaults(self):
+        # A handler whose result the request consumes is created as aborting on error
+        with self.app.test_request_context('/event/defaults/Federation',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            self.assertTrue(res.json.get("result").get("value").get("abort_on_error"))
+
+        # Any other handler is best-effort
+        with self.app.test_request_context('/event/defaults/UserNotification',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            self.assertFalse(res.json.get("result").get("value").get("abort_on_error"))
+
+        # An unknown handler module does not fail the request
+        with self.app.test_request_context('/event/defaults/DoesNotExist',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            self.assertFalse(res.json.get("result").get("value").get("abort_on_error"))
+
+    def test_06c_create_federation_event_defaults_to_abort(self):
+        # A Federation binding created without the parameter gets the default of its handler module
+        param = {
+            "name": "forward to the remote server",
+            "event": "validate_check",
+            "action": "forward",
+            "handlermodule": "Federation",
+            "position": "post"
+        }
+        with self.app.test_request_context('/event',
+                                           method='POST',
+                                           data=param,
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            event_id = res.json.get("result").get("value")
+
+        with self.app.test_request_context(f'/event/{event_id}',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+            self.assertTrue(res.json.get("result").get("value")[0].get("abort_on_error"))
+
+        # An update that does not send the parameter keeps the stored value
+        param["id"] = event_id
+        param["ordering"] = 2
+        with self.app.test_request_context('/event',
+                                           method='POST',
+                                           data=param,
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+
+        with self.app.test_request_context(f'/event/{event_id}',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.json.get("result").get("value")[0].get("abort_on_error"))
+
+        # It can be switched off explicitly
+        param["abort_on_error"] = False
+        with self.app.test_request_context('/event',
+                                           method='POST',
+                                           data=param,
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
+
+        with self.app.test_request_context(f'/event/{event_id}',
+                                           method='GET',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertFalse(res.json.get("result").get("value")[0].get("abort_on_error"))
+
+        with self.app.test_request_context(f'/event/{event_id}',
+                                           method='DELETE',
+                                           headers={'Authorization': self.at}):
+            res = self.app.full_dispatch_request()
+            self.assertTrue(res.status_code == 200, res)
 
     def test_07_positions(self):
         # test the available Positions
@@ -421,18 +573,16 @@ class APIEventsTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertGreaterEqual(result.get("value"), 1, result)
             ev1_id = result.get('value')
 
         # check the event
-        with self.app.test_request_context('/event/{0!s}'.format(ev1_id),
+        with self.app.test_request_context(f'/event/{ev1_id!s}',
                                            method='GET',
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value")[0].get("position"), "post")
 
         # Update event with the position=pre
@@ -445,28 +595,25 @@ class APIEventsTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value"), ev1_id, result)
 
         # check the event
-        with self.app.test_request_context('/event/{0!s}'.format(ev1_id),
+        with self.app.test_request_context(f'/event/{ev1_id!s}',
                                            method='GET',
                                            headers={'Authorization': self.at}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value")[0].get("position"), "pre")
 
         # delete event
-        with self.app.test_request_context('/event/{0!s}'.format(ev1_id),
+        with self.app.test_request_context(f'/event/{ev1_id!s}',
                                            method='DELETE',
                                            headers={
                                                'Authorization': self.at}):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value"), ev1_id, result)
 
         # list empty events
@@ -476,13 +623,11 @@ class APIEventsTestCase(MyApiTestCase):
             res = self.app.full_dispatch_request()
             self.assertTrue(res.status_code == 200, res)
             result = res.json.get("result")
-            detail = res.json.get("detail")
             self.assertEqual(result.get("value"), [])
 
     @smtpmock.activate
     def test_08_create_token_for_user(self):
         smtpmock.setdata(response={"pi_tester@privacyidea.org": (200, 'OK')})
-        transactionid = "123456098712"
         # send the email with the old configuration
         set_privacyidea_config("email.mailserver", "localhost")
         set_privacyidea_config("email.username", "user")
@@ -543,7 +688,7 @@ class APIEventsTestCase(MyApiTestCase):
             # This is a challenge response!
             self.assertTrue("transaction_id" in detail, detail)
             self.assertTrue("multi_challenge" in detail, detail)
-            self.assertEqual(detail.get("message"), u"Enter the OTP from the Email:")
+            self.assertEqual(detail.get("message"), "Enter the OTP from the Email")
 
         # check user has a token
         with self.app.test_request_context('/token/',
@@ -556,12 +701,106 @@ class APIEventsTestCase(MyApiTestCase):
             result = res.json.get("result")
             detail = res.json.get("detail")
             self.assertEqual(result.get("value").get("count"), 1)
-            self.assertEqual(result.get("value").get("tokens")[0].get("tokentype"), u"email")
+            self.assertEqual(result.get("value").get("tokens")[0].get("tokentype"), "email")
+
+    def test_09_get_container_serial(self):
+        # Get container serial from response
+        payload = {"type": "Smartphone", "description": "test description!!"}
+        request = self.app.test_request_context('/container/init',
+                                                method='POST',
+                                                data=payload,
+                                                headers={'Authorization': self.at})
+        with request:
+            res = self.app.full_dispatch_request()
+
+            c_handler = ContainerEventHandler()
+            content = c_handler._get_response_content(res)
+            container_serial = c_handler._get_container_serial(request.request, content)
+
+            self.assertIsNotNone(container_serial)
+
+        # Get container serial from request
+        container_serial = init_container({"type": "Generic", "description": "test description!!"})["container_serial"]
+        payload = {"container_serial": container_serial, "states": ["active"]}
+        request = self.app.test_request_context(f'/container/{container_serial}/states',
+                                                method='POST',
+                                                data=payload,
+                                                headers={'Authorization': self.at})
+        with request:
+            res = self.app.full_dispatch_request()
+
+            c_handler = ContainerEventHandler()
+            container_serial_req = c_handler._get_container_serial(request.request, res)
+
+            self.assertEqual(container_serial_req, container_serial)
+
+        # Get container serial from token
+        token_serial = "SPASS0001"
+        init_token({"type": "spass", "serial": token_serial})
+        add_token_to_container(container_serial, token_serial)
+
+        payload = {"serial": token_serial}
+        request = self.app.test_request_context('/token/enable',
+                                                method='POST',
+                                                data=payload,
+                                                headers={'Authorization': self.at})
+        with request:
+            res = self.app.full_dispatch_request()
+            g = FakeFlaskG()
+
+            c_handler = ContainerEventHandler()
+            container_serial_token = c_handler._get_container_serial_from_token(request.request, res, g)
+
+            self.assertEqual(container_serial_token, container_serial)
+
+
+class EventParameterAllowlistTestCase(MyApiTestCase):
+    """
+    The action and the position of an event binding are names the handler module defines, so a
+    binding that is stored is a binding that can fire.
+    """
+
+    def _post(self, **overrides):
+        param = {"name": "allowlist test", "event": "token_init",
+                 "handlermodule": "UserNotification", "action": "sendmail"}
+        param.update(overrides)
+        with self.app.test_request_context('/event',
+                                           method='POST',
+                                           data=param,
+                                           headers={'Authorization': self.at}):
+            return self.app.full_dispatch_request()
+
+    def test_01_a_known_action_and_position_are_stored(self):
+        res = self._post(position="post")
+        self.assertEqual(200, res.status_code, res.data)
+        event_id = res.json["result"]["value"]
+        with self.app.test_request_context(f'/event/{event_id}',
+                                           method='DELETE',
+                                           headers={'Authorization': self.at}):
+            self.assertEqual(200, self.app.full_dispatch_request().status_code)
+
+    def test_02_an_unknown_action_is_refused(self):
+        res = self._post(action="send_carrier_pigeon")
+        self.assertEqual(400, res.status_code, res.data)
+        message = res.json["result"]["error"]["message"]
+        self.assertIn("send_carrier_pigeon", message)
+        # The message says which actions the handler does define
+        self.assertIn("sendmail", message)
+
+    def test_03_an_unknown_position_is_refused(self):
+        res = self._post(position="during")
+        self.assertEqual(400, res.status_code, res.data)
+        self.assertIn("during", res.json["result"]["error"]["message"])
+
+    def test_04_an_unknown_handlermodule_is_still_refused(self):
+        res = self._post(handlermodule="NoSuchHandler")
+        self.assertEqual(400, res.status_code, res.data)
+        self.assertIn("NoSuchHandler", res.json["result"]["error"]["message"])
 
 
 class CustomUserAttributeHandlerTestCase(MyApiTestCase):
     def setUp(self):
-        super(CustomUserAttributeHandlerTestCase, self).setUp()
+        super().setUp()
         self.setUp_user_realms()
 
     def test_01_user_attribute_with_handler_tokenowner(self):
@@ -720,3 +959,538 @@ class CustomUserAttributeHandlerTestCase(MyApiTestCase):
 
         delete_event(eid)
         user.delete_attribute('foo')
+
+
+class EventWrapperTestCase(MyApiTestCase):
+    # Test the wrapper/decorator in lib/event.py
+    # In other cases we test specific event handlers, but not the calling of the event handler
+    # We do this here via an API call.
+    serial = "myToken"
+
+    def test_00_setup(self):
+        # setup realms
+        self.setUp_user_realms()
+
+        r = add_smtpserver(identifier="myserver", server="1.2.3.4", tls=False)
+        self.assertTrue(r > 0)
+
+    @smtpmock.activate
+    def test_01_sendmail_post(self):
+        r = set_event("send email", "token_init", "UserNotification", "sendmail",
+                      conditions={},
+                      options={"emailconfig": "myserver",
+                               "To": "email",
+                               "To email": "pretzel@example.com",
+                               "reply_to": "email",
+                               "reply_to email": "privacyidea@example.com"})
+        self.assertTrue(r > 0)
+
+        smtpmock.setdata(response={"pretzel@example.com": (450, "Mailbox not available")},
+                         support_tls=False)
+
+        with mock.patch("logging.Logger.warning") as mock_log:
+            with self.app.test_request_context('/token/init',
+                                               data={"genkey": 1,
+                                                     "serial": self.serial},
+                                               headers={'Authorization': self.at},
+                                               method='POST'):
+                res = self.app.full_dispatch_request()
+                self.assertTrue(res.status_code == 200, res)
+                result = res.json.get("result")
+                self.assertTrue(result.get("value"), result)
+            # Check warning in log
+            expected = "Failed to send a notification email to user {'email': ['pretzel@example.com']}"
+            mock_log.assert_called_once_with(expected)
+            msg = smtpmock.get_sent_message()
+            self.assertIn('To: pretzel@example.com', msg)
+        delete_event(r)
+
+    @smtpmock.activate
+    def test_02_sendmail_pre(self):
+        r = set_event("send email", "token_init", "UserNotification", "sendmail",
+                      conditions={},
+                      position="pre",
+                      options={"emailconfig": "myserver",
+                               "To": "email",
+                               "To email": "donut@example.com",
+                               "reply_to": "email",
+                               "reply_to email": "privacyidea@example.com"})
+        self.assertTrue(r > 0)
+
+        smtpmock.setdata(response={"donut@example.com": (450, "Mailbox not available")},
+                         support_tls=False)
+
+        with mock.patch("logging.Logger.warning") as mock_log:
+            with self.app.test_request_context('/token/init',
+                                               data={"genkey": 1,
+                                                     "serial": self.serial},
+                                               headers={'Authorization': self.at},
+                                               method='POST'):
+                res = self.app.full_dispatch_request()
+                self.assertTrue(res.status_code == 200, res)
+                result = res.json.get("result")
+                self.assertTrue(result.get("value"), result)
+            # Check warning in log
+            expected = "Failed to send a notification email to user {'email': ['donut@example.com']}"
+            mock_log.assert_called_once_with(expected)
+
+            msg = smtpmock.get_sent_message()
+            self.assertIn('To: donut@example.com', msg)
+        delete_event(r)
+
+
+class ContainerHandlerTestCase(MyApiTestCase):
+    """
+    Full workflow tests for container actions:
+    These tests cover some typical use cases for event handlers, but not all possible combinations
+    """
+
+    def request_assert_success(self, url, data: dict, auth_token, method='POST'):
+        with self.app.test_request_context(url,
+                                           method=method,
+                                           data=data if method == 'POST' else None,
+                                           query_string=data if method == 'GET' else None,
+                                           headers={'Authorization': auth_token} if auth_token else None):
+            res = self.app.full_dispatch_request()
+            self.assertEqual(200, res.status_code, res.json)
+            self.assertTrue(res.json["result"]["status"])
+        return res.json
+
+    def request_assert_error(self, url, data: dict, auth_token, method='POST'):
+        with self.app.test_request_context(url,
+                                           method=method,
+                                           data=data if method == 'POST' else None,
+                                           query_string=data if method == 'GET' else None,
+                                           headers={'Authorization': auth_token} if auth_token else None):
+            res = self.app.full_dispatch_request()
+            self.assertFalse(res.json["result"]["status"])
+        return res.json
+
+    @classmethod
+    def setup_container_with_tokens(cls):
+        # create container
+        container_serial = init_container({"type": "smartphone"})["container_serial"]
+        container = find_container_by_serial(container_serial)
+
+        # create tokens
+        hotp = init_token({"type": "hotp", "genkey": True})
+        container.add_token(hotp)
+        totp = init_token({"type": "totp", "genkey": True})
+        container.add_token(totp)
+
+        return container, hotp, totp
+
+    def test_01_disable_tokens_on_unregister(self):
+        # create container with tokens
+        container, hotp, totp = self.setup_container_with_tokens()
+
+        # check that tokens are enabled
+        self.assertTrue(hotp.is_active())
+        self.assertTrue(totp.is_active())
+
+        # Register container
+        ContainerEventTestCase.register_smartphone(container)
+
+        # Create event handler definition
+        eid = set_event("event", event=["container_unregister"], handlermodule="Container",
+                        action=C_ACTION_TYPE.DISABLE_TOKENS, conditions={}, active=True, position="post")
+
+        # Unregister
+        self.request_assert_success(f'container/register/{container.serial}/terminate',
+                                    {},
+                                    self.at, 'POST')
+
+        # Check that tokens are disabled
+        self.assertFalse(hotp.is_active())
+        self.assertFalse(totp.is_active())
+
+        # Clean up
+        delete_event(eid)
+        container.delete()
+        hotp.delete_token()
+        totp.delete_token()
+
+    def test_02_disable_enable_tokens_on_rollover(self):
+        # Disable all tokens if a rollover is initiated and enable them after the rollover is successfully completed
+        # create container with tokens
+        container, hotp, totp = self.setup_container_with_tokens()
+
+        # check that tokens are enabled
+        self.assertTrue(hotp.is_active())
+        self.assertTrue(totp.is_active())
+
+        # Register container
+        ContainerEventTestCase.register_smartphone(container)
+
+        # Create event handler definition
+        eid_disable = set_event("disable", event=["container_register_initialize"], handlermodule="Container",
+                                action=C_ACTION_TYPE.DISABLE_TOKENS, conditions=None,
+                                ordering=None, options=None, active=True,
+                                position="post")
+        eid_enable = set_event("enable", event=["container_register_finalize"], handlermodule="Container",
+                               action=C_ACTION_TYPE.ENABLE_TOKENS, conditions=None,
+                               ordering=None, options=None, active=True,
+                               position="post")
+
+        # Init rollover
+        set_policy("policy", scope=SCOPE.CONTAINER, action={PolicyAction.CONTAINER_SERVER_URL: "https://pi.net/"},
+                   priority=2)
+        result = self.request_assert_success('container/register/initialize',
+                                             {"container_serial": container.serial, "rollover": True},
+                                             self.at, 'POST')
+        init_result = result["result"]["value"]
+
+        # Check that tokens are disabled
+        self.assertFalse(hotp.is_active())
+        self.assertFalse(totp.is_active())
+
+        # Finalize rollover fails
+        self.request_assert_error('container/register/finalize',
+                                  {"container_serial": container.serial},
+                                  self.at, 'POST')
+        # Check that tokens are disabled
+        self.assertFalse(hotp.is_active())
+        self.assertFalse(totp.is_active())
+
+        # Finalize rollover success
+        scope = "https://pi.net/container/register/finalize"
+        mock_smph = MockSmartphone()
+        params = mock_smph.register_finalize(init_result["nonce"], init_result["time_stamp"],
+                                             scope, container.serial)
+
+        self.request_assert_success('container/register/finalize',
+                                    params,
+                                    self.at, 'POST')
+
+        # check that tokens are enabled
+        self.assertTrue(hotp.is_active())
+        self.assertTrue(totp.is_active())
+
+        # Clean up
+        delete_policy("policy")
+        delete_event(eid_enable)
+        delete_event(eid_disable)
+        container.delete()
+        hotp.delete_token()
+        totp.delete_token()
+
+    def test_03_disable_tokens_if_one_is_locked(self):
+        # Disable all tokens if one token in the container is locked
+        # create container with tokens
+        container, hotp, totp = self.setup_container_with_tokens()
+
+        # check that tokens are enabled
+        self.assertTrue(hotp.is_active())
+        self.assertTrue(totp.is_active())
+
+        # setup token
+        hotp.set_maxfail(1)
+
+        # set event handler definition
+        eid = set_event("disable", event=["validate_check"], handlermodule="Container",
+                        action=C_ACTION_TYPE.DISABLE_TOKENS, conditions={"token_locked": "True"},
+                        ordering=None, options=None, active=True,
+                        position="post")
+
+        # login with token
+        self.request_assert_success('/validate/check',
+                                    {"serial": hotp.get_serial(),
+                                     "pass": "1234"},
+                                    None, 'POST')
+
+        # check that tokens are disabled
+        self.assertFalse(hotp.is_active())
+        self.assertFalse(totp.is_active())
+
+        # Cleanup
+        delete_event(eid)
+        container.delete()
+        hotp.delete_token()
+        totp.delete_token()
+
+    @smtpmock.activate
+    def test_04_mail_on_register_init(self):
+        """
+        Send a mail with the registration QR code to the user.
+        """
+        # create container with tokens
+        container, hotp, totp = self.setup_container_with_tokens()
+        # policy for registration
+        set_policy("policy", scope=SCOPE.CONTAINER, action={PolicyAction.CONTAINER_SERVER_URL: "https://pi.net/"})
+
+        self.setUp_user_realms()
+        r = add_smtpserver(identifier="myserver", server="1.2.3.4", tls=False)
+        self.assertTrue(r > 0)
+
+        msg = """
+                Hello {user},
+
+                the administrator {admin}@{realm} initialized a registration for your container {container_serial}.
+                To complete the registration, please scan the attached QR code or click on this link
+                {container_url_value} on your smartphone.
+
+                The QR code allows you to synchronize the tokens on your smartphone with the server.
+                Be aware of no one else can see this QR code, otherwise your tokens might be compromised.
+
+                <img src={container_url_img}>
+
+                To check your container you may login to the Web UI:
+                {url}
+                """
+        r = set_event("send email", "container_register_initialize", "UserNotification", "sendmail",
+                      conditions={},
+                      options={"emailconfig": "myserver",
+                               "To": "email",
+                               "To email": "pretzel@example.com",
+                               "reply_to": "email",
+                               "reply_to email": "privacyidea@example.com",
+                               "subject": "Container Registration.",
+                               "body": msg,
+                               "attach_qrcode": True,
+                               "mimetype": "html"})
+        self.assertTrue(r > 0)
+
+        smtpmock.setdata(response={"pretzel@example.com": (450, "Mailbox not available")},
+                         support_tls=False)
+
+        with mock.patch("logging.Logger.warning") as mock_log:
+            self.request_assert_success('/container/register/initialize',
+                                        {"container_serial": container.serial},
+                                        self.at, 'POST')
+
+            # Check warning in log
+            expected = "Failed to send a notification email to user {'email': ['pretzel@example.com']}"
+            mock_log.assert_called_once_with(expected)
+            msg = smtpmock.get_sent_message()
+            self.assertIn('To: pretzel@example.com', msg)
+            self.assertIn("Container Registration", msg)
+        delete_event(r)
+        delete_policy("policy")
+
+    @smtpmock.activate
+    def test_05_mail_on_unregister(self):
+        """
+        Send a user notification if the container is unregistered
+        The smtp server is mocked to return an error. The event is successfully triggered if the error occurs in the
+        log.
+        """
+        # create container with tokens
+        container, hotp, totp = self.setup_container_with_tokens()
+
+        # Register container
+        ContainerEventTestCase.register_smartphone(container)
+
+        self.setUp_user_realms()
+        r = add_smtpserver(identifier="myserver", server="1.2.3.4", tls=False)
+        self.assertTrue(r > 0)
+
+        msg = """
+                Hello {user},
+
+                the administrator {admin}@{realm} performed the action
+                {action} on your container {container_serial}.
+
+                To check your tokens you may login to the Web UI:
+                {url}
+                """
+        r = set_event("send email", "container_unregister", "UserNotification", "sendmail",
+                      conditions={},
+                      options={"emailconfig": "myserver",
+                               "To": "email",
+                               "To email": "pretzel@example.com",
+                               "reply_to": "email",
+                               "reply_to email": "privacyidea@example.com",
+                               "subject": "Your container was unregistered.",
+                               "body": msg,
+                               "mimetype": "html"})
+        self.assertTrue(r > 0)
+
+        smtpmock.setdata(response={"pretzel@example.com": (450, "Mailbox not available")},
+                         support_tls=False)
+
+        with mock.patch("logging.Logger.warning") as mock_log:
+            self.request_assert_success(f'/container/register/{container.serial}/terminate',
+                                        {},
+                                        self.at, 'POST')
+
+            # Check warning in log
+            expected = "Failed to send a notification email to user {'email': ['pretzel@example.com']}"
+            mock_log.assert_called_once_with(expected)
+            msg = smtpmock.get_sent_message()
+            self.assertIn('To: pretzel@example.com', msg)
+            self.assertIn("Your container was unregistered.", msg)
+        delete_event(r)
+
+    @smtpmock.activate
+    def test_06_mail_on_client_rollover(self):
+        """
+        Send a user notification if the container shall be rolled over
+        """
+        # create container with tokens
+        container, hotp, totp = self.setup_container_with_tokens()
+
+        self.setUp_user_realms()
+        r = add_smtpserver(identifier="myserver", server="1.2.3.4", tls=False)
+        self.assertTrue(r > 0)
+
+        msg = """
+                Hello {user},
+
+                a rollover was requested for your container {container_serial}.
+                The request came from the IP {client_ip}.
+                If that was you, you can ignore this mail, otherwise your container and all tokens might be compromised.
+                Please contact your admin and deactivate all tokens in the Web UI {url}.
+                """
+        r = set_event("send email", "container_init_rollover", "UserNotification", "sendmail",
+                      conditions={},
+                      options={"emailconfig": "myserver",
+                               "To": "email",
+                               "To email": "pretzel@example.com",
+                               "reply_to": "email",
+                               "reply_to email": "privacyidea@example.com",
+                               "subject": "Container Rollover.",
+                               "body": msg,
+                               "mimetype": "html"},
+                      position="post")
+        self.assertTrue(r > 0)
+
+        smtpmock.setdata(response={"pretzel@example.com": (450, "Mailbox not available")},
+                         support_tls=False)
+
+        # Prepare rollover
+        # Register container
+        mock_smph = ContainerEventTestCase.register_smartphone(container)
+        set_policy("policy", scope=SCOPE.CONTAINER,
+                   action={PolicyAction.CONTAINER_SERVER_URL: "https://pi.net/",
+                           PolicyAction.CONTAINER_CLIENT_ROLLOVER: True})
+        # Create Challenge for rollover
+        scope = "https://pi.net/container/rollover"
+        challenge_data = container.create_challenge(scope)
+        # Mock smartphone
+        params = mock_smph.register_finalize(challenge_data["nonce"],
+                                             challenge_data["time_stamp"],
+                                             scope)
+
+        with mock.patch("logging.Logger.warning") as mock_log:
+            self.request_assert_success("/container/rollover",
+                                        params,
+                                        None, 'POST')
+
+            # Check warning in log
+            expected = "Failed to send a notification email to user {'email': ['pretzel@example.com']}"
+            mock_log.assert_called_once_with(expected)
+            msg = smtpmock.get_sent_message()
+            self.assertIn('To: pretzel@example.com', msg)
+            self.assertIn("Container Rollover", msg)
+        delete_event(r)
+        delete_policy("policy")
+
+    @smtpmock.activate
+    def test_07_mail_on_rollover(self):
+        """
+        Send a user notification if the container shall be rolled over
+        """
+        # create container with tokens
+        container, hotp, totp = self.setup_container_with_tokens()
+
+        self.setUp_user_realms()
+        r = add_smtpserver(identifier="myserver", server="1.2.3.4", tls=False)
+        self.assertTrue(r > 0)
+
+        msg = """
+                Hello {user},
+
+                the administrator {admin}@{realm} initialized a rollover for your container {container_serial}.
+                To complete the rollover, please scan the attached QR code or click on this link {container_url_value}
+                on your smartphone.
+
+                The QR code allows you to synchronize the tokens on your smartphone with the server.
+                Be aware of no one else can see this QR code, otherwise your tokens might be compromised.
+
+                <img src={container_url_img}>
+
+                After the rollover is completed, the tokens and container on the old device are not valid anymore.
+
+                To check your container you may login to the Web UI:
+                {url}
+                """
+        r = set_event("send email", "container_register_initialize", "UserNotification", "sendmail",
+                      conditions={"container_info": "registration_state==rollover"},
+                      options={"emailconfig": "myserver",
+                               "To": "email",
+                               "To email": "pretzel@example.com",
+                               "reply_to": "email",
+                               "reply_to email": "privacyidea@example.com",
+                               "subject": "Container Rollover.",
+                               "body": msg,
+                               "mimetype": "html"},
+                      position="post")
+        self.assertTrue(r > 0)
+
+        smtpmock.setdata(response={"pretzel@example.com": (450, "Mailbox not available")},
+                         support_tls=False)
+
+        set_policy("policy", scope=SCOPE.CONTAINER,
+                   action={PolicyAction.CONTAINER_SERVER_URL: "https://pi.net/",
+                           PolicyAction.CONTAINER_CLIENT_ROLLOVER: True})
+
+        # Register container
+        ContainerEventTestCase.register_smartphone(container)
+
+        with mock.patch("logging.Logger.warning") as mock_log:
+            self.request_assert_success('/container/register/initialize',
+                                        {"container_serial": container.serial, "rollover": True},
+                                        self.at, 'POST')
+
+            # Check warning in log
+            expected = "Failed to send a notification email to user {'email': ['pretzel@example.com']}"
+            mock_log.assert_called_once_with(expected)
+            msg = smtpmock.get_sent_message()
+            self.assertIn('To: pretzel@example.com', msg)
+            self.assertIn("Container Rollover", msg)
+
+        delete_event(r)
+        delete_policy("policy")
+
+    @smtpmock.activate
+    def test_08_mail_on_rollover_not_triggered_for_register(self):
+        """
+        Send a user notification if the container shall be rolled over.
+        The mail shall not be triggered, if a container is initially registered.
+        """
+        # create container with tokens
+        container, hotp, totp = self.setup_container_with_tokens()
+
+        self.setUp_user_realms()
+        r = add_smtpserver(identifier="myserver", server="1.2.3.4", tls=False)
+        self.assertTrue(r > 0)
+
+        r = set_event("send email", "container_register_initialize", "UserNotification", "sendmail",
+                      conditions={"container_info": "registration_state==rollover"},
+                      options={"emailconfig": "myserver",
+                               "To": "email",
+                               "To email": "pretzel@example.com",
+                               "reply_to": "email",
+                               "reply_to email": "privacyidea@example.com",
+                               "subject": "Container Rollover.",
+                               "body": ""},
+                      position="post")
+        self.assertTrue(r > 0)
+
+        smtpmock.setdata(response={"pretzel@example.com": (450, "Mailbox not available")},
+                         support_tls=False)
+
+        set_policy("policy", scope=SCOPE.CONTAINER,
+                   action={PolicyAction.CONTAINER_SERVER_URL: "https://pi.net/",
+                           PolicyAction.CONTAINER_CLIENT_ROLLOVER: True})
+
+        with mock.patch("logging.Logger.warning") as mock_log:
+            self.request_assert_success('/container/register/initialize',
+                                        {"container_serial": container.serial},
+                                        self.at, 'POST')
+
+            # mock log not called
+            mock_log.assert_not_called()
+
+        delete_event(r)
+        delete_policy("policy")
